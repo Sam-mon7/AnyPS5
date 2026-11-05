@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -179,6 +180,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     Timeline::WaitScope timelineWait(packet, awaited, awaitedBytes);
     // Arch C label census: which thread recorded the awaited label and when, against this wait's start and end.
     ArchB::LabelCensus::WaitScope labelCensus(awaited, requireMemory);
+    // Label chain 2 census: a blocked wait's begin and end.
+    struct ChainWait {
+        std::uint64_t address;
+        bool blocked = false;
+        ~ChainWait() { if (blocked) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::WaitEnd, address); }
+    } chainWait{awaited};
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(awaited));
@@ -251,6 +258,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return;
     }
     labelCensus.Blocked();
+    if (ArchB::ChainCensus::On()) {
+        chainWait.blocked = true;
+        ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::WaitBlock, awaited, requireMemory ? 1u : 0u, static_cast<std::uint32_t>(awaitedBytes));
+    }
     std::optional<std::uint64_t> historyGeneration;
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
         submitWriter(writer);

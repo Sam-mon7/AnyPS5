@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -152,6 +153,7 @@ void NoteQ0Dispatch(Q0Dispatch outcome) {
     }();
     static_cast<void>(registered);
     q0Dispatches[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::Q0Dispatch, 0, static_cast<std::uint32_t>(outcome));
 }
 
 // APS5_COPY_KERNEL_DIAG=1 (diagnostic): the queue-0 copy kernels by kind: how many found the pipeline

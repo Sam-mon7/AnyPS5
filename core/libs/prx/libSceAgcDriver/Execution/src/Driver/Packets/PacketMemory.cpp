@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -87,6 +88,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 auto& entry = deferred.labels.emplace_back();
                 entry.address = label->address;
                 entry.decodedNs = ArchB::LabelCensus::On() ? ArchB::LabelCensus::Now() : 0;
+                ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::LabelDecoded, label->address, static_cast<std::uint32_t>(bytes.size()));
                 if (Timeline::Enabled) {
                     Timeline::DeferredOrigins().push_back({Timeline::Packet, Timeline::Opcode});
                     Timeline::Store(Timeline::Kind::LabelDeferred, label->address, bytes, 0);
@@ -428,6 +430,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         if (profile) Graphics::Recorder::ProfileStore(address, bytes.size(), queue, opcode, Graphics::Recorder::WaitStage::Deferred);
     }
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
+    if (label.has_value()) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::LabelQueued, address, static_cast<std::uint32_t>(bytes.size()));
     auto stored = bytes;
     auto labelBytes = bytes;
     auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, writes, stored = std::move(stored)]() mutable {

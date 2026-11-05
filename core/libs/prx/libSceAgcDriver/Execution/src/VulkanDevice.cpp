@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -2803,6 +2804,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         if (reason >= 0 && reason < 8) ArchB::Recorder::Count(ArchB::LabelCensus::ReasonNames[reason]);
         if (reason == 0 || reason == 1 || reason == 5) ArchB::LabelCensus::Recorded(address, bytes.size());
     }
+    if (reason == 0 || reason == 1 || reason == 5) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::LabelRecorded, address, static_cast<std::uint32_t>(reason), queue);
     // C_LABEL_WAKE: the label is in the table; wake a waiter sleeping on its dword.
     if (reason == 0 || reason == 5) ArchB::LabelWake::Recorded(address, bytes.size());
     return reason;

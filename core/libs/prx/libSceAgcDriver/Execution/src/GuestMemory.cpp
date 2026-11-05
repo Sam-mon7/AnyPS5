@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -5758,6 +5759,9 @@ void GpuMutexType::acquired() {
         recorderHoldGeneration = ArchB::Recorder::Generation();
         recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
+        if (ArchB::ChainCensus::On()) {
+            if (const auto code = ArchB::ChainCensus::ThreadCode(); code != 1 && code != 9) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::LockAcquired);
+        }
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         const bool skipInvalidation = ArchB::Switches::Enabled(ArchB::Feature::UbNoLockInvalidation);
         bool skipped = false;
@@ -5857,6 +5861,9 @@ void GpuMutexType::unlock() {
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
+        if (ArchB::ChainCensus::On()) {
+            if (const auto code = ArchB::ChainCensus::ThreadCode(); code != 1 && code != 9) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::LockRelease);
+        }
 #ifdef _WIN32
         if (auto* log = HoldLog::Instance(); log != nullptr && holdLogBegin != 0) {
             log->Push(LockStats().tag, holdLogBegin, HoldLog::Now());
@@ -5891,6 +5898,9 @@ void AssertGpuLockHeld(const char* where) {
 
 void GpuMutexType::lock() {
     if (holdMarksOn && !HeldByThisThread()) HoldMarkSlow(HoldMark::LockBegin);
+    if (ArchB::ChainCensus::On() && !HeldByThisThread()) {
+        if (const auto code = ArchB::ChainCensus::ThreadCode(); code != 1 && code != 9) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::LockBegin);
+    }
     // Before the wait timer: time given to the committer is counted apart (pipe_mutex_priority_*).
     DeferToCommitter(*this);
     PerformanceTimer recorderTiming("GpuMutex.wait");

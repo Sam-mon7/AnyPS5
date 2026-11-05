@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -1033,6 +1034,9 @@ void DrawPipeline::run() {
         // Stage 4 M1: the committer idles (spins, then sleeps until queue 0 enqueues).
         std::optional<Stage4::WaitScope> stage4Idle;
         if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == 0) stage4Idle.emplace(Stage4::Wait::Idle, true);
+        // Label chain 2 census: the committer idles until queue 0's next item.
+        const bool chainIdle = ArchB::ChainCensus::On() && outstanding.load(std::memory_order_acquire) == 0;
+        if (chainIdle) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::IdleBegin);
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -1054,6 +1058,7 @@ void DrawPipeline::run() {
             }
         }
         stage4Idle.reset();
+        if (chainIdle) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::IdleEnd, 0, static_cast<std::uint32_t>(kind));
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTaken);
         if (Stage4::ResolveCensus()) Stage4::BeginItem(static_cast<std::uint8_t>(kind), stage4Reads, stage4Writes, Graphics::StorageTexture::PendingSerial());
         const auto start = std::chrono::steady_clock::now();
@@ -1170,6 +1175,12 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, Drain
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();
+    // Label chain 2 census: queue 0's drain, its cause and opcode.
+    struct ChainDrain {
+        bool on;
+        ~ChainDrain() { if (on) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::DrainEnd); }
+    } chainDrain{ArchB::ChainCensus::On()};
+    if (chainDrain.on) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::DrainBegin, outstanding.load(std::memory_order_acquire), static_cast<std::uint32_t>(cause), opcode | (static_cast<std::uint32_t>(reason) << 16u));
     std::optional<Stage4::WaitScope> stage4Wait;
     if (Stage4::Tracking()) stage4Wait.emplace(Stage4::Wait::PipeDrain, true);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });

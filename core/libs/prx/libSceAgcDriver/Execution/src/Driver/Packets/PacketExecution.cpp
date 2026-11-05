@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/ChainCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -319,6 +320,18 @@ void Driver::execute(const Submission& submission) {
             }
         }
         Timeline::PacketScope timelinePacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.serial, cursor);
+        // Label chain 2 census: flips and dispatch packets.
+        struct ChainPacket {
+            std::uint32_t opcode = 0;
+            ~ChainPacket() { if (opcode != 0) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::PacketEnd, 0, opcode); }
+        } chainPacket;
+        if (ArchB::ChainCensus::On()) {
+            if (header == FlipPacketHeader && submission.queue == 0) ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::Frame);
+            else if (header != FlipPacketHeader && (opcode == 0x15 || opcode == 0x16)) {
+                chainPacket.opcode = opcode;
+                ArchB::ChainCensus::Emit(ArchB::ChainCensus::Kind::PacketBegin, 0, opcode);
+            }
+        }
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
