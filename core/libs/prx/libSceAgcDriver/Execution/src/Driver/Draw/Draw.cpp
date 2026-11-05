@@ -1775,6 +1775,10 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     DrawLockTiming lockTiming{profile};
     GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockBegin);
     const bool replayLikely = identity != nullptr && recipe == nullptr && Graphics::ArchcReplayLikely(localDevice->Device(), graphics, drawParameters, stages, identity, pipelineStateReuse);
+    const bool nostageTimed = Graphics::ArchcNostageArmed();
+    const auto nostageNow = [] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
+    std::array<std::uint64_t, 6> nostageAt{};
+    if (nostageTimed) nostageAt[0] = nostageNow();
     if (Graphics::DrawPrelockEnabled() && !replayLikely) {
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         static const bool aheadCensus = GuestMemory::CollectAheadCensus() || GuestMemory::CommitterCollectCensus();
@@ -1791,20 +1795,32 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (profile) lockTiming.prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     }
     GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockEnd);
+    if (nostageTimed) nostageAt[1] = nostageNow();
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     lockTiming.Start();
     slotProbe.Locked();
+    if (nostageTimed) nostageAt[2] = nostageNow();
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
+        std::array<std::uint64_t, 6>* census;
         ~SubmitDue() noexcept(false) {
-            if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            if (std::uncaught_exceptions() != 0) return;
+            const auto now = [] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
+            const auto before = census != nullptr ? now() : 0;
+            driver.submitDueAfterCommit(device.get());
+            if (census != nullptr) {
+                const auto& at = *census;
+                Graphics::ArchcNostageWrapper(at[1] - at[0], at[2] - at[1], at[3] - at[2], at[4] - at[3], at[5] - at[4], before - at[5], now() - before);
+            }
         }
-    } submitDue{*this, localDevice};
+    } submitDue{*this, localDevice, nostageTimed ? &nostageAt : nullptr};
     recordLabelsForPacket(localDevice.get(), queue);
+    if (nostageTimed) nostageAt[3] = nostageNow();
     noteDrawWriters(stages, queue);
+    if (nostageTimed) nostageAt[4] = nostageNow();
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse) == RecipeOutcome::Recorded) {
             slotProbe.kind = archcSlotCensus::RecipeHit;
@@ -1815,6 +1831,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr ? identity : nullptr);
+    if (nostageTimed) nostageAt[5] = nostageNow();
     slotProbe.Replay();
     if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind < archcSlotCensus::IndirectReplayed && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));

@@ -1422,6 +1422,12 @@ struct Counters {
     std::array<std::atomic<std::uint64_t>, RecordCount> record{}, recordNs{};
     std::array<std::atomic<std::uint64_t>, SyncCount> reason{};
     std::atomic<std::uint64_t> completion{0}, passBegun{0}, passContinued{0}, waitNs{0}, slow{0}, slowNs{0}, moved{0}, cacheable{0}, inserted{0};
+    std::array<std::array<std::atomic<std::uint64_t>, PhaseCount + 1>, KindCount> kindPhaseNs{};
+    std::array<std::atomic<std::uint64_t>, PhaseCount + 1> slowPhaseNs{};
+    static constexpr std::size_t WrapperCount = 7;
+    static constexpr std::array<const char*, WrapperCount> WrapperNames{"prelock", "lock_wait", "labels", "writers", "draw", "after", "submit"};
+    std::array<std::atomic<std::uint64_t>, WrapperCount> wrapperNs{};
+    std::atomic<std::uint64_t> wrapped{0}, submits{0}, submitSlowNs{0};
     Counters() {
         using AgcDriver::ArchB::Recorder;
         const auto add = [](const std::string& name, std::atomic<std::uint64_t>& value) { Recorder::RegisterCounter((new std::string("archc_nostage_" + name))->c_str(), value); };
@@ -1454,6 +1460,14 @@ struct Counters {
         add("moved", moved);
         add("cacheable", cacheable);
         add("inserted", inserted);
+        for (std::size_t k = 0; k < KindCount; ++k) {
+            for (std::size_t i = 0; i <= PhaseCount; ++i) add("kind_phase_ns_" + std::to_string(k) + "_" + (i < PhaseCount ? DrawPhaseNames[i] : "tail"), kindPhaseNs[k][i]);
+        }
+        for (std::size_t i = 0; i <= PhaseCount; ++i) add(std::string("slow_phase_ns_") + (i < PhaseCount ? DrawPhaseNames[i] : "tail"), slowPhaseNs[i]);
+        for (std::size_t i = 0; i < WrapperCount; ++i) add(std::string("wrapper_ns_") + WrapperNames[i], wrapperNs[i]);
+        add("wrapped", wrapped);
+        add("submits", submits);
+        add("submit_slow_ns", submitSlowNs);
     }
 };
 
@@ -3977,6 +3991,7 @@ struct PreparedDraw {
     const DrawSlotIdentity* identity = nullptr;
     bool slotVerify = false;
     bool slotVerifyPatch = false;
+    bool slotWordless = false;
     bool slotCapture = false;
 };
 
@@ -4480,12 +4495,18 @@ void patchCensus(VkDevice device, const DrawSlotIdentity& identity, const Pm4::D
     entry = key;
 }
 
-Slot* lookup(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, bool pipelineStateReuse) {
+Slot* lookupKeyed(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, bool pipelineStateReuse, bool wordless) {
     auto& made = table();
-    const bool wordless = wordlessIdentity(identity);
     const auto found = made.slots.find(keyOf(device, identity, draw, shaders, wordless));
     if (found == made.slots.end() || !sameIdentity(found->second, device, state, draw, shaders, identity, pipelineStateReuse, wordless)) return nullptr;
     return &found->second;
+}
+
+// The slot keyed with the patch words first; under C_REPLAY_PATCH_SLOTS the one keyed without them next, so a
+// draw whose words repeat keeps its static moved list and cached moved set.
+Slot* lookup(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, bool pipelineStateReuse) {
+    if (auto* slot = lookupKeyed(device, state, draw, shaders, identity, pipelineStateReuse, false)) return slot;
+    return wordlessIdentity(identity) ? lookupKeyed(device, state, draw, shaders, identity, pipelineStateReuse, true) : nullptr;
 }
 
 std::uint64_t hashRanges(std::uint64_t hash, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -4572,7 +4593,7 @@ bool wantsCapture(const PreparedDraw& prepared) {
 void capture(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDraw& prepared, SlotPassCapture& pass, bool inputsInPlace, const std::optional<std::array<std::uint64_t, ComponentCount>>& predicted) {
     auto& made = table();
     const auto& identity = *prepared.identity;
-    const bool wordless = wordlessIdentity(identity);
+    const bool wordless = prepared.slotWordless && wordlessIdentity(identity);
     const auto key = keyOf(context.device, identity, draw, shaders, wordless);
     const auto mismatch = [&](std::size_t component) {
         auto& counts = counters();
@@ -4742,10 +4763,13 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (slot == nullptr) {
         if (stepTiming()) classifyMiss(identity, draw, shaders);
         if (archcNostage::enabled()) patchCensus(context.device, identity, draw, shaders, table().slots.contains(keyOf(context.device, identity, draw, shaders, true)));
-        prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders, wordlessIdentity(identity)));
+        prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders));
+        prepared.slotWordless = false;
+        if (!prepared.slotCapture && wordlessIdentity(identity)) prepared.slotWordless = prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders, true));
         return refuse(RefusedNew);
     }
     prepared.slotCapture = true;
+    prepared.slotWordless = slot->wordless;
     slot->replayedLast = false;
     slot->lastUse = ++table().uses;
     if (slot->switches != currentSwitches() || diagnosticsBlock()) return refuse(RefusedSwitches);
@@ -6121,6 +6145,29 @@ std::string ResolvePipelineText() {
     return "[pipe-resolve-pipeline] cumulative: speculated " + get(counters.speculated) + " hits " + get(counters.hits) + " misses " + get(counters.misses) + " verified " + get(counters.verified) + " mismatches " + get(counters.mismatches);
 }
 
+namespace {
+
+struct NostageTargets {
+    std::array<std::atomic<std::uint64_t>, archcTargets::FastRefusalCount> refused{};
+    std::array<std::atomic<std::uint64_t>, archcTargets::TokenRefusalCount> tokenRefused{};
+    std::atomic<std::uint64_t> hits{0}, tokens{0}, targets{0}, slowLogged{0}, sampled{0};
+    NostageTargets() {
+        using AgcDriver::ArchB::Recorder;
+        for (std::size_t i = 0; i < archcTargets::FastRefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_nostage_target_refused_") + archcTargets::FastRefusalNames[i]))->c_str(), refused[i]);
+        for (std::size_t i = 0; i < archcTargets::TokenRefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_nostage_target_token_refused_") + archcTargets::TokenRefusalNames[i]))->c_str(), tokenRefused[i]);
+        Recorder::RegisterCounter("archc_nostage_target_hits", hits);
+        Recorder::RegisterCounter("archc_nostage_target_tokens", tokens);
+        Recorder::RegisterCounter("archc_nostage_targets", targets);
+    }
+};
+
+NostageTargets& nostageTargets() {
+    static NostageTargets made;
+    return made;
+}
+
+}
+
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse, const DrawSlotIdentity* identity) {
     if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     if (preparation != nullptr) RecheckDrawPreparation(context, *preparation);
@@ -6142,7 +6189,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         PreparedDraw& prepared;
         bool on = false;
         bool reached = false;
-        explicit NostageScope(PreparedDraw& owner, bool direct) : prepared(owner) {
+        explicit NostageScope(PreparedDraw& owner, bool direct, const State& drawn) : prepared(owner), state(drawn) {
             if (!archcNostage::enabled()) return;
             auto& made = archcNostage::state();
             if (made.armed < 0 || !direct) return;
@@ -6186,12 +6233,62 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             counts.validate[!outcome.validateMemoized ? archcNostage::ValidateOff : outcome.validateHit ? archcNostage::ValidateHit : archcNostage::ValidateMiss].fetch_add(1, std::memory_order_relaxed);
             const auto waited = Recorder::ThreadWaitedMs() - made.waitedBefore;
             if (waited > 0) counts.waitNs.fetch_add(static_cast<std::uint64_t>(waited * 1e6), std::memory_order_relaxed);
+            const auto kind = reached ? std::min<std::size_t>(outcome.kind, KindCount - 1) : std::size_t{0};
+            for (std::size_t i = 0; i <= PhaseCount; ++i) counts.kindPhaseNs[kind][i].fetch_add(made.phase[i], std::memory_order_relaxed);
             if (total >= archcNostage::TrimNs) {
                 counts.slow.fetch_add(1, std::memory_order_relaxed);
                 counts.slowNs.fetch_add(total, std::memory_order_relaxed);
+                for (std::size_t i = 0; i <= PhaseCount; ++i) counts.slowPhaseNs[i].fetch_add(made.phase[i], std::memory_order_relaxed);
+            }
+            auto& targets = nostageTargets();
+            auto& fast = archcTargets::fastCounters();
+            for (std::size_t i = 0; i < archcTargets::FastRefusalCount; ++i) targets.refused[i].fetch_add(fast.refused[i].load(std::memory_order_relaxed) - refusedBefore[i], std::memory_order_relaxed);
+            for (std::size_t i = 0; i < archcTargets::TokenRefusalCount; ++i) targets.tokenRefused[i].fetch_add(fast.tokenRefused[i].load(std::memory_order_relaxed) - tokenBefore[i], std::memory_order_relaxed);
+            targets.hits.fetch_add(fast.hits.load(std::memory_order_relaxed) - hitsBefore, std::memory_order_relaxed);
+            targets.tokens.fetch_add(fast.tokens.load(std::memory_order_relaxed) - tokensBefore, std::memory_order_relaxed);
+            targets.targets.fetch_add(prepared.targets.size(), std::memory_order_relaxed);
+            const bool slowDraw = total >= 300000;
+            const auto logged = slowDraw ? targets.slowLogged.fetch_add(1, std::memory_order_relaxed) : targets.sampled.fetch_add(1, std::memory_order_relaxed);
+            if ((slowDraw && logged < 48) || (!slowDraw && logged % 4096 == 0 && logged < 4096 * 24)) {
+                char line[1536];
+                int n = std::snprintf(line, sizeof(line), "[archc-nostage] %s total %.1f us why %s kind %zu lookup %s record %d waited %.1f us targets %zu depth %d:", slowDraw ? "slow" : "sample", total / 1000.0, archcNostage::WhyNames[made.why], kind, archcNostage::LookupNames[made.lookup], static_cast<int>(record), waited * 1000.0, prepared.targets.size(), state.depth.has_value() ? 1 : 0);
+                for (std::size_t i = 0; i <= PhaseCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+                    if (made.phase[i] >= 1000) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1f", i < PhaseCount ? DrawPhaseNames[i] : "tail", made.phase[i] / 1000.0);
+                }
+                for (const auto& binding : prepared.targets) {
+                    if (n <= 0 || static_cast<std::size_t>(n) >= sizeof(line)) break;
+                    const auto& color = binding.color;
+                    n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " | target 0x%llx+0x%zx %ux%u fmt %u tile %u dcc 0x%llx cmask 0x%llx fmask 0x%llx slice %u layers %u mips %u samples %u resident %d", static_cast<unsigned long long>(color.address), color.bytes, color.extent.width, color.extent.height, static_cast<unsigned>(color.format), static_cast<unsigned>(color.tileMode), static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), static_cast<unsigned long long>(color.fmaskAddress), color.arraySlice, color.layers, color.mipCount, color.samples, binding.resident != nullptr ? 1 : 0);
+                }
+                if (n > 0 && static_cast<std::size_t>(n) < sizeof(line)) {
+                    n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " | refused");
+                    for (std::size_t i = 0; i < archcTargets::FastRefusalCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+                        const auto delta = fast.refused[i].load(std::memory_order_relaxed) - refusedBefore[i];
+                        if (delta != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%llu", archcTargets::FastRefusalNames[i], static_cast<unsigned long long>(delta));
+                    }
+                    for (std::size_t i = 0; i < archcTargets::TokenRefusalCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+                        const auto delta = fast.tokenRefused[i].load(std::memory_order_relaxed) - tokenBefore[i];
+                        if (delta != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " token_%s=%llu", archcTargets::TokenRefusalNames[i], static_cast<unsigned long long>(delta));
+                    }
+                }
+                std::fprintf(stderr, "%s\n", line);
             }
         }
-    } nostage(prepared, !draw.indirect.has_value());
+        std::array<std::uint64_t, archcTargets::FastRefusalCount> refusedBefore{};
+        std::array<std::uint64_t, archcTargets::TokenRefusalCount> tokenBefore{};
+        std::uint64_t hitsBefore = 0;
+        std::uint64_t tokensBefore = 0;
+        const State& state;
+        void Snapshot() {
+            if (!on) return;
+            auto& fast = archcTargets::fastCounters();
+            for (std::size_t i = 0; i < archcTargets::FastRefusalCount; ++i) refusedBefore[i] = fast.refused[i].load(std::memory_order_relaxed);
+            for (std::size_t i = 0; i < archcTargets::TokenRefusalCount; ++i) tokenBefore[i] = fast.tokenRefused[i].load(std::memory_order_relaxed);
+            hitsBefore = fast.hits.load(std::memory_order_relaxed);
+            tokensBefore = fast.tokens.load(std::memory_order_relaxed);
+        }
+    } nostage(prepared, !draw.indirect.has_value(), state);
+    nostage.Snapshot();
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) {
         nostage.reached = true;
         recordPreparedDraw(context, state, draw, shaders, prepared);
@@ -6200,6 +6297,21 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 bool ArchcNostageCensus() {
     return archcNostage::enabled();
+}
+
+bool ArchcNostageArmed() {
+    return archcNostage::enabled() && archcNostage::state().armed >= 0;
+}
+
+void ArchcNostageWrapper(std::uint64_t prelockNs, std::uint64_t lockWaitNs, std::uint64_t labelsNs, std::uint64_t writersNs, std::uint64_t drawNs, std::uint64_t afterNs, std::uint64_t submitNs) {
+    auto& counts = archcNostage::counters();
+    const std::array<std::uint64_t, archcNostage::Counters::WrapperCount> parts{prelockNs, lockWaitNs, labelsNs, writersNs, drawNs, afterNs, submitNs};
+    for (std::size_t i = 0; i < parts.size(); ++i) counts.wrapperNs[i].fetch_add(parts[i], std::memory_order_relaxed);
+    counts.wrapped.fetch_add(1, std::memory_order_relaxed);
+    if (submitNs >= 5000) {
+        counts.submits.fetch_add(1, std::memory_order_relaxed);
+        counts.submitSlowNs.fetch_add(submitNs, std::memory_order_relaxed);
+    }
 }
 
 void ArchcNostageArm(int why) {
