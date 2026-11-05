@@ -617,7 +617,19 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     E::Token* token = nullptr;
     auto& made = E::table();
     bool verifying = false;
-    if (epochs) {
+    if (epochs && variant.runs.empty()) {
+        const auto period = E::verifyPeriod();
+        verifying = period != 0 && ++made.verifyTick % period == 0;
+        E::totals().hits.fetch_add(1, std::memory_order_relaxed);
+        ArchB::Recorder::Count("c_q0_epochs_hits_no_runs");
+        if (!verifying) {
+            variantCompared = false;
+            variantExact = true;
+            if (live != nullptr) live->clear();
+            if (feedbackHit != nullptr) *feedbackHit = false;
+            return EntryOutcome::Equal;
+        }
+    } else if (epochs) {
         const auto checked = E::check(made, variant, token);
         ArchB::Recorder::Count(E::CheckNames[static_cast<std::size_t>(checked)]);
         (checked == E::Check::Hit ? E::totals().hits : E::totals().misses).fetch_add(1, std::memory_order_relaxed);
