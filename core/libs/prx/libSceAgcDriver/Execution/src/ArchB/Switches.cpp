@@ -61,6 +61,7 @@ constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
+constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -176,6 +177,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
     // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
     {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
+    {Feature::CLazyFenceDepth, "C_LAZY_FENCE_DEPTH", false, true, CLazyFenceDepthPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

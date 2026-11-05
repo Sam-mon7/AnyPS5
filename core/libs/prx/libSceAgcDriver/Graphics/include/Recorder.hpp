@@ -635,15 +635,24 @@ public:
     // _VERIFY=N: one deferral in N records the accesses of its flush instead of waiting at them,
     // waits at the flush's end and counts accesses whose bytes the wait changed (a mismatch).
     static bool LazyFenceEnabled();
+    // Arch C P5d (APS5_ARCHB_C_LAZY_FENCE_DEPTH, prerequisite C_LAZY_FENCE): the same deferral for
+    // FlushDepthPlanes' depth-plane store flush (a Depth scope around each store's FlushPending).
+    // The store's write-back is a GPU copy ordered after the writer like the refresh's; the
+    // write-back's own unsynced compares run inside the scope (hooked); after it, readers wait for
+    // the write-back's pending write, which is later than the writer. Its deferrals count both in
+    // the c_lazy_fence_* totals and in c_lazy_fence_depth_{candidates,deferred}.
+    static bool LazyFenceDepthEnabled();
     class LazyFenceScope {
     public:
-        LazyFenceScope();
+        enum class Kind { Refresh, Depth };
+        explicit LazyFenceScope(Kind kind = Kind::Refresh);
         ~LazyFenceScope();
         LazyFenceScope(const LazyFenceScope&) = delete;
         LazyFenceScope& operator=(const LazyFenceScope&) = delete;
 
     private:
         bool allowed;
+        bool depth;
     };
     bool DeferWriterWait(std::uint64_t address, std::size_t bytes, std::uint64_t writer, bool imported);
     // Whether a batch with a serial up to `serial` is still in the in-flight list (not yet finished).
@@ -651,6 +660,7 @@ public:
     static void EndFlushDeferral();
     struct LazyFenceCounts {
         std::uint64_t candidates = 0, deferred = 0, refusedCompletions = 0, refusedNested = 0, late = 0, lateWaited = 0, unresolved = 0, verified = 0, verifyMismatches = 0;
+        std::uint64_t depthCandidates = 0, depthDeferred = 0;
     };
     static LazyFenceCounts LazyFenceTotals();
     // APS5_PROFILE_DRAW: the calling thread's fence and timeline waits so far, in milliseconds (0

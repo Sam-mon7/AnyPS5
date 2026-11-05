@@ -2389,7 +2389,14 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         planes.ranges = std::move(remaining);
         publishStaleHull(planes);
     }
-    for (auto& entry : stored) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
+    for (auto& entry : stored) {
+        // Arch C P5d (C_LAZY_FENCE_DEPTH): the store's flush may defer its wait for the range's GPU
+        // writer to the first driver access inside this scope (Recorder::DeferWriterWait). One scope
+        // per store: a deferral left unresolved at its end is covered afterwards by the write-back's
+        // own pending write, which is later than the writer.
+        const Recorder::LazyFenceScope lazyFence(Recorder::LazyFenceScope::Kind::Depth);
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
+    }
     const auto generation = GuestMemory::TrackerGeneration();
     std::lock_guard lock(surfacesMutex());
     for (const auto& entry : stored) {

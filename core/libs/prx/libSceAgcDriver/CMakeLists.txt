@@ -2842,6 +2842,18 @@ if(BUILD_TESTING)
             set_tests_properties(agc_archc_lazy_fence_${archcFence} agc_archc_lazy_fence_${archcFence}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # Arch C P5d: C_LAZY_FENCE_DEPTH, the same deferral in the depth-plane store's scope (off twins: C_LAZY_FENCE
+    # on, the depth switch off: the depth scope must wait eagerly; in-refresh defers through the refresh scope).
+    foreach(archcFenceDepth read store nested unresolved submitted completion in-refresh)
+        add_test(NAME agc_archc_lazy_fence_depth_${archcFenceDepth} COMMAND agc_driver_recorder_tests --archc-lazy-fence depth-${archcFenceDepth})
+        add_test(NAME agc_archc_lazy_fence_depth_${archcFenceDepth}_off COMMAND agc_driver_recorder_tests --archc-lazy-fence depth-${archcFenceDepth})
+        set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth} PROPERTIES ENVIRONMENT "APS5_ARCHB_C_LAZY_FENCE=1;APS5_ARCHB_C_LAZY_FENCE_DEPTH=1")
+        set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth}_off PROPERTIES ENVIRONMENT "APS5_ARCHB_C_LAZY_FENCE=1;APS5_ARCHB_C_LAZY_FENCE_DEPTH=0")
+        set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth} agc_archc_lazy_fence_depth_${archcFenceDepth}_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth} agc_archc_lazy_fence_depth_${archcFenceDepth}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     # Arch C P5b: C_LAZY_STORE_HOOK publishes a lazy range before a driver store into it (no fault).
     foreach(archcLazy store locked read)
         add_test(NAME agc_archc_lazy_store_hook_${archcLazy} COMMAND agc_driver_recorder_tests --archc-lazy ${archcLazy})

@@ -11110,11 +11110,22 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
 // the deferral), orders a driver store after the writer, and the GPU lands the later write-back over
 // the writer's bytes. Deterministic: the later write is in the open batch, never submitted before the
 // checks. The same scenarios run with the switch off (the eager wait) and must leave identical bytes.
+// Arch C P5d (C_LAZY_FENCE_DEPTH): "depth-<scenario>" runs the scenario in a Depth scope (the
+// depth-plane store's), deferring only with C_LAZY_FENCE_DEPTH on; "depth-in-refresh" opens it inside
+// a refresh scope: the deferral outlives the depth scope until the refresh scope ends, and a read
+// after the depth scope (still in the refresh scope) makes the wait.
 int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
-    const bool on = Switches::Enabled(Feature::CLazyFence);
+    const std::string_view label = scenario;
+    const bool depthKind = scenario.starts_with("depth-");
+    if (depthKind) scenario.remove_prefix(6);
+    const bool inRefresh = depthKind && scenario == "in-refresh";
+    const bool depthOn = Switches::Enabled(Feature::CLazyFenceDepth);
+    // Whether the scope defers at all: a depth scope only with C_LAZY_FENCE_DEPTH; inside a refresh
+    // scope, C_LAZY_FENCE alone already allows it (the refresh scope is open).
+    const bool on = inRefresh ? Switches::Enabled(Feature::CLazyFence) : depthKind ? depthOn : Switches::Enabled(Feature::CLazyFence);
     constexpr std::size_t bytes = 65536;
     constexpr std::size_t half = bytes / 2;
     void* watched = AllocateWatched(bytes, bytes);
@@ -11162,7 +11173,10 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
     if (scenario == "submitted") recorder.Submit();
     std::vector<std::byte> seen(bytes);
     {
-        const Recorder::LazyFenceScope scope;
+        std::optional<Recorder::LazyFenceScope> outer;
+        if (inRefresh) outer.emplace();
+        std::optional<Recorder::LazyFenceScope> scope;
+        scope.emplace(depthKind ? Recorder::LazyFenceScope::Kind::Depth : Recorder::LazyFenceScope::Kind::Refresh);
         const auto writer = recorder.PendingWriterSerial(address, bytes);
         Require(writer != 0, "the writer left no pending write");
         const bool deferred = recorder.DeferWriterWait(address, bytes, writer, true);
@@ -11178,8 +11192,14 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
             Require(deferred && after.deferred == before.deferred + 1, "the writer wait was not deferred");
             Require(recorder.InFlightThrough(recorder.OpenSerial() - 1), "the deferral did not leave the writer in flight");
         }
+        Require(after.depthDeferred == before.depthDeferred + ((depthKind && depthOn && deferred) ? 1u : 0u), "the depth deferral count is wrong");
         store(address, half, std::byte{0xb2});
-        if (scenario == "read" || scenario == "submitted" || scenario == "completion") {
+        if (inRefresh) {
+            scope.reset();
+            if (on) Require(recorder.InFlightThrough(recorder.OpenSerial() - 1), "closing the depth scope inside the refresh scope landed the writer");
+            if (on) Require(Recorder::LazyFenceTotals().unresolved == before.unresolved, "closing the depth scope inside the refresh scope dropped the deferral");
+        }
+        if (scenario == "read" || scenario == "submitted" || scenario == "completion" || inRefresh) {
             AgcDriver::GuestMemory::ReadCommittedUnsynced(address, seen);
             Require(std::all_of(seen.begin(), seen.end(), [](std::byte value) { return value == std::byte{0xa1}; }), "a driver read in the scope saw the range before the writer landed, or the later write-back");
             if (on && scenario != "completion") Require(Recorder::LazyFenceTotals().late == before.late + 1, "the read did not make the deferred wait");
@@ -11203,7 +11223,7 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
     recorder.Sync();
     Require(all(0, half, std::byte{0xb2}), "the later write-back did not land over the writer's bytes");
     Require(all(half, bytes, scenario == "store" ? std::byte{0xc3} : std::byte{0xa1}), "the writer's bytes or the driver store did not survive in order");
-    std::cout << "Arch C lazy fence " << scenario << " passed (" << (on ? "on" : "off") << ")\n";
+    std::cout << "Arch C lazy fence " << label << " passed (" << (on ? "on" : "off") << ")\n";
     return 0;
 }
 
