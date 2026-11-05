@@ -3457,7 +3457,17 @@ void CheckPageStateMemo() {
     std::cout << "page-state memo test passed (" << totals["page_memo_hits"] << " hits, " << totals["page_memo_misses"] << " misses)\n";
 }
 
-void CheckWriteTrackingBookkeeping(std::wstring_view mode) {
+// The control file of the bookkeeping toggle and bench modes. Set before anything initializes the switches: the
+// tracker's initialization reads them (WT_FAULT), and Switches::Initialize runs once.
+std::filesystem::path BookkeepingControl(std::wstring_view mode) {
+    if (mode != L"toggle" && mode != L"bench") return {};
+    auto control = std::filesystem::temp_directory_path() / ("wt-bookkeeping-" + std::to_string(GetCurrentProcessId()) + ".txt");
+    _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+    _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
+    return control;
+}
+
+void CheckWriteTrackingBookkeeping(std::wstring_view mode, const std::filesystem::path& control) {
     using Recorder = AgcDriver::ArchB::Recorder;
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -3465,12 +3475,6 @@ void CheckWriteTrackingBookkeeping(std::wstring_view mode) {
         const char* value = std::getenv("APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING");
         return value != nullptr && std::string_view(value) == "1";
     }();
-    std::filesystem::path control;
-    if (mode == L"toggle" || mode == L"bench") {
-        control = std::filesystem::temp_directory_path() / ("wt-bookkeeping-" + std::to_string(GetCurrentProcessId()) + ".txt");
-        _putenv_s("APS5_ARCHB_GATE_RUN", "1");
-        _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
-    }
     struct RemoveControl {
         std::filesystem::path path;
         ~RemoveControl() {
@@ -4170,8 +4174,10 @@ int main(int argc, char** argv) {
         }
         const auto bookkeeping = command.rfind(L"--wt-bookkeeping-");
         if (bookkeeping != std::wstring_view::npos) {
+            const auto mode = command.substr(bookkeeping + 17);
+            const auto control = BookkeepingControl(mode);
             Require(WriteWatched(), "the bookkeeping test needs write watching");
-            CheckWriteTrackingBookkeeping(command.substr(bookkeeping + 17));
+            CheckWriteTrackingBookkeeping(mode, control);
             return 0;
         }
 #endif
