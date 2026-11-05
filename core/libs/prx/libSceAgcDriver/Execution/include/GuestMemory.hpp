@@ -83,7 +83,7 @@ struct UnchangedQuery {
     std::size_t bytes;
     std::uint64_t generation;
 };
-bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site = std::source_location::current());
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_location site = std::source_location::current());
 bool UnchangedSinceClean(std::span<const UnchangedQuery> queries, std::source_location site = std::source_location::current());
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::source_location site = std::source_location::current());
@@ -99,7 +99,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes, std::source_
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::source_location site = std::source_location::current());
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store);
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source);
-bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site = std::source_location::current());
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Collect epoch: within one epoch a range already collected is not walked again, CollectWrites
 // returns the current generation instead. A guest write landing between two collects of the same
@@ -157,7 +157,7 @@ bool ResolveShareActive();
 // the range since then (it would have faulted). Lock-free; false when tracking is off or a page is
 // open, untracked or armed later. Stores the driver stamps without a fault (MarkWritten of GPU
 // results) are not covered: pair it with UnchangedSince.
-bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site = std::source_location::current());
 std::uint64_t FaultClock();
 bool FaultUntracked(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // The committer's tracker-mutex acquisitions that waited, and the nanoseconds waited.
@@ -329,7 +329,7 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
 // page after it). Appended to `runs` as merged, ascending [begin, end) runs. One tracker lock. False
 // (runs empty) when the range is not tracked or the generation is 0: the caller then treats the whole
 // range as changed.
-bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
+bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::source_location site = std::source_location::current());
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how

@@ -708,11 +708,37 @@ void Driver::execute(const Submission& submission) {
             return;
         }
         ++costs.endSubmits;
+        static const bool computeCensus = [] {
+            const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_CENSUS");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (computeCensus) {
+            ArchB::Recorder::Count("c8_end_submits");
+            if (workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) ArchB::Recorder::Count("c8_end_submits_queued");
+            if (!deferredLabels().labels.empty()) ArchB::Recorder::Count("c8_end_submits_deferred_labels");
+            if (Graphics::Recorder::PendingLabelSince().has_value()) ArchB::Recorder::Count("c8_end_submits_pending_label");
+        }
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
+        if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue != 0 && ArchB::Switches::Enabled(ArchB::Feature::CComputeSubmitMerge) && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {
+            static const std::uint64_t verifyPeriod = [] {
+                const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_SUBMIT_MERGE_VERIFY");
+                return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+            }();
+            static std::atomic<std::uint64_t> merges{0};
+            const auto merge = merges.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (verifyPeriod == 0 || merge % verifyPeriod != 0) {
+                ArchB::Recorder::Count("c_submit_merge_skipped");
+                if (Graphics::Recorder::PendingLabelSince().has_value()) ArchB::Recorder::Count("c_submit_merge_open_label");
+                ++costs.endSkipped;
+                endTiming.Finish();
+                return;
+            }
+            ArchB::Recorder::Count("c_submit_merge_verified");
+        }
         if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
     }
     endTiming.Finish();

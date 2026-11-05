@@ -1035,10 +1035,22 @@ bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
 }
 #endif
 
+namespace census {
+std::uint64_t pageStart();
+void pageEnd(std::uint64_t start, const char* entry, bool clean);
+}
+
 // Checks that [address, address + bytes) is mapped with read (and, if asked, write) access. Returns
 // an empty string when it is, otherwise why it is not.
 std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
     const TimedAccess timed(CounterVerify, bytes);
+    struct PageCensus {
+        std::uint64_t start = census::pageStart();
+        bool clean = false;
+        ~PageCensus() {
+            if (start != 0) census::pageEnd(start, "page_verify", clean);
+        }
+    } pageCensus;
     if (onOwnLiveStack(address, bytes)) return {};
 #ifdef __linux__
     if (!writable && readableWithoutQuery(address, bytes)) return {};
@@ -1055,6 +1067,7 @@ std::string verify(std::uintptr_t address, std::size_t bytes, bool writable) {
         return reason.empty();
     });
     if (!queried && reason.empty()) reason = "cannot query guest memory";
+    pageCensus.clean = reason.empty();
     return reason;
 }
 
@@ -1087,6 +1100,7 @@ bool DescribeCommittedInto(std::uint64_t address, std::size_t bytes, bool writab
     ranges.clear();
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);
+    const auto censusStart = census::pageStart();
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes, [&](const PageRun& run) {
         if (run.readable && (!writable || run.writable)) {
             if (!ranges.empty() && ranges.back().second == run.begin) ranges.back().second = run.end;
@@ -1095,7 +1109,9 @@ bool DescribeCommittedInto(std::uint64_t address, std::size_t bytes, bool writab
         return true;
     });
     require(queried, "cannot query guest memory");
-    return bytes == 0 || (ranges.size() == 1 && ranges.front().first == address && ranges.front().second == address + bytes);
+    const bool whole = bytes == 0 || (ranges.size() == 1 && ranges.front().first == address && ranges.front().second == address + bytes);
+    if (censusStart != 0) census::pageEnd(censusStart, "page_describe", whole);
+    return whole;
 }
 
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
@@ -1833,6 +1849,7 @@ WriteTracker& Tracker() {
 namespace census {
 bool enabled();
 bool timeLock(AgcDriver::Mutex& mutex);
+void liveFlip();
 }
 
 class TrackerLock {
@@ -2169,8 +2186,14 @@ struct Row {
     std::uint64_t widenPages = 0;
     std::uint64_t lockWaits = 0;
     std::uint64_t lockNs = 0;
+    std::array<std::uint64_t, 6> outcomes{};
+    std::array<std::uint64_t, 6> outcomeNs{};
 
     void add(const Row& other) {
+        for (std::size_t i = 0; i < outcomes.size(); ++i) {
+            outcomes[i] += other.outcomes[i];
+            outcomeNs[i] += other.outcomeNs[i];
+        }
         lockWaits += other.lockWaits;
         lockNs += other.lockNs;
         widenCovered += other.widenCovered;
@@ -2245,8 +2268,15 @@ void insertRange(std::map<std::uint64_t, std::uint64_t>& ranges, std::uint64_t b
     ranges.emplace(begin, end);
 }
 
+enum Outcome : int { OutcomeHit = 0, OutcomeClean = 1, OutcomeChanged = 2, OutcomeFailed = 3, OutcomeSkip = 4, OutcomeOther = 5 };
+constexpr const char* OutcomeNames[6] = {"hit", "clean", "changed", "failed", "skip", "other"};
+
 class Scope;
 thread_local Scope* active = nullptr;
+
+std::uint32_t threadTag() {
+    return IsCommitterThread() ? 0xc0c0c0c0u : GpuLockThreadTag();
+}
 
 class Scope {
 public:
@@ -2254,7 +2284,7 @@ public:
         if (!enabled() || active != nullptr) return;
         on = true;
         active = this;
-        key = {GpuLockThreadTag(), entry, site != nullptr ? site->file_name() : "", site != nullptr ? site->line() : 0u, site != nullptr ? site->function_name() : ""};
+        key = {threadTag(), entry, site != nullptr ? site->file_name() : "", site != nullptr ? site->line() : 0u, site != nullptr ? site->function_name() : ""};
 #ifdef _WIN32
         before = GuestArena::GuestArenaWriteWatchCensus_nid_no_patch();
 #endif
@@ -2265,6 +2295,9 @@ public:
         active = nullptr;
         row.calls = 1;
         row.ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        const auto kind = static_cast<std::size_t>(result < 0 ? OutcomeOther : result);
+        row.outcomes[kind] = 1;
+        row.outcomeNs[kind] = row.ns;
 #ifdef _WIN32
         const auto after = GuestArena::GuestArenaWriteWatchCensus_nid_no_patch();
         row.collects = after.collects - before.collects;
@@ -2280,7 +2313,16 @@ public:
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 
+    static int rank(int outcome) {
+        constexpr int ranks[6] = {0, 2, 3, 4, 1, 5};
+        return outcome < 0 ? -1 : ranks[outcome];
+    }
+    void set(int outcome) {
+        if (on && rank(outcome) > rank(result)) result = outcome;
+    }
+
     Row row;
+    int result = -1;
 
 private:
     bool on = false;
@@ -2290,6 +2332,19 @@ private:
 #endif
     std::chrono::steady_clock::time_point start{};
 };
+
+void note(int outcome) {
+    if (active != nullptr) active->set(outcome);
+}
+
+void noteIfUnset(int outcome) {
+    if (active != nullptr && active->result < 0) active->set(outcome);
+}
+
+bool answer(bool unchanged) {
+    note(unchanged ? OutcomeClean : OutcomeChanged);
+    return unchanged;
+}
 
 std::uint64_t threadEpoch() {
     return HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
@@ -2376,6 +2431,24 @@ bool timeLock(AgcDriver::Mutex& mutex) {
     ++active->row.lockWaits;
     active->row.lockNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     return true;
+}
+
+std::uint64_t pageStart() {
+    if (!enabled() || active != nullptr) return 0;
+    return static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+}
+
+void pageEnd(std::uint64_t start, const char* entry, bool clean) {
+    const auto now = static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::duration(static_cast<std::chrono::steady_clock::rep>(now - start))).count());
+    Row row;
+    row.calls = 1;
+    row.ns = ns;
+    const auto kind = clean ? OutcomeClean : OutcomeChanged;
+    row.outcomes[kind] = 1;
+    row.outcomeNs[kind] = ns;
+    std::lock_guard lock(tableMutex());
+    table()[Key{threadTag(), entry, ReadSiteName(CurrentReadSite()), 0, ""}].add(row);
 }
 
 void noteBump() {
@@ -2736,6 +2809,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
             if (GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), entry.clock) == GuestArena::WtFaultAnswer::Unchanged) {
                 if (!syncSkip::verify()) {
                     tracker.bump();
+                    census::note(census::OutcomeSkip);
                     syncSkip::counters().skips.fetch_add(1, std::memory_order_relaxed);
                     if (stamped != nullptr) *stamped = 0;
                     return true;
@@ -3467,12 +3541,14 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                 if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
                 committerCall.hit(committerCensus::OutcomeHitCache);
+                census::note(census::OutcomeHit);
                 return tracker.stable.load(std::memory_order_acquire);
             }
             verifyHit = true;
         }
     }
     const auto memoHit = [&] {
+        census::note(census::OutcomeHit);
         if (cached != nullptr) *cached = {first, stop, epoch, unwatched, mapping};
         if (verifyHit) bookkeeping::count(bookkeeping::Verified);
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
@@ -3519,6 +3595,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (const auto* found = failed.Find(first); found != nullptr && found->end == stop && found->unwatched == unwatched && found->mapping == mapping) {
             if (MemoryProfiled()) failedCollectMemoHits.fetch_add(1, std::memory_order_relaxed);
             committerCall.hit(committerCensus::OutcomeFailedHit);
+            census::note(census::OutcomeHit);
             return 0;
         }
     }
@@ -3550,6 +3627,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (!stableFailed::verify()) {
                 stableFailed::counters().hits.fetch_add(1, std::memory_order_relaxed);
                 committerCall.hit(committerCensus::OutcomeFailedHit);
+                census::note(census::OutcomeHit);
                 EpochMemoMap<WriteTracker::Memo>::SlotState state;
                 epochCollectMap(epoch).failedRanges.Slot(first, state) = {first, stop, epoch, unwatched, mapping};
                 noteMemoReuse(state);
@@ -3560,6 +3638,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto refusedBefore = refusedWalkPages;
     const auto fail = [&]() -> std::uint64_t {
+        census::note(census::OutcomeFailed);
         if (memoFailures) {
             EpochMemoMap<WriteTracker::Memo>::SlotState state;
             epochCollectMap(epoch).failedRanges.Slot(failedFirst, state) = {failedFirst, failedStop, epoch, unwatched, mapping};
@@ -3594,6 +3673,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                census::note(census::OutcomeHit);
                 return tracker.generation;
             }
         }
@@ -3660,6 +3740,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (!verifying) {
                 // Answered like a memo hit (the current generation; queue 0's walk stamped what it found).
                 committerCall.hit(committerCensus::OutcomeHitShare);
+                census::note(census::OutcomeHit);
                 remember();
                 return tracker.generation.load(std::memory_order_relaxed);
             }
@@ -3679,6 +3760,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (aheadScope.on && useMemo) aheadScope.walked((stop - first) / page, aheadCensus::nowNs() - aheadWalkStart);
     if (committerCall.on) committerCall.walked(walkedOk, aheadCensus::nowNs() - aheadWalkStart);
     if (!walkedOk) return fail();
+    if (stamped != 0) census::note(census::OutcomeChanged);
+    else census::noteIfUnset(census::OutcomeClean);
     if (shareCommitter) {
         auto& counters = CommitterCollects();
         const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count());
@@ -3826,7 +3909,17 @@ bool ResolveShareActive() {
     return resolveShareActive();
 }
 
-bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+static bool faultUnchangedSinceImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site);
+
+bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    census::Scope censusScope("fault_unchanged", &site);
+    const auto result = faultUnchangedSinceImpl(address, bytes, generation, site);
+    census::answer(result);
+    return result;
+}
+
+static bool faultUnchangedSinceImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    static_cast<void>(site);
 #ifdef _WIN32
     if (bytes == 0 || !wtFault::active.load(std::memory_order_acquire)) return false;
     return GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, generation) == GuestArena::WtFaultAnswer::Unchanged;
@@ -3925,6 +4018,7 @@ void WtFaultFlip(bool presenter) {
     static std::atomic<bool> presenterSeen{false};
     if (presenter) presenterSeen.store(true, std::memory_order_relaxed);
     else if (presenterSeen.load(std::memory_order_relaxed)) return;
+    if (presenter) census::liveFlip();
     walkCost::flip();
     if (!wtFault::active.load(std::memory_order_acquire)) return;
     // The runs just armed are walked by write watching (resetting, stamping what was stored before the
@@ -4131,6 +4225,52 @@ void ResetWriteCensus() {
     census::table().clear();
 }
 
+namespace {
+namespace census {
+void printRows(const std::map<Key, Row>& rows, const char* prefix, const char* what, std::uint64_t pass, std::uint64_t frames) {
+    const auto base = [](const char* path) {
+        const char* name = path;
+        for (const char* at = path; *at != 0; ++at) if (*at == '/' || *at == '\\') name = at + 1;
+        return name;
+    };
+    for (const auto& [key, row] : rows) {
+        std::string outcomes;
+        for (std::size_t i = 0; i < row.outcomes.size(); ++i) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s=%llu/%llu", OutcomeNames[i], static_cast<unsigned long long>(row.outcomes[i]), static_cast<unsigned long long>(row.outcomeNs[i]));
+            outcomes += text;
+        }
+        std::fprintf(stderr, "%s %s=%llu frames=%llu tag=0x%x entry=%s site=%s:%u calls=%llu walks=%llu lock_waits=%llu lock_ns=%llu widen_covered=%llu widen_calls=%llu widen_pages=%llu exact=%llu covered=%llu partial=%llu walk_pages=%llu repeat_pages=%llu unbumped=%llu collects=%llu queries=%llu resets=%llu os_pages=%llu dirty=%llu os_ns=%llu ns=%llu%s fn=%s\n",
+            prefix, what, static_cast<unsigned long long>(pass), static_cast<unsigned long long>(frames), key.tag, key.entry, base(key.file), key.line,
+            static_cast<unsigned long long>(row.calls), static_cast<unsigned long long>(row.walks), static_cast<unsigned long long>(row.lockWaits), static_cast<unsigned long long>(row.lockNs), static_cast<unsigned long long>(row.widenCovered), static_cast<unsigned long long>(row.widenCalls), static_cast<unsigned long long>(row.widenPages), static_cast<unsigned long long>(row.exact), static_cast<unsigned long long>(row.covered),
+            static_cast<unsigned long long>(row.partial), static_cast<unsigned long long>(row.walkPages), static_cast<unsigned long long>(row.repeatPages), static_cast<unsigned long long>(row.unbumped),
+            static_cast<unsigned long long>(row.collects), static_cast<unsigned long long>(row.queries), static_cast<unsigned long long>(row.resets), static_cast<unsigned long long>(row.osPages),
+            static_cast<unsigned long long>(row.dirty), static_cast<unsigned long long>(row.osNs), static_cast<unsigned long long>(row.ns), outcomes.c_str(), key.function);
+    }
+}
+
+void liveFlip() {
+    if (!enabled()) return;
+    static std::atomic<std::uint64_t> flips{0};
+    static std::atomic<std::int64_t> lastReport{0};
+    static const auto started = std::chrono::steady_clock::now();
+    const auto count = flips.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10000 || !lastReport.compare_exchange_strong(last, now)) return;
+    std::map<Key, Row> rows;
+    {
+        std::lock_guard lock(tableMutex());
+        rows = table();
+    }
+    std::fprintf(stderr, "[wt-census-live] begin t_ms=%lld flips=%llu rows=%zu\n", static_cast<long long>(now), static_cast<unsigned long long>(count), rows.size());
+    printRows(rows, "[wt-census-live]", "t_ms", static_cast<std::uint64_t>(now), count);
+    std::fprintf(stderr, "[wt-census-live] end t_ms=%lld\n", static_cast<long long>(now));
+    std::fflush(stderr);
+}
+}
+}
+
 void ReportWriteCensus(std::uint64_t pass, std::uint64_t frames) {
     if (Gen::Active()) Gen::ReportCensus(pass, frames);
     if (!census::enabled()) return;
@@ -4139,19 +4279,7 @@ void ReportWriteCensus(std::uint64_t pass, std::uint64_t frames) {
         std::lock_guard lock(census::tableMutex());
         rows.swap(census::table());
     }
-    const auto base = [](const char* path) {
-        const char* name = path;
-        for (const char* at = path; *at != 0; ++at) if (*at == '/' || *at == '\\') name = at + 1;
-        return name;
-    };
-    for (const auto& [key, row] : rows) {
-        std::fprintf(stderr, "[wt-census] pass=%llu frames=%llu tag=0x%x entry=%s site=%s:%u calls=%llu walks=%llu lock_waits=%llu lock_ns=%llu widen_covered=%llu widen_calls=%llu widen_pages=%llu exact=%llu covered=%llu partial=%llu walk_pages=%llu repeat_pages=%llu unbumped=%llu collects=%llu queries=%llu resets=%llu os_pages=%llu dirty=%llu os_ns=%llu ns=%llu fn=%s\n",
-            static_cast<unsigned long long>(pass), static_cast<unsigned long long>(frames), key.tag, key.entry, base(key.file), key.line,
-            static_cast<unsigned long long>(row.calls), static_cast<unsigned long long>(row.walks), static_cast<unsigned long long>(row.lockWaits), static_cast<unsigned long long>(row.lockNs), static_cast<unsigned long long>(row.widenCovered), static_cast<unsigned long long>(row.widenCalls), static_cast<unsigned long long>(row.widenPages), static_cast<unsigned long long>(row.exact), static_cast<unsigned long long>(row.covered),
-            static_cast<unsigned long long>(row.partial), static_cast<unsigned long long>(row.walkPages), static_cast<unsigned long long>(row.repeatPages), static_cast<unsigned long long>(row.unbumped),
-            static_cast<unsigned long long>(row.collects), static_cast<unsigned long long>(row.queries), static_cast<unsigned long long>(row.resets), static_cast<unsigned long long>(row.osPages),
-            static_cast<unsigned long long>(row.dirty), static_cast<unsigned long long>(row.osNs), static_cast<unsigned long long>(row.ns), key.function);
-    }
+    census::printRows(rows, "[wt-census]", "pass", pass, frames);
 #ifdef _WIN32
     const auto sweep = GuestArena::GuestArenaWriteWatchSweep_nid_no_patch();
     std::fprintf(stderr, "[wt-census-sweep] pass=%llu regions=%llu bytes=%llu dirty=%llu refused=%llu queries=%llu resident_runs=%llu resident_bytes=%llu walk_ns=%llu query_ns=%llu\n",
@@ -4438,7 +4566,16 @@ bool lockedUnchangedSince(const WriteTracker& tracker, std::uint64_t address, st
 }
 }
 
+static bool unchangedSinceImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site);
+
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    census::Scope censusScope("unchanged_since", &site);
+    const auto result = unchangedSinceImpl(address, bytes, generation, site);
+    census::answer(result);
+    return result;
+}
+
+static bool unchangedSinceImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
     const Stage4::TrackerScope stage4Scope(false, address, bytes);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
@@ -4524,7 +4661,16 @@ FastAnswer fastUnchangedAll(const WriteTracker& tracker, std::span<const Unchang
 }
 }
 
+static bool unchangedSinceAllImpl(std::span<const UnchangedQuery> queries, std::source_location site);
+
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries, std::source_location site) {
+    census::Scope censusScope("unchanged_since_all", &site);
+    const auto result = unchangedSinceAllImpl(queries, site);
+    census::answer(result);
+    return result;
+}
+
+static bool unchangedSinceAllImpl(std::span<const UnchangedQuery> queries, std::source_location site) {
     Stage4::TrackerScope stage4Scope(false, 0, 0);
     if (Stage4::ResolveCensus()) for (const auto& query : queries) stage4Scope.AddRead(query.address, query.bytes);
     auto& tracker = Tracker();
@@ -4699,7 +4845,16 @@ FastAnswer fastUnchangedCommittedSince(const WriteTracker& tracker, std::span<co
 }
 }
 
+static bool unchangedCommittedSinceImpl(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, std::source_location site);
+
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, std::source_location site) {
+    census::Scope censusScope("unchanged_committed", &site);
+    const auto result = unchangedCommittedSinceImpl(ranges, generation, site);
+    census::answer(result);
+    return result;
+}
+
+static bool unchangedCommittedSinceImpl(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, std::source_location site) {
     auto& tracker = Tracker();
     const auto shadowFast = [&](bool answer) {
         if (!Gen::ShadowActive() || ranges.empty()) return;
@@ -4881,7 +5036,17 @@ FastAnswer fastStoredOver(const WriteTracker& tracker, std::uint64_t address, st
 }
 }
 
-bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+static bool storedOverImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site);
+
+bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    census::Scope censusScope("stored_over", &site);
+    const auto result = storedOverImpl(address, bytes, generation, site);
+    census::answer(!result);
+    return result;
+}
+
+static bool storedOverImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    static_cast<void>(site);
     auto& tracker = Tracker();
     if (lockFree(tracker)) {
         if (const auto fast = fastStoredOver(tracker, address, bytes, generation); fast != FastAnswer::Inconclusive) {
@@ -5074,7 +5239,17 @@ FastAnswer fastWrittenSince(const WriteTracker& tracker, std::uint64_t address, 
 }
 }
 
-bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+static bool writtenSinceImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site);
+
+bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    census::Scope censusScope("written_since", &site);
+    const auto result = writtenSinceImpl(address, bytes, generation, site);
+    census::answer(!result);
+    return result;
+}
+
+static bool writtenSinceImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::source_location site) {
+    static_cast<void>(site);
     auto& tracker = Tracker();
     if (lockFree(tracker)) {
         if (const auto fast = fastWrittenSince(tracker, address, bytes, generation); fast != FastAnswer::Inconclusive) {
@@ -5121,7 +5296,16 @@ FastAnswer fastChangedBlocks(const WriteTracker& tracker, std::uint64_t address,
 }
 }
 
+static bool changedBlocksImpl(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu, std::source_location site);
+
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu, std::source_location site) {
+    census::Scope censusScope("changed_blocks", &site);
+    const auto result = changedBlocksImpl(address, bytes, generations, changed, cpu, site);
+    census::answer(result && std::none_of(changed.begin(), changed.end(), [](std::uint8_t value) { return value != BlockUnchanged; }));
+    return result;
+}
+
+static bool changedBlocksImpl(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu, std::source_location site) {
     const Stage4::TrackerScope stage4Scope(false, address, bytes);
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
@@ -5186,7 +5370,17 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     return true;
 }
 
-bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+static bool changedPagesImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::source_location site);
+
+bool ChangedPages(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::source_location site) {
+    census::Scope censusScope("changed_pages", &site);
+    const auto result = changedPagesImpl(address, bytes, generation, runs, site);
+    census::answer(result && runs.empty());
+    return result;
+}
+
+static bool changedPagesImpl(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::source_location site) {
+    static_cast<void>(site);
     const Stage4::TrackerScope stage4Scope(false, address, bytes);
     runs.clear();
     if (bytes == 0 || generation == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;

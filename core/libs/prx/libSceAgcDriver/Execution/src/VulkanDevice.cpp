@@ -4537,6 +4537,45 @@ bool NoPresync() {
 }
 
 // Debug aid: APS5_SYNC_DISPATCH=1 waits for every dispatch, as before batching.
+bool ComputeCensusOn() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_CENSUS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+std::uint64_t CensusNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+const char* CensusPhaseName(std::size_t phase) {
+    static const auto names = [] {
+        std::array<const char*, DispatchPhaseCount> made{};
+        for (std::size_t i = 0; i < made.size(); ++i) {
+            std::string name = std::string("c8_ph_") + DispatchPhaseNames[i];
+            for (auto& c : name) if (c == ' ' || c == ':' || c == '+' || c == '(' || c == ')') c = '_';
+            made[i] = (new std::string(name))->c_str();
+        }
+        return made;
+    }();
+    return names[phase];
+}
+
+struct CensusLap {
+    bool on = ComputeCensusOn();
+    std::uint64_t at = on ? CensusNow() : 0;
+    void lap(std::size_t phase) {
+        if (!on) return;
+        const auto now = CensusNow();
+        ArchB::Recorder::Count(CensusPhaseName(phase), static_cast<double>(now - at));
+        at = now;
+    }
+    void restart() {
+        if (on) at = CensusNow();
+    }
+};
+
 bool SyncEachDispatch() {
     static const bool syncEachDispatch = std::getenv("APS5_SYNC_DISPATCH") != nullptr;
     return syncEachDispatch;
@@ -5429,7 +5468,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // opening the batch, the keeps, the data refresh, the barriers with the bind and the dispatch
     // itself, the pending-write notes and marks (MarkGpuWrites), and the completion registration.
     auto recordFrom = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    CensusLap censusLap;
     const auto recordStep = [&](DispatchPhase which) {
+        censusLap.lap(which);
         if (!timer.profile) return;
         const auto now = std::chrono::steady_clock::now();
         timer.add(which, std::chrono::duration<double, std::milli>(now - recordFrom).count());
@@ -5870,11 +5911,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
     // (CPU write-backs) land before stage B or a cached object's Revalidate reads, and the flush
     // hook then finds nothing pending over their surfaces.
+    CensusLap censusLap;
+    if (censusLap.on) ArchB::Recorder::Count("c8_dispatch_calls");
     if (prepared != nullptr && prepared->presyncSerial != 0) {
         // Timed alone: the phase entry exists only when a reap ran, and measures just the reap.
         timer.restart();
         ReapRecorded(prepared->presyncSerial);
         timer.phase(PhaseReap);
+        censusLap.lap(PhaseReap);
     }
     // The 'resources' phase below, split (APS5_PROFILE_DRAW) into what runs under the mutex: the
     // sub-phases are extra rows named "resources: ..." in the [dispatch] totals and the [indirect]
@@ -5918,7 +5962,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        censusLap.restart();
         resources->Complete();
+        censusLap.lap(PhaseResourcesComplete);
         require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
         if (profile) {
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();
@@ -5953,6 +5999,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const bool exactEntry = prepared != nullptr && prepared->exact;
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        censusLap.restart();
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
                 bool usable = true;
@@ -6013,12 +6060,15 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                 revalidateMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - subPhaseStart).count();
                 timer.add(PhaseResourcesRevalidate, revalidateMs);
             }
+            censusLap.lap(PhaseResourcesRevalidate);
         }
     }
     if (resources == nullptr) {
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        censusLap.restart();
         resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
+        censusLap.lap(PhaseResourcesFullBuild);
         if (cacheable) {
             ++d.cacheMisses;
             if (refusedMove) noteRefusalBuild(resources->Reusable());
@@ -6254,7 +6304,10 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
     }();
     report.trace = traceProofProgram != 0 && programAddress == traceProofProgram;
+    CensusLap censusLap;
+    if (censusLap.on) ArchB::Recorder::Count("c8_recipe_calls");
     const bool proved = hit->resources->ProveCurrent(shaders[0], &report);
+    censusLap.lap(PhaseProof);
     if (report.trace) {
         static std::atomic<std::uint64_t> traced{0};
         const auto count = traced.fetch_add(1, std::memory_order_relaxed) + 1;

@@ -182,6 +182,13 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
     // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
     {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
+    // Arch C P8 (each with _VERIFY=N). COMPUTE_DEPTH_PROOF: the fast resource proof passes an element over a
+    // depth surface when no stale plane, sync or pending clear of the surface lies in its range and the depth
+    // surface set is the one the template's last full walk proved its objects under. COMPUTE_SUBMIT_MERGE: a
+    // compute queue's end of submission leaves its recorded work in the open batch when its next submission is
+    // already queued and no label is deferred (waiters submit labels they find in the open batch).
+    {Feature::CComputeDepthProof, "C_COMPUTE_DEPTH_PROOF", false, true, {}},
+    {Feature::CComputeSubmitMerge, "C_COMPUTE_SUBMIT_MERGE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

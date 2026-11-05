@@ -35,6 +35,29 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+struct DispatchCensusScope {
+    static bool On() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_CENSUS");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    static std::uint64_t Now() {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    bool on = On();
+    std::uint64_t start = on ? Now() : 0;
+    void Labels() const {
+        if (on) ArchB::Recorder::Count("c8_locked_labels_ns", static_cast<double>(Now() - start));
+    }
+    ~DispatchCensusScope() {
+        if (!on) return;
+        ArchB::Recorder::Count("c8_locked_n");
+        ArchB::Recorder::Count("c8_locked_ns", static_cast<double>(Now() - start));
+    }
+};
+
 bool DispatchItemsEnabled() {
     static const bool enabled = [] {
         const char* text = std::getenv("APS5_PIPELINE_DISPATCH");
@@ -981,8 +1004,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     Stage4::Mark(Stage4::Bucket::DispatchPrepare);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    const DispatchCensusScope dispatchCensus;
                     Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
                     recordLabelsForPacket(localDevice.get(), queueId);
+                    dispatchCensus.Labels();
                     Stage4::Mark(Stage4::Bucket::Labels);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
@@ -1086,9 +1111,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        const DispatchCensusScope dispatchCensus;
         Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
+        dispatchCensus.Labels();
         phaseTiming.Phase(PhaseLabels);
         if (noteWrites && writerKeyedEvidence() && !writersNoted) {
             noteWrittenBuffers(address, submission.queue, compiled);

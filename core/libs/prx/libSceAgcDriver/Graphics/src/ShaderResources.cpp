@@ -3455,10 +3455,66 @@ bool ShaderResources::finishPartialSnapshots(std::uint64_t forgetBefore) {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
+namespace {
+bool ComputeCensus();
+
+struct DepthProofCounters {
+    std::atomic<std::uint64_t> blocked{0}, accepted{0}, wouldAccept{0}, noWalk{0}, surfaces{0}, stale{0}, unlocked{0}, verified{0}, mismatches{0};
+};
+
+DepthProofCounters& depthProofCounters() {
+    static auto* made = [] {
+        auto* c = new DepthProofCounters();
+        const std::pair<const char*, std::atomic<std::uint64_t>*> named[] = {
+            {"c_depth_proof_blocked", &c->blocked}, {"c_depth_proof_accepted", &c->accepted}, {"c_depth_proof_would_accept", &c->wouldAccept},
+            {"c_depth_proof_refused_no_walk", &c->noWalk}, {"c_depth_proof_refused_surfaces", &c->surfaces}, {"c_depth_proof_refused_stale", &c->stale},
+            {"c_depth_proof_refused_unlocked", &c->unlocked}, {"c_depth_proof_verified", &c->verified}, {"c_depth_proof_verify_mismatches", &c->mismatches}};
+        for (const auto& [name, counter] : named) AgcDriver::ArchB::Recorder::RegisterCounter(name, *counter);
+        return c;
+    }();
+    return *made;
+}
+
+bool depthProofOn() {
+    return ArchB::Switches::Enabled(ArchB::Feature::CComputeDepthProof);
+}
+
+bool depthProofVerifyNow() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_DEPTH_PROOF_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    if (period == 0) return false;
+    static std::atomic<std::uint64_t> uses{0};
+    return (uses.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0;
+}
+}
+
+bool ShaderResources::depthProofAccepts(std::uint64_t address, std::uint64_t bytes) {
+    const bool on = depthProofOn();
+    const bool census = ComputeCensus();
+    if (!on && !census) return false;
+    auto& c = depthProofCounters();
+    c.blocked.fetch_add(1, std::memory_order_relaxed);
+    const auto refuse = [](std::atomic<std::uint64_t>& counter) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(c.unlocked);
+    if (depthWalkSerial == 0) return refuse(c.noWalk);
+    if (DepthSurfacesSerial() != depthWalkSerial || DepthSurfacesReleased() != depthWalkReleased) return refuse(c.surfaces);
+    if (DepthSurfaceBlocksMemoryProof(context.device, address, bytes)) return refuse(c.stale);
+    if (!on) return refuse(c.wouldAccept);
+    c.accepted.fetch_add(1, std::memory_order_relaxed);
+    depthProofAccepted = true;
+    return true;
+}
+
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
+    depthProofAccepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto forgetBefore = GuestMemory::ForgetSerial();
     const auto fail = [&reason](FastFail why) {
@@ -3499,7 +3555,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (DepthBlocksProof(context.device, address, bytes)) return fail(FastFail::Depth);
+        if (DepthBlocksProof(context.device, address, bytes) && !depthProofAccepts(address, bytes)) return fail(FastFail::Depth);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
         if (!surface.committed.has_value()) {
             surface.collected = GuestMemory::CollectWrites(address, bytes);
@@ -3557,7 +3613,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (DepthBlocksProof(context.device, address, bytes)) {
+        if (DepthBlocksProof(context.device, address, bytes) && !depthProofAccepts(address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
@@ -3862,7 +3918,54 @@ bool pendingScanVerifyNow();
 std::uint64_t quietProofCount(int which);
 }
 
+namespace {
+bool ComputeCensus() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_CENSUS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+struct ProofCensusNames {
+    const char* calls;
+    const char* ns;
+};
+
+ProofCensusNames proofCensusNames(const ShaderResources::ProofReport& report, bool ok) {
+    static constexpr std::array<ProofCensusNames, 6> fixed{{{"c8_rv_quiet_n", "c8_rv_quiet_ns"}, {"c8_rv_epoch_n", "c8_rv_epoch_ns"}, {"c8_rv_stamp_n", "c8_rv_stamp_ns"}, {"c8_rv_fast_n", "c8_rv_fast_ns"}, {"c8_rv_own_n", "c8_rv_own_ns"}, {"c8_rv_failed_n", "c8_rv_failed_ns"}}};
+    static const auto full = [] {
+        std::array<ProofCensusNames, static_cast<std::size_t>(ShaderResources::FastFail::Count) + 1> names{};
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            const char* reason = i < static_cast<std::size_t>(ShaderResources::FastFail::Count) ? ShaderResources::FastFailName(i) : "none";
+            names[i] = {(new std::string(std::string("c8_rv_full_") + reason + "_n"))->c_str(), (new std::string(std::string("c8_rv_full_") + reason + "_ns"))->c_str()};
+        }
+        return names;
+    }();
+    if (!ok) return fixed[5];
+    if (report.quiet) return fixed[0];
+    if (report.epochReused) return fixed[1];
+    if (report.stampReused) return fixed[2];
+    if (report.path == ShaderResources::ProofPath::OwnRefreshed) return fixed[4];
+    if (report.path == ShaderResources::ProofPath::Full) return full[std::min<std::size_t>(report.fastFail, full.size() - 1)];
+    return fixed[3];
+}
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (!ComputeCensus()) return revalidateCensused(shaders, report);
+    ProofReport local;
+    auto* used = report != nullptr ? report : &local;
+    const auto start = std::chrono::steady_clock::now();
+    const bool ok = revalidateCensused(shaders, used);
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    const auto names = proofCensusNames(*used, ok);
+    AgcDriver::ArchB::Recorder::Count(names.calls);
+    AgcDriver::ArchB::Recorder::Count(names.ns, static_cast<double>(ns));
+    return ok;
+}
+
+bool ShaderResources::revalidateCensused(std::span<const CompiledShader> shaders, ProofReport* report) {
     PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::ResourceProof);
     const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
@@ -3900,7 +4003,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         pendingSerialSeen = StorageTexture::PendingSerial();
         provedOnce = true;
         AgcDriver::ArchB::Recorder::Count("proof_fast_pass_quiet");
-        if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+        if (report != nullptr) {
+            *report = {ProofPath::Fast, ProofFailure::None};
+            report->quiet = true;
+        }
         return true;
     }
     if (EpochProofs()) {
@@ -4523,6 +4629,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         recorderTiming.RecorderCounter("full_walk_ms");
         AgcDriver::ArchB::Recorder::Count("full_walks");
         lastFullWalk = std::chrono::steady_clock::now();
+        depthWalkSerial = 0;
+        const auto walkSerial = DepthSurfacesSerial();
+        const auto walkReleased = DepthSurfacesReleased();
         lookupLog().clear();
         BuildLookups lookups;
         std::size_t textureIndex = 0;
@@ -4598,6 +4707,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         // spurious stamp (a label sharing a 64 KiB block with a surface's edge) would keep this
         // object on the full walk for good.
         captureValidation();
+        if (GuestMemory::GpuMutex().HeldByThisThread() && walkSerial != 0 && DepthSurfacesSerial() == walkSerial && DepthSurfacesReleased() == walkReleased) {
+            depthWalkSerial = walkSerial;
+            depthWalkReleased = walkReleased;
+        }
         return true;
     };
     if (stampProofs && !noFast && !epochReused && stampProofHolds()) {
@@ -4622,6 +4735,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     bool fast = epochReused || stampReused;
     if (fast && report != nullptr) report->path = ProofPath::Fast;
+    if (report != nullptr) report->stampReused = stampReused;
     if (epochReused) {
         for (const auto& entry : epochImages) entry.image->NoteProved();
     }
@@ -4680,6 +4794,24 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     }
                 }();
                 return finish(false, false, failure);
+            }
+        } else if (depthProofAccepted && depthProofVerifyNow()) {
+            auto& c = depthProofCounters();
+            c.verified.fetch_add(1, std::memory_order_relaxed);
+            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* depthVersionsSlot = nullptr;
+            auto& versions = ShaderRecompiler::ThreadOwned(depthVersionsSlot);
+            versions.clear();
+            for (const auto& surface : validatedTextures) {
+                if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+            }
+            for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+            const auto texturesBefore = textures;
+            const bool same = fullWalk();
+            const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+            if (!same || moved != versions.end() || textures != texturesBefore) {
+                const auto count = c.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 8) std::fprintf(stderr, "[archc] C_COMPUTE_DEPTH_PROOF VERIFY mismatch: the full walk %s\n", !same ? "returned another object" : "uploaded");
+                if (!same) return finish(false, false, ProofFailure::Changed);
             }
         } else if (ownRefreshed || accepted) {
             if (profile && ownRefreshed) Revalidations().ownRefreshed.fetch_add(1, std::memory_order_relaxed);

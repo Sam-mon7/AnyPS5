@@ -383,11 +383,14 @@ public:
         bool epochReused = false;
         std::size_t fastFail = 255;
         bool trace = false;
+        bool quiet = false;
+        bool stampReused = false;
         std::array<double, 6> stageMs{};
         std::array<double, 6> stageWaitMs{};
     };
     static const char* FastFailName(std::size_t reason);
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    bool revalidateCensused(std::span<const CompiledShader> shaders, ProofReport* report);
     struct ProofExtent {
         std::uint64_t directRegions = 0, directBytes = 0, describedRanges = 0, describedBytes = 0, storageImages = 0, storageBytes = 0;
     };
@@ -728,6 +731,10 @@ private:
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
     std::chrono::steady_clock::time_point lastFullWalk = std::chrono::steady_clock::now();
+    std::uint64_t depthWalkSerial = 0;
+    std::uint64_t depthWalkReleased = 0;
+    bool depthProofAccepted = false;
+    bool depthProofAccepts(std::uint64_t address, std::uint64_t bytes);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnlyRanges;
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
