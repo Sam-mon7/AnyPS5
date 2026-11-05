@@ -4326,6 +4326,98 @@ ShaderResources::ResourceEpochProof ShaderResources::currentStampSerials() {
     return serials;
 }
 
+namespace {
+struct StampScanCounters {
+    std::atomic<std::uint64_t> hits{0}, scans{0}, made{0}, refusedEpoch{0}, refusedDrain{0}, identity{0}, verified{0}, mismatches{0};
+};
+
+StampScanCounters& stampScanCounters() {
+    static auto* made = [] {
+        auto* c = new StampScanCounters();
+        const std::pair<const char*, std::atomic<std::uint64_t>*> named[] = {
+            {"c_stamp_scan_token_hits", &c->hits}, {"c_stamp_scan_token_scans", &c->scans}, {"c_stamp_scan_token_made", &c->made},
+            {"c_stamp_scan_token_refused_epoch", &c->refusedEpoch}, {"c_stamp_scan_token_refused_drain", &c->refusedDrain}, {"c_stamp_scan_token_identity", &c->identity},
+            {"c_stamp_scan_token_verified", &c->verified}, {"c_stamp_scan_token_verify_mismatches", &c->mismatches}};
+        for (const auto& [name, counter] : named) AgcDriver::ArchB::Recorder::RegisterCounter(name, *counter);
+        return c;
+    }();
+    return *made;
+}
+
+bool stampScanTokensActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::CStampScanToken) && ArchB::Switches::Enabled(ArchB::Feature::ArchcImageEpochs);
+}
+
+bool stampScanVerifyNow() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_STAMP_SCAN_TOKEN_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    if (period == 0) return false;
+    static std::atomic<std::uint64_t> uses{0};
+    return (uses.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0;
+}
+}
+
+bool ShaderResources::stampScanPending(bool& overlaps) {
+    overlaps = false;
+    const auto scanNow = [&] {
+        thread_local std::vector<StorageTexture::PendingQuery>* scanSlot = nullptr;
+        auto& scan = ShaderRecompiler::ThreadOwned(scanSlot);
+        scan.assign(stampProof.pending.begin(), stampProof.pending.end());
+        stampProofCounters().pendingScans.fetch_add(1, std::memory_order_relaxed);
+        if (!StorageTexture::ScanPending(scan)) return false;
+        overlaps = std::any_of(scan.begin(), scan.end(), [](const StorageTexture::PendingQuery& query) { return query.overlaps; });
+        return true;
+    };
+    if (!stampScanTokensActive()) return scanNow();
+    auto& c = stampScanCounters();
+    if (std::any_of(stampProof.pending.begin(), stampProof.pending.end(), [](const StorageTexture::PendingQuery& query) { return query.pending != nullptr; })) {
+        c.identity.fetch_add(1, std::memory_order_relaxed);
+        stampScanToken.valid = false;
+        return scanNow();
+    }
+    if (stampScanToken.valid) {
+        if (!ArchC::ImageEpochs::Get().DrainIfNew()) {
+            c.refusedDrain.fetch_add(1, std::memory_order_relaxed);
+            stampScanToken.valid = false;
+        } else if (stampScanEpoch.load(std::memory_order_acquire) != stampScanToken.epoch || ArchC::ImageEpochs::Get().Loss() != stampScanToken.loss) {
+            c.refusedEpoch.fetch_add(1, std::memory_order_relaxed);
+            stampScanToken.valid = false;
+        } else if (!stampScanVerifyNow()) {
+            c.hits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        } else {
+            c.verified.fetch_add(1, std::memory_order_relaxed);
+            const bool scanned = scanNow();
+            if (!scanned || overlaps) {
+                const auto count = c.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 8) std::fprintf(stderr, "[archc] C_STAMP_SCAN_TOKEN VERIFY mismatch: the scan %s while the token held\n", scanned ? "found an overlap" : "failed");
+                stampScanToken.valid = false;
+            }
+            return scanned;
+        }
+    }
+    if (!stampScanToken.registered) {
+        thread_local std::vector<ArchC::EpochRange>* rangesSlot = nullptr;
+        auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+        ranges.clear();
+        for (const auto& query : stampProof.pending) ranges.push_back({query.begin, query.end});
+        ArchC::ImageEpochs::Get().RegisterOwner(&stampScanEpoch, stampScanEpoch, ranges, ArchC::SourceBit(ArchC::EpochSource::PendingInsert));
+        stampScanToken.registered = true;
+    }
+    const bool drained = ArchC::ImageEpochs::Get().DrainIfNew();
+    const auto epoch = stampScanEpoch.load(std::memory_order_acquire);
+    const auto loss = ArchC::ImageEpochs::Get().Loss();
+    c.scans.fetch_add(1, std::memory_order_relaxed);
+    if (!scanNow()) return false;
+    if (!overlaps && drained && ArchC::ImageEpochs::Get().DrainIfNew() && stampScanEpoch.load(std::memory_order_acquire) == epoch && ArchC::ImageEpochs::Get().Loss() == loss) {
+        stampScanToken = {true, true, epoch, loss};
+        c.made.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
 bool ShaderResources::stampProofHolds() {
     auto& counters = stampProofCounters();
     const auto refuse = [&](StampRefusal reason) {
@@ -4350,14 +4442,8 @@ bool ShaderResources::stampProofHolds() {
     }
     if (HostImportsIdentity(context, false) != stampProof.imports) return refuse(StampRefusal::Imports);
     if (now.pending != stampProof.serials.pending && !stampProof.pending.empty()) {
-        thread_local std::vector<StorageTexture::PendingQuery>* scanSlot = nullptr;
-        auto& scan = ShaderRecompiler::ThreadOwned(scanSlot);
-        scan.assign(stampProof.pending.begin(), stampProof.pending.end());
-        stampProofCounters().pendingScans.fetch_add(1, std::memory_order_relaxed);
-        if (!StorageTexture::ScanPending(scan)) return refuse(StampRefusal::Pending);
-        for (const auto& query : scan) {
-            if (query.overlaps) return refuse(StampRefusal::Pending);
-        }
+        bool overlaps = false;
+        if (!stampScanPending(overlaps) || overlaps) return refuse(StampRefusal::Pending);
     }
     for (const auto index : stampProof.partials) {
         const auto& surface = validatedTextures[index];
@@ -4420,6 +4506,8 @@ void ShaderResources::rememberStampProof(std::uint64_t generation, const Resourc
     }
     stampProof.partials.clear();
     stampProof.pending.clear();
+    stampScanToken.valid = false;
+    stampScanToken.registered = false;
     const auto range = [&](std::uint64_t address, std::uint64_t bytes) {
         if (address != 0 && bytes != 0) stampProof.ranges.emplace_back(address, address + bytes);
     };
@@ -6831,6 +6919,7 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 ShaderResources::~ShaderResources() {
     if (archcToken.registered) ArchC::ImageEpochs::Get().UnregisterOwner(this);
     if (pendingScanToken.registered) ArchC::ImageEpochs::Get().UnregisterOwner(&pendingScanEpoch);
+    if (stampScanToken.registered || stampScanEpoch.load(std::memory_order_relaxed) != 1) ArchC::ImageEpochs::Get().UnregisterOwner(&stampScanEpoch);
     release();
 }
 

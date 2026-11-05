@@ -189,6 +189,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // already queued and no label is deferred (waiters submit labels they find in the open batch).
     {Feature::CComputeDepthProof, "C_COMPUTE_DEPTH_PROOF", false, true, {}},
     {Feature::CComputeSubmitMerge, "C_COMPUTE_SUBMIT_MERGE", false, true, {}},
+    // Arch C P8: the stamp memo's pending-registry scan is skipped while a token made by a scan that found no
+    // overlap holds (an ImageEpochs owner over the scanned ranges, source PendingInsert; no identity query).
+    {Feature::CStampScanToken, "C_STAMP_SCAN_TOKEN", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

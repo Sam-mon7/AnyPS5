@@ -848,6 +848,9 @@ private:
         std::vector<StorageTexture::PendingQuery> pending;
     };
     StampProof stampProof;
+    std::atomic<std::uint64_t> stampScanEpoch{1};
+    PendingScanToken stampScanToken;
+    bool stampScanPending(bool& overlaps);
     std::atomic<bool> stampArmed{false};
     void setStampValid(bool valid) {
         stampProof.valid = valid;

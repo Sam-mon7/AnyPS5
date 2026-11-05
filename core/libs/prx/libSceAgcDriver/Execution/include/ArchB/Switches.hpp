@@ -94,6 +94,7 @@ enum class Feature : std::uint8_t {
     CLazyFence,
     CComputeDepthProof,
     CComputeSubmitMerge,
+    CStampScanToken,
     Count
 };
 
