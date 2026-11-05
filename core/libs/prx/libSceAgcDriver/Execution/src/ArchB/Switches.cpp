@@ -173,6 +173,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // SLOT_INPUTS: the input step takes the slot's validated fragment outputs and stages (same decode, same
     // stage owners) instead of the validation memo and the state's pure validation checks.
     {Feature::ArchcReplaySlotInputs, "C_REPLAY_SLOT_INPUTS", false, true, ArchcReplayCutPrerequisites},
+    // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
+    // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
+    {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

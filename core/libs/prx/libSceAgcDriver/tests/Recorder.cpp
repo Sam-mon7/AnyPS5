@@ -11105,6 +11105,108 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     return true;
 }
 
+// Arch C P5c (C_LAZY_FENCE): a deferred writer wait is made by the first driver access to the range
+// inside the scope, lands exactly the batches up to the writer (not the write-back recorded after
+// the deferral), orders a driver store after the writer, and the GPU lands the later write-back over
+// the writer's bytes. Deterministic: the later write is in the open batch, never submitted before the
+// checks. The same scenarios run with the switch off (the eager wait) and must leave identical bytes.
+int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    const bool on = Switches::Enabled(Feature::CLazyFence);
+    constexpr std::size_t bytes = 65536;
+    constexpr std::size_t half = bytes / 2;
+    void* watched = AllocateWatched(bytes, bytes);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) return 77;
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    recorder.Sync();
+    const auto store = [&](std::uint64_t at, std::size_t size, std::byte value) {
+        std::vector<std::byte> data(size, value);
+        for (std::size_t done = 0; done < size; done += 4096) recorder.RecordStore(import->buffer, HostImportOffset(*import, at + done), std::span<const std::byte>(data).subspan(done, 4096), at + done);
+        recorder.NotePendingWrite(at, size);
+    };
+    const auto all = [&](std::size_t from, std::size_t to, std::byte value) { return std::all_of(block + from, block + to, [&](std::byte seen) { return seen == value; }); };
+    const auto before = Recorder::LazyFenceTotals();
+    store(address, bytes, std::byte{0xa1});
+    if (scenario == "completion") recorder.OnComplete([] {});
+    if (scenario == "submitted") recorder.Submit();
+    std::vector<std::byte> seen(bytes);
+    {
+        const Recorder::LazyFenceScope scope;
+        const auto writer = recorder.PendingWriterSerial(address, bytes);
+        Require(writer != 0, "the writer left no pending write");
+        const bool deferred = recorder.DeferWriterWait(address, bytes, writer, true);
+        if (!deferred) {
+            if (writer == recorder.OpenSerial()) recorder.Sync();
+            else recorder.FinishUpTo(writer);
+        }
+        const auto after = Recorder::LazyFenceTotals();
+        if (!on || scenario == "completion") {
+            Require(!deferred, "a writer wait was deferred with the switch off or behind a completion");
+            if (on) Require(after.refusedCompletions == before.refusedCompletions + 1, "the completion refusal was not counted");
+        } else {
+            Require(deferred && after.deferred == before.deferred + 1, "the writer wait was not deferred");
+            Require(recorder.InFlightThrough(recorder.OpenSerial() - 1), "the deferral did not leave the writer in flight");
+        }
+        store(address, half, std::byte{0xb2});
+        if (scenario == "read" || scenario == "submitted" || scenario == "completion") {
+            AgcDriver::GuestMemory::ReadCommittedUnsynced(address, seen);
+            Require(std::all_of(seen.begin(), seen.end(), [](std::byte value) { return value == std::byte{0xa1}; }), "a driver read in the scope saw the range before the writer landed, or the later write-back");
+            if (on && scenario != "completion") Require(Recorder::LazyFenceTotals().late == before.late + 1, "the read did not make the deferred wait");
+        } else if (scenario == "nested") {
+            std::lock_guard again(AgcDriver::GuestMemory::GpuMutex());
+            const std::vector<std::byte> expected(half, std::byte{0xa1});
+            Require(AgcDriver::GuestMemory::EqualsCommittedUnsynced(address + half, expected), "a nested compare saw the range before the writer landed");
+            if (on) Require(Recorder::LazyFenceTotals().late == before.late + 1, "the nested compare did not make the deferred wait");
+        } else if (scenario == "store") {
+            const std::vector<std::byte> cpu(half, std::byte{0xc3});
+            AgcDriver::GuestMemory::Write(address + half, cpu);
+            Require(all(half, bytes, std::byte{0xc3}), "the driver store did not land");
+            if (on) Require(Recorder::LazyFenceTotals().late == before.late + 1, "the store did not make the deferred wait first");
+        } else if (scenario == "unresolved") {
+            if (on) Require(recorder.InFlightThrough(recorder.OpenSerial() - 1), "the writer batch left the in-flight list without an access");
+        } else {
+            throw std::runtime_error("unknown lazy fence scenario");
+        }
+    }
+    if (on && scenario == "unresolved") Require(Recorder::LazyFenceTotals().unresolved == before.unresolved + 1, "the unresolved deferral was not counted");
+    recorder.Sync();
+    Require(all(0, half, std::byte{0xb2}), "the later write-back did not land over the writer's bytes");
+    Require(all(half, bytes, scenario == "store" ? std::byte{0xc3} : std::byte{0xa1}), "the writer's bytes or the driver store did not survive in order");
+    std::cout << "Arch C lazy fence " << scenario << " passed (" << (on ? "on" : "off") << ")\n";
+    return 0;
+}
+
 int archcLazyTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -13707,6 +13809,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-template-token") {
             return archcTemplateTokenTests(device, recorder);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy-fence") {
+            return archcLazyFenceTests(device, recorder, argv[2]);
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy") {
             return archcLazyTests(device, recorder, argv[2]);

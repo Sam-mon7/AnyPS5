@@ -89,6 +89,7 @@ enum class Feature : std::uint8_t {
     ArchcReplayDepthEpoch,
     ArchcReplaySlotBindings,
     ArchcReplaySlotInputs,
+    CLazyFence,
     Count
 };
 

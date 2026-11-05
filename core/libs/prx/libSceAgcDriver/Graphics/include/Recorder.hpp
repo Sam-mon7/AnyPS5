@@ -28,6 +28,7 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class PipelineStateReuse;
+class ShaderResources;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -271,7 +272,11 @@ public:
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
-    void OnComplete(std::function<void()> action);
+    // `checkOnly`: the action only checks the batch's results (a BDA fault check): it stores no guest
+    // bytes and stamps nothing, so C_LAZY_FENCE may leave it to run after a deferred writer wait.
+    // `copiedWriter`: the action is that object's copied-buffer write-back (plus its fault check), so its
+    // guest stores are exactly its CopiedWritesOverlap ranges (kept alive by the batch).
+    void OnComplete(std::function<void()> action, bool checkOnly = false, const ShaderResources* copiedWriter = nullptr);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -604,6 +609,50 @@ public:
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.
     static void AnnounceSyncSite(const void* site);
+    // Arch C P5c fence census (APS5_ARCHB_C_FENCE_CENSUS=1, diagnostic): every fence wait finish()
+    // makes, by thread, sync source and site, read site, packet and the reason scope below; a
+    // [fence-census] report every 10 s. The scope names the work a nested sync is made for.
+    enum class FenceReason : std::uint8_t { None = 0, LabelStore, LazyPublish, DrawnLinear, Count };
+    static bool FenceCensus();
+    class FenceReasonScope {
+    public:
+        explicit FenceReasonScope(FenceReason reason);
+        ~FenceReasonScope();
+        FenceReasonScope(const FenceReasonScope&) = delete;
+        FenceReasonScope& operator=(const FenceReasonScope&) = delete;
+
+    private:
+        bool active;
+        FenceReason previous;
+    };
+    // Arch C P5c (APS5_ARCHB_C_LAZY_FENCE): inside a LazyFenceScope (StorageTexture::refresh), the
+    // flush of other images' pending results over the refreshed range may record their write-back
+    // without first waiting for the range's pending GPU writer (DeferWriterWait). The GPU orders the
+    // write-back after the writer (its barriers cover earlier submissions); the CPU-side wait is made
+    // only when a driver store or read on this thread reaches the range before the scope ends
+    // (GuestMemory's deferred-fence hook), so every CPU access still sees the writer's bytes. Refused
+    // when a batch up to the writer carries completions (CPU write-backs that must land first).
+    // _VERIFY=N: one deferral in N records the accesses of its flush instead of waiting at them,
+    // waits at the flush's end and counts accesses whose bytes the wait changed (a mismatch).
+    static bool LazyFenceEnabled();
+    class LazyFenceScope {
+    public:
+        LazyFenceScope();
+        ~LazyFenceScope();
+        LazyFenceScope(const LazyFenceScope&) = delete;
+        LazyFenceScope& operator=(const LazyFenceScope&) = delete;
+
+    private:
+        bool allowed;
+    };
+    bool DeferWriterWait(std::uint64_t address, std::size_t bytes, std::uint64_t writer, bool imported);
+    // Whether a batch with a serial up to `serial` is still in the in-flight list (not yet finished).
+    bool InFlightThrough(std::uint64_t serial) const { return !inFlight.empty() && inFlight.front()->serial <= serial; }
+    static void EndFlushDeferral();
+    struct LazyFenceCounts {
+        std::uint64_t candidates = 0, deferred = 0, refusedCompletions = 0, refusedNested = 0, late = 0, lateWaited = 0, unresolved = 0, verified = 0, verifyMismatches = 0;
+    };
+    static LazyFenceCounts LazyFenceTotals();
     // APS5_PROFILE_DRAW: the calling thread's fence and timeline waits so far, in milliseconds (0
     // when not profiling): a caller reads it around a span of its own work to learn how much of
     // that span waited for the GPU (a resource build's nested flush-hook waits, a draw's).
@@ -804,6 +853,10 @@ private:
         std::uint32_t completionStoreCount = 0;
         // Write-back completions (OnComplete), likewise.
         std::uint32_t writeBackCompletionCount = 0;
+        // Arch C P5c: the code that registered each completion (C_LAZY_FENCE refusals, _TRACE).
+        std::vector<const void*> completionSites;
+        std::uint32_t checkOnlyCompletions = 0;
+        std::vector<const ShaderResources*> copiedWriterCompletions;
         // The ranges of the completion labels also stored on the GPU, and whether each entered the
         // pending count (NoteWrittenBack counts one the first time a write-back overlaps it).
         struct CompletionLabel {
