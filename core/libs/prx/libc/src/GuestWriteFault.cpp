@@ -56,6 +56,9 @@ struct Counters {
     std::atomic<std::uint64_t> holds{0}, heldOpened{0}, opens{0}, forgotten{0}, tracked{0};
     std::atomic<std::uint64_t> verifyWalks{0}, verifyDirty{0}, verifyUntracked{0}, verifyMismatches{0}, queries{0};
     std::atomic<std::uint64_t> logAppends{0}, logLost{0}, coldRearmed{0};
+    // Diagnostics: pages excluded because an arm's VirtualProtect of a checked run failed (it spans
+    // allocations), those calls, and the pages excluded right now (stock; a forget releases them).
+    std::atomic<std::uint64_t> excludedProtect{0}, excludedProtectRuns{0}, excludedNow{0};
 };
 
 struct State {
@@ -814,12 +817,16 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
                 if (done) {
                     armed.push_back({subBegin, subEnd});
                 } else {
+                    std::uint64_t failedPages = 0;
                     for (auto page = subBegin; page < subEnd; page += PageBytes) {
                         auto* leaf = leafAt(state, page);
                         auto& word = wordOf(*leaf, page);
                         auto expected = word.load(std::memory_order_acquire);
-                        if (stateOf(expected) == WtFaultArming && word.compare_exchange_strong(expected, make(0, false, WtFaultExcluded), std::memory_order_acq_rel)) ++excluded;
+                        if (stateOf(expected) == WtFaultArming && word.compare_exchange_strong(expected, make(0, false, WtFaultExcluded), std::memory_order_acq_rel)) ++failedPages;
                     }
+                    excluded += failedPages;
+                    state.counters.excludedProtect.fetch_add(failedPages, std::memory_order_relaxed);
+                    state.counters.excludedProtectRuns.fetch_add(1, std::memory_order_relaxed);
                 }
                 subBegin = subEnd = 0;
             };
@@ -868,6 +875,7 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
     counters.armRuns.fetch_add(armed.size(), std::memory_order_relaxed);
     counters.armQueries.fetch_add(queries, std::memory_order_relaxed);
     counters.excluded.fetch_add(excluded, std::memory_order_relaxed);
+    counters.excludedNow.fetch_add(excluded, std::memory_order_relaxed);
     counters.keptHot.fetch_add(kept, std::memory_order_relaxed);
     counters.armProtectTicks.fetch_add(static_cast<std::uint64_t>(protectTicks), std::memory_order_relaxed);
     counters.armQueryTicks.fetch_add(static_cast<std::uint64_t>(queryTicks), std::memory_order_relaxed);
@@ -914,6 +922,7 @@ void GuestWtFaultForget_nid_no_patch(std::uintptr_t address, std::size_t bytes) 
         const auto current = stateOf(previous);
         if (current == WtFaultUntracked) continue;
         if (current == WtFaultArmed) leaf->notArmed.fetch_add(1, std::memory_order_relaxed);
+        if (current == WtFaultExcluded) state.counters.excludedNow.fetch_sub(1, std::memory_order_relaxed);
         leaf->candidates.fetch_sub(1, std::memory_order_relaxed);
         ++forgotten;
     }
@@ -1199,6 +1208,26 @@ void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* out) {
     out->watchFaults = g_watchFaults.load(std::memory_order_relaxed);
     out->watchHandlerNs = ns(g_watchFaultTicks);
     out->watchedPages = g_watchedPages.load(std::memory_order_relaxed);
+    out->excludedProtect = c.excludedProtect.load(std::memory_order_relaxed);
+    out->excludedProtectRuns = c.excludedProtectRuns.load(std::memory_order_relaxed);
+    out->excludedNow = c.excludedNow.load(std::memory_order_relaxed);
+}
+
+bool GuestWtFaultRangeExcluded_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (!g_enabled.load(std::memory_order_acquire)) return false;
+    const auto& state = *g_state;
+    std::uintptr_t first = 0;
+    std::uintptr_t stop = 0;
+    if (!clamp(state, address, bytes, first, stop)) return false;
+    for (auto page = first; page < stop; page += PageBytes) {
+        const auto* leaf = leafAt(state, page);
+        if (leaf == nullptr) {
+            page = std::min(stop, state.base + ((((page - state.base) >> LeafShift) + 1) << LeafShift)) - PageBytes;
+            continue;
+        }
+        if (stateOf(leaf->words[(page >> PageShift) & (LeafPages - 1)].load(std::memory_order_acquire)) == WtFaultExcluded) return true;
+    }
+    return false;
 }
 
 bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t address) {
@@ -1596,6 +1625,7 @@ bool GuestWtFaultProtects_nid_no_patch(std::uintptr_t, std::size_t) { return fal
 void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* counters) { *counters = {}; }
 std::uint64_t GuestWtFaultWord_nid_no_patch(std::uintptr_t) { return 0; }
 bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t) { return false; }
+bool GuestWtFaultRangeExcluded_nid_no_patch(std::uintptr_t, std::size_t) { return false; }
 std::uint64_t GuestWtFaultLogHead_nid_no_patch() { return 0; }
 std::size_t GuestWtFaultLogRead_nid_no_patch(std::uint64_t*, std::uint64_t*, std::size_t, bool* lost) {
     *lost = false;

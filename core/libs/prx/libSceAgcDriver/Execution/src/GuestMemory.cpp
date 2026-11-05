@@ -1194,6 +1194,13 @@ struct Counters {
     std::atomic<std::uint64_t> consumerUnchanged{0}, consumerChanged{0}, consumerFallback{0}, consumerVerified{0}, consumerMismatches{0};
     std::atomic<std::uint64_t> keptDirty{0}, armDirtyNs{0}, dirtyWalks{0}, dirtyWalkNs{0}, armedWalkNs{0};
     std::atomic<std::uint64_t> logAppends{0}, logLost{0}, coldRearmed{0};
+    // Diagnostics (wt-split premise): excluded pages by cause and stock (libc), and the consumer slow
+    // paths an excluded page caused: whole-range fallbacks of the sync (and their walk time, all
+    // fallbacks and excluded ones), WT_SYNC_SKIP refusals answered Untracked, FaultUnchangedSince
+    // answered Untracked (stamp proofs, armed snapshots, staging carry).
+    std::atomic<std::uint64_t> excludedProtect{0}, excludedProtectRuns{0}, excludedNow{0};
+    std::atomic<std::uint64_t> fallbackExcluded{0}, fallbackWalks{0}, fallbackWalkNs{0}, fallbackExcludedWalkNs{0};
+    std::atomic<std::uint64_t> queryUntracked{0}, queryExcluded{0};
 };
 bool dirtyArmOn() {
     return active.load(std::memory_order_relaxed) && ArchB::Switches::Enabled(ArchB::Feature::WtFaultDirtyArm);
@@ -1212,7 +1219,11 @@ Counters& counters() {
             {"wt_fault_mismatches", &c->mismatches}, {"wt_fault_consumer_unchanged", &c->consumerUnchanged}, {"wt_fault_consumer_changed", &c->consumerChanged},
             {"wt_fault_consumer_fallback", &c->consumerFallback}, {"wt_fault_consumer_verified", &c->consumerVerified}, {"wt_fault_consumer_mismatches", &c->consumerMismatches},
             {"wt_fault_kept_dirty", &c->keptDirty}, {"wt_fault_arm_dirty_ns", &c->armDirtyNs}, {"wt_fault_dirty_walks", &c->dirtyWalks}, {"wt_fault_dirty_walk_ns", &c->dirtyWalkNs},
-            {"wt_fault_armed_walk_ns", &c->armedWalkNs}, {"wt_fault_log_appends", &c->logAppends}, {"wt_fault_log_lost", &c->logLost}, {"wt_fault_cold_rearmed", &c->coldRearmed}};
+            {"wt_fault_armed_walk_ns", &c->armedWalkNs}, {"wt_fault_log_appends", &c->logAppends}, {"wt_fault_log_lost", &c->logLost}, {"wt_fault_cold_rearmed", &c->coldRearmed},
+            {"wt_fault_excluded_protect", &c->excludedProtect}, {"wt_fault_excluded_protect_runs", &c->excludedProtectRuns}, {"wt_fault_excluded_now", &c->excludedNow},
+            {"wt_fault_consumer_fallback_excluded", &c->fallbackExcluded}, {"wt_fault_consumer_fallback_walks", &c->fallbackWalks},
+            {"wt_fault_consumer_fallback_walk_ns", &c->fallbackWalkNs}, {"wt_fault_consumer_fallback_excluded_walk_ns", &c->fallbackExcludedWalkNs},
+            {"wt_fault_query_untracked", &c->queryUntracked}, {"wt_fault_query_excluded", &c->queryExcluded}};
         for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
         return c;
     }();
@@ -1251,6 +1262,9 @@ void publish() {
     c.logAppends.store(raw.logAppends, std::memory_order_relaxed);
     c.logLost.store(raw.logLost, std::memory_order_relaxed);
     c.coldRearmed.store(raw.coldRearmed, std::memory_order_relaxed);
+    c.excludedProtect.store(raw.excludedProtect, std::memory_order_relaxed);
+    c.excludedProtectRuns.store(raw.excludedProtectRuns, std::memory_order_relaxed);
+    c.excludedNow.store(raw.excludedNow, std::memory_order_relaxed);
 }
 
 // The dirty pages of one walk, for VERIFY (filled under the tracker mutex).
@@ -2574,6 +2588,9 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 // (nothing stamped) when a page is untracked or excluded or the lists overflow: the caller walks the
 // whole range. With VERIFY the whole range is walked as well, and every dirty page write watching
 // reports must be among the pages this walk stamped or walked (wt_fault_consumer_mismatches).
+// Diagnostics: the last faultSync fallback on this thread saw an excluded page (walkWrites times the
+// whole-range walk that follows).
+thread_local bool fallbackExcluded = false;
 bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::uint64_t walkClock) {
     auto& c = wtFault::counters();
     static std::vector<void*> dirty(4096);
@@ -2582,6 +2599,10 @@ bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::ui
     std::size_t openCount = open.size() / 2;
     if (!GuestArena::GuestWtFaultSync_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::uintptr_t>(stop), walkClock, dirty.data(), &dirtyCount, open.data(), &openCount)) {
         c.consumerFallback.fetch_add(1, std::memory_order_relaxed);
+        if (GuestArena::GuestWtFaultRangeExcluded_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
+            c.fallbackExcluded.fetch_add(1, std::memory_order_relaxed);
+            fallbackExcluded = true;
+        }
         return false;
     }
     const auto savedTag = stampTrace::walkTag;
@@ -2680,6 +2701,7 @@ Table& table() {
 
 struct Counters {
     std::atomic<std::uint64_t> skips{0}, refused{0}, recorded{0}, verified{0}, mismatches{0}, verifiedNs{0};
+    std::atomic<std::uint64_t> refusedUntracked{0}, refusedExcluded{0};
 };
 
 Counters& counters() {
@@ -2687,7 +2709,8 @@ Counters& counters() {
         auto* c = new Counters();
         const std::pair<const char*, std::atomic<std::uint64_t>*> named[] = {
             {"wt_sync_skips", &c->skips}, {"wt_sync_skip_refused", &c->refused}, {"wt_sync_skip_recorded", &c->recorded},
-            {"wt_sync_skip_verified", &c->verified}, {"wt_sync_skip_mismatches", &c->mismatches}, {"wt_sync_skip_verified_ns", &c->verifiedNs}};
+            {"wt_sync_skip_verified", &c->verified}, {"wt_sync_skip_mismatches", &c->mismatches}, {"wt_sync_skip_verified_ns", &c->verifiedNs},
+            {"wt_sync_skip_refused_untracked", &c->refusedUntracked}, {"wt_sync_skip_refused_excluded", &c->refusedExcluded}};
         for (const auto& [name, counter] : named) ArchB::Recorder::RegisterCounter(name, *counter);
         return c;
     }();
@@ -2733,7 +2756,12 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     if (skipCandidate) {
         const auto& entry = syncSkip::table().at(first, stop);
         if (entry.first == first && entry.stop == stop && entry.unwatched == skipUnwatched && entry.mapping == skipMapping) {
-            if (GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), entry.clock) == GuestArena::WtFaultAnswer::Unchanged) {
+            const auto answer = GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), entry.clock);
+            if (answer == GuestArena::WtFaultAnswer::Untracked) {
+                syncSkip::counters().refusedUntracked.fetch_add(1, std::memory_order_relaxed);
+                if (GuestArena::GuestWtFaultRangeExcluded_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) syncSkip::counters().refusedExcluded.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (answer == GuestArena::WtFaultAnswer::Unchanged) {
                 if (!syncSkip::verify()) {
                     tracker.bump();
                     syncSkip::counters().skips.fetch_add(1, std::memory_order_relaxed);
@@ -2790,8 +2818,10 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         static_cast<void>(Gen::Note(Gen::Event::FailedWalk, first, stop, 0, tracker.generation.load(std::memory_order_relaxed), false));
     };
 #ifdef _WIN32
+    bool fellBack = false;
     if (faultWalk && !osWalk && window == nullptr && wtFault::consumersOn()) {
         runs.dirty = nullptr;
+        fallbackExcluded = false;
         if (faultSync(runs, first, stop, walkClock)) {
             if (skipCandidate) syncSkip::record(first, stop, walkClock, skipUnwatched, skipMapping);
             skipVerify.completed = true;
@@ -2799,7 +2829,22 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
             return true;
         }
         runs.dirty = dirty;
+        fellBack = true;
     }
+    const auto fallbackStart = fellBack ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct FallbackTime {
+        bool on;
+        bool excluded;
+        std::chrono::steady_clock::time_point start;
+        ~FallbackTime() {
+            if (!on) return;
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            auto& c = wtFault::counters();
+            c.fallbackWalks.fetch_add(1, std::memory_order_relaxed);
+            c.fallbackWalkNs.fetch_add(ns, std::memory_order_relaxed);
+            if (excluded) c.fallbackExcludedWalkNs.fetch_add(ns, std::memory_order_relaxed);
+        }
+    } fallbackTime{fellBack, fellBack && fallbackExcluded, fallbackStart};
     if (collectWindowsWrites(runs, first, stop, armedOnly, memoVirtualQuery)) {
         if (skipCandidate) syncSkip::record(first, stop, walkClock, skipUnwatched, skipMapping);
         skipVerify.completed = true;
@@ -3829,7 +3874,13 @@ bool ResolveShareActive() {
 bool FaultUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
 #ifdef _WIN32
     if (bytes == 0 || !wtFault::active.load(std::memory_order_acquire)) return false;
-    return GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, generation) == GuestArena::WtFaultAnswer::Unchanged;
+    const auto answer = GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, generation);
+    if (answer == GuestArena::WtFaultAnswer::Untracked) {
+        auto& c = wtFault::counters();
+        c.queryUntracked.fetch_add(1, std::memory_order_relaxed);
+        if (GuestArena::GuestWtFaultRangeExcluded_nid_no_patch(static_cast<std::uintptr_t>(address), bytes)) c.queryExcluded.fetch_add(1, std::memory_order_relaxed);
+    }
+    return answer == GuestArena::WtFaultAnswer::Unchanged;
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

@@ -73,6 +73,9 @@ struct WtFaultCounters {
     std::uint64_t watchFaults = 0;
     std::uint64_t watchHandlerNs = 0;
     std::uint64_t watchedPages = 0;
+    std::uint64_t excludedProtect = 0;     // of excluded, pages whose checked run one VirtualProtect refused (it spans allocations)
+    std::uint64_t excludedProtectRuns = 0; // those VirtualProtect calls
+    std::uint64_t excludedNow = 0;         // pages excluded right now (excluded minus the excluded pages forgotten since)
 };
 
 struct WtFaultMismatch {
@@ -152,6 +155,8 @@ void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* counters);
 std::uint64_t GuestWtFaultWord_nid_no_patch(std::uintptr_t address);
 // Diagnostics: whether a sync would skip the page now (armed no later than its last sync).
 bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t address);
+// Diagnostics: whether any page of the range is excluded (a consumer's slow path asks after the fact).
+bool GuestWtFaultRangeExcluded_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 std::uint64_t GuestWtFaultLogHead_nid_no_patch();
 std::size_t GuestWtFaultLogRead_nid_no_patch(std::uint64_t* cursor, std::uint64_t* entries, std::size_t capacity, bool* lost);
 void GuestWtFaultSetCold_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool cold);
