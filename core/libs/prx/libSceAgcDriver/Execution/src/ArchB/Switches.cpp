@@ -173,6 +173,12 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // SLOT_INPUTS: the input step takes the slot's validated fragment outputs and stages (same decode, same
     // stage owners) instead of the validation memo and the state's pure validation checks.
     {Feature::ArchcReplaySlotInputs, "C_REPLAY_SLOT_INPUTS", false, true, ArchcReplayCutPrerequisites},
+    // Arch C P3c (each with _VERIFY=N, see Draw.cpp archcSlots). PATCH_SLOTS: a data-word patched stage
+    // without buffer-base words is keyed by its variant alone; the replay takes the moved list and the
+    // bindings live, so the words reach only the moved data buffers. CONTINUE: a continued pass skips
+    // Pipeline::Continue when the reuse state already holds the slot's pipeline, layout and inputs.
+    {Feature::ArchcReplayPatchSlots, "C_REPLAY_PATCH_SLOTS", false, true, ArchcReplayCutPrerequisites},
+    {Feature::ArchcReplayContinue, "C_REPLAY_CONTINUE", false, true, ArchcReplayCutPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

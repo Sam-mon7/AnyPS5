@@ -30,6 +30,14 @@ public:
     bool Push(VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::span<const std::byte, PipelinePushSlotBytes> bytes);
     bool SameInputs(const Pipeline* pipeline, std::span<const std::byte> bytes, std::uint32_t calls) const;
     void RememberInputs(const Pipeline* pipeline, std::span<const std::byte> bytes);
+    // Arch C P3c (C_REPLAY_CONTINUE): whether Continue would record nothing: `selected` bound under
+    // `layout`, and the input memo holds `pipeline` with these bytes. Changes counts every change of
+    // the bound pipeline, the push layout, a dynamic value or the input memo (a Continue that records
+    // a command changes it).
+    bool HoldsContinue(VkPipeline selected, VkPipelineLayout layout, const Pipeline* pipeline, std::span<const std::byte> bytes) const {
+        return bound == selected && pushLayout == layout && inputPipeline == pipeline && inputSize == bytes.size() && std::memcmp(inputs.data(), bytes.data(), bytes.size()) == 0;
+    }
+    std::uint64_t Changes() const { return changes; }
 
 private:
     struct DynamicValue {
@@ -48,6 +56,7 @@ private:
     const Pipeline* inputPipeline = nullptr;
     std::array<std::byte, 256> inputs{};
     std::size_t inputSize = 0;
+    std::uint64_t changes = 0;
 };
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
@@ -104,6 +113,17 @@ public:
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes, PipelineStateReuse* reuse = nullptr) const;
+    // Arch C P3c (C_REPLAY_CONTINUE): the pipeline Continue would bind (the optimized one once linked), its
+    // input memo bytes for `state` (the bytes Continue compares; false when it has no memo for the state),
+    // and Continue's side effect besides recording (the deferred optimized relink).
+    VkPipeline Selected() const {
+        const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+        return best != VK_NULL_HANDLE ? best : pipeline;
+    }
+    bool ContinueInputs(const State& state, std::array<std::byte, 256>& bytes, std::size_t& size) const;
+    void ScheduleOptimized() const {
+        if (optimized != nullptr) optimized->Schedule();
+    }
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 

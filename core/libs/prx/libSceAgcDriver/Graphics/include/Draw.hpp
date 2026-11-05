@@ -105,6 +105,10 @@ struct ArchcReplayTotals {
     std::uint64_t verifyMismatches = 0;
 };
 ArchcReplayTotals ArchcReplayCounts();
+// Arch C P3c census (APS5_ARCHB_C_NOSTAGE_CENSUS=1): the committer arms the next direct Draw with the
+// reason it has no recipe stages (-1 disarms); Graphics::Draw times it (archc_nostage_*).
+bool ArchcNostageCensus();
+void ArchcNostageArm(int why);
 void RecheckDrawPreparation(const Context& context, DrawPreparation& preparation);
 
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw

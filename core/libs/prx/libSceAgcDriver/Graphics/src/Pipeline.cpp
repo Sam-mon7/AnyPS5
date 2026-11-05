@@ -912,6 +912,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
 
 void PipelineStateReuse::Invalidate(const char* counter) {
     if (bound != VK_NULL_HANDLE || inputPipeline != nullptr || pushLayout != VK_NULL_HANDLE) AgcDriver::ArchB::Recorder::Count(counter);
+    ++changes;
     for (auto& value : dynamic) value.size = 0;
     for (auto& value : push) value.stages = 0;
     bound = VK_NULL_HANDLE;
@@ -926,11 +927,13 @@ bool PipelineStateReuse::Bind(VkPipeline value, VkPipelineLayout layout, bool li
         if (pushLayout != VK_NULL_HANDLE) R::Count("fix_pso_reuse_invalidations_layout");
         for (auto& slot : push) slot.stages = 0;
         pushLayout = layout;
+        ++changes;
     }
     if (bound == value) {
         R::Count("fix_pso_reuse_skipped_binds");
         return false;
     }
+    ++changes;
     if (!libraries || !boundLibraries) {
         for (auto& slot : dynamic) slot.size = 0;
         inputPipeline = nullptr;
@@ -951,6 +954,7 @@ bool PipelineStateReuse::Dynamic(std::size_t slot, std::span<const std::byte> by
     inputPipeline = nullptr;
     std::memcpy(value.bytes.data(), bytes.data(), bytes.size());
     value.size = bytes.size();
+    ++changes;
     return true;
 }
 
@@ -960,6 +964,7 @@ bool PipelineStateReuse::Push(VkPipelineLayout layout, VkShaderStageFlags stages
         if (pushLayout != VK_NULL_HANDLE) AgcDriver::ArchB::Recorder::Count("fix_pso_reuse_invalidations_layout");
         for (auto& value : push) value.stages = 0;
         pushLayout = layout;
+        ++changes;
     }
     auto& value = push[offset / PipelinePushSlotBytes];
     if (value.stages == stages && std::memcmp(value.bytes.data(), bytes.data(), bytes.size()) == 0) {
@@ -968,6 +973,7 @@ bool PipelineStateReuse::Push(VkPipelineLayout layout, VkShaderStageFlags stages
     }
     value.stages = stages;
     std::copy(bytes.begin(), bytes.end(), value.bytes.begin());
+    ++changes;
     return true;
 }
 
@@ -980,6 +986,7 @@ bool PipelineStateReuse::SameInputs(const Pipeline* pipeline, std::span<const st
 
 void PipelineStateReuse::RememberInputs(const Pipeline* pipeline, std::span<const std::byte> bytes) {
     Require(bytes.size() <= inputs.size(), "pipeline input memo capacity");
+    if (inputPipeline != pipeline || inputSize != bytes.size() || std::memcmp(inputs.data(), bytes.data(), bytes.size()) != 0) ++changes;
     std::copy(bytes.begin(), bytes.end(), inputs.begin());
     inputSize = bytes.size();
     inputPipeline = pipeline;
@@ -1003,28 +1010,7 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state, PipelineSt
     std::array<std::byte, 256> inputs;
     std::size_t inputSize = 0;
     if (reuse != nullptr) {
-        const auto append = [&](const auto& value) {
-            Require(inputSize + sizeof(value) <= inputs.size(), "pipeline input capacity");
-            std::memcpy(inputs.data() + inputSize, &value, sizeof(value));
-            inputSize += sizeof(value);
-        };
-        append(state.viewport);
-        append(state.scissor);
-        append(state.depth.has_value());
-        append(state.depth ? state.depth->format : VK_FORMAT_UNDEFINED);
-        append(state.depthBiasConstant);
-        append(state.depthBiasClamp);
-        append(state.depthBiasSlope);
-        append(state.minDepthBounds);
-        append(state.maxDepthBounds);
-        append(state.cullMode);
-        append(state.frontFace);
-        append(state.depthTest);
-        append(state.depthWrite);
-        append(state.depthCompare);
-        append(state.stencilTest);
-        append(state.stencilFront);
-        append(state.stencilBack);
+        ContinueInputs(state, inputs, inputSize);
         if (reuse->SameInputs(this, {inputs.data(), inputSize}, 2u + (libraries ? 17u : static_cast<unsigned>(depthBias) + static_cast<unsigned>(depthBounds)))) return;
         R::Count("fix_pso_reuse_refused_changed_inputs");
     }
@@ -1044,6 +1030,33 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state, PipelineSt
     }
     phases.Mark("dynamic");
     if (reuse != nullptr) reuse->RememberInputs(this, {inputs.data(), inputSize});
+}
+
+bool Pipeline::ContinueInputs(const State& state, std::array<std::byte, 256>& inputs, std::size_t& inputSize) const {
+    inputSize = 0;
+    const auto append = [&](const auto& value) {
+        Require(inputSize + sizeof(value) <= inputs.size(), "pipeline input capacity");
+        std::memcpy(inputs.data() + inputSize, &value, sizeof(value));
+        inputSize += sizeof(value);
+    };
+    append(state.viewport);
+    append(state.scissor);
+    append(state.depth.has_value());
+    append(state.depth ? state.depth->format : VK_FORMAT_UNDEFINED);
+    append(state.depthBiasConstant);
+    append(state.depthBiasClamp);
+    append(state.depthBiasSlope);
+    append(state.minDepthBounds);
+    append(state.maxDepthBounds);
+    append(state.cullMode);
+    append(state.frontFace);
+    append(state.depthTest);
+    append(state.depthWrite);
+    append(state.depthCompare);
+    append(state.stencilTest);
+    append(state.stencilFront);
+    append(state.stencilBack);
+    return true;
 }
 
 void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, PipelineStateReuse* reuse) const {
