@@ -1093,6 +1093,15 @@ if(BUILD_TESTING)
         SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_archb_wt_fault PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
     set_tests_properties(agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
+    # APS5_ARCHB_WT_FAULT: host-side bulk copies (libkernel's 64 KiB staging memcpy, a kernel-mode read) and an
+    # explicit open into armed guest memory committed one 16 KiB allocation per PS5 page; alone, and with the
+    # kept consumers, sync skip and VERIFY.
+    add_test(NAME agc_archb_wt_fault_host_copy COMMAND agc_write_tracking_tests --wt-fault-host-copy)
+    add_test(NAME agc_archb_wt_fault_host_copy_kept COMMAND agc_write_tracking_tests --wt-fault-host-copy)
+    set_tests_properties(agc_archb_wt_fault_host_copy agc_archb_wt_fault_host_copy_kept PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    set_tests_properties(agc_archb_wt_fault_host_copy PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
+    set_tests_properties(agc_archb_wt_fault_host_copy_kept PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_SYNC_SKIP=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
     # APS5_ARCHB_WT_FAULT_CONSUMERS: collects from the fault states (no write-watch query for an armed
     # range), with and without VERIFY; and the whole write-tracking suite with consumers on.
     add_test(NAME agc_archb_wt_fault_consumers COMMAND agc_write_tracking_tests --wt-fault-consumers)
@@ -2854,6 +2863,18 @@ if(BUILD_TESTING)
         set_tests_properties(agc_archc_lazy_fence_${archcFence} agc_archc_lazy_fence_${archcFence}_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
         if(WIN32)
             set_tests_properties(agc_archc_lazy_fence_${archcFence} agc_archc_lazy_fence_${archcFence}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    # Arch C P5d: C_LAZY_FENCE_DEPTH, the same deferral in the depth-plane store's scope (off twins: C_LAZY_FENCE
+    # on, the depth switch off: the depth scope must wait eagerly; in-refresh defers through the refresh scope).
+    foreach(archcFenceDepth read store nested unresolved submitted completion in-refresh)
+        add_test(NAME agc_archc_lazy_fence_depth_${archcFenceDepth} COMMAND agc_driver_recorder_tests --archc-lazy-fence depth-${archcFenceDepth})
+        add_test(NAME agc_archc_lazy_fence_depth_${archcFenceDepth}_off COMMAND agc_driver_recorder_tests --archc-lazy-fence depth-${archcFenceDepth})
+        set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth} PROPERTIES ENVIRONMENT "APS5_ARCHB_C_LAZY_FENCE=1;APS5_ARCHB_C_LAZY_FENCE_DEPTH=1")
+        set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth}_off PROPERTIES ENVIRONMENT "APS5_ARCHB_C_LAZY_FENCE=1;APS5_ARCHB_C_LAZY_FENCE_DEPTH=0")
+        set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth} agc_archc_lazy_fence_depth_${archcFenceDepth}_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archc_lazy_fence_depth_${archcFenceDepth} agc_archc_lazy_fence_depth_${archcFenceDepth}_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
     # Arch C labels: C_LABEL_LAZY_PREWAIT leaves a range whose label-time store C_LAZY_PUBLISH defers out of the

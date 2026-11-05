@@ -61,6 +61,7 @@ constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
+constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
@@ -183,6 +184,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
     // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
     {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
+    {Feature::CLazyFenceDepth, "C_LAZY_FENCE_DEPTH", false, true, CLazyFenceDepthPrerequisites},
     // Arch C P8 (each with _VERIFY=N). COMPUTE_DEPTH_PROOF: the fast resource proof passes an element over a
     // depth surface when no stale plane, sync or pending clear of the surface lies in its range and the depth
     // surface set is the one the template's last full walk proved its objects under. COMPUTE_SUBMIT_MERGE: a

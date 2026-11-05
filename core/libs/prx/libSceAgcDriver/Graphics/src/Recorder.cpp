@@ -1717,6 +1717,7 @@ namespace {
 
 struct LazyFenceCounters {
     std::atomic<std::uint64_t> candidates{0}, deferred{0}, refusedCompletions{0}, refusedImport{0}, refusedNested{0}, late{0}, lateWaited{0}, unresolved{0}, torn{0}, verified{0}, verifyReads{0}, verifyMismatches{0}, verifyUnchecked{0};
+    std::atomic<std::uint64_t> depthCandidates{0}, depthDeferred{0};
     LazyFenceCounters() {
         const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { ArchB::Recorder::RegisterCounter(name, counter); };
         add("c_lazy_fence_candidates", candidates);
@@ -1732,6 +1733,8 @@ struct LazyFenceCounters {
         add("c_lazy_fence_verify_reads", verifyReads);
         add("c_lazy_fence_verify_mismatches", verifyMismatches);
         add("c_lazy_fence_verify_unchecked", verifyUnchecked);
+        add("c_lazy_fence_depth_candidates", depthCandidates);
+        add("c_lazy_fence_depth_deferred", depthDeferred);
     }
 };
 
@@ -1742,6 +1745,8 @@ LazyFenceCounters& lazyFenceCounters() {
 
 struct LazyFenceThread {
     int allowed = 0;
+    // Open Depth scopes (P5d) among the allowed ones: deferrals made while one is open count as depth.
+    int depth = 0;
     bool active = false;
     bool resolved = false;
     bool sampled = false;
@@ -1819,13 +1824,21 @@ bool Recorder::LazyFenceEnabled() {
     return ArchB::Switches::Enabled(ArchB::Feature::CLazyFence);
 }
 
-Recorder::LazyFenceScope::LazyFenceScope() : allowed(LazyFenceEnabled()) {
-    if (allowed) ++lazyFenceThread().allowed;
+bool Recorder::LazyFenceDepthEnabled() {
+    return ArchB::Switches::Enabled(ArchB::Feature::CLazyFenceDepth);
+}
+
+Recorder::LazyFenceScope::LazyFenceScope(Kind kind) : allowed(kind == Kind::Depth ? LazyFenceDepthEnabled() : LazyFenceEnabled()), depth(kind == Kind::Depth) {
+    if (!allowed) return;
+    auto& state = lazyFenceThread();
+    ++state.allowed;
+    if (depth) ++state.depth;
 }
 
 Recorder::LazyFenceScope::~LazyFenceScope() {
     if (!allowed) return;
     auto& state = lazyFenceThread();
+    if (depth) --state.depth;
     if (--state.allowed != 0) return;
     if (state.active && !state.resolved) lazyFenceCounters().unresolved.fetch_add(1, std::memory_order_relaxed);
     state.active = false;
@@ -1839,6 +1852,7 @@ bool Recorder::DeferWriterWait(std::uint64_t address, std::size_t bytes, std::ui
     if (state.allowed == 0 || completionDepth != 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     auto& counters = lazyFenceCounters();
     counters.candidates.fetch_add(1, std::memory_order_relaxed);
+    if (state.depth != 0) counters.depthCandidates.fetch_add(1, std::memory_order_relaxed);
     if (state.active && !state.resolved) {
         counters.refusedNested.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1892,6 +1906,7 @@ bool Recorder::DeferWriterWait(std::uint64_t address, std::size_t bytes, std::ui
     state.recorder = this;
     state.accesses.clear();
     counters.deferred.fetch_add(1, std::memory_order_relaxed);
+    if (state.depth != 0) counters.depthDeferred.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -1907,6 +1922,8 @@ Recorder::LazyFenceCounts Recorder::LazyFenceTotals() {
     counts.unresolved = c.unresolved.load();
     counts.verified = c.verified.load();
     counts.verifyMismatches = c.verifyMismatches.load();
+    counts.depthCandidates = c.depthCandidates.load();
+    counts.depthDeferred = c.depthDeferred.load();
     return counts;
 }
 

@@ -92,6 +92,7 @@ enum class Feature : std::uint8_t {
     ArchcReplayPatchSlots,
     ArchcReplayContinue,
     CLazyFence,
+    CLazyFenceDepth,
     CComputeDepthProof,
     CComputeSubmitMerge,
     CStampScanToken,

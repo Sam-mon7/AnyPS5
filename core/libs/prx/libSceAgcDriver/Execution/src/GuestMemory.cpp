@@ -4101,6 +4101,9 @@ void WtFaultFlip(bool presenter) {
                  per(now.holds, last.holds), per(now.forgotten, last.forgotten), per(now.tracked, last.tracked), per(now.verifyDirty, last.verifyDirty),
                  per(now.verifyUntracked, last.verifyUntracked), static_cast<unsigned long long>(now.verifyMismatches),
                  per(unchanged, lastUnchanged), per(changed, lastChanged), per(fallback, lastFallback), static_cast<unsigned long long>(c.consumerMismatches.load(std::memory_order_relaxed)));
+    if (now.openSplitRuns != last.openSplitRuns || now.openRefused != last.openRefused) {
+        std::fprintf(stderr, "[wt-fault] opens across allocations: %llu runs restored in %llu regions, %llu pages refused (totals)\n", static_cast<unsigned long long>(now.openSplitRuns), static_cast<unsigned long long>(now.openSplitPieces), static_cast<unsigned long long>(now.openRefused));
+    }
     last = now;
     lastTime = time;
     lastUnchanged = unchanged;

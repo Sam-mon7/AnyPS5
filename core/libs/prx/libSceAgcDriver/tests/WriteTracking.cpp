@@ -2188,6 +2188,155 @@ void CheckWtFault() {
     const auto final = counters();
     std::cout << "wt-fault: faults " << final.faults << " armed pages " << final.armedPages << " runs " << final.armRuns << " holds " << final.holds << " verify dirty " << final.verifyDirty << " untracked " << final.verifyUntracked << " mismatches " << final.verifyMismatches << "\n";
 }
+
+// APS5_ARCHB_WT_FAULT, host-side copies into armed guest memory laid out like live direct memory (one
+// 16 KiB allocation per PS5 page, GuestArenaCommit's granule): an arm protects each allocation apart, so a
+// host-write scope over several of them opens a run of armed pages one VirtualProtect refuses. The scope
+// must still leave every page writable and open, so libkernel's 64 KiB staging memcpy (APR and file reads)
+// and a kernel-mode read land without a fault; an explicit open the same; and after every step a page is
+// read-only exactly when the tracker holds it protected, so a guest store after the next flip either
+// faults into the tracker or does not fault at all (Demon's Souls, debug menu -> Title, 2026-11-05).
+void CheckWtFaultHostCopy() {
+    using namespace GuestArena;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Require(Switches::Enabled(Feature::WtFault) && WtFault().active, "the fault tracker did not turn on with write watching");
+    constexpr std::uint64_t Page = 4096;
+    constexpr std::size_t Granule = 16384;
+    constexpr std::size_t Bytes = 4 * Block;
+    constexpr std::size_t Staging = 64 * 1024;
+    const auto counters = [] {
+        WtFaultCounters value{};
+        GuestWtFaultCounters_nid_no_patch(&value);
+        return value;
+    };
+    const auto state = [](std::uint64_t address) { return GuestWtFaultWord_nid_no_patch(address) & WtFaultStateMask; };
+    const auto protection = [](std::uint64_t address) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == sizeof(info), "cannot query a fault-tracked page");
+        return info.Protect;
+    };
+    const auto requireConsistent = [&](std::uint64_t base, const std::string& step) {
+        for (std::uint64_t page = base; page < base + Bytes; page += Page) {
+            const auto current = state(page);
+            const bool tracked = current == WtFaultArmed || current == WtFaultArming || current == WtFaultOpening;
+            const auto actual = protection(page);
+            Require(tracked == (actual == PAGE_READONLY), step + ": page +0x" + std::to_string(page - base) + " is in state " + std::to_string(current) + " with protection 0x" + std::to_string(actual));
+        }
+    };
+    struct Fixture {
+        std::uint8_t* memory = nullptr;
+        Fixture() {
+            memory = static_cast<std::uint8_t*>(GuestArenaAllocate_nid_postfix(Bytes, Block));
+            Require(memory != nullptr, "cannot allocate the host-copy fixture");
+            GuestArenaCommit_nid_postfix(memory, Bytes, PAGE_READWRITE, Granule);
+        }
+        ~Fixture() {
+            GuestArenaReset_nid_postfix(memory, Bytes);
+            GuestArenaRelease_nid_postfix(memory, Bytes);
+        }
+        std::uint64_t Address() const { return reinterpret_cast<std::uint64_t>(memory); }
+    };
+    const auto armFresh = [&](Fixture& fixture) {
+        const auto base = fixture.Address();
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(fixture.memory + Granule, &info, sizeof(info)) == sizeof(info) && info.AllocationBase == fixture.memory + Granule, "the fixture is not one allocation per 16 KiB");
+        std::memset(fixture.memory, 0x11, Bytes);
+        const auto armed = [&] {
+            for (std::uint64_t page = base; page < base + Bytes; page += Page) {
+                if (state(page) != WtFaultArmed || protection(page) != PAGE_READONLY) return false;
+            }
+            return true;
+        };
+        const auto before = counters();
+        for (int flip = 0; flip < 4 && !armed(); ++flip) {
+            BumpCollectEpoch();
+            CollectWrites(base, Bytes);
+            WtFaultFlip();
+        }
+        const auto after = counters();
+        Require(armed(), "a fixture page was not armed within four flips");
+        Require(after.armRuns - before.armRuns >= Bytes / Granule, "the arm protected the fixture across allocations");
+        requireConsistent(base, "armed");
+    };
+    const auto storeEveryPage = [&](Fixture& fixture, std::uint8_t value, const std::string& step) {
+        for (std::size_t offset = 0; offset < Bytes; offset += Page) static_cast<volatile std::uint8_t*>(fixture.memory)[offset + 7] = value;
+        requireConsistent(fixture.Address(), step);
+    };
+    const auto start = counters();
+
+    // The staging copy of libkernel's APR read, inside the scope it opens, over 16 allocations.
+    {
+        Fixture fixture;
+        armFresh(fixture);
+        const auto base = fixture.Address();
+        const auto beforeScope = counters();
+        {
+            const HostWrite scope(fixture.memory, Bytes);
+            Require(scope.Open(), "the host-write scope refused armed private memory");
+            requireConsistent(base, "inside the host-write scope");
+            for (std::uint64_t page = base; page < base + Bytes; page += Page) Require(state(page) == WtFaultOpen && protection(page) == PAGE_READWRITE, "a host-write scope over several allocations left a page protected");
+            std::vector<std::uint8_t> staging(Staging);
+            for (std::size_t offset = 0; offset < Bytes; offset += Staging) {
+                std::fill(staging.begin(), staging.end(), static_cast<std::uint8_t>(0x40 + offset / Staging));
+                std::memcpy(fixture.memory + offset, staging.data(), staging.size());
+            }
+            WtFaultFlip();
+            for (std::uint64_t page = base; page < base + Bytes; page += Page) Require(state(page) == WtFaultOpen, "a flip protected a page held open by a host-write scope");
+        }
+        const auto afterScope = counters();
+        Require(afterScope.faults == beforeScope.faults, "the host copy faulted inside its host-write scope");
+        Require(afterScope.openSplitRuns > beforeScope.openSplitRuns && afterScope.openRefused == beforeScope.openRefused, "the scope's run across allocations was not restored region by region");
+        for (std::size_t offset = 0; offset < Bytes; offset += Staging) Require(fixture.memory[offset] == 0x40 + offset / Staging && fixture.memory[offset + Staging - 1] == 0x40 + offset / Staging, "the host copy did not land");
+        WtFaultFlip();
+        requireConsistent(base, "after the scope's flip");
+        storeEveryPage(fixture, 0x51, "after guest stores");
+    }
+
+    // A kernel-mode read (libkernel's file and AIO reads) into a scope over four allocations, unaligned.
+    {
+        Fixture fixture;
+        armFresh(fixture);
+        const auto base = fixture.Address();
+        wchar_t directory[MAX_PATH];
+        wchar_t path[MAX_PATH];
+        Require(GetTempPathW(MAX_PATH, directory) != 0 && GetTempFileNameW(directory, L"wtc", 0, path) != 0, "cannot make a temporary file");
+        HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        Require(file != INVALID_HANDLE_VALUE, "cannot open the temporary file");
+        std::vector<std::uint8_t> bytes(Staging, 0x66);
+        DWORD done = 0;
+        Require(WriteFile(file, bytes.data(), static_cast<DWORD>(Staging), &done, nullptr) && done == Staging, "cannot fill the temporary file");
+        SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+        auto* target = fixture.memory + Granule + 0x123;
+        {
+            const HostWrite scope(target, Staging);
+            requireConsistent(base, "inside the kernel-read scope");
+            const bool read = ReadFile(file, target, static_cast<DWORD>(Staging), &done, nullptr) != 0;
+            Require(read && done == Staging, "a kernel-mode read inside a host-write scope over several allocations failed (error " + std::to_string(GetLastError()) + ")");
+        }
+        CloseHandle(file);
+        Require(target[0] == 0x66 && target[Staging - 1] == 0x66, "the kernel-mode read did not land");
+        WtFaultFlip();
+        requireConsistent(base, "after the kernel read's flip");
+        storeEveryPage(fixture, 0x52, "after guest stores");
+    }
+
+    // An explicit open of armed pages across allocations, then stores that must not fault.
+    {
+        Fixture fixture;
+        armFresh(fixture);
+        const auto base = fixture.Address();
+        Require(GuestWtFaultOpen_nid_no_patch(base, Bytes) == Bytes / Page, "an open across allocations did not open every armed page");
+        requireConsistent(base, "after an open");
+        const auto faults = counters().faults;
+        storeEveryPage(fixture, 0x53, "after stores into opened pages");
+        Require(counters().faults == faults, "a store into a page an open restored faulted");
+    }
+
+    const auto end = counters();
+    Require(end.openRefused == start.openRefused, "an open refused pages of live guest memory");
+    std::cout << "wt-fault host copy: faults " << end.faults - start.faults << " split opens " << end.openSplitRuns - start.openSplitRuns << " regions " << end.openSplitPieces - start.openSplitPieces << " refused " << end.openRefused - start.openRefused << " excluded " << end.excluded - start.excluded << "\n";
+}
 #endif
 
 #ifdef _WIN32
@@ -3308,7 +3457,17 @@ void CheckPageStateMemo() {
     std::cout << "page-state memo test passed (" << totals["page_memo_hits"] << " hits, " << totals["page_memo_misses"] << " misses)\n";
 }
 
-void CheckWriteTrackingBookkeeping(std::wstring_view mode) {
+// The control file of the bookkeeping toggle and bench modes. Set before anything initializes the switches: the
+// tracker's initialization reads them (WT_FAULT), and Switches::Initialize runs once.
+std::filesystem::path BookkeepingControl(std::wstring_view mode) {
+    if (mode != L"toggle" && mode != L"bench") return {};
+    auto control = std::filesystem::temp_directory_path() / ("wt-bookkeeping-" + std::to_string(GetCurrentProcessId()) + ".txt");
+    _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+    _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
+    return control;
+}
+
+void CheckWriteTrackingBookkeeping(std::wstring_view mode, const std::filesystem::path& control) {
     using Recorder = AgcDriver::ArchB::Recorder;
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -3316,12 +3475,6 @@ void CheckWriteTrackingBookkeeping(std::wstring_view mode) {
         const char* value = std::getenv("APS5_VERIFY_WRITE_TRACKING_BOOKKEEPING");
         return value != nullptr && std::string_view(value) == "1";
     }();
-    std::filesystem::path control;
-    if (mode == L"toggle" || mode == L"bench") {
-        control = std::filesystem::temp_directory_path() / ("wt-bookkeeping-" + std::to_string(GetCurrentProcessId()) + ".txt");
-        _putenv_s("APS5_ARCHB_GATE_RUN", "1");
-        _putenv_s("APS5_ARCHB_CONTROL_FILE", control.string().c_str());
-    }
     struct RemoveControl {
         std::filesystem::path path;
         ~RemoveControl() {
@@ -4021,8 +4174,10 @@ int main(int argc, char** argv) {
         }
         const auto bookkeeping = command.rfind(L"--wt-bookkeeping-");
         if (bookkeeping != std::wstring_view::npos) {
+            const auto mode = command.substr(bookkeeping + 17);
+            const auto control = BookkeepingControl(mode);
             Require(WriteWatched(), "the bookkeeping test needs write watching");
-            CheckWriteTrackingBookkeeping(command.substr(bookkeeping + 17));
+            CheckWriteTrackingBookkeeping(mode, control);
             return 0;
         }
 #endif
@@ -4073,6 +4228,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--wt-fault") {
             CheckWtFault();
             std::cout << "fault tracking test passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--wt-fault-host-copy") {
+            CheckWtFaultHostCopy();
+            std::cout << "fault tracking host copy test passed\n";
             return 0;
         }
 #endif
