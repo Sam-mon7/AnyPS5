@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -10,6 +11,7 @@
 #include "ThreadOwned.hpp"
 #include <algorithm>
 #include <cstdlib>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
 
@@ -155,6 +157,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         std::chrono::steady_clock::time_point start;
         double historyUs = 0;
         ~Clear() {
+            ArchB::LabelCensus::Steps closeCensus;
             const auto closeStart = opcodes != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const auto count = labels.size();
             const bool failed = std::uncaught_exceptions() != 0;
@@ -166,6 +169,11 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
 
             Graphics::Recorder::ForgetQueuedLabels();
             queuedLabelsNoted() = 0;
+            if (closeCensus.Active()) {
+                closeCensus.Step("c9_close_ns");
+                ArchB::Recorder::Count("c9_group_n");
+                ArchB::Recorder::Count("c9_group_labels", static_cast<double>(count));
+            }
             if (opcodes != nullptr) {
                 struct Totals {
                     std::uint64_t groups = 0, labels = 0;
@@ -197,7 +205,13 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         } restorePacket{profile, packet};
         const auto bytes = std::span<const std::byte>(label.bytes).first(label.size);
         const auto stamp = ++eventSerial;
+        ArchB::LabelCensus::Steps labelCensus;
+        if (labelCensus.Active()) ArchB::LabelCensus::Thread().decodeNs = label.decodedNs;
         const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label.address, bytes, stamp, queue, first) : 4;
+        if (labelCensus.Active()) {
+            ArchB::LabelCensus::Thread().decodeNs = 0;
+            labelCensus.Step("c9_rec_write_ns");
+        }
         first = false;
         countLabelOutcome(reason);
         if (reason != 0 && reason != 5) {
@@ -207,6 +221,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
         const auto historyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         noteLabelStore(label.address, bytes, stamp, queue);
         if (profile) clear.historyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - historyStart).count();
+        labelCensus.Step("c9_rec_history_ns");
     }
     ++labelGroups;
     if (profile && (labelGroups.load(std::memory_order_relaxed) & 63u) == 0 && std::chrono::steady_clock::now() - lastSyncReport > std::chrono::seconds(10)) {
@@ -220,16 +235,43 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // Arch C label census (c9_rlp_*): the prewait, the record and the packet-flush submit, per thread. The thread's
+    // prewait time and C_LABEL_LAZY_PREWAIT's left-out ranges belong to this record only.
+    ArchB::LabelCensus::Steps census;
+    struct EndRecord {
+        ~EndRecord() {
+            auto& thread = ArchB::LabelCensus::Thread();
+            thread.syncNs = 0;
+            thread.prewaitSkipped.clear();
+        }
+    };
+    std::optional<EndRecord> endRecord;
     if (!deferredLabels().labels.empty()) {
-        if (Graphics::Recorder::ComputeSyncEnabled()) Graphics::StorageTexture::PrepareReadbackBeforeLabel(true);
+        if (census.Active()) {
+            ArchB::Recorder::Count("c9_rlp_n");
+            ArchB::Recorder::Count("c9_rlp_labels", static_cast<double>(deferredLabels().labels.size()));
+        }
+        if (Graphics::Recorder::ComputeSyncEnabled()) {
+            endRecord.emplace();
+            Graphics::StorageTexture::PrepareReadbackBeforeLabel(true);
+        }
+        census.Step("c9_rlp_prep_ns");
         recordDeferredLabels(localDevice, queue);
+        census.Step("c9_rlp_record_ns");
         ++packetLockRecords;
         if (profile) packetLockRecordUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    } else if (census.Active()) {
+        ArchB::Recorder::Count("c9_rlp_empty_n");
     }
     if (localDevice == nullptr || !packetFlush || !Graphics::Recorder::PendingLabelSince().has_value()) return false;
 
     const auto submitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    census.Step("c9_rlp_other_ns");
     localDevice->SubmitRecorded(queue == 0);
+    if (census.Active()) {
+        census.Step("c9_rlp_submit_ns");
+        ArchB::Recorder::Count("c9_rlp_submit_n");
+    }
     ++packetLockSubmits;
     if (profile) packetLockSubmitUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submitStart).count());
     return true;

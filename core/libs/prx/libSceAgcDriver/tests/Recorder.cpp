@@ -11366,6 +11366,238 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
     return 0;
 }
 
+// Arch C labels, C_LABEL_LAZY_PREWAIT: the compute-sync prewait before a dispatch's deferred labels leaves out a range
+// whose label-time store C_LAZY_PUBLISH defers. The GPU writer of the range is held in flight by a semaphore wait
+// submitted ahead of its batch. With the switch, the prewait returns at once (the writer still in flight) and the
+// label-time store renews the deferral; without it, the prewait blocks until the writer finishes. Either way a later
+// CPU read of the range (another thread, or this one under the GPU mutex) must wait for the writer and see its
+// results, never the bytes from before the draw; the GPU is released by a thread that takes no lock (no deadlock).
+// Scenarios: read (another thread reads, no lock held), locked (this thread reads under the GPU mutex), verify
+// (_VERIFY=1: the prewait waits anyway).
+int archcLabelPrewaitTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    const bool on = Switches::Enabled(Feature::CLabelLazyPrewait) && Switches::Enabled(Feature::CLazyPublish);
+    const bool verify = scenario == "verify";
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 2;
+    constexpr std::size_t surface = 64 * 64 * 4;
+    constexpr auto gateDelay = std::chrono::milliseconds(300);
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            Lazy::PublishAll();
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    // main() holds the GPU mutex around the tests; the prewait refuses a nested hold, and the reader thread must be
+    // able to take it. Released here, taken again before the cleanup.
+    struct Unhold {
+        bool held = AgcDriver::GuestMemory::GpuMutex().HeldByThisThread();
+        Unhold() { if (held) AgcDriver::GuestMemory::GpuMutex().unlock(); }
+        ~Unhold() { if (held) AgcDriver::GuestMemory::GpuMutex().lock(); }
+    } unhold;
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    Require(GuestArena::GuestWtFaultEnabled_nid_no_patch() && Lazy::Active(), "the label prewait test needs C_LAZY_PUBLISH and the fault tracker");
+    const auto shader = [](auto& words, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(words), std::end(words));
+        program.variantId = variant;
+        return program;
+    };
+    auto vertex = shader(COVER_VERT_SPV, 311);
+    auto pixel = shader(COVER_FRAG_SPV, 312);
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {address, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    const auto draw = [&] {
+        Draw(context, state, triangle, shaders);
+        WaitForOptimizedPipelines(context.device);
+    };
+    for (int i = 0; i < 3; ++i) {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        draw();
+        StorageTexture::FlushAllPending("archc label prewait test");
+        recorder.Sync();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    }
+    std::vector<std::byte> published(surface);
+    std::memcpy(published.data(), block, surface);
+    Require(std::any_of(published.begin(), published.end(), [](std::byte value) { return value != std::byte{0}; }), "the draw stored nothing");
+    std::fill_n(block, surface, std::byte{0x11});
+    AgcDriver::GuestMemory::CollectWrites(address, bytes);
+    GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    AgcDriver::GuestMemory::WtFaultFlip();
+    AgcDriver::GuestMemory::WtFaultFlip();
+
+    // A command buffer waiting for a host-set event, submitted ahead of the draw's batch, holds the writer: no later
+    // batch's fence can signal before it completes (fence signals cover all earlier submissions on the queue).
+    VkEventCreateInfo eventInfo{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+    VkEvent event = VK_NULL_HANDLE;
+    Check(context.Function<PFN_vkCreateEvent>("vkCreateEvent")(context.device, &eventInfo, nullptr, &event), "create label prewait event");
+    VkCommandBuffer gateCommands = VK_NULL_HANDLE;
+    struct DestroyGate {
+        const Context& context;
+        Recorder& recorder;
+        VkEvent event;
+        VkCommandBuffer& commands;
+        ~DestroyGate() {
+            context.Function<PFN_vkSetEvent>("vkSetEvent")(context.device, event);
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            recorder.Sync();
+            context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+            if (commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+            context.Function<PFN_vkDestroyEvent>("vkDestroyEvent")(context.device, event, nullptr);
+        }
+    } destroyGate{context, recorder, event, gateCommands};
+    std::chrono::steady_clock::time_point released{};
+    std::atomic<bool> signaled{false};
+    const auto ungate = [&] {
+        std::this_thread::sleep_for(gateDelay);
+        released = std::chrono::steady_clock::now();
+        signaled.store(true, std::memory_order_release);
+        context.Function<PFN_vkSetEvent>("vkSetEvent")(context.device, event);
+    };
+    std::thread releaser;
+    struct Join {
+        std::thread& thread;
+        ~Join() { if (thread.joinable()) thread.join(); }
+    } joinReleaser{releaser};
+
+    AgcDriver::GuestMemory::TagGpuLockThread(0x20);
+    std::chrono::steady_clock::duration prewait{};
+    Lazy::Counts before{}, afterPrewait{}, afterStore{};
+    {
+        AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Dispatch);
+        std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.commandPool = context.pool;
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &gateCommands), "allocate the label prewait gate");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(gateCommands, &begin), "begin the label prewait gate");
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        context.Function<PFN_vkCmdWaitEvents>("vkCmdWaitEvents")(gateCommands, 1, &event, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 1, &barrier, 0, nullptr, 0, nullptr);
+        Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(gateCommands), "end the label prewait gate");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &gateCommands;
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, VK_NULL_HANDLE), "submit the label prewait gate");
+        releaser = std::thread(ungate);
+        // The draw goes behind the gate: its batch cannot finish before the releaser signals.
+        draw();
+        Require(StorageTexture::PendingStoreInside(address, surface), "the draw left no pending results");
+        // A render-target draw keeps its results in the texture; a compute writer of the range also notes it as a
+        // pending write of its batch (what the prewait waits for). Note one, as an address-based dispatch would.
+        recorder.NotePendingWrite(address, surface);
+        const auto writer = recorder.PendingWriterSerial(address, surface);
+        Require(!signaled.load(std::memory_order_acquire), "the gate was released before the prewait (the draw waited for the GPU)");
+        Require(writer != 0, "the draw has no pending writer (open serial " + std::to_string(recorder.OpenSerial()) + ")");
+        before = Lazy::Totals();
+        const auto start = std::chrono::steady_clock::now();
+        {
+            const Recorder::ComputeSyncScope computeSync(true);
+            StorageTexture::PrepareReadbackBeforeLabel(true);
+        }
+        prewait = std::chrono::steady_clock::now() - start;
+        afterPrewait = Lazy::Totals();
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        afterStore = Lazy::Totals();
+        const bool waited = !on || verify;
+        if (waited) {
+            Require(signaled.load(std::memory_order_acquire), "the prewait did not wait for the writer");
+            Require(!recorder.InFlightThrough(writer), "the waited writer is still in flight");
+        } else {
+            Require(!signaled.load(std::memory_order_acquire), "the prewait waited for a writer whose label-time store is deferred");
+            Require(afterPrewait.deferred == before.deferred + 1, "the prewait did not make the deferral");
+            Require(afterStore.renewed == afterPrewait.renewed + 1 && afterStore.deferred == afterPrewait.deferred, "the label-time store did not renew the prewait's deferral");
+        }
+        Require(Lazy::Entries() == 1 && StorageTexture::PendingStoreInside(address, surface), "the label-time store was not deferred");
+        if (scenario == "locked") {
+            // The fault is served under the GPU mutex this thread holds; the writer lands when the releaser signals.
+            std::vector<std::byte> seen(surface);
+            const volatile std::byte* bytesSeen = block;
+            for (std::size_t i = 0; i < surface; ++i) seen[i] = bytesSeen[i];
+            Require(signaled.load(std::memory_order_acquire), "the locked read finished before the writer was released");
+            Require(seen == published, "the locked read did not see the writer's results");
+        }
+    }
+    if (scenario == "read" || scenario == "verify") {
+        std::vector<std::byte> seen(surface);
+        std::chrono::steady_clock::time_point done{};
+        std::exception_ptr failure;
+        std::thread reader([&] {
+            try {
+                AgcDriver::GuestMemory::TagGpuLockThread(0);
+                const volatile std::byte* bytesSeen = block;
+                for (std::size_t i = 0; i < surface; ++i) seen[i] = bytesSeen[i];
+                done = std::chrono::steady_clock::now();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        reader.join();
+        if (failure) std::rethrow_exception(failure);
+        Require(signaled.load(std::memory_order_acquire) && done >= released, "the read finished before the writer was released");
+        Require(seen == published, "the read did not see the writer's results");
+    } else if (scenario != "locked") {
+        return 2;
+    }
+    if (releaser.joinable()) releaser.join();
+    const auto served = Lazy::Totals();
+    Require(served.services == afterStore.services + 1, "the access was not served exactly once");
+    Require(Lazy::Entries() == 0, "the served range is still lazy");
+    std::cout << "agc_archc_label_prewait_" << scenario << (on ? "" : " (off)") << ": ok (prewait " << std::chrono::duration<double, std::milli>(prewait).count() << " ms)\n";
+    return 0;
+}
+
 int archcTargetTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -13815,6 +14047,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy") {
             return archcLazyTests(device, recorder, argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--archc-label-prewait") {
+            return archcLabelPrewaitTests(device, recorder, argv[2]);
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;

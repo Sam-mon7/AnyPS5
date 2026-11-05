@@ -1,4 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -44,6 +49,26 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         if (record && !deferredDue && selfLocking && !labelTryEachPacket()) {
             record = false;
             recordAtLock = true;
+            // Arch C labels, C_LABEL_AWAITED_EARLY: a queued label another queue is already blocked on (its awaited
+            // slot overlaps the label) is recorded by a try here, before the self-locking packet's unlocked
+            // preparation, instead of at that packet's own lock. The same try flushAwaitedLabels makes when the
+            // waiter blocked first; the labels still go out in order and before the packet's work.
+            if (queue != 0 && ArchB::Switches::Enabled(ArchB::Feature::CLabelAwaitedEarly)) {
+                const auto ownSlot = queue - 0x20 + 1;
+                const auto& labels = deferred.labels;
+                for (std::size_t index = 0; index < awaitedSlots.size() && recordAtLock; ++index) {
+                    if (index == ownSlot) continue;
+                    const auto address = awaitedSlots[index].address.load(std::memory_order_acquire);
+                    if (address == 0) continue;
+                    const auto bytes = awaitedSlots[index].shape.load(std::memory_order_relaxed) >> 32u;
+                    if (bytes != 4 && bytes != 8) continue;
+                    if (std::any_of(labels.begin(), labels.end(), [&](const DeferredLabel& label) { return address >= label.address ? address - label.address < label.size : label.address - address < bytes; })) {
+                        record = true;
+                        recordAtLock = false;
+                        ArchB::Recorder::Count("c_label_awaited_early");
+                    }
+                }
+            }
         }
     }
     if (pending.has_value()) {
@@ -85,10 +110,19 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         else if (selfLocking && submit) ++packetSubmitDeferred;
         return;
     }
-    if (record || recordAtLock) Graphics::StorageTexture::PrepareReadbackBeforeLabel();
+    if (record || recordAtLock) {
+        // An early record (C_LABEL_AWAITED_EARLY) on a compute queue makes the compute-sync prewait the packet's own
+        // lock would have made (FIX_COMPUTE_SYNC_UNLOCKED), so its label-time stores wait unlocked as before.
+        const bool early = record && selfLocking && queue != 0 && !deferredDue && ArchB::Switches::Enabled(ArchB::Feature::CLabelAwaitedEarly);
+        const Graphics::Recorder::ComputeSyncScope computeSync(early ? ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) : Graphics::Recorder::ComputeSyncEnabled());
+        Graphics::StorageTexture::PrepareReadbackBeforeLabel(early && Graphics::Recorder::ComputeSyncEnabled());
+    }
     const auto localDevice = device.Load();
     if (record || recordAtLock) {
         recordDeferredLabels(localDevice.get(), queue);
+        auto& labelThread = ArchB::LabelCensus::Thread();
+        labelThread.syncNs = 0;
+        labelThread.prewaitSkipped.clear();
 
         if ((!labelPacket && packetFlush) || deferredDue) submit = true;
     }

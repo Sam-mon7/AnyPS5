@@ -95,6 +95,8 @@ enum class Feature : std::uint8_t {
     CComputeDepthProof,
     CComputeSubmitMerge,
     CStampScanToken,
+    CLabelLazyPrewait,
+    CLabelAwaitedEarly,
     Count
 };
 

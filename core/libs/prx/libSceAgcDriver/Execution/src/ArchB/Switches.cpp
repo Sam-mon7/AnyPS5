@@ -61,6 +61,7 @@ constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
+constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -192,6 +193,13 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Arch C P8: the stamp memo's pending-registry scan is skipped while a token made by a scan that found no
     // overlap holds (an ImageEpochs owner over the scanned ranges, source PendingInsert; no identity query).
     {Feature::CStampScanToken, "C_STAMP_SCAN_TOKEN", false, true, {}},
+    // Arch C labels (_VERIFY=N): the compute-sync prewait before a dispatch's deferred labels (FIX_COMPUTE_SYNC_UNLOCKED,
+    // StorageTexture::PrepareReadbackBeforeLabel) leaves out the ranges whose label-time store C_LAZY_PUBLISH defers: no
+    // store is recorded for them at the label, so their GPU writer need not finish first.
+    {Feature::CLabelLazyPrewait, "C_LABEL_LAZY_PREWAIT", false, true, CLabelLazyPrewaitPrerequisites},
+    // Arch C labels: a compute queue records a queued label another queue is already blocked on by a try before its next
+    // self-locking packet (a dispatch), instead of at that packet's lock after its unlocked preparation.
+    {Feature::CLabelAwaitedEarly, "C_LABEL_AWAITED_EARLY", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -430,6 +430,20 @@ bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
     return deferred || verify();
 }
 
+LabelStoreOutcome PeekLabelStore(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !Active()) return LabelStoreOutcome::Eager;
+    if (!StorageTexture::PendingStoreInside(address, bytes) && !AnyShadowedOverlaps(address, bytes)) return LabelStoreOutcome::Nothing;
+    const auto end = address + bytes;
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    if (s.eager.contains({address, end})) return LabelStoreOutcome::Eager;
+    const auto it = containing(s, address);
+    if (it != s.live.end() && end <= it->second.end) return it->second.serving ? LabelStoreOutcome::Eager : LabelStoreOutcome::Renew;
+    const auto next = s.live.lower_bound(address);
+    if ((next != s.live.end() && next->first < end) || it != s.live.end() || s.live.size() >= MaxEntries) return LabelStoreOutcome::Eager;
+    return LabelStoreOutcome::New;
+}
+
 Counts Totals() {
     auto& c = counters();
     Counts counts;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -2655,129 +2656,153 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
-    if (state->recorder != nullptr) state->recorder->EndComputeChain();
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    struct LabelTiming {
-        std::chrono::steady_clock::time_point cursor = std::chrono::steady_clock::now();
-        std::array<double, 3> us{};
-        std::size_t phase = 0;
-        void Next() {
-            const auto now = std::chrono::steady_clock::now();
-            us[phase++] += std::chrono::duration<double, std::micro>(now - cursor).count();
-            cursor = now;
+    // Arch C label census (APS5_ARCHB_C_LABEL_CENSUS=1): the steps below per label (c9_wl_*), the outcome, and the
+    // label's entry in the label-chain registry once other queues can see it (reasons 0, 1 and 5).
+    ArchB::LabelCensus::Steps census;
+    const int reason = [&]() -> int {
+        if (state->recorder != nullptr) state->recorder->EndComputeChain();
+        census.Step("c9_wl_chain_ns");
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        struct LabelTiming {
+            std::chrono::steady_clock::time_point cursor = std::chrono::steady_clock::now();
+            std::array<double, 3> us{};
+            std::size_t phase = 0;
+            void Next() {
+                const auto now = std::chrono::steady_clock::now();
+                us[phase++] += std::chrono::duration<double, std::micro>(now - cursor).count();
+                cursor = now;
+            }
+            ~LabelTiming() {
+                Next();
+                struct Totals {
+                    std::uint64_t labels = 0;
+                    std::array<double, 3> us{};
+                    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+                };
+                static thread_local Totals totals;
+                ++totals.labels;
+                for (std::size_t i = 0; i < us.size(); ++i) totals.us[i] += us[i];
+                if (cursor - totals.since < std::chrono::seconds(10)) return;
+                AgcDriver::ProfilePrint_nid_no_patch("[label-work] thread 0x%x: %llu labels, storage %.0f ms, reap %.0f ms, record %.0f ms (%.2f us/label, %.0f s)\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(totals.labels), totals.us[0] / 1000.0, totals.us[1] / 1000.0, totals.us[2] / 1000.0, (totals.us[0] + totals.us[1] + totals.us[2]) / totals.labels, std::chrono::duration<double>(cursor - totals.since).count());
+                totals = {};
+            }
+        };
+        std::optional<LabelTiming> timing;
+        if (profile) {
+            timing.emplace();
+            GuestMemory::NoteGpuLabel();
         }
-        ~LabelTiming() {
-            Next();
-            struct Totals {
-                std::uint64_t labels = 0;
-                std::array<double, 3> us{};
-                std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-            };
-            static thread_local Totals totals;
-            ++totals.labels;
-            for (std::size_t i = 0; i < us.size(); ++i) totals.us[i] += us[i];
-            if (cursor - totals.since < std::chrono::seconds(10)) return;
-            AgcDriver::ProfilePrint_nid_no_patch("[label-work] thread 0x%x: %llu labels, storage %.0f ms, reap %.0f ms, record %.0f ms (%.2f us/label, %.0f s)\n", GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(totals.labels), totals.us[0] / 1000.0, totals.us[1] / 1000.0, totals.us[2] / 1000.0, (totals.us[0] + totals.us[1] + totals.us[2]) / totals.labels, std::chrono::duration<double>(cursor - totals.since).count());
-            totals = {};
+        static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
+        if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
+        if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
+        census.Step("c9_wl_linear_ns");
+        Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        census.Step("c9_wl_srb_ns");
+        if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
+        if (profile) timing->Next();
+        auto& recorder = *state->recorder;
+        // Batches that already finished are retired before the checks: their completions ran, so they
+        // neither keep the recorder busy nor force this label behind a completion. Only for the
+        // graphics worker: a reap runs completions (copied write-backs, whose guest stores can re-enter
+        // the flush hook and sync a later batch) under the mutex, which a compute worker must never do
+        // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
+        // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
+        static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
+        if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+        census.Step("c9_wl_reap_ns");
+        if (profile) timing->Next();
+        if (recorder.Idle()) return 1;
+        static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
+        const auto context = graphicsContext();
+        const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+        if (import == nullptr) return 3;
+        // A unit shadow's results in the label's unit reach the import before the store lands over
+        // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
+        // FlushPending of their own.
+        if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
+        // The store on the GPU, into the open batch: everything recorded so far completes before it,
+        // and it is visible to the host after. The barriers belong to the recorder's store run: one
+        // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
+        // stores of a run against each other and against the work before and after, the queued DCC
+        // key stores included).
+        const auto recordStore = [&] { recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address); };
+        // On the console every store a queue made before a label is in memory once the label is
+        // visible. A listed copied writer (a dispatch or draw whose written buffer the device holds as a
+        // CPU copy) is written back by the CPU when its batch is reaped, after the GPU already ran any
+        // store recorded here, so a title polling the label could rewrite the written region and have
+        // the late write-back land over its bytes (a title that rebuilds its command buffer there sees
+        // a stale packet). While one is listed, a label of 8 bytes or less (every RELEASE_MEM, the fence
+        // WRITE_DATAs) is therefore not recorded on the GPU at all: a completion action of the open (or
+        // newest in-flight) batch stores it when that batch is reaped. Completions run in push order and
+        // batches finish front-first, so it lands after every earlier write-back, whatever range that
+        // one wrote. The GPU store plus completion re-store below would not do: its GPU store is
+        // visible before the write-back, and its re-store runs only over a write-back that overlapped
+        // the label. While such a completion store is pending (PendingCompletionStores: no end-of-pipe
+        // delivery and no write-back counts there), later small labels follow it even after every
+        // writer was written back, or a GPU store would become visible before the earlier completion
+        // store lands (#1458), or land under it at the reap when both are at one address. Larger stores
+        // (DUMP_CONST_RAM, COPY_DATA and DMA_DATA payloads that later GPU work reads through the import)
+        // stay on the GPU and follow only a pending completion store over their own range. Readers of a
+        // range stored this way sync through its batch first (the label is a pending write of its batch
+        // and counted in PendingCompletionLabels). Debug aid: APS5_DRAIN_COMPLETION_LABELS=1 drains
+        // (reason 2) instead and stores the label on the CPU.
+        const bool listed = !state->copiedWriters->empty() || !Graphics::DrawCopiedWriters()->empty();
+        if (drain) {
+            if (listed) return 2;
+        } else if (const bool storesPending = Graphics::Recorder::PendingCompletionStores() != 0; bytes.size() <= 8 ? (listed || storesPending) : (storesPending && recorder.CompletionLabelIn(address, bytes.size()))) {
+            census.Step("c9_wl_check_ns");
+            recorder.AfterCompletions(address, bytes, stamp, queue, false);
+            census.Step("c9_wl_note_ns");
+            return 5;
         }
-    };
-    std::optional<LabelTiming> timing;
-    if (profile) {
-        timing.emplace();
-        GuestMemory::NoteGpuLabel();
-    }
-    static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
-    if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
-    if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
-    Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
-    if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
-    if (profile) timing->Next();
-    auto& recorder = *state->recorder;
-    // Batches that already finished are retired before the checks: their completions ran, so they
-    // neither keep the recorder busy nor force this label behind a completion. Only for the
-    // graphics worker: a reap runs completions (copied write-backs, whose guest stores can re-enter
-    // the flush hook and sync a later batch) under the mutex, which a compute worker must never do
-    // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
-    // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
-    static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
-    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
-    if (profile) timing->Next();
-    if (recorder.Idle()) return 1;
-    static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
-    const auto context = graphicsContext();
-    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
-    if (import == nullptr) return 3;
-    // A unit shadow's results in the label's unit reach the import before the store lands over
-    // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
-    // FlushPending of their own.
-    if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
-    // The store on the GPU, into the open batch: everything recorded so far completes before it,
-    // and it is visible to the host after. The barriers belong to the recorder's store run: one
-    // pair for a whole group of labels recorded back to back (Recorder::RecordStore orders the
-    // stores of a run against each other and against the work before and after, the queued DCC
-    // key stores included).
-    const auto recordStore = [&] { recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address); };
-    // On the console every store a queue made before a label is in memory once the label is
-    // visible. A listed copied writer (a dispatch or draw whose written buffer the device holds as a
-    // CPU copy) is written back by the CPU when its batch is reaped, after the GPU already ran any
-    // store recorded here, so a title polling the label could rewrite the written region and have
-    // the late write-back land over its bytes (a title that rebuilds its command buffer there sees
-    // a stale packet). While one is listed, a label of 8 bytes or less (every RELEASE_MEM, the fence
-    // WRITE_DATAs) is therefore not recorded on the GPU at all: a completion action of the open (or
-    // newest in-flight) batch stores it when that batch is reaped. Completions run in push order and
-    // batches finish front-first, so it lands after every earlier write-back, whatever range that
-    // one wrote. The GPU store plus completion re-store below would not do: its GPU store is
-    // visible before the write-back, and its re-store runs only over a write-back that overlapped
-    // the label. While such a completion store is pending (PendingCompletionStores: no end-of-pipe
-    // delivery and no write-back counts there), later small labels follow it even after every
-    // writer was written back, or a GPU store would become visible before the earlier completion
-    // store lands (#1458), or land under it at the reap when both are at one address. Larger stores
-    // (DUMP_CONST_RAM, COPY_DATA and DMA_DATA payloads that later GPU work reads through the import)
-    // stay on the GPU and follow only a pending completion store over their own range. Readers of a
-    // range stored this way sync through its batch first (the label is a pending write of its batch
-    // and counted in PendingCompletionLabels). Debug aid: APS5_DRAIN_COMPLETION_LABELS=1 drains
-    // (reason 2) instead and stores the label on the CPU.
-    const bool listed = !state->copiedWriters->empty() || !Graphics::DrawCopiedWriters()->empty();
-    if (drain) {
-        if (listed) return 2;
-    } else if (const bool storesPending = Graphics::Recorder::PendingCompletionStores() != 0; bytes.size() <= 8 ? (listed || storesPending) : (storesPending && recorder.CompletionLabelIn(address, bytes.size()))) {
-        recorder.AfterCompletions(address, bytes, stamp, queue, false);
-        return 5;
-    }
-    // A larger store over a listed copied writer's range (as FillBuffer tests it) goes behind the
-    // completions too, below; any other one stores on the GPU. Debug aid: APS5_LABEL_GATE_ALL=1
-    // gates on any completion, as before (a completion label there registered its own completion,
-    // so every later label followed).
-    static const bool gateAll = std::getenv("APS5_LABEL_GATE_ALL") != nullptr;
-    if (gateAll ? recorder.HasCompletions() : state->CopiedWriterOverlaps(address, bytes.size())) {
-        // A copied buffer's write-back is still to run: the store must land after it. It is stored
-        // by a completion action of the batch (a CPU memcpy when the batch is reaped) instead of
-        // draining the device here. The same bytes are also recorded on the GPU into the open batch
-        // first, so GPU work recorded after this point that reads the range through the host import
-        // (a shader binding constants a DUMP_CONST_RAM dumped, a dispatch consuming a COPY_DATA or
-        // DMA_DATA fill) sees them in order; the completion memcpy stores identical bytes again
-        // after any write-back that overwrote them, so either order of the two stores is correct.
-        // CPU readers are covered by the pending-write note (the flush hook syncs) and waits by the
-        // label table. Debug aid: APS5_DRAIN_COMPLETION_LABELS=1 drains as before; try it first when
-        // a title misbehaves with this path.
-        if (drain) return 2;
+        // A larger store over a listed copied writer's range (as FillBuffer tests it) goes behind the
+        // completions too, below; any other one stores on the GPU. Debug aid: APS5_LABEL_GATE_ALL=1
+        // gates on any completion, as before (a completion label there registered its own completion,
+        // so every later label followed).
+        static const bool gateAll = std::getenv("APS5_LABEL_GATE_ALL") != nullptr;
+        if (gateAll ? recorder.HasCompletions() : state->CopiedWriterOverlaps(address, bytes.size())) {
+            // A copied buffer's write-back is still to run: the store must land after it. It is stored
+            // by a completion action of the batch (a CPU memcpy when the batch is reaped) instead of
+            // draining the device here. The same bytes are also recorded on the GPU into the open batch
+            // first, so GPU work recorded after this point that reads the range through the host import
+            // (a shader binding constants a DUMP_CONST_RAM dumped, a dispatch consuming a COPY_DATA or
+            // DMA_DATA fill) sees them in order; the completion memcpy stores identical bytes again
+            // after any write-back that overwrote them, so either order of the two stores is correct.
+            // CPU readers are covered by the pending-write note (the flush hook syncs) and waits by the
+            // label table. Debug aid: APS5_DRAIN_COMPLETION_LABELS=1 drains as before; try it first when
+            // a title misbehaves with this path.
+            if (drain) return 2;
+            census.Step("c9_wl_check_ns");
+            recordStore();
+            census.Step("c9_wl_record_ns");
+            // Commands() opened the batch the store went into, so the completion is appended to that
+            // batch and runs at its reap, after the write-backs of every batch before it.
+            recorder.AfterCompletions(address, bytes, stamp, queue, true);
+            GuestMemory::MarkWritten(address, bytes.size());
+            census.Step("c9_wl_note_ns");
+            return 5;
+        }
+        census.Step("c9_wl_check_ns");
         recordStore();
-        // Commands() opened the batch the store went into, so the completion is appended to that
-        // batch and runs at its reap, after the write-backs of every batch before it.
-        recorder.AfterCompletions(address, bytes, stamp, queue, true);
+        census.Step("c9_wl_record_ns");
+        // The table entry and the label's own pending-write note (Recorder::NoteLabel).
+        recorder.NoteLabel(address, bytes, stamp, queue);
         GuestMemory::MarkWritten(address, bytes.size());
-        return 5;
+        census.Step("c9_wl_note_ns");
+        // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
+        // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
+        // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
+        static const bool submitNow = std::getenv("APS5_LABEL_SUBMIT_NOW") != nullptr;
+        if (submitNow) recorder.Submit();
+        return 0;
+    }();
+    if (census.Active()) {
+        ArchB::Recorder::Count("c9_wl_n");
+        ArchB::Recorder::Count("c9_wl_ns", static_cast<double>(census.Total()));
+        if (reason >= 0 && reason < 8) ArchB::Recorder::Count(ArchB::LabelCensus::ReasonNames[reason]);
+        if (reason == 0 || reason == 1 || reason == 5) ArchB::LabelCensus::Recorded(address, bytes.size());
     }
-    recordStore();
-    // The table entry and the label's own pending-write note (Recorder::NoteLabel).
-    recorder.NoteLabel(address, bytes, stamp, queue);
-    GuestMemory::MarkWritten(address, bytes.size());
-    // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
-    // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
-    // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
-    static const bool submitNow = std::getenv("APS5_LABEL_SUBMIT_NOW") != nullptr;
-    if (submitNow) recorder.Submit();
-    return 0;
+    return reason;
 }
 
 bool VulkanDevice::AfterRecordedWork(std::function<void()> action, bool reapFirst) {

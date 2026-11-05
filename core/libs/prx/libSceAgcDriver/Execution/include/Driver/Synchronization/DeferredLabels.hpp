@@ -16,6 +16,8 @@ struct DeferredLabel {
     std::uint64_t address;
     std::size_t size;
     std::array<std::byte, Capacity> bytes;
+    // When the packet was decoded (steady_clock ns), set only under APS5_ARCHB_C_LABEL_CENSUS=1.
+    std::uint64_t decodedNs = 0;
 };
 
 struct DeferredLabels {

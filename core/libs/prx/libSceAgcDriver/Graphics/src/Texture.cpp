@@ -47,6 +47,7 @@
 #include <utility>
 #include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 
 namespace AgcDriver::Graphics {
@@ -4889,6 +4890,7 @@ void StorageTexture::PrepareReadbackBeforeLabel(bool computeSync) {
         if (computeSync) ArchB::Recorder::Count("fix_csync_refused_recorder");
         return;
     }
+    ArchB::LabelCensus::Steps steps;
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
         auto& pending = Pending();
@@ -4897,6 +4899,21 @@ void StorageTexture::PrepareReadbackBeforeLabel(bool computeSync) {
             if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
+    // Arch C labels, C_LABEL_LAZY_PREWAIT: this wait only exists so that StoreReadbackBeforeLabel's FlushPending (in
+    // WriteLabelOnGpu, under the mutex) finds the range's GPU writer finished. A range whose label-time store
+    // C_LAZY_PUBLISH defers records no store at the label: its writer is left out of the target (the deferral is made
+    // here, and the label-time call renews it). A later CPU access faults and publishes with its own wait; later GPU
+    // work is ordered after the writer by the recorder's stream. _VERIFY=N: one prewait in N that left a writer out
+    // waits for it anyway; a left-out range the label-time store then flushes eagerly counts a mismatch.
+    const bool lazyPrewait = computeSync && ArchB::Switches::Enabled(ArchB::Feature::CLabelLazyPrewait) && ArchC::LazyPublish::Active();
+    static const std::uint64_t lazyPrewaitVerify = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_LABEL_LAZY_PREWAIT_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    auto& skippedRanges = ArchB::LabelCensus::Thread().prewaitSkipped;
+    if (lazyPrewait) skippedRanges.clear();
+    bool allDeferrable = true;
+    std::uint64_t skippedTarget = 0;
     std::uint64_t target = 0;
     for (const auto& [address, bytes] : ranges) {
         std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -4912,11 +4929,46 @@ void StorageTexture::PrepareReadbackBeforeLabel(bool computeSync) {
         }
         if (flush.empty()) continue;
         if (flush.size() != 1 || ExistingHostImportFor(flush.front()->context, flush.front()->descriptor.baseAddress, static_cast<std::size_t>(flush.front()->guestBytes)) == nullptr) ownNotes.clear();
+        if (steps.Active() && computeSync) {
+            constexpr const char* outcomes[4] = {"c9_prep_ranges_eager", "c9_prep_ranges_renew", "c9_prep_ranges_new", "c9_prep_ranges_nothing"};
+            const auto outcome = ArchC::LazyPublish::PeekLabelStore(address, bytes);
+            ArchB::Recorder::Count(outcomes[static_cast<int>(outcome)]);
+            if (outcome != ArchC::LazyPublish::LabelStoreOutcome::Renew && outcome != ArchC::LazyPublish::LabelStoreOutcome::New) allDeferrable = false;
+        }
+        if (lazyPrewait && ArchC::LazyPublish::DeferLabelStore(address, bytes)) {
+            ArchB::Recorder::Count("c_label_lazy_prewait_ranges");
+            skippedRanges.emplace_back(address, address + bytes);
+            if (lazyPrewaitVerify != 0) skippedTarget = std::max(skippedTarget, recorder->PendingWriterSerial(address, bytes, ownNotes));
+            continue;
+        }
         target = std::max(target, recorder->PendingWriterSerial(address, bytes, ownNotes));
     }
+    if (lazyPrewait && !skippedRanges.empty()) {
+        if (target == 0) ArchB::Recorder::Count("c_label_lazy_prewait_skipped");
+        static std::atomic<std::uint64_t> prewaits{0};
+        if (lazyPrewaitVerify != 0 && skippedTarget != 0 && (prewaits.fetch_add(1, std::memory_order_relaxed) + 1) % lazyPrewaitVerify == 0) {
+            ArchB::Recorder::Count("c_label_lazy_prewait_verified");
+            target = std::max(target, skippedTarget);
+        }
+    }
+    if (computeSync) steps.Step("c9_prep_scan_ns");
     if (target != 0) {
-        if (computeSync) static_cast<void>(recorder->FinishComputeSyncUnlocked(target));
+        const auto waitStart = steps.Active() ? ArchB::LabelCensus::Now() : 0;
+        bool waited = false;
+        if (computeSync) waited = recorder->FinishComputeSyncUnlocked(target);
         else static_cast<void>(recorder->FinishUpToUnlocked(target));
+        if (steps.Active() && computeSync) {
+            const auto ns = ArchB::LabelCensus::Now() - waitStart;
+            ArchB::Recorder::Count("c9_prep_wait_ns", static_cast<double>(ns));
+            if (waited) {
+                ArchB::Recorder::Count("c9_prep_waited_n");
+                ArchB::LabelCensus::Thread().syncNs += ns;
+                if (allDeferrable) {
+                    ArchB::Recorder::Count("c9_prep_deferrable_n");
+                    ArchB::Recorder::Count("c9_prep_deferrable_ns", static_cast<double>(ns));
+                }
+            }
+        }
     }
 }
 
@@ -4943,8 +4995,18 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
     }
     const Recorder::FenceReasonScope fenceReason(Recorder::FenceReason::LabelStore);
     ArchC::LazyPublish::BeforeLabelStores();
+    static const bool lazyPrewaitVerify = std::getenv("APS5_ARCHB_C_LABEL_LAZY_PREWAIT_VERIFY") != nullptr;
     for (const auto& [address, bytes] : ranges) {
         if (ArchC::LazyPublish::DeferLabelStore(address, bytes)) continue;
+        if (lazyPrewaitVerify) {
+            // C_LABEL_LAZY_PREWAIT left this range's writer out of the prewait because its store was deferred; an
+            // eager store of it now could wait for that writer under the mutex.
+            const auto& skipped = ArchB::LabelCensus::Thread().prewaitSkipped;
+            const auto end = address + bytes;
+            const bool left = std::any_of(skipped.begin(), skipped.end(), [&](const auto& range) { return range.first < end && address < range.second; });
+            ArchB::Recorder::Count("c_label_lazy_prewait_verify_checks");
+            if (left && StorageTexture::PendingStoreInside(address, bytes)) ArchB::Recorder::Count("c_label_lazy_prewait_verify_mismatches");
+        }
         if (FlushPending(address, bytes, nullptr, reason) && census.on) ArchC::LazyCensus::LabelStored(GuestMemory::GpuLockThreadTag() == 0);
     }
 }

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -135,6 +136,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto alignMask = awaitedBytes == 8 ? ~7ull : ~3ull;
     const std::uint64_t awaited = (packet[2] & static_cast<std::uint32_t>(alignMask)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
     Timeline::WaitScope timelineWait(packet, awaited, awaitedBytes);
+    // Arch C label census: which thread recorded the awaited label and when, against this wait's start and end.
+    ArchB::LabelCensus::WaitScope labelCensus(awaited, requireMemory);
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(awaited));
@@ -206,6 +209,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         finishProfile(Graphics::Recorder::WaitEnd::Held);
         return;
     }
+    labelCensus.Blocked();
     std::optional<std::uint64_t> historyGeneration;
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &historyGeneration)) {
         submitWriter(writer);

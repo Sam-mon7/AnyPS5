@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
@@ -204,6 +205,62 @@ bool RunProducer(AgcDriver::VulkanDevice& device, std::uint64_t address, std::ui
     return true;
 }
 
+// Arch C labels, C_LABEL_AWAITED_EARLY: a WRITE_DATA label queued on a compute queue before any waiter, then awaited by
+// another queue, is recorded by the boundary before the next dispatch (a self-locking packet) instead of being left to
+// that dispatch's lock; without the switch it stays queued. A busy GPU mutex makes the try fail and leaves the label
+// to the dispatch's lock (no wait, no deadlock); a wait by the producing queue itself never records early. Either way
+// the label lands with its value, after the work recorded before it.
+bool RunAwaitedEarly(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t writer, std::uint32_t waiter, bool contended) {
+    const bool on = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLabelAwaitedEarly);
+    const std::uint32_t value = 0x5a000000u | writer;
+    const std::array<std::uint32_t, 4> pattern{5, 6, 7, 8};
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::TagGpuLockThread(writer);
+        AgcDriver::GuestMemory::SetCurrentPacket(0x37, writer);
+        if (!device.FillBuffer(address + 16384, 4096, pattern)) return false;
+    }
+    const std::array<std::uint32_t, 5> packet{0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value};
+    Require(Access::Label(packet, writer) && Access::Deferred(), "awaited early: an unawaited label did not stay queued");
+    Access::Await(waiter, address, 4);
+    struct ClearWait {
+        std::uint32_t queue;
+        ~ClearWait() { Access::Await(queue, 0, 0); }
+    } clearWait{waiter};
+    std::promise<void> held;
+    std::jthread holder;
+    if (contended) {
+        auto ready = held.get_future();
+        holder = std::jthread([&](std::stop_token stop) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            held.set_value();
+            while (!stop.stop_requested()) std::this_thread::yield();
+        });
+        ready.wait();
+    }
+    Access::Flush(0xc0031500u, writer);
+    if (holder.joinable()) { holder.request_stop(); holder.join(); }
+    const bool early = on && waiter != writer && !contended;
+    Require(Access::Deferred() != early, "awaited early: the boundary before the dispatch did not record exactly when another queue awaited the label");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        if (early) {
+            Recorder::LabelRefusal refusal{};
+            const auto hit = device.PendingLabel(address, 4, 0, &refusal);
+            Require(hit.has_value() && hit->value == value && hit->queue == writer, "awaited early: the recorded label is not in the table");
+        }
+        Access::PacketRecord(device, writer);
+        Require(!Access::Deferred(), "awaited early: the dispatch's lock left the label queued");
+        device.SubmitRecorded(false);
+        device.WaitIdle();
+        std::uint32_t actual = 0;
+        std::memcpy(&actual, reinterpret_cast<const void*>(address), 4);
+        Require(actual == value, "awaited early: the label has the wrong value");
+        Require(std::memcmp(reinterpret_cast<const void*>(address + 16384), pattern.data(), sizeof(pattern)) == 0, "awaited early: work before the label did not complete");
+    }
+    return true;
+}
+
 bool RunStateBatching(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t queue) {
     using namespace AgcDriver::DriverDetail;
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -284,6 +341,16 @@ int main(int argc, char** argv) {
                 if (!RunStateBatching(*device, base, queue)) return VulkanTestSkipped;
             }
             std::puts("label state batching tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--awaited-early") {
+            std::uint64_t address = base;
+            for (const auto queue : {0x20u, 0x28u, 0x30u, 0x38u, 0x40u, 0x48u, 0x50u}) {
+                if (!RunAwaitedEarly(*device, address, queue, 0, false) || !RunAwaitedEarly(*device, address + 256, queue, queue == 0x50u ? 0x20u : queue + 8, false)) return VulkanTestSkipped;
+                address += 512;
+            }
+            if (!RunAwaitedEarly(*device, address, 0x38, 0x38, false) || !RunAwaitedEarly(*device, address + 256, 0x38, 0, true)) return VulkanTestSkipped;
+            std::puts("awaited label early record tests passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--producer") {
