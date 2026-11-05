@@ -179,6 +179,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Pipeline::Continue when the reuse state already holds the slot's pipeline, layout and inputs.
     {Feature::ArchcReplayPatchSlots, "C_REPLAY_PATCH_SLOTS", false, true, ArchcReplayCutPrerequisites},
     {Feature::ArchcReplayContinue, "C_REPLAY_CONTINUE", false, true, ArchcReplayCutPrerequisites},
+    // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
+    // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
+    {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

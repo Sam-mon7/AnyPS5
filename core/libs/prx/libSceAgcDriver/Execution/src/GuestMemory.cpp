@@ -4736,15 +4736,21 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> lazyStoreHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t)> deferredFenceHook{nullptr};
 }
 
 void SetLazyStoreHook(void (*hook)(std::uint64_t, std::size_t)) {
     lazyStoreHook.store(hook, std::memory_order_release);
 }
 
+void SetDeferredFenceHook(void (*hook)(std::uint64_t, std::size_t)) {
+    deferredFenceHook.store(hook, std::memory_order_release);
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, bytes);
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes);
     const census::Scope censusScope("store_own");
     const Stage4::TrackerScope stage4Scope(true, address, bytes);
     Stage4::NoteDriverWrite(address, bytes);
@@ -5924,6 +5930,7 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, destination.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, destination.size());
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -6001,6 +6008,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, destination.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, destination.size());
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -6011,6 +6019,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, destination.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, destination.size());
     GuardRead(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -6026,6 +6035,7 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, bytes.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes.size());
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
@@ -6037,6 +6047,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, bytes.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes.size());
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
     // Each run's page state is consulted right before its bytes are compared.
@@ -6051,6 +6062,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     if (out.empty()) return Compare::Equal;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, out.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, out.size());
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
