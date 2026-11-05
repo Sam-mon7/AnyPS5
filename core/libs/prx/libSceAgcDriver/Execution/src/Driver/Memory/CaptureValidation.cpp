@@ -2,6 +2,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include <cstdlib>
 #include <cstring>
 
@@ -61,6 +62,7 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
 bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderRecompiler::RecompileResult& compiled, bool inPlace, const PendingView& view, bool* unmapped, std::optional<SampledReadScope>* sampling, const DataMask* data, std::span<const VouchedRegions> vouched) {
     using Policy = ShaderMemory::PendingWrite;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    ArchB::Recorder::Timer census("Q0.Captured", Stage4::Queue0Census());
 
     thread_local std::vector<std::size_t>* pendingSlot = nullptr;
     auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
@@ -173,6 +175,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         }
         return true;
     };
+    census.Mark("scan");
     if (pending.empty()) return compare(false);
     const bool verify = validateSkipVerify();
     std::optional<SampledReadScope> ownSampling;
@@ -209,6 +212,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         }
     }
 
+    census.Mark("classify");
     const bool rawSame = skip ? compare(true) : false;
     const bool unsyncedMiss = skip && !rawSame;
     if (unsyncedMiss) skip = false;

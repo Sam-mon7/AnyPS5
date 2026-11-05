@@ -163,6 +163,31 @@ void BindRole(Role value) {
     if (ResolveCensus()) currentItem = &committerItem();
 }
 
+void CommitterOverlapProbe(std::int64_t now, std::int64_t* totals) {
+    const auto clock = committerClock().Read(now);
+    totals[0] = clock[static_cast<std::size_t>(CommitterState::Idle)] + clock[static_cast<std::size_t>(CommitterState::Spin)];
+    totals[1] = clock[static_cast<std::size_t>(CommitterState::GpuMutex)];
+}
+
+std::vector<CounterExport> Queue0WaitExports() {
+    auto& totals = m1();
+    std::vector<CounterExport> out;
+    const auto name = [](std::string text) { return (new std::string(std::move(text)))->c_str(); };
+    for (std::size_t k = 0; k < WaitKinds; ++k) {
+        out.push_back({name(std::string("q0m1_") + WaitNames[k] + "_n"), &totals.count[k]});
+        out.push_back({name(std::string("q0m1_") + WaitNames[k] + "_wait_ns"), &totals.waitNs[k]});
+        out.push_back({name(std::string("q0m1_") + WaitNames[k] + "_neither_ns"), &totals.neitherAllNs[k]});
+    }
+    for (std::uint32_t queue = 0x20; queue <= 0x58; queue += 8) {
+        char text[48];
+        std::snprintf(text, sizeof text, "q0m1_label_q%02x", queue);
+        out.push_back({name(std::string(text) + "_n"), &totals.queueCount[queue]});
+        out.push_back({name(std::string(text) + "_wait_ns"), &totals.queueWaitNs[queue]});
+        out.push_back({name(std::string(text) + "_neither_ns"), &totals.queueNeitherNs[queue]});
+    }
+    return out;
+}
+
 // --- M1 -------------------------------------------------------------------------------------------
 
 void WaitScope::begin(Wait waitKind, bool spinsFirst) noexcept {

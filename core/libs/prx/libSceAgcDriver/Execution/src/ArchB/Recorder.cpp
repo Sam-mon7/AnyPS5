@@ -108,7 +108,75 @@ struct Recorder::Thread {
     std::array<CounterEntry, 512> counters;
     Value phaseOverflow;
     Value counterOverflow;
+    struct OverlapFrame {
+        const Scope* scope = nullptr;
+        std::array<std::int64_t, OverlapMetrics> at{};
+        std::array<std::int64_t, OverlapMetrics> children{};
+    };
+    struct OverlapName {
+        const char* name = nullptr;
+        const char* stage = nullptr;
+        std::array<const char*, OverlapMetrics> counters{};
+    };
+    OverlapProbe probe = nullptr;
+    std::array<const char*, OverlapMetrics> prefixes{};
+    std::array<OverlapFrame, 64> frames;
+    std::size_t depth = 0;
+    std::vector<OverlapName> names;
+
+    const std::array<const char*, OverlapMetrics>& counterNames(const char* scope, const char* stage) {
+        for (const auto& entry : names) {
+            if (entry.name == scope && entry.stage == stage) return entry.counters;
+        }
+        OverlapName entry{scope, stage, {}};
+        for (std::size_t i = 0; i < OverlapMetrics; ++i) entry.counters[i] = (new std::string(std::string(prefixes[i]) + (scope != nullptr ? scope : "?") + (stage != nullptr ? std::string(".") + stage : std::string())))->c_str();
+        names.push_back(entry);
+        return names.back().counters;
+    }
+    std::array<std::int64_t, OverlapMetrics> read(Clock::time_point now) const {
+        std::array<std::int64_t, OverlapMetrics> totals{};
+        probe(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count(), totals.data());
+        return totals;
+    }
+    void begin(const Scope* scope, Clock::time_point now) {
+        if (depth == frames.size()) return;
+        frames[depth++] = {scope, read(now), {}};
+    }
+    void pop(const Scope* scope) {
+        if (depth != 0 && frames[depth - 1].scope == scope) --depth;
+    }
+    void mark(const Scope* scope, const char* name, const char* stage, Clock::time_point now) {
+        std::size_t index = depth;
+        while (index != 0 && frames[index - 1].scope != scope) --index;
+        if (index == 0) return;
+        depth = index;
+        auto& frame = frames[index - 1];
+        const auto totals = read(now);
+        const auto& counters = counterNames(name, stage);
+        for (std::size_t i = 0; i < OverlapMetrics; ++i) {
+            const auto inclusive = totals[i] - frame.at[i];
+            const auto exclusive = inclusive - frame.children[i];
+            if (exclusive > 0) Recorder::Count(counters[i], static_cast<double>(exclusive) / 1e6);
+            if (index > 1) frames[index - 2].children[i] += inclusive;
+            frame.at[i] = totals[i];
+            frame.children[i] = 0;
+        }
+    }
 };
+
+namespace {
+thread_local Recorder::OverlapProbe threadProbe = nullptr;
+thread_local std::array<const char*, Recorder::OverlapMetrics> threadPrefixes{};
+}
+
+void Recorder::SetThreadOverlapProbe(OverlapProbe probe, std::array<const char*, OverlapMetrics> prefixes) {
+    threadProbe = probe;
+    threadPrefixes = prefixes;
+    if (local == nullptr) return;
+    local->probe = probe;
+    local->prefixes = prefixes;
+    local->depth = 0;
+}
 
 Recorder::Thread& Recorder::thread() {
     if (local == nullptr) BindThread("unbound");
@@ -118,6 +186,8 @@ Recorder::Thread& Recorder::thread() {
 void Recorder::BindThread(const char* name) {
     if (local != nullptr && local->name == name) return;
     auto bound = std::make_shared<Thread>(name);
+    bound->probe = threadProbe;
+    bound->prefixes = threadPrefixes;
     local = bound.get();
     std::lock_guard lock(state().mutex);
     state().threads.push_back(std::move(bound));
@@ -148,6 +218,7 @@ void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phas
     category = phase != Phase::Inherit ? phase : parent != nullptr && parent->work == work ? parent->category : work != nullptr ? work->phase : Phase::Prepare;
     generation = Recorder::generation.load(std::memory_order_relaxed);
     currentScope = this;
+    if (local != nullptr && local->probe != nullptr) local->begin(this, now);
 }
 
 void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
@@ -159,6 +230,7 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
         Recorder::phase(name, stage, exclusive);
         if (work != nullptr && work->generation == generation) work->elapsed[static_cast<std::size_t>(category)] += exclusive;
     }
+    if (local != nullptr && local->probe != nullptr) local->mark(this, name, stage, now);
     if (parent != nullptr) parent->children += inclusive;
     previous = now;
     children = {};
@@ -167,6 +239,7 @@ void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
 void Recorder::Scope::End(Clock::time_point now) {
     if (!active) return;
     Mark(nullptr, now);
+    if (local != nullptr && local->probe != nullptr) local->pop(this);
     if (counter != nullptr && generation == Recorder::generation.load(std::memory_order_relaxed)) Count(counter, milliseconds(elapsed));
     currentScope = parent;
     active = false;

@@ -105,6 +105,11 @@ public:
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {});
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     DrawEntryCounters DrawCacheCounters();
+    struct Q0EpochCounts {
+        std::uint64_t hits = 0, misses = 0, tokens = 0, verifyChecks = 0, verifyMismatches = 0, pages = 0, stable = 0, refusedOpen = 0, refusedMoved = 0, exact = 0;
+    };
+    static Q0EpochCounts Q0EpochCounters();
+    static std::array<std::uint64_t, 3> Q0DispatchItemCounts();
     EntryCounters DispatchCacheCounters();
     struct DispatchCacheFootprint {
         std::size_t entries = 0;
@@ -284,6 +289,9 @@ private:
     static bool validateSkipEnabled();
     static bool vouchedValidation();
     static bool validateLegacy();
+    static bool q0EpochsActive();
+    static bool q0DispatchItemsActive();
+    static void q0DispatchItemCommitted(std::span<const Graphics::GuestMemorySnapshot> snapshots);
     static bool gateRetry();
     static bool validateSkipVerify();
     static std::uint32_t writeEvidenceAfter();
@@ -325,6 +333,7 @@ private:
     bool syncPendingRuns(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& synced, PendingView& pending, std::optional<SampledReadScope>& sampling, std::span<const VouchedRegions> skipped = {});
     // `consumer` names the validation for the write-generation counters (GEN_DRAW_VALIDATION).
     EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr, bool feedbackMask = false, bool* feedbackHit = nullptr, bool bufferBases = false, GuestMemory::Gen::Consumer consumer = GuestMemory::Gen::Consumer::DrawValidate);
+    EntryOutcome validateVariantLegacy(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer);
     static int waitTimeoutMs();
     static bool pollReapAll();
     static bool pollTryEach();

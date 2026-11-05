@@ -93,6 +93,8 @@ enum class Feature : std::uint8_t {
     ArchcReplayContinue,
     CLazyFence,
     CLazyFenceDepth,
+    CQ0Epochs,
+    CQ0DispatchItems,
     Count
 };
 

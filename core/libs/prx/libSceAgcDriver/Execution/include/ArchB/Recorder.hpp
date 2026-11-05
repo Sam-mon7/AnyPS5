@@ -72,6 +72,7 @@ public:
     class Timer {
     public:
         explicit Timer(const char* name) { if (Enabled()) scope.Begin(name, Clock::now()); }
+        Timer(const char* name, bool on) { if (on && Enabled()) scope.Begin(name, Clock::now()); }
         ~Timer() { if (scope.Active()) scope.End(Clock::now()); }
         Timer(const Timer&) = delete;
         Timer& operator=(const Timer&) = delete;
@@ -105,6 +106,9 @@ public:
     static void RegisterCounter(const char* name, const std::atomic<std::uint64_t>& counter);
     static std::uint64_t Digest(std::span<const std::uint32_t> code);
     static void AddShader(Key key, std::uint64_t calls, const std::array<Clock::duration, 4>& elapsed);
+    using OverlapProbe = void (*)(std::int64_t nowNs, std::int64_t* totals);
+    static constexpr std::size_t OverlapMetrics = 2;
+    static void SetThreadOverlapProbe(OverlapProbe probe, std::array<const char*, OverlapMetrics> prefixes);
 
 private:
     struct Thread;

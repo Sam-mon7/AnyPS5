@@ -452,7 +452,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (indirectArguments == 0 && (packet[4] & 0x2u) != 0) {
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
-    const bool pipelineCandidate = !resolving && !fromAhead && DrawPipeline::DispatchItems() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    const bool pipelineCandidate = !resolving && !fromAhead && DrawPipeline::DispatchItems() && (indirectArguments == 0 || (submission.queue == 0 && q0DispatchItemsActive())) && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     if (resolving) {
@@ -940,7 +940,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
+        DrawPipeline::Queue0().Enqueue([this, allocChurn, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync, indirectArguments, threadGroup] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
@@ -970,7 +970,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             // labels (apply) and its device call (proofs, refreshes and recording: not split).
             Stage4::Mark(Stage4::Bucket::Pre);
             try {
-                std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, false);
+                std::shared_ptr<RecipeHit> recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(recipe, indirectArguments != 0);
                 std::shared_ptr<const Recipe> builtRecipe;
                 RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
                 bool writersNoted = false;
@@ -984,13 +984,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
                     recordLabelsForPacket(localDevice.get(), queueId);
                     Stage4::Mark(Stage4::Bucket::Labels);
+                    if (indirectArguments != 0) q0DispatchItemCommitted(snapshots);
                     if (noteWrites && writerKeyedEvidence() && !writersNoted) {
                         noteWrittenBuffers(address, queueId, compiledCommit);
                         writersNoted = true;
                     }
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
-                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup);
                         if (recipeResult == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
                             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
@@ -998,6 +999,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             Stage4::Mark(Stage4::Bucket::DispatchDevice);
                             continue;
                         }
+                    } else if (indirectArguments != 0) {
+                        static_cast<void>(localDevice->DispatchIndirect(compiledCommit, indirectArguments, snapshots, address, std::move(prepared), &builtRecipe, threadGroup, profile ? &recipeFailure : nullptr));
                     } else {
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, profile ? &recipeFailure : nullptr);
                     }
@@ -1021,7 +1024,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
-        }, std::move(itemWrites), 0, {}, {}, false, DrawPipeline::ItemKind::Dispatch);
+        }, std::move(itemWrites), 0, {}, indirectArguments != 0 ? std::vector<DrawPipeline::Range>{{indirectArguments, indirectArguments + 12}} : std::vector<DrawPipeline::Range>{}, false, DrawPipeline::ItemKind::Dispatch);
         ReportDispatchItems(profile);
         return;
     }

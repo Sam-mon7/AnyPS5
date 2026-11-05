@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include <algorithm>
 #include <bit>
 
@@ -124,6 +125,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
             maybeReportDrawCache(profile);
         }
+        const bool census = Stage4::Queue0Census();
+        if (census) {
+            recorderTiming.Mark("key");
+            ArchB::Recorder::Count("q0c_draw_lookups");
+        }
         if (feedbackMask && entry == nullptr && feedbackEntry != nullptr && feedbackEntry->stages.size() == programs.size()) {
             bool eligible = true, maskedUser = false;
             for (std::size_t i = 0; eligible && i < programs.size(); ++i) {
@@ -169,6 +175,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         const auto& variant = variants[rank];
                         if (variant->pushOffset != cursor) continue;
                         if (!pointerFree && drawParameters.indirect && variant->indirectCapture != nullptr) {
+                            const ArchB::Recorder::Timer indirectCensus("Q0.IndirectRefusal", census);
                             const auto& indirect = *drawParameters.indirect;
                             std::vector<std::size_t> patchedWords;
                             for (const auto location : {indirect.baseVertexLocation, indirect.startInstanceLocation, indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u}) {
@@ -193,7 +200,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         bool memoryFeedback = false;
                         auto& regions = matchedRegions[i];
                         regions.clear();
-                        appendEntryRegions(*variant, regions);
+                        {
+                            const ArchB::Recorder::Timer regionsCensus("Q0.EntryRegions", census);
+                            appendEntryRegions(*variant, regions);
+                        }
                         ++compared;
                         const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
@@ -209,7 +219,10 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             for (const auto& [position, value] : liveData) hit.words[position] = value;
                             regions.clear();
                             appendEntryRegions(*variant, regions, &hit.words);
-                            hit.compiled = patchDataWords(*variant, hit.words, bufferBases);
+                            {
+                                const ArchB::Recorder::Timer patchCensus("Q0.PatchData", census);
+                                hit.compiled = patchDataWords(*variant, hit.words, bufferBases);
+                            }
                             if (hit.compiled == nullptr) { ArchB::Recorder::Count("fix_buffer_base_refused_patch"); hit.words.clear(); continue; }
                             hit.bufferBaseHit = bufferBases && std::any_of(liveData.begin(), liveData.end(), [&](const auto& word) { return WordMask(variant->bufferBaseMasks, word.first) != 0; });
                             if (hit.bufferBaseHit) ArchB::Recorder::Count("fix_buffer_base_hits");
@@ -230,6 +243,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            if (census) {
+                recorderTiming.Mark("stages");
+                ArchB::Recorder::Count(drawHit ? "q0c_draw_hits" : "q0c_draw_misses");
+                ArchB::Recorder::Count("q0c_draw_variants_compared", static_cast<double>(compared));
+                ArchB::Recorder::Count("q0c_draw_data_stages", static_cast<double>(dataStages));
+            }
             if (genShadow) GuestMemory::Gen::NoteDrawLookup(genQueue0, drawHit, drawHit && genAllClean);
             const bool feedbackHit = drawHit && std::any_of(stageData.begin(), stageData.end(), [](const auto& stage) { return stage.feedbackHit; });
             if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");

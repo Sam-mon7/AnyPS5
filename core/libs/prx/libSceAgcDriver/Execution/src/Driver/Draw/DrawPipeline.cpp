@@ -845,6 +845,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             resumeAt = ArchB::Switches::Enabled(ArchB::Feature::PipeFullHysteresis) ? capacity / 2 : capacity - 1;
             ++idleWaiters;
             {
+                const ArchB::Recorder::Timer census("Q0.Wait.full", Stage4::Queue0Census());
                 const Stage4::WaitScope stage4Wait(Stage4::Wait::PipeFull, false);
                 idle.wait(lock, [&] { return items.size() <= resumeAt; });
             }
@@ -1170,6 +1171,7 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, Drain
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();
+    ArchB::Recorder::Timer census("Q0.Wait.drain", Stage4::Queue0Census());
     std::optional<Stage4::WaitScope> stage4Wait;
     if (Stage4::Tracking()) stage4Wait.emplace(Stage4::Wait::PipeDrain, true);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });

@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <span>
 #include <utility>
+#include <atomic>
+#include <vector>
 
 namespace AgcDriver::Stage4 {
 
@@ -44,6 +46,16 @@ inline bool ResolveCensus() {
     static const bool on = EnvSwitch("APS5_RESOLVE_CENSUS");
     return on;
 }
+inline bool Queue0Census() {
+    static const bool on = IdleAttrib() && EnvSwitch("APS5_ARCHB_C_Q0_CENSUS");
+    return on;
+}
+void CommitterOverlapProbe(std::int64_t now, std::int64_t* totals);
+struct CounterExport {
+    const char* name;
+    const std::atomic<std::uint64_t>* value;
+};
+std::vector<CounterExport> Queue0WaitExports();
 // IdleAttrib() || ResolveCensus(): the wait scopes run.
 inline bool Tracking() {
     static const bool on = IdleAttrib() || ResolveCensus();

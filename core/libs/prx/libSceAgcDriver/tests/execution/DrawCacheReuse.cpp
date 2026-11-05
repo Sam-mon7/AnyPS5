@@ -6,6 +6,10 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -812,6 +816,69 @@ void PipelineStateReusePath(const std::filesystem::path& control) {
 
 }
 
+float* WatchedConstant() {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 65536;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+    return static_cast<float*>(block);
+#else
+    return nullptr;
+#endif
+}
+
+AgcDriver::DriverDetail::DrawEntryCounters SubmitWatchedConstantDraws(const float* constant, std::size_t draws) {
+    const auto address = reinterpret_cast<std::uintptr_t>(constant);
+    const std::vector<std::vector<std::uint32_t>> words(draws, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)});
+    return Submit(Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, words));
+}
+
+int Q0EpochsPath() {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    using AgcDriver::DriverDetail::Driver;
+    auto* constant = WatchedConstant();
+    if (constant == nullptr) return VulkanTestSkipped;
+    const bool on = Switches::Enabled(Feature::CQ0Epochs) && Switches::Enabled(Feature::ArchcImageEpochs);
+    const char* verifyText = std::getenv("APS5_ARCHB_C_Q0_EPOCHS_VERIFY");
+    const bool verify = on && verifyText != nullptr && std::string_view(verifyText) == "1";
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    ColorMemory.fill(std::byte{0});
+    constant[0] = 0.25f;
+    static_cast<void>(SubmitWatchedConstantDraws(constant, 3));
+    Require(BrightestColorByte() == 64, "q0 epochs: the draws of constant 0.25 did not write 64");
+    const auto start = Driver::Q0EpochCounters();
+    for (int i = 0; i < 6; ++i) {
+        AgcDriver::GuestMemory::WtFaultFlip();
+        static_cast<void>(SubmitWatchedConstantDraws(constant, 2));
+    }
+    Require(BrightestColorByte() == 64, "q0 epochs: repeated draws of an unchanged constant did not write 64");
+    const auto warmed = Driver::Q0EpochCounters();
+    if (on && !verify) Require(warmed.hits > start.hits && warmed.tokens > start.tokens, "q0 epochs: repeated draws over armed, unchanged runs made " + std::to_string(warmed.tokens - start.tokens) + " tokens and " + std::to_string(warmed.hits - start.hits) + " hits");
+    if (!on) Require(warmed.hits == start.hits && warmed.tokens == start.tokens, "q0 epochs: the switch is off but tokens were used");
+    ColorMemory.fill(std::byte{0});
+    constant[0] = 1.0f;
+    static_cast<void>(SubmitWatchedConstantDraws(constant, 2));
+    Require(BrightestColorByte() == 255, "q0 epochs: a CPU store to the captured constant was not seen (wrote " + std::to_string(BrightestColorByte()) + ", expected 255)");
+    for (int i = 0; i < 4; ++i) {
+        AgcDriver::GuestMemory::WtFaultFlip();
+        static_cast<void>(SubmitWatchedConstantDraws(constant, 2));
+    }
+    ColorMemory.fill(std::byte{0});
+    constant[0] = 0.5f;
+    static_cast<void>(SubmitWatchedConstantDraws(constant, 1));
+    const auto bright = BrightestColorByte();
+    Require(bright == 127 || bright == 128, "q0 epochs: a second CPU store after new tokens was not seen (wrote " + std::to_string(bright) + ")");
+    const auto end = Driver::Q0EpochCounters();
+    if (verify) {
+        Require(end.verifyChecks > start.verifyChecks, "q0 epochs: VERIFY checked no hit");
+        Require(end.verifyMismatches == start.verifyMismatches, "q0 epochs: VERIFY mismatch");
+    }
+    std::cout << "agc_archc_q0_epochs" << (on ? (verify ? " (verify)" : "") : " (off)") << ": tokens " << end.tokens - start.tokens << ", hits " << end.hits - start.hits << ", misses " << end.misses - start.misses << ", pages " << end.pages << ", verified " << end.verifyChecks - start.verifyChecks << ", stable " << end.stable - start.stable << ", exact " << end.exact - start.exact << ", refused open " << end.refusedOpen - start.refusedOpen << ", moved " << end.refusedMoved - start.refusedMoved << ": ok\n";
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-base-proof") {
@@ -867,6 +934,13 @@ int main(int argc, char** argv) {
             TsharpCachePath(mode.find("dispatch") != std::string_view::npos, mode.find("user") != std::string_view::npos, toggle);
             AgcDriverShutdown_nid_postfix();
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--q0-epochs") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            const auto result = Q0EpochsPath();
+            AgcDriverShutdown_nid_postfix();
+            return result;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--dispatch-relocation") {
             const auto probe = OpenVulkanTestDevice();

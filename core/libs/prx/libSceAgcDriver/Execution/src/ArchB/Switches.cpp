@@ -62,6 +62,8 @@ constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
+constexpr Feature CQ0EpochsPrerequisites[] = {Feature::ArchcImageEpochs};
+constexpr Feature CQ0DispatchItemsPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -184,6 +186,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
     {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
     {Feature::CLazyFenceDepth, "C_LAZY_FENCE_DEPTH", false, true, CLazyFenceDepthPrerequisites},
+    {Feature::CQ0Epochs, "C_Q0_EPOCHS", false, true, CQ0EpochsPrerequisites},
+    {Feature::CQ0DispatchItems, "C_Q0_DISPATCH_ITEMS", false, true, CQ0DispatchItemsPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

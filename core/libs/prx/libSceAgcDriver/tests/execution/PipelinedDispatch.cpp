@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -97,6 +98,15 @@ std::vector<std::uint32_t> Round(const void* destination, std::uint32_t value, c
         0xc0031500u, 1u, 1u, 1u, 0x8041u,
     };
     words.insert(words.end(), commands.begin(), commands.end());
+    return words;
+}
+
+std::vector<std::uint32_t> IndirectRound(const void* destination, std::uint32_t value, const void* code, const void* arguments) {
+    auto words = Round(destination, value, code);
+    const auto address = reinterpret_cast<std::uintptr_t>(arguments);
+    words.resize(words.size() - 5);
+    const std::vector<std::uint32_t> indirect{0xc0021600u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0x8041u};
+    words.insert(words.end(), indirect.begin(), indirect.end());
     return words;
 }
 
@@ -260,6 +270,32 @@ int main() {
             if (!pipelinedDispatch) check(drains >= 1, "a dispatch did not drain the pipeline, and APS5_PIPELINE_DISPATCH is off");
             if (pipelinedDispatch) check(drains <= 1, "a dispatch drained the pipeline more than once (" + std::to_string(drains) + ")");
         }
+        const char* indirectItemsSwitch = std::getenv("APS5_ARCHB_C_Q0_DISPATCH_ITEMS");
+        const bool indirectItems = indirectItemsSwitch != nullptr && indirectItemsSwitch[0] == '1' && pipeSwitch != nullptr && pipeSwitch[0] == '1';
+        auto* arguments = NewBlock();
+        arguments[0] = 1u;
+        arguments[1] = 1u;
+        arguments[2] = 1u;
+        const auto itemsBefore = AgcDriver::DriverDetail::Driver::Q0DispatchItemCounts();
+        for (std::size_t round = 0; round < 4; ++round) {
+            const auto value = 0x7e570000u + static_cast<std::uint32_t>(round);
+            auto fill = FillPacket(value, Input, BufferBytes);
+            std::vector<std::uint32_t> first(fill.begin(), fill.end());
+            Submit(first);
+            AgcDriverWaitIdle_nid_postfix();
+            auto words = IndirectRound(Scratch, value ^ 0xffu, Code.data(), arguments);
+            Submit(words);
+            AgcDriverWaitIdle_nid_postfix();
+            AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), BufferBytes);
+            for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
+                check(Output[lane] == value + 1u, "indirect round " + std::to_string(round) + ": lane " + std::to_string(lane) + " of the output is " + std::to_string(Output[lane]) + ", expected " + std::to_string(value + 1u));
+            }
+        }
+        const auto itemsAfter = AgcDriver::DriverDetail::Driver::Q0DispatchItemCounts();
+        std::printf("pipelined dispatch: indirect rounds as committer items %llu (verified %llu, mismatches %llu)\n", static_cast<unsigned long long>(itemsAfter[0] - itemsBefore[0]), static_cast<unsigned long long>(itemsAfter[1] - itemsBefore[1]), static_cast<unsigned long long>(itemsAfter[2] - itemsBefore[2]));
+        if (indirectItems) check(itemsAfter[0] > itemsBefore[0], "no indirect dispatch became a committer item with C_Q0_DISPATCH_ITEMS on");
+        else check(itemsAfter[0] == itemsBefore[0], "an indirect dispatch became a committer item with C_Q0_DISPATCH_ITEMS off");
+        check(itemsAfter[2] == itemsBefore[2], "C_Q0_DISPATCH_ITEMS VERIFY found a changed snapshot");
         LibcRunShutdown_nid_postfix();
         std::puts("pipelined dispatch tests passed");
         return 0;

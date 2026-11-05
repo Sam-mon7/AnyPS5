@@ -41,6 +41,11 @@ struct TsharpFeedbackMasks {
     bool operator==(const TsharpFeedbackMasks&) const = default;
 };
 
+inline std::uint64_t NextVariantSerial() {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 struct DispatchVariant {
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
@@ -89,6 +94,9 @@ struct DispatchVariant {
     // checks at that ticket or an older one need no sweep (GEN_DRAW_VALIDATION). Any since paired
     // with any proven ticket is evidence: both come from readings that found the words.
     mutable std::atomic<std::uint64_t> genProvenTicket{0};
+    mutable std::atomic<std::uint64_t> q0CensusClock{0};
+    mutable std::atomic<std::uint64_t> q0CensusGeneration{0};
+    const std::uint64_t archcSerial = NextVariantSerial();
 };
 
 struct DispatchEntry {

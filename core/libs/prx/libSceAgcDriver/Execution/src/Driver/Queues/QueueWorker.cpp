@@ -146,6 +146,14 @@ void Driver::run(std::uint32_t id) noexcept {
     std::snprintf(role, sizeof role, "queue worker 0x%x", id);
     PinWorkerThread(role);
     if (id == 0) Stage4::BindRole(Stage4::Role::Queue0);
+    if (id == 0 && Stage4::Queue0Census()) {
+        ArchB::Recorder::SetThreadOverlapProbe(&Stage4::CommitterOverlapProbe, {"q0ov_idle:", "q0ov_mutex:"});
+        static const bool exported = [] {
+            for (const auto& entry : Stage4::Queue0WaitExports()) ArchB::Recorder::RegisterCounter(entry.name, *entry.value);
+            return true;
+        }();
+        static_cast<void>(exported);
+    }
 
     GuestMemory::TagGpuLockThread(id);
     static const auto sampledQueue = [] {
