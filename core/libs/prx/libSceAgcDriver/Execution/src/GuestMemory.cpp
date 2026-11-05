@@ -5558,6 +5558,7 @@ void GpuMutexType::acquired() {
 #ifdef _WIN32
         if (HoldLog::Instance() != nullptr) holdLogBegin = HoldLog::Now();
 #endif
+        HoldLogMark(HoldMark::LockAcquired);
         recorderHoldGeneration = ArchB::Recorder::Generation();
         recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
@@ -5624,17 +5625,26 @@ void SetGpuUnlockHook(void (*hook)()) {
     gpuUnlockHook.store(hook, std::memory_order_release);
 }
 
+namespace {
+std::atomic<void (*)(HoldMark)> holdMarkHook{nullptr};
+}
+
+void SetHoldMarkHook(void (*hook)(HoldMark)) {
+    holdMarkHook.store(hook, std::memory_order_release);
+}
+
 void EnableHoldMarks() {
 #ifdef _WIN32
     holdMarksOn = HoldLog::Instance() != nullptr;
 #endif
+    if (holdMarkHook.load(std::memory_order_acquire) != nullptr) holdMarksOn = true;
 }
 
 void HoldMarkSlow(HoldMark mark) {
+    if (auto* hook = holdMarkHook.load(std::memory_order_relaxed); hook != nullptr) hook(mark);
 #ifdef _WIN32
+    if (mark > HoldMark::UnlockHookEnd) return;
     if (auto* log = HoldLog::Instance(); log != nullptr) log->Mark(static_cast<std::uint32_t>(mark));
-#else
-    static_cast<void>(mark);
 #endif
 }
 
@@ -5667,6 +5677,7 @@ void GpuMutexType::unlock() {
         }
 #endif
         mutex.unlock();
+        HoldLogMark(HoldMark::Unlocked);
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.

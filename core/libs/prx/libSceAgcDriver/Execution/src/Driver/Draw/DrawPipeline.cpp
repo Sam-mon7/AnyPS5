@@ -1003,12 +1003,162 @@ void countAheadWindow(std::uint64_t enqueuedNs, std::uint64_t enqueueClock, std:
     else if (window < collects.walkNs + AheadLatencyNs) counters.aheadLateNs.fetch_add(collects.walkNs, std::memory_order_relaxed);
     else counters.aheadFeasibleNs.fetch_add(collects.walkNs, std::memory_order_relaxed);
 }
+
+// Arch C P7 census (APS5_ARCHB_C_ITEM_CENSUS=1, committer only): every hold mark of an item, with its
+// time, attributed at the item's end to (kind, previous mark, mark). The spin and the wait of an item
+// taken from an empty pipeline go to the "idle" kind. Counters c_item_census_<kind>_<from>_<to>_{ns,n}.
+constexpr std::size_t CensusMarks = static_cast<std::size_t>(GuestMemory::HoldMark::Count);
+constexpr std::size_t CensusKinds = static_cast<std::size_t>(DrawPipeline::ItemKind::Count) + 1;
+constexpr std::size_t CensusIdle = CensusKinds - 1;
+constexpr std::array<const char*, CensusMarks> CensusMarkNames{"none", "top", "taken", "cbegin", "cend", "done", "pbegin", "pend", "lbegin", "hookend", "lacq", "unlock", "bodyend", "proofs", "spin", "prepfreed"};
+constexpr std::array<const char*, CensusKinds> CensusKindNames{"other", "draw", "dispatch", "label", "dma", "fill", "idle"};
+struct ItemCensus {
+    struct Seen {
+        std::uint8_t mark = 0;
+        std::uint64_t ns = 0;
+    };
+    std::array<Seen, 96> seen{};
+    std::size_t count = 0;
+    Seen previous{};
+    std::size_t kind = 0;
+    bool idle = false;
+    std::array<std::array<std::array<std::atomic<std::uint64_t>, CensusMarks>, CensusMarks>, CensusKinds> ns{};
+    std::array<std::array<std::array<std::atomic<std::uint64_t>, CensusMarks>, CensusMarks>, CensusKinds> n{};
+    std::array<std::array<std::array<bool, CensusMarks>, CensusMarks>, CensusKinds> registered{};
+    std::array<std::atomic<std::uint64_t>, CensusKinds> items{};
+    std::array<std::atomic<std::uint64_t>, CensusKinds> itemNs{};
+    std::array<std::atomic<std::uint64_t>, CensusKinds> holds{};
+    std::array<bool, CensusKinds> itemsRegistered{};
+    std::atomic<std::uint64_t> overflows{0};
+};
+
+bool itemCensusEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_ITEM_CENSUS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+ItemCensus& itemCensus() {
+    static auto* census = new ItemCensus();
+    return *census;
+}
+
+std::uint64_t censusNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void censusRegister(const std::string& name, const std::atomic<std::uint64_t>& counter) {
+    ArchB::Recorder::RegisterCounter((new std::string(name))->c_str(), counter);
+}
+
+void censusAdd(ItemCensus& census, std::size_t kind, std::uint8_t from, std::uint8_t to, std::uint64_t ns) {
+    if (!census.registered[kind][from][to]) {
+        census.registered[kind][from][to] = true;
+        const auto stem = std::string("c_item_census_") + CensusKindNames[kind] + "_" + CensusMarkNames[from] + "_" + CensusMarkNames[to];
+        censusRegister(stem + "_ns", census.ns[kind][from][to]);
+        censusRegister(stem + "_n", census.n[kind][from][to]);
+    }
+    census.ns[kind][from][to].fetch_add(ns, std::memory_order_relaxed);
+    census.n[kind][from][to].fetch_add(1, std::memory_order_relaxed);
+}
+
+void itemCensusMark(GuestMemory::HoldMark mark) {
+    auto& census = itemCensus();
+    const auto now = censusNow();
+    if (census.count == census.seen.size()) {
+        census.overflows.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    census.seen[census.count++] = {static_cast<std::uint8_t>(mark), now};
+}
+
+void itemCensusKind(DrawPipeline::ItemKind kind, bool idle) {
+    auto& census = itemCensus();
+    census.kind = static_cast<std::size_t>(kind);
+    census.idle = idle;
+}
+
+// Arch C P7 C_LEAN_ITEMS: items retired together with the next take, items whose retire was deferred,
+// and the _VERIFY checks that the deferred retire found the committed item at the front.
+struct LeanCounters {
+    std::atomic<std::uint64_t> merged{0};
+    std::atomic<std::uint64_t> deferred{0};
+    std::atomic<std::uint64_t> checks{0};
+    std::atomic<std::uint64_t> mismatches{0};
+};
+
+LeanCounters& leanCounters() {
+    static auto* counters = [] {
+        auto* created = new LeanCounters();
+        ArchB::Recorder::RegisterCounter("c_lean_items_merged", created->merged);
+        ArchB::Recorder::RegisterCounter("c_lean_items_deferred", created->deferred);
+        ArchB::Recorder::RegisterCounter("c_lean_items_verify_checks", created->checks);
+        ArchB::Recorder::RegisterCounter("c_lean_items_verify_mismatches", created->mismatches);
+        return created;
+    }();
+    return *counters;
+}
+
+bool leanItemsVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_LEAN_ITEMS_VERIFY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    if (enabled) leanCounters().checks.fetch_add(1, std::memory_order_relaxed);
+    return enabled;
+}
+
+void noteLeanMismatch() {
+    const auto count = leanCounters().mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((count & (count - 1)) == 0) std::fprintf(stderr, "[pipe] C_LEAN_ITEMS VERIFY mismatch: a deferred retire did not find the committed item at the front (%llu so far)\n", static_cast<unsigned long long>(count));
+}
+
+void itemCensusFlush() {
+    auto& census = itemCensus();
+    if (census.count == 0) return;
+    const auto kind = census.kind;
+    auto previous = census.previous;
+    std::uint64_t itemStart = 0;
+    std::uint64_t holds = 0;
+    for (std::size_t i = 0; i < census.count; ++i) {
+        const auto& seen = census.seen[i];
+        const auto mark = static_cast<GuestMemory::HoldMark>(seen.mark);
+        const bool idleSpan = census.idle && (mark == GuestMemory::HoldMark::SpinEnd || mark == GuestMemory::HoldMark::ItemTaken);
+        if (mark == GuestMemory::HoldMark::LockAcquired) ++holds;
+        if (previous.mark != 0 && seen.ns >= previous.ns) censusAdd(census, idleSpan ? CensusIdle : kind, previous.mark, seen.mark, seen.ns - previous.ns);
+        if (mark == GuestMemory::HoldMark::ItemTaken) itemStart = seen.ns;
+        previous = seen;
+    }
+    if (!census.itemsRegistered[kind]) {
+        census.itemsRegistered[kind] = true;
+        censusRegister(std::string("c_item_census_items_") + CensusKindNames[kind], census.items[kind]);
+        censusRegister(std::string("c_item_census_item_ns_") + CensusKindNames[kind], census.itemNs[kind]);
+        censusRegister(std::string("c_item_census_holds_") + CensusKindNames[kind], census.holds[kind]);
+    }
+    census.items[kind].fetch_add(1, std::memory_order_relaxed);
+    if (itemStart != 0 && previous.ns >= itemStart) census.itemNs[kind].fetch_add(previous.ns - itemStart, std::memory_order_relaxed);
+    census.holds[kind].fetch_add(holds, std::memory_order_relaxed);
+    census.previous = previous;
+    census.count = 0;
+}
+}
+
+bool DrawPipeline::ItemCensus() {
+    return itemCensusEnabled();
+}
+
+void DrawPipeline::CensusStep(const char* name, std::uint64_t ns) {
+    ArchB::Recorder::Count(name, static_cast<double>(ns));
 }
 
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     GuestMemory::MarkCommitterThread();
     Stage4::BindRole(Stage4::Role::Committer);
+    const bool census = itemCensusEnabled();
+    if (census) GuestMemory::SetHoldMarkHook(&itemCensusMark);
     GuestMemory::EnableHoldMarks();
     // Stage 4 M4 (APS5_RESOLVE_CENSUS): the item's declared reads and writes, copied under the mutex
     // (ReleaseRunningReads clears the running item's reads during its commit).
@@ -1018,6 +1168,32 @@ void DrawPipeline::run() {
     static std::atomic<std::uint64_t> recorderCommits{0};
     static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();
     static_cast<void>(registered);
+    static const bool timedReports = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    struct Retire {
+        const Commit* commit = nullptr;
+        std::exception_ptr fatal;
+        std::uint64_t serial = 0;
+        std::uint64_t spent = 0;
+        ItemKind kind = ItemKind::Other;
+        bool failed = false;
+    };
+    std::optional<Retire> deferred;
+    const auto retireFront = [&](const Retire& note) {
+        if (note.commit != nullptr && leanItemsVerify() && &items.front().commit != note.commit) noteLeanMismatch();
+        countWrites(items.front().writes, false);
+        if (!resolvers.empty()) noteApplied(items.front(), note.serial);
+        retired.push_back(std::move(items.front()));
+        items.pop_front();
+        retiredItems.fetch_add(1, std::memory_order_release);
+        ++commits;
+        recorderCommits.fetch_add(1, std::memory_order_relaxed);
+        pipeCounters().commits[static_cast<std::size_t>(note.kind)].fetch_add(1, std::memory_order_relaxed);
+        commitNs += note.spent;
+        if (note.failed) ++commitErrors;
+        if (note.fatal != nullptr && failure == nullptr) failure = note.fatal;
+        outstanding.fetch_sub(1, std::memory_order_release);
+        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+    };
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -1027,20 +1203,7 @@ void DrawPipeline::run() {
         std::shared_ptr<ResolveSlot> resolveSlot;
         std::uint64_t serial = 0;
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTop);
-        // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
-        const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
-        const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        // Stage 4 M1: the committer idles (spins, then sleeps until queue 0 enqueues).
-        std::optional<Stage4::WaitScope> stage4Idle;
-        if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == 0) stage4Idle.emplace(Stage4::Wait::Idle, true);
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
-            std::unique_lock lock(mutex);
-            if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
-            committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty() || closing; });
-            committerWaiting = false;
-            if (items.empty()) break;
+        const auto takeFront = [&] {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             kind = items.front().kind;
@@ -1052,11 +1215,45 @@ void DrawPipeline::run() {
                 stage4Reads.assign(items.front().reads.begin(), items.front().reads.end());
                 stage4Writes.assign(items.front().writes.begin(), items.front().writes.end());
             }
+        };
+        bool taken = false;
+        bool censusIdle = false;
+        if (deferred) {
+            std::lock_guard lock(mutex);
+            retireFront(*deferred);
+            deferred.reset();
+            if (!items.empty()) {
+                takeFront();
+                taken = true;
+                leanCounters().merged.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-        stage4Idle.reset();
+        // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
+        const bool idleBefore = !taken && ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
+        const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (!taken) {
+            // Stage 4 M1: the committer idles (spins, then sleeps until queue 0 enqueues).
+            std::optional<Stage4::WaitScope> stage4Idle;
+            if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == 0) stage4Idle.emplace(Stage4::Wait::Idle, true);
+            censusIdle = census && outstanding.load(std::memory_order_acquire) == 0;
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+            GuestMemory::HoldLogMark(GuestMemory::HoldMark::SpinEnd);
+            {
+                std::unique_lock lock(mutex);
+                if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
+                committerWaiting = true;
+                wake.wait(lock, [&] { return !items.empty() || closing; });
+                committerWaiting = false;
+                if (items.empty()) break;
+                takeFront();
+            }
+        }
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTaken);
+        if (census) itemCensusKind(kind, censusIdle);
         if (Stage4::ResolveCensus()) Stage4::BeginItem(static_cast<std::uint8_t>(kind), stage4Reads, stage4Writes, Graphics::StorageTexture::PendingSerial());
-        const auto start = std::chrono::steady_clock::now();
+        const bool lean = ArchB::Switches::Enabled(ArchB::Feature::CLeanItems);
+        const bool timed = !lean || timedReports || idleBefore || resolveSlot != nullptr || enqueuedNs != 0;
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (idleBefore) {
             const auto idleNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(start - idleStart).count());
             pipeCounters().idleNs.fetch_add(idleNs, std::memory_order_relaxed);
@@ -1073,6 +1270,7 @@ void DrawPipeline::run() {
             if (commit != nullptr) (*commit)();
             GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitEnd);
             if (!isDraw) GuestMemory::BreakProofs();
+            GuestMemory::HoldLogMark(GuestMemory::HoldMark::ProofsBroken);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
@@ -1082,7 +1280,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        const auto spent = elapsedNs(start);
+        const auto spent = timed ? elapsedNs(start) : 0;
         if (resolveSlot != nullptr) {
             resolveCounters().applyNs.fetch_add(spent, std::memory_order_relaxed);
             resolveCounters().applyItems.fetch_add(1, std::memory_order_relaxed);
@@ -1093,21 +1291,16 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
-        countWrites(items.front().writes, false);
-        if (!resolvers.empty()) noteApplied(items.front(), serial);
-        retired.push_back(std::move(items.front()));
-        items.pop_front();
-        retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        recorderCommits.fetch_add(1, std::memory_order_relaxed);
-        pipeCounters().commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
-        commitNs += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        Retire note{commit, fatal, serial, spent, kind, failed};
+        if (lean && fatal == nullptr) {
+            deferred = std::move(note);
+            leanCounters().deferred.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            std::lock_guard lock(mutex);
+            retireFront(note);
+        }
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemDone);
+        if (census) itemCensusFlush();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }

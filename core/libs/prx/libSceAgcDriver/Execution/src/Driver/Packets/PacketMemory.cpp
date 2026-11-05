@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include <array>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -450,20 +451,38 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const bool census = DrawPipeline::ItemCensus() && GuestMemory::IsCommitterThread();
+    const auto censusNow = [] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
+    auto censusAt = census ? censusNow() : 0;
+    const auto censusStep = [&](const char* name) {
+        if (!census) return;
+        const auto now = censusNow();
+        DrawPipeline::CensusStep(name, now - censusAt);
+        censusAt = now;
+    };
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
+    censusStep("c_item_census_label_step_deferred_ns");
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
         if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        censusStep("c_item_census_label_step_linear_ns");
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        censusStep("c_item_census_label_step_write_ns");
+        if (census) {
+            static constexpr std::array<const char*, 8> reasonNames{"c_item_census_label_reason_0", "c_item_census_label_reason_1", "c_item_census_label_reason_2", "c_item_census_label_reason_3", "c_item_census_label_reason_4", "c_item_census_label_reason_5", "c_item_census_label_reason_6", "c_item_census_label_reason_other"};
+            DrawPipeline::CensusStep(reasonNames[reason >= 0 && reason < 7 ? reason : 7], 1);
+        }
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
+            censusStep(reason == 1 ? "c_item_census_label_step_fallback_idle_ns" : "c_item_census_label_step_fallback_wait_ns");
         }
         noteLabelStore(address, bytes, stamp, queue);
         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+        censusStep("c_item_census_label_step_note_ns");
         countLabelOutcome(reason);
         ++immediateLabels;
     } else {

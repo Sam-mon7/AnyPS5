@@ -368,7 +368,10 @@ void SetGpuUnlockHook(void (*hook)());
 // APS5_HOLD_LOG item marks (diag): on a thread that called EnableHoldMarks, each mark adds a record
 // {0xffffffff, mark, QPC, OS thread} to the hold log (readers that predate marks skip thread 0xffffffff).
 // Without APS5_HOLD_LOG or on other threads a mark is a thread-local load and a branch.
-enum class HoldMark : std::uint32_t { ItemTop = 1, ItemTaken, CommitBegin, CommitEnd, ItemDone, PrelockBegin, PrelockEnd, LockBegin, UnlockHookEnd };
+enum class HoldMark : std::uint32_t { ItemTop = 1, ItemTaken, CommitBegin, CommitEnd, ItemDone, PrelockBegin, PrelockEnd, LockBegin, UnlockHookEnd, LockAcquired, Unlocked, ClosureBodyEnd, ProofsBroken, SpinEnd, PrepFreed, Count };
+// Arch C P7 census (APS5_ARCHB_C_ITEM_CENSUS=1): every mark of a hold-marking thread also goes to this
+// hook, set before EnableHoldMarks; only marks up to UnlockHookEnd go to the hold log.
+void SetHoldMarkHook(void (*hook)(HoldMark));
 void EnableHoldMarks();
 void HoldMarkSlow(HoldMark mark);
 inline thread_local bool holdMarksOn = false;

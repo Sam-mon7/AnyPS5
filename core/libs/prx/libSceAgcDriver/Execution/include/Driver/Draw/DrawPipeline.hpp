@@ -151,6 +151,10 @@ public:
     enum BumpCause : std::size_t { BumpSubmission, BumpWait, BumpDrain, BumpReap, BumpPacket, BumpCauses };
     static void CountEpochBump(BumpCause cause);
     static unsigned Committers();
+    // Arch C P7 census (APS5_ARCHB_C_ITEM_CENSUS=1): adds `ns` to the recorder counter `name` (a static
+    // string), for steps inside an item's commit on the committer.
+    static bool ItemCensus();
+    static void CensusStep(const char* name, std::uint64_t ns);
 
     // Never waits while the calling thread holds the GPU mutex: a full pipeline then takes the item
     // past its capacity (the committer needs the mutex to make room).
