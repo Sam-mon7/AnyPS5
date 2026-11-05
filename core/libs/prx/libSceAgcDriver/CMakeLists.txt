@@ -1093,6 +1093,15 @@ if(BUILD_TESTING)
         SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_archb_wt_fault PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
     set_tests_properties(agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
+    # APS5_ARCHB_WT_FAULT: host-side bulk copies (libkernel's 64 KiB staging memcpy, a kernel-mode read) and an
+    # explicit open into armed guest memory committed one 16 KiB allocation per PS5 page; alone, and with the
+    # kept consumers, sync skip and VERIFY.
+    add_test(NAME agc_archb_wt_fault_host_copy COMMAND agc_write_tracking_tests --wt-fault-host-copy)
+    add_test(NAME agc_archb_wt_fault_host_copy_kept COMMAND agc_write_tracking_tests --wt-fault-host-copy)
+    set_tests_properties(agc_archb_wt_fault_host_copy agc_archb_wt_fault_host_copy_kept PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    set_tests_properties(agc_archb_wt_fault_host_copy PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=0;APS5_ARCHB_WT_FAULT_CONSUMERS=0;APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
+    set_tests_properties(agc_archb_wt_fault_host_copy_kept PROPERTIES ENVIRONMENT "APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_VERIFY=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_WT_SYNC_SKIP=1;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0")
     # APS5_ARCHB_WT_FAULT_CONSUMERS: collects from the fault states (no write-watch query for an armed
     # range), with and without VERIFY; and the whole write-tracking suite with consumers on.
     add_test(NAME agc_archb_wt_fault_consumers COMMAND agc_write_tracking_tests --wt-fault-consumers)

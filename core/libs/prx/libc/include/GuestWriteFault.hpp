@@ -73,6 +73,9 @@ struct WtFaultCounters {
     std::uint64_t watchFaults = 0;
     std::uint64_t watchHandlerNs = 0;
     std::uint64_t watchedPages = 0;
+    std::uint64_t openSplitRuns = 0;   // opened runs one VirtualProtect refused (they spanned allocations), restored region by region
+    std::uint64_t openSplitPieces = 0; // regions those took
+    std::uint64_t openRefused = 0;     // pages an open could not restore (left untracked)
 };
 
 struct WtFaultMismatch {

@@ -56,6 +56,7 @@ struct Counters {
     std::atomic<std::uint64_t> holds{0}, heldOpened{0}, opens{0}, forgotten{0}, tracked{0};
     std::atomic<std::uint64_t> verifyWalks{0}, verifyDirty{0}, verifyUntracked{0}, verifyMismatches{0}, queries{0};
     std::atomic<std::uint64_t> logAppends{0}, logLost{0}, coldRearmed{0};
+    std::atomic<std::uint64_t> openSplitRuns{0}, openSplitPieces{0}, openRefused{0};
 };
 
 struct State {
@@ -256,23 +257,57 @@ DWORD guestProtection(bool exec) {
     return exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
 }
 
-// Opening -> Open after restoring the guest protection of [begin, end) (all words already Opening,
-// all with the same exec bit). Under the mutex or from the handler. False when the protect failed:
-// the words go back to Untracked (the page is not what the tracker armed any more).
-bool finishOpening(State& state, std::uintptr_t begin, std::uintptr_t end, bool exec) {
+// Protects [begin, end) with one VirtualProtect; when that fails and `split`, once per VirtualQuery region
+// (a region never spans allocations). `failed(pieceBegin, pieceEnd)` for what stayed unprotected.
+template <typename Failed>
+bool protectPieces(std::uintptr_t begin, std::uintptr_t end, DWORD protection, bool split, std::atomic<std::uint64_t>& splitRuns, std::atomic<std::uint64_t>& splitPieces, Failed&& failed) {
     DWORD previous;
-    const bool done = VirtualProtect(reinterpret_cast<void*>(begin), end - begin, guestProtection(exec), &previous) != 0;
-    for (auto page = begin; page < end; page += PageBytes) {
-        auto* leaf = leafAt(state, page);
-        auto& word = wordOf(*leaf, page);
-        auto expected = word.load(std::memory_order_acquire);
-        if (stateOf(expected) != WtFaultOpening) continue;
-        if (done) {
-            if (word.compare_exchange_strong(expected, (expected & ~WtFaultStateMask) | WtFaultOpen, std::memory_order_acq_rel)) leaf->open.store(1, std::memory_order_release);
-        } else if (word.compare_exchange_strong(expected, WtFaultUntracked, std::memory_order_acq_rel)) {
-            leaf->candidates.fetch_sub(1, std::memory_order_relaxed);
-        }
+    if (VirtualProtect(reinterpret_cast<void*>(begin), end - begin, protection, &previous) != 0) return true;
+    if (!split) {
+        failed(begin, end);
+        return false;
     }
+    splitRuns.fetch_add(1, std::memory_order_relaxed);
+    bool all = true;
+    for (auto cursor = begin; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        auto pieceEnd = cursor + PageBytes;
+        if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) == sizeof(memory) && memory.RegionSize != 0) {
+            pieceEnd = std::min(end, std::max(pieceEnd, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize));
+        }
+        splitPieces.fetch_add(1, std::memory_order_relaxed);
+        if (VirtualProtect(reinterpret_cast<void*>(cursor), pieceEnd - cursor, protection, &previous) == 0) {
+            failed(cursor, pieceEnd);
+            all = false;
+        }
+        cursor = pieceEnd;
+    }
+    return all;
+}
+
+// Opening -> Open after restoring the guest protection of [begin, end) (all words already Opening,
+// all with the same exec bit). Under the mutex or from the handler. A run of armed pages can span
+// allocations (live direct memory is one 16 KiB allocation per PS5 page, and an arm protects each
+// allocation apart), which one VirtualProtect refuses whole: the run is then restored one VirtualQuery
+// region at a time. Only the pages of a piece whose protect failed go back to Untracked (they are not
+// what the tracker armed any more); false when any did.
+bool finishOpening(State& state, std::uintptr_t begin, std::uintptr_t end, bool exec) {
+    const auto settle = [&](std::uintptr_t from, std::uintptr_t to, bool done) {
+        for (auto page = from; page < to; page += PageBytes) {
+            auto* leaf = leafAt(state, page);
+            auto& word = wordOf(*leaf, page);
+            auto expected = word.load(std::memory_order_acquire);
+            if (stateOf(expected) != WtFaultOpening) continue;
+            if (done) {
+                if (word.compare_exchange_strong(expected, (expected & ~WtFaultStateMask) | WtFaultOpen, std::memory_order_acq_rel)) leaf->open.store(1, std::memory_order_release);
+            } else if (word.compare_exchange_strong(expected, WtFaultUntracked, std::memory_order_acq_rel)) {
+                leaf->candidates.fetch_sub(1, std::memory_order_relaxed);
+                state.counters.openRefused.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    };
+    const bool done = protectPieces(begin, end, guestProtection(exec), true, state.counters.openSplitRuns, state.counters.openSplitPieces, [&](std::uintptr_t pieceBegin, std::uintptr_t pieceEnd) { settle(pieceBegin, pieceEnd, false); });
+    settle(begin, end, true);
     return done;
 }
 
@@ -343,34 +378,6 @@ DWORD trackedProtection(std::uint64_t word) {
 void spinOnce(unsigned spins) {
     if (spins < 1024) YieldProcessor();
     else SwitchToThread();
-}
-
-// Protects [begin, end) with one VirtualProtect; when that fails and `split`, once per VirtualQuery region
-// (a region never spans allocations). `failed(pieceBegin, pieceEnd)` for what stayed unprotected.
-template <typename Failed>
-bool protectPieces(std::uintptr_t begin, std::uintptr_t end, DWORD protection, bool split, Failed&& failed) {
-    DWORD previous;
-    if (VirtualProtect(reinterpret_cast<void*>(begin), end - begin, protection, &previous) != 0) return true;
-    if (!split) {
-        failed(begin, end);
-        return false;
-    }
-    g_watchSplitRuns.fetch_add(1, std::memory_order_relaxed);
-    bool all = true;
-    for (auto cursor = begin; cursor < end;) {
-        MEMORY_BASIC_INFORMATION memory{};
-        auto pieceEnd = cursor + PageBytes;
-        if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) == sizeof(memory) && memory.RegionSize != 0) {
-            pieceEnd = std::min(end, std::max(pieceEnd, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize));
-        }
-        g_watchSplitPieces.fetch_add(1, std::memory_order_relaxed);
-        if (VirtualProtect(reinterpret_cast<void*>(cursor), pieceEnd - cursor, protection, &previous) == 0) {
-            failed(cursor, pieceEnd);
-            all = false;
-        }
-        cursor = pieceEnd;
-    }
-    return all;
 }
 
 bool unwatchPage(Leaf& leaf, std::uintptr_t page, std::uint64_t kind) {
@@ -454,7 +461,7 @@ std::size_t unwatchRange(State& state, std::uintptr_t first, std::uintptr_t stop
         auto j = i + 1;
         while (j < claims.size() && claims[j].page == claims[j - 1].page + PageBytes && trackedProtection(claims[j].value) == protection) ++j;
         // Split on failure whatever the switch: adjacent ranges watched apart may lie in different allocations.
-        protectPieces(claims[i].page, claims[j - 1].page + PageBytes, protection, true, [](std::uintptr_t, std::uintptr_t) {});
+        protectPieces(claims[i].page, claims[j - 1].page + PageBytes, protection, true, g_watchSplitRuns, g_watchSplitPieces, [](std::uintptr_t, std::uintptr_t) {});
         for (auto k = i; k < j; ++k) {
             if (clearWatch(*claims[k].leaf, claims[k].page)) {
                 ++unwatched;
@@ -1199,6 +1206,9 @@ void GuestWtFaultCounters_nid_no_patch(WtFaultCounters* out) {
     out->watchFaults = g_watchFaults.load(std::memory_order_relaxed);
     out->watchHandlerNs = ns(g_watchFaultTicks);
     out->watchedPages = g_watchedPages.load(std::memory_order_relaxed);
+    out->openSplitRuns = c.openSplitRuns.load(std::memory_order_relaxed);
+    out->openSplitPieces = c.openSplitPieces.load(std::memory_order_relaxed);
+    out->openRefused = c.openRefused.load(std::memory_order_relaxed);
 }
 
 bool GuestWtFaultSyncedClean_nid_no_patch(std::uintptr_t address) {
@@ -1370,7 +1380,7 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
         }
         g_watchedPages.fetch_add(j - i, std::memory_order_relaxed);
         auto done = j - i;
-        protectPieces(claims[i].page, claims[j - 1].page + PageBytes, PAGE_NOACCESS, g_watchSplit.load(std::memory_order_relaxed), [&](std::uintptr_t begin, std::uintptr_t end) {
+        protectPieces(claims[i].page, claims[j - 1].page + PageBytes, PAGE_NOACCESS, g_watchSplit.load(std::memory_order_relaxed), g_watchSplitRuns, g_watchSplitPieces, [&](std::uintptr_t begin, std::uintptr_t end) {
             for (auto k = i; k < j; ++k) {
                 if (claims[k].page < begin || claims[k].page >= end) continue;
                 clearWatch(*claims[k].leaf, claims[k].page);
