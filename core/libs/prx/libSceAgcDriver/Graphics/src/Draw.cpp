@@ -4049,8 +4049,8 @@ struct Table {
 };
 
 Table& table() {
-    thread_local Table made;
-    return made;
+    thread_local Table* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
 }
 
 std::uint64_t mix(std::uint64_t hash, std::uint64_t value) {
@@ -4112,7 +4112,8 @@ struct Seen {
 };
 
 void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
-    thread_local std::unordered_map<std::uint64_t, Seen> byShape;
+    thread_local std::unordered_map<std::uint64_t, Seen>* byShapeSlot = nullptr;
+    auto& byShape = ShaderRecompiler::ThreadOwned(byShapeSlot);
     std::uint64_t shape = 0x5348u;
     for (const auto& shader : shaders) shape = mix(shape, (static_cast<std::uint64_t>(shader.stage) << 32u) | shader.pushConstantOffset);
     shape = mix(shape, shaders.empty() || shaders.front().program == nullptr ? 0 : shaders.front().program->variantId);
@@ -4131,10 +4132,18 @@ void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& d
     else if (!sameDraw(seen.draw, draw)) kind = MissDraw;
     counters().misses[kind].fetch_add(1, std::memory_order_relaxed);
     seen = now;
-    thread_local std::unordered_set<std::uint64_t> states;
-    thread_local std::unordered_set<std::uint64_t> programs;
-    thread_local std::unordered_set<std::uint64_t> arguments;
-    thread_local std::unordered_set<std::uint64_t> draws;
+    struct SeenSets {
+        std::unordered_set<std::uint64_t> states;
+        std::unordered_set<std::uint64_t> programs;
+        std::unordered_set<std::uint64_t> arguments;
+        std::unordered_set<std::uint64_t> draws;
+    };
+    thread_local SeenSets* setsSlot = nullptr;
+    auto& sets = ShaderRecompiler::ThreadOwned(setsSlot);
+    auto& states = sets.states;
+    auto& programs = sets.programs;
+    auto& arguments = sets.arguments;
+    auto& draws = sets.draws;
     if (states.insert(reinterpret_cast<std::uintptr_t>(identity.state.get())).second) counters().misses[MissNewState].fetch_add(1, std::memory_order_relaxed);
     bool newProgram = false;
     for (const auto& shader : shaders) newProgram |= programs.insert(reinterpret_cast<std::uintptr_t>(shader.program)).second;
@@ -4372,21 +4381,21 @@ struct ReplayScratch {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> linearReads;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     DrawInputs inputs;
+    DrawOutcome outcome{false};
+    DrawTimer timer{false};
 };
 
 ReplayScratch& scratch() {
-    thread_local ReplayScratch made;
-    return made;
+    thread_local ReplayScratch* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
 }
 
 DrawOutcome& replayOutcome() {
-    thread_local DrawOutcome made(false);
-    return made;
+    return scratch().outcome;
 }
 
 DrawTimer& replayTimer() {
-    thread_local DrawTimer made(false);
-    return made;
+    return scratch().timer;
 }
 
 bool tryReplay(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, const DrawTraceContext* trace, bool pipelineStateReuse, PreparedDraw& prepared) {
