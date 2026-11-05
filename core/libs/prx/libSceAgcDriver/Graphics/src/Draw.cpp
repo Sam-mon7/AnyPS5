@@ -1696,7 +1696,15 @@ bool prelockFindVerify() {
     return enabled;
 }
 
-DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPreparation* preparation = nullptr) {
+// Arch C P3b (C_REPLAY_SLOT_INPUTS): a slot replay's validated fragment outputs and pipeline stages. The State
+// and stages are those of the capture (the same decode, the same stage owners; a patched stage by its variant and
+// words), so they replace the validation memo and the state's pure validation checks.
+struct ReplayInputsHint {
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+};
+
+DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPreparation* preparation = nullptr, const ReplayInputsHint* hint = nullptr) {
     const auto* handoff = recipe == nullptr && preparation != nullptr && preparation->device == context.device && preparation->resolved && resolveHandoff() ? preparation : nullptr;
     DrawInputs inputs;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
@@ -1743,6 +1751,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     if (recipe != nullptr) {
         inputs.fragmentOutputs = recipe->fragmentOutputs;
         inputs.shaderStages = recipe->shaderStages;
+    } else if (hint != nullptr) {
+        inputs.fragmentOutputs = hint->fragmentOutputs;
+        inputs.shaderStages = hint->shaderStages;
     } else if (handoff != nullptr && handoff->resolvedOutputsKnown) {
         inputs.fragmentOutputs = handoff->resolvedOutputs;
         outcome.validateMemoized = true;
@@ -1776,10 +1787,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     if (state.stages.tessellation) Require(draw.indexCount % state.stages.tessellation->inputControlPoints == 0, "incomplete tessellation patch");
     // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
-    ValidateViewport(context, state.viewport);
-    ValidateDepthBounds(context, state);
-    ValidateSampleMask(context, state, shaders);
+    if (hint == nullptr) {
+        ValidateViewport(context, state.viewport);
+        ValidateDepthBounds(context, state);
+        ValidateSampleMask(context, state, shaders);
+    }
     timer.phase(PhaseValidate);
+    ArchC::ProbeAt(ArchC::Probe::InValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (state.quadList || StripPatches(state, shaders)) {
         Require(!draw.indirect, state.quadList ? "indirect quad-list draw is unsupported" : "an indirect triangle strip through emulated barycentric patches is unsupported");
@@ -1931,6 +1945,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+    ArchC::ProbeAt(ArchC::Probe::InIndex);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
@@ -3062,6 +3077,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     kept->scratch = std::move(scratch);
     kept->targets = std::move(targets);
     const auto& residents = kept->targets;
+    ArchC::ProbeAt(ArchC::Probe::KpKept);
     resources->KeepStorageImageBytes(recorder);
     for (const auto& target : residents) {
         if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
@@ -3073,8 +3089,10 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     // finishes the recorder up to the open batch, which holds the kept resources and gets the
     // next serial), or waited for by the caller (any wait releases it at once).
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
+    ArchC::ProbeAt(ArchC::Probe::KpStorage);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
     resources->MarkGpuWrites(recorder);
+    ArchC::ProbeAt(ArchC::Probe::KpMarkGpu);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
     if (listed && resources->HasCopiedWrites()) {
@@ -3092,6 +3110,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
     }
+    ArchC::ProbeAt(ArchC::Probe::KpComplete);
     std::vector<bool> storeNow(residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
@@ -3102,6 +3121,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (storeNow[index]) StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
     }
+    ArchC::ProbeAt(ArchC::Probe::KpDirty);
 }
 
 struct SlotPassCapture {
@@ -3916,6 +3936,8 @@ enum Component : std::size_t { ComponentTargets, ComponentTemplate, ComponentObj
 constexpr std::array<const char*, ComponentCount + 1> ComponentNames{"targets", "template", "objects", "inputs", "args", "pass", "push", "ineligible"};
 enum MissKind : std::size_t { MissState, MissPrograms, MissArguments, MissDraw, MissOther, MissNewState, MissNewProgram, MissNewArguments, MissNewDraw, MissCount };
 constexpr std::array<const char*, MissCount> MissNames{"state", "programs", "arguments", "draw", "other", "new_state", "new_program", "new_arguments", "new_draw"};
+constexpr std::array<const char*, static_cast<std::size_t>(ArchC::Probe::Count)> ProbeNames{"rv_prelude", "rv_complete", "rv_stamp", "rv_scan", "rv_imports", "rv_staging", "rv_finish", "dv_htile", "dv_settle", "dv_find", "dv_planes", "dv_sync", "dv_written", "dv_stale", "dv_note", "in_validate", "in_index", "bd_reuse", "bd_flush", "bd_linear", "bd_prepare", "rc_start", "rc_timing", "rc_begin", "rc_begin_new", "rc_bind", "rc_push", "rc_draw", "rc_leave", "kp_kept", "kp_storage", "kp_markgpu", "kp_complete", "kp_dirty"};
+constexpr std::uint64_t TrimNs = 40000;
 enum OutcomeKind : int { OutcomeReplayed = 0, OutcomeVerified = 1, OutcomeRefused = 2, OutcomeNew = 3 };
 
 struct Counters {
@@ -3923,6 +3945,9 @@ struct Counters {
     std::array<std::atomic<std::uint64_t>, RefusalCount> refused{};
     std::array<std::atomic<std::uint64_t>, IneligibleCount> ineligible{};
     std::array<std::atomic<std::uint64_t>, StepCount> stepNs{};
+    // Trimmed per-step time (STEPS=1): samples under 40 us, their count, and the samples over.
+    std::array<std::atomic<std::uint64_t>, StepCount> stepTrimNs{}, stepTrimN{}, stepOut{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ArchC::Probe::Count)> probeNs{}, probeN{}, probeOut{};
     std::array<std::atomic<std::uint64_t>, ComponentCount + 1> mismatched{};
     std::array<std::atomic<std::uint64_t>, MissCount> misses{};
     Counters() {
@@ -3938,6 +3963,16 @@ struct Counters {
         for (std::size_t i = 0; i < RefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_replay_refused_") + RefusalNames[i]))->c_str(), refused[i]);
         for (std::size_t i = 0; i < IneligibleCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_replay_ineligible_") + IneligibleNames[i]))->c_str(), ineligible[i]);
         for (std::size_t i = 0; i < StepCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_replay_step_ns_") + StepNames[i]))->c_str(), stepNs[i]);
+        for (std::size_t i = 0; i < StepCount; ++i) {
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_step_trim_ns_") + StepNames[i]))->c_str(), stepTrimNs[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_step_trim_n_") + StepNames[i]))->c_str(), stepTrimN[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_step_out_") + StepNames[i]))->c_str(), stepOut[i]);
+        }
+        for (std::size_t i = 0; i < ProbeNames.size(); ++i) {
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_probe_ns_") + ProbeNames[i]))->c_str(), probeNs[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_probe_n_") + ProbeNames[i]))->c_str(), probeN[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_probe_out_") + ProbeNames[i]))->c_str(), probeOut[i]);
+        }
         for (std::size_t i = 0; i < MissCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_replay_miss_") + MissNames[i]))->c_str(), misses[i]);
         for (std::size_t i = 0; i <= ComponentCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_replay_verify_mismatch_") + ComponentNames[i]))->c_str(), mismatched[i]);
     }
@@ -3946,6 +3981,73 @@ struct Counters {
 Counters& counters() {
     static Counters made;
     return made;
+}
+
+// Arch C P3b cuts (C_REPLAY_*): uses, refusals (the step ran live), VERIFY checks and mismatches.
+// (C_REPLAY_QUIET_TEMPLATE counts in ShaderResources.cpp: archc_replay_p3b_quiet_template_*.)
+// (C_REPLAY_DEPTH_EPOCH counts in DepthSurface.cpp: archc_replay_p3b_depth_epoch_*.)
+enum Cut : std::size_t { CutSlotMoved, CutSlotBindings, CutSlotInputs, CutCount };
+constexpr std::array<const char*, CutCount> CutNames{"slot_moved", "slot_bindings", "slot_inputs"};
+constexpr std::array<const char*, CutCount> CutVerifyVariables{"APS5_ARCHB_C_REPLAY_SLOT_BINDINGS_VERIFY", "APS5_ARCHB_C_REPLAY_SLOT_BINDINGS_VERIFY", "APS5_ARCHB_C_REPLAY_SLOT_INPUTS_VERIFY"};
+
+struct CutCounters {
+    std::array<std::atomic<std::uint64_t>, CutCount> hits{}, live{}, verifyChecks{}, verifyMismatches{};
+    CutCounters() {
+        using AgcDriver::ArchB::Recorder;
+        for (std::size_t i = 0; i < CutCount; ++i) {
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_p3b_") + CutNames[i] + "_hits"))->c_str(), hits[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_p3b_") + CutNames[i] + "_live"))->c_str(), live[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_p3b_") + CutNames[i] + "_verify_checks"))->c_str(), verifyChecks[i]);
+            Recorder::RegisterCounter((new std::string(std::string("archc_replay_p3b_") + CutNames[i] + "_verify_mismatches"))->c_str(), verifyMismatches[i]);
+        }
+    }
+};
+
+CutCounters& cutCounters() {
+    static CutCounters made;
+    return made;
+}
+
+void cutHit(Cut cut) {
+    cutCounters().hits[cut].fetch_add(1, std::memory_order_relaxed);
+}
+
+void cutLive(Cut cut) {
+    cutCounters().live[cut].fetch_add(1, std::memory_order_relaxed);
+}
+
+// One use in N (the cut's _VERIFY=N) also runs the live step and compares; counts the check.
+bool cutVerifyNow(Cut cut) {
+    static const std::array<std::uint64_t, CutCount> periods = [] {
+        std::array<std::uint64_t, CutCount> made{};
+        for (std::size_t i = 0; i < CutCount; ++i) {
+            const char* value = std::getenv(CutVerifyVariables[i]);
+            made[i] = value == nullptr ? 0 : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+        }
+        return made;
+    }();
+    if (periods[cut] == 0) return false;
+    static std::array<std::uint64_t, CutCount> uses{};
+    if (++uses[cut] % periods[cut] != 0) return false;
+    cutCounters().verifyChecks[cut].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void cutMismatch(Cut cut, const char* what) {
+    const auto previous = cutCounters().verifyMismatches[cut].fetch_add(1, std::memory_order_relaxed);
+    if (previous < 8) std::fprintf(stderr, "[archc] replay cut %s VERIFY mismatch: %s\n", CutNames[cut], what);
+}
+
+bool cutEnabled(AgcDriver::ArchB::Feature feature) {
+    return AgcDriver::ArchB::Switches::Enabled(feature);
+}
+
+bool sameMoved(std::span<const ShaderResources::MovedBuffer> a, std::span<const ShaderResources::MovedBuffer> b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].allocation != b[i].allocation || a[i].address != b[i].address || a[i].size != b[i].size || !std::ranges::equal(a[i].words, b[i].words)) return false;
+    }
+    return true;
 }
 
 int& lastOutcome() {
@@ -3981,9 +4083,34 @@ bool verifyNow() {
 bool stepTiming() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_STEPS");
-        return value != nullptr && value[0] == '1';
+        return value != nullptr && (value[0] == '1' || value[0] == '2');
     }();
     return enabled;
+}
+
+// STEPS=2 also times sub-steps inside the shared functions a replay calls (ArchC::ProbeAt).
+bool probeTiming() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_STEPS");
+        return value != nullptr && value[0] == '2';
+    }();
+    return enabled;
+}
+
+std::uint64_t probeNow() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// The committer's last probe or step mark (only the committer probes).
+std::uint64_t probeLast = 0;
+
+void addTrimmed(std::atomic<std::uint64_t>& ns, std::atomic<std::uint64_t>& n, std::atomic<std::uint64_t>& out, std::uint64_t sample) {
+    if (sample < TrimNs) {
+        ns.fetch_add(sample, std::memory_order_relaxed);
+        n.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        out.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 std::uint32_t currentSwitches() {
@@ -4041,7 +4168,32 @@ struct Slot {
     SlotPassCapture pass;
     std::array<std::byte, PipelinePushConstantBytes> push{};
     VkShaderStageFlags pushStages = 0;
+    // C_REPLAY_SLOT_BINDINGS: the last live moved list of a slot whose list is not static (words copied into
+    // liveWords), and the cached moved set its last bindings used (weakly: the template's cache owns it).
+    bool liveKept = false;
+    std::vector<ShaderResources::MovedBuffer> liveMoved;
+    std::vector<std::vector<std::uint32_t>> liveWords;
+    std::weak_ptr<void> bindSet;
+    VkDescriptorSet bindVertex = VK_NULL_HANDLE;
+    VkDescriptorSet bindFragment = VK_NULL_HANDLE;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> bindReads;
+    HostImportsProof bindProof{};
 };
+
+void keepLiveMoved(Slot& slot, std::span<const ShaderResources::MovedBuffer> moved) {
+    slot.liveWords.clear();
+    slot.liveMoved.clear();
+    slot.liveWords.reserve(moved.size());
+    slot.liveMoved.reserve(moved.size());
+    for (const auto& entry : moved) slot.liveWords.emplace_back(entry.words.begin(), entry.words.end());
+    for (std::size_t i = 0; i < moved.size(); ++i) {
+        auto entry = moved[i];
+        entry.words = slot.liveWords[i];
+        slot.liveMoved.push_back(entry);
+    }
+    slot.liveKept = true;
+    slot.bindSet.reset();
+}
 
 struct Table {
     std::unordered_map<std::uint64_t, Slot> slots;
@@ -4230,8 +4382,12 @@ public:
     void Mark(Step step) {
         if (!on) return;
         const auto now = std::chrono::steady_clock::now();
-        counters().stepNs[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        const auto sample = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
+        auto& made = counters();
+        made.stepNs[step].fetch_add(sample, std::memory_order_relaxed);
+        addTrimmed(made.stepTrimNs[step], made.stepTrimN[step], made.stepOut[step], sample);
         last = now;
+        if (probeTiming()) probeLast = probeNow();
     }
     void Finish() {
         if (!on) return;
@@ -4400,6 +4556,15 @@ DrawTimer& replayTimer() {
 
 bool tryReplay(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, const DrawTraceContext* trace, bool pipelineStateReuse, PreparedDraw& prepared) {
     auto& counts = counters();
+    struct Probing {
+        bool on = probeTiming();
+        Probing() {
+            if (on) ArchC::probing.store(true, std::memory_order_relaxed);
+        }
+        ~Probing() {
+            if (on) ArchC::probing.store(false, std::memory_order_relaxed);
+        }
+    } probing;
     StepClock clock;
     const auto refuse = [&](Refusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
@@ -4434,10 +4599,16 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (recorder->PendingLabelIn(args->arguments, rangeBytes) || StorageTexture::AnyPendingOverlaps(argumentRange)) return refuse(RefusedArgs);
     if (archcTargets::verifyPeriod() != 0) return refuse(RefusedTargets);
     clock.Mark(StepChecks);
+    using AgcDriver::ArchB::Feature;
     context.recorder->BoundKeptBytes();
     auto& work = scratch();
-    work.inputs = prepareDrawInputs(context, state, draw, shaders, replayOutcome(), replayTimer(), nullptr, nullptr);
+    const bool slotInputs = cutEnabled(Feature::ArchcReplaySlotInputs);
+    const bool verifyInputs = slotInputs && cutVerifyNow(CutSlotInputs);
+    const ReplayInputsHint inputsHint{slot->fragmentOutputs, slot->shaderStages};
+    if (slotInputs && !verifyInputs) cutHit(CutSlotInputs);
+    work.inputs = prepareDrawInputs(context, state, draw, shaders, replayOutcome(), replayTimer(), nullptr, nullptr, slotInputs && !verifyInputs ? &inputsHint : nullptr);
     auto& inputs = work.inputs;
+    if (verifyInputs && !inputs.nothing && (inputs.fragmentOutputs != slot->fragmentOutputs || inputs.shaderStages != slot->shaderStages)) cutMismatch(CutSlotInputs, "the slot's fragment outputs or stages differ from the validation's");
     if (inputs.nothing) {
         work.inputs = DrawInputs{};
         clock.Finish();
@@ -4458,6 +4629,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (state.depth) {
         const auto view = DepthSurfaceView(context, *state.depth, state.depthWrite);
         if (writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+        ArchC::ProbeAt(ArchC::Probe::DvNote);
         prepared.takenDepthView = view;
         if (slot->views.size() != state.colors.size() + 1 || view != slot->views.back() || DepthSurfacesReleased() != slot->depthReleases) return refuse(RefusedDepth);
     }
@@ -4469,12 +4641,25 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         return refuse(RefusedProof);
     }
     clock.Mark(StepProof);
+    // C_REPLAY_SLOT_BINDINGS: a non-static list is the slot's last live list while its live conditions hold.
+    const bool slotBindings = cutEnabled(Feature::ArchcReplaySlotBindings);
     std::optional<std::vector<ShaderResources::MovedBuffer>> liveMoved;
+    bool movedFromSlot = false;
     if (!slot->movedStatic) {
-        liveMoved = resources->MovedReadOnlyBuffers(shaders, *recorder);
-        if (!liveMoved.has_value()) return refuse(RefusedMoved);
+        const bool verifyMoved = slotBindings && slot->liveKept && cutVerifyNow(CutSlotMoved);
+        const bool holds = slotBindings && slot->liveKept && resources->MovedStillReadOnly(slot->liveMoved, *recorder);
+        if (holds && !verifyMoved) {
+            movedFromSlot = true;
+            cutHit(CutSlotMoved);
+        } else {
+            if (slotBindings) cutLive(CutSlotMoved);
+            liveMoved = resources->MovedReadOnlyBuffers(shaders, *recorder);
+            if (verifyMoved && holds != (liveMoved.has_value() && sameMoved(*liveMoved, slot->liveMoved))) cutMismatch(CutSlotMoved, holds ? "the kept moved list held where the live list differs" : "the kept moved list was refused where the live list equals it");
+            if (!liveMoved.has_value()) return refuse(RefusedMoved);
+            if (slotBindings && (!slot->liveKept || !sameMoved(*liveMoved, slot->liveMoved))) keepLiveMoved(*slot, *liveMoved);
+        }
     }
-    const std::span<const ShaderResources::MovedBuffer> moved = slot->movedStatic ? std::span<const ShaderResources::MovedBuffer>(slot->moved) : std::span<const ShaderResources::MovedBuffer>(*liveMoved);
+    const std::span<const ShaderResources::MovedBuffer> moved = slot->movedStatic ? std::span<const ShaderResources::MovedBuffer>(slot->moved) : movedFromSlot ? std::span<const ShaderResources::MovedBuffer>(slot->liveMoved) : std::span<const ShaderResources::MovedBuffer>(*liveMoved);
     if (const auto present = Recorder::Presents(); slot->touched != present) {
         SharedResourceCache().Touch(slot->contentKey);
         slot->touched = present;
@@ -4503,6 +4688,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     } reuseGuard{recorder};
     if (!pipelineStateReuse) recorder->ReusePipelineState(false);
     auto* reuse = pipelineStateReuse ? recorder->ReusePipelineState(true) : nullptr;
+    ArchC::ProbeAt(ArchC::Probe::BdReuse);
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (resources->WritesOverlap(begin, bytes) || resources->ReadsOverlap(begin, bytes)) return true;
@@ -4510,29 +4696,77 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     };
     if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
     if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
+    ArchC::ProbeAt(ArchC::Probe::BdFlush);
     auto& linearReads = work.linearReads;
     linearReads.assign(slot->pass.linearReads.begin(), slot->pass.linearReads.end());
     linearReads.insert(linearReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentLinearRead), argumentRange.front());
     linearReads.insert(linearReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(linearReads.begin(), linearReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources->WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, slot->pass.unknownMemory));
-    const auto drawBindings = resources->PrepareDrawBindings(*recorder, moved);
+    ArchC::ProbeAt(ArchC::Probe::BdLinear);
+    // C_REPLAY_SLOT_BINDINGS: PrepareDrawBindings' answer without the call where it depends only on the slot:
+    // with zero-copy storage and nothing moved it binds the template's set (no bindings); with a moved list it
+    // hands back the cached moved set while the batch holds no GPU store, no moved range has a pending write
+    // and the imports are those the set was built under. The set's read notes and its keep still run.
+    std::shared_ptr<ShaderResources::DrawBindings> drawBindings;
+    std::shared_ptr<void> slotSet;
+    bool slotBound = false;
+    if (slotBindings) {
+        if (moved.empty() && Recorder::ZeroCopyStorageActive()) {
+            slotBound = true;
+        } else if (!moved.empty() && Recorder::ZeroCopyStorageActive() && cutEnabled(Feature::ZeroCopyMoved) && recorder->OpenGpuStores() == 0 && (slotSet = slot->bindSet.lock()) != nullptr) {
+            slotBound = std::none_of(slot->bindReads.begin(), slot->bindReads.end(), [&](const auto& read) { return recorder->PendingWriteOverlaps(read.first, static_cast<std::size_t>(read.second - read.first)); }) && HostImportsUnchanged(context, slot->bindProof);
+            if (!slotBound) slotSet.reset();
+        }
+    }
+    const bool verifyBindings = slotBound && cutVerifyNow(CutSlotBindings);
+    if (slotBound && !verifyBindings) {
+        cutHit(CutSlotBindings);
+        if (slotSet != nullptr) {
+            static const bool noNotes = std::getenv("APS5_ZC_MOVED_NO_READNOTES") != nullptr;
+            if (!noNotes)
+                for (const auto& [begin, end] : slot->bindReads) recorder->NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DispatchElement);
+            recorder->Keep(slotSet);
+        }
+    } else {
+        if (slotBindings) cutLive(CutSlotBindings);
+        drawBindings = resources->PrepareDrawBindings(*recorder, moved);
+        if (verifyBindings) {
+            const bool same = slotSet == nullptr ? drawBindings == nullptr : drawBindings != nullptr && drawBindings->cachedSet == slotSet && drawBindings->allocation.set == slot->bindVertex && drawBindings->fragmentAllocation.set == slot->bindFragment && drawBindings->inPlaceReads == slot->bindReads;
+            if (!same) cutMismatch(CutSlotBindings, slotSet == nullptr ? "the slot answered no bindings" : "the slot's cached moved set differs from PrepareDrawBindings'");
+        }
+        if (slotBindings && !moved.empty() && drawBindings != nullptr && drawBindings->cachedSet != nullptr) {
+            slot->bindSet = drawBindings->cachedSet;
+            slot->bindVertex = drawBindings->allocation.set;
+            slot->bindFragment = drawBindings->fragmentAllocation.set;
+            slot->bindReads = drawBindings->inPlaceReads;
+            slot->bindProof = drawBindings->movedProof;
+        }
+        slotSet.reset();
+    }
+    const VkDescriptorSet boundSet = slotSet != nullptr ? slot->bindVertex : drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE;
+    const VkDescriptorSet boundFragmentSet = slotSet != nullptr ? slot->bindFragment : drawBindings != nullptr ? drawBindings->fragmentAllocation.set : VK_NULL_HANDLE;
+    const bool setBound = slotSet != nullptr || drawBindings != nullptr;
+    const auto* boundReads = slotSet != nullptr ? &slot->bindReads : drawBindings != nullptr ? &drawBindings->inPlaceReads : nullptr;
+    ArchC::ProbeAt(ArchC::Probe::BdPrepare);
     static const bool zcNoPassReads = std::getenv("APS5_ZC_MOVED_NO_PASSREADS") != nullptr;
     auto& passReads = work.passReads;
     passReads.assign(slot->pass.passReads.begin(), slot->pass.passReads.end());
     passReads.insert(passReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentRead), argumentRange.front());
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    if (!zcNoPassReads && drawBindings != nullptr && !drawBindings->inPlaceReads.empty()) passReads.insert(passReads.end(), drawBindings->inPlaceReads.begin(), drawBindings->inPlaceReads.end());
+    if (!zcNoPassReads && boundReads != nullptr && !boundReads->empty()) passReads.insert(passReads.end(), boundReads->begin(), boundReads->end());
     clock.Mark(StepBindings);
     const PassAccess passAccess{passReads, slot->pass.passWrites, slot->pass.images, slot->pass.attachments, slot->pass.unknownMemory, slot->pass.unknownWrites, slot->pass.writeOnly};
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
     const auto start = recorder->StartDrawPass(slot->pass.passKey, slot->pass.forced, slot->pass.fenced, passAccess);
+    ArchC::ProbeAt(ArchC::Probe::RcStart);
     const bool continued = start.continued;
     const auto commands = start.commands;
     if (!continued) recorder->PrepareSampleSlot();
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     const auto passTimingKey = Recorder::GpuTimingEnabled() ? timingPassKey(state) : 0;
     if (drawTiming != Recorder::NoTiming) recorder->TagGpuTiming(drawTiming, passTimingKey);
+    ArchC::ProbeAt(ArchC::Probe::RcTiming);
     std::unique_ptr<DeviceBuffer> argumentScratch;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
@@ -4561,21 +4795,26 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         rewritten = recordIndirectArguments(context, commands, recorder, true, indirect, argumentScratch, argumentBuffer, argumentOffset, countBarrier);
         pipeline->Begin(commands, *framebuffer, state.renderExtent, state, reuse);
     }
-    if (drawBindings != nullptr) {
-        const auto set = drawBindings->allocation.set;
-        const auto fragmentSet = drawBindings->fragmentAllocation.set;
+    ArchC::ProbeAt(continued ? ArchC::Probe::RcBegin : ArchC::Probe::RcBeginNew);
+    if (setBound) {
+        const auto set = boundSet;
+        const auto fragmentSet = boundFragmentSet;
         if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 0, 1, &set, 0, nullptr);
         if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
     } else {
         resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     }
+    ArchC::ProbeAt(ArchC::Probe::RcBind);
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, &slot->push, slot->pushStages, 0, false, reuse);
+    ArchC::ProbeAt(ArchC::Probe::RcPush);
     const auto ownTiming = Recorder::GpuDrawTimingEnabled() && state.renderLayers <= 1u ? recorder->BeginGpuTimingInPass(timingDrawKey(shaders, passTimingKey)) : Recorder::NoTiming;
     std::uint32_t subdraw = 0;
     recordDrawCommands(context, commands, state, draw, inputs, &indirect, argumentBuffer, argumentOffset, trace, subdraw);
     recorder->EndGpuTiming(ownTiming);
     CountIndirectDraw(IndirectDrawPath::Gpu, 0, rewritten);
+    ArchC::ProbeAt(ArchC::Probe::RcDraw);
     recorder->LeaveRenderPassOpen(slot->pass.passKey, drawTiming, slot->pass.fenced, passAccess, {});
+    ArchC::ProbeAt(ArchC::Probe::RcLeave);
     clock.Mark(StepRecord);
     keepRecordedDraw(*recorder, resources, std::move(pipeline), std::move(framebuffer), inputs, std::move(work.targets), slot->slices, state.scissor, std::move(argumentScratch), {}, false, slot->completion, replayOutcome());
     work.targets.clear();
@@ -5645,6 +5884,21 @@ std::uint64_t ResolveDraw(const Context& context, const State& state, const Pm4:
 
 int ArchcTakeRecipeBuild() {
     return std::exchange(archcLastRecipeBuild(), -1);
+}
+
+namespace ArchC {
+
+std::atomic<bool> probing{false};
+
+void ProbeMark(Probe probe) {
+    if (!GuestMemory::IsCommitterThread() || probe >= Probe::Count) return;
+    const auto now = archcSlots::probeNow();
+    auto& made = archcSlots::counters();
+    const auto index = static_cast<std::size_t>(probe);
+    archcSlots::addTrimmed(made.probeNs[index], made.probeN[index], made.probeOut[index], now - archcSlots::probeLast);
+    archcSlots::probeLast = now;
+}
+
 }
 
 int ArchcTakeReplayOutcome() {

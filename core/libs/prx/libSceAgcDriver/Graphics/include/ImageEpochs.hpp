@@ -18,7 +18,9 @@ struct EpochRange {
     std::uint64_t end;
 };
 
-enum class EpochSource : std::uint8_t { CpuStore, Hold, Open, Forget, TrackerStamp, GpuNote, Pending, Depth, Unwatch, Count };
+// PendingInsert (Arch C P3b): an image entering the pending registry (also noted as Pending), the only event
+// that can make a range newly overlap a pending image.
+enum class EpochSource : std::uint8_t { CpuStore, Hold, Open, Forget, TrackerStamp, GpuNote, Pending, Depth, Unwatch, PendingInsert, Count };
 
 constexpr std::uint32_t SourceBit(EpochSource source) {
     return std::uint32_t{1} << static_cast<unsigned>(source);
@@ -58,6 +60,15 @@ public:
     static void InvalidateAll();
     static void SetSuppressed(EpochSource source, bool suppressed);
 };
+
+// Arch C P3b: sub-step probes of a draw replay (APS5_ARCHB_C_DRAW_REPLAY_STEPS=2; committer only;
+// counters archc_replay_probe_ns_<name> and _n_<name> hold the samples under 40 us, _out_<name> the rest).
+enum class Probe : std::uint8_t { RvPrelude, RvComplete, RvStamp, RvScan, RvImports, RvStaging, RvFinish, DvHtile, DvSettle, DvFind, DvPlanes, DvSync, DvWritten, DvStale, DvNote, InValidate, InIndex, BdReuse, BdFlush, BdLinear, BdPrepare, RcStart, RcTiming, RcBegin, RcBeginNew, RcBind, RcPush, RcDraw, RcLeave, KpKept, KpStorage, KpMarkGpu, KpComplete, KpDirty, Count };
+extern std::atomic<bool> probing;
+void ProbeMark(Probe probe);
+inline void ProbeAt(Probe probe) {
+    if (probing.load(std::memory_order_relaxed)) ProbeMark(probe);
+}
 
 class SelfScope {
 public:

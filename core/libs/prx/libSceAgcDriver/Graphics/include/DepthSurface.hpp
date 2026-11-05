@@ -33,6 +33,10 @@ DepthPlaneStoreStatistics DepthPlaneStoreCounts();
 void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
+// Changes of the stale depth plane list, and whether a range overlaps one of its planes (FlushDepthPlanes
+// stores nothing over a range that overlaps none; a new plane in the list bumps the serial).
+std::uint64_t DepthStalePlanesSerial();
+bool DepthStalePlaneOverlaps(std::uint64_t begin, std::uint64_t end);
 std::uint64_t DepthSurfacesReleased();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 std::uint64_t MultisampledDepthBytes_nid_no_patch(VkExtent2D extent, std::uint32_t bytesPerTexel, std::uint32_t samples);

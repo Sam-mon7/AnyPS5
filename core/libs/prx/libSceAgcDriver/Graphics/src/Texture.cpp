@@ -4175,6 +4175,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     pending.textures.push_back(this);
     BumpPendingSerial();
     notePendingChange();
+    notePendingInsert();
 }
 
 void StorageTexture::reconcilePending() {
@@ -4188,6 +4189,7 @@ void StorageTexture::reconcilePending() {
     else pending.textures.remove(this);
     BumpPendingSerial();
     notePendingChange();
+    if (any) notePendingInsert();
 }
 
 bool StorageTexture::Dirty() const {
@@ -5351,6 +5353,10 @@ void StorageTexture::BumpPendingSerial() {
 
 void StorageTexture::notePendingChange() const {
     ArchC::ImageEpochs::Note(descriptor.baseAddress, descriptor.baseAddress + guestBytes, ArchC::EpochSource::Pending, this);
+}
+
+void StorageTexture::notePendingInsert() const {
+    ArchC::ImageEpochs::Note(descriptor.baseAddress, descriptor.baseAddress + guestBytes, ArchC::EpochSource::PendingInsert, this);
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {

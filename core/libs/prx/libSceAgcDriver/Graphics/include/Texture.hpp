@@ -255,6 +255,7 @@ public:
     // retile) moves it too.
     static void BumpPendingSerial();
     void notePendingChange() const;
+    void notePendingInsert() const;
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);

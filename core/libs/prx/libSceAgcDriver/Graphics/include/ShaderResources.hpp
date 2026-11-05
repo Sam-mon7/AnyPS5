@@ -224,6 +224,9 @@ public:
         // ranges it reads in place (the draw adds them to its pass reads).
         std::shared_ptr<void> cachedSet;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+        // The import identity the cached set's entry was built under (cachedMovedBindings drops the entry
+        // once HostImportsUnchanged fails for it).
+        HostImportsProof movedProof{};
         // APS5_ARCHB_FIX_DRAW_SET_POOL: the pool the sets return to when this object is released (its
         // batch completed), and the allocation indices whose elements hold this draw's snapshots
         // instead of the template's own buffer descriptors.
@@ -713,6 +716,14 @@ private:
     struct MovedSetCache;
     mutable std::shared_ptr<MovedSetCache> movedSetCache;
     std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
+
+public:
+    // Arch C P3b (C_REPLAY_SLOT_BINDINGS): the conditions of MovedReadOnlyBuffers that do not depend only on the
+    // stages and this object, for a list it made for the same stages: each address entry's range is mapped, not
+    // written by this object's buffers, the open batch, a pending storage image or a unit shadow.
+    bool MovedStillReadOnly(std::span<const MovedBuffer> moved, Recorder& recorder) const;
+
+private:
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
@@ -753,6 +764,38 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
+    // Arch C P3b (C_REPLAY_QUIET_TEMPLATE): a token for the pending scan of the imported regions and written
+    // ranges (revalidateFull's (2)): made when a scan found nothing to flush and neither this object's pending
+    // epoch (an ImageEpochs owner over those ranges, source PendingInsert: registry inserts and unit-shadow
+    // retiles) nor the epoch loss moved through it; while they stay, the scan's answer is the same and it is skipped.
+    struct PendingScanToken {
+        bool valid = false;
+        bool registered = false;
+        std::uint64_t epoch = 0;
+        std::uint64_t loss = 0;
+    };
+    std::atomic<std::uint64_t> pendingScanEpoch{1};
+    PendingScanToken pendingScanToken;
+    bool pendingScanHolds();
+    // C_REPLAY_QUIET_TEMPLATE, whole proof: armed after a stamp-memo pass of an object with no textures, storage
+    // images, described image ranges or stamp ranges that did nothing (no depth plane flush, no CPU-write
+    // completion, no pending flush, no import re-proof). While the stamp memo's generation, the serials its
+    // check reads (forget, unwatch, depth surfaces), the stale depth planes and the imports stay, no copied
+    // writer or completion label is pending, the audit is not due and the pending scan's answer stands, that
+    // pass would do nothing again: Revalidate keeps only its staging copies.
+    struct QuietProof {
+        bool valid = false;
+        std::uint64_t generation = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t forgotten = 0;
+        std::uint64_t depth = 0;
+        std::uint64_t depthReleased = 0;
+        std::uint64_t stalePlanes = 0;
+        HostImportsProof imports{};
+    };
+    QuietProof quietProof;
+    std::atomic<bool> lastProofQuiet{false};
+    bool quietProofHolds();
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;

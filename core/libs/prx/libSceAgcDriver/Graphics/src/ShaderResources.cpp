@@ -3855,6 +3855,13 @@ ShaderResources::ProofExtent ShaderResources::Extent() const {
     return extent;
 }
 
+namespace {
+bool quietProofsActive();
+bool pendingScanVerifyNow();
+// C_REPLAY_QUIET_TEMPLATE whole-proof counts: 0 hits, 1 VERIFY checks, 2 VERIFY mismatches (returns the previous count).
+std::uint64_t quietProofCount(int which);
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     PerformanceTimer recorderTiming("Resources.Proof", AgcDriver::ArchB::Recorder::Phase::Proof);
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::ResourceProof);
@@ -3865,6 +3872,37 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         return true;
     }
     if (GuestMemory::ResourceEpochProofsEnabled()) return revalidateFull(shaders, report, true);
+    // C_REPLAY_QUIET_TEMPLATE: the whole pass skipped while its quiet proof holds (see QuietProof); VERIFY runs
+    // the pass and requires a stamp-memo pass that did nothing.
+    if (!EpochProofs() && EpochRevalidate() && reusable && !shaders.empty() && quietProofsActive() && GuestMemory::GpuMutex().HeldByThisThread() && quietProofHolds()) {
+        if (pendingScanVerifyNow()) {
+            quietProofCount(1);
+            const bool ok = revalidateFull(shaders, report);
+            if (!ok || !lastProofQuiet.load(std::memory_order_relaxed)) {
+                const auto previous = quietProofCount(2);
+                if (previous < 8) std::fprintf(stderr, "[archc] quiet proof VERIFY mismatch: the pass %s while the quiet proof held\n", ok ? "did work" : "failed");
+            }
+            return ok;
+        }
+        quietProofCount(0);
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            try {
+                guestMemory.RecordStagingCopies(*recorder);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
+                quietProof.valid = false;
+                setStampValid(false);
+                AgcDriver::ArchB::Recorder::Count("proof_failed");
+                if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::Other};
+                return false;
+            }
+        }
+        pendingSerialSeen = StorageTexture::PendingSerial();
+        provedOnce = true;
+        AgcDriver::ArchB::Recorder::Count("proof_fast_pass_quiet");
+        if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+        return true;
+    }
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
@@ -4018,6 +4056,100 @@ bool templateTokenVerifyNow() {
 }
 
 constexpr std::uint32_t TemplateTokenSources = ArchC::SourceBit(ArchC::EpochSource::CpuStore) | ArchC::SourceBit(ArchC::EpochSource::Hold) | ArchC::SourceBit(ArchC::EpochSource::Open) | ArchC::SourceBit(ArchC::EpochSource::Forget) | ArchC::SourceBit(ArchC::EpochSource::TrackerStamp) | ArchC::SourceBit(ArchC::EpochSource::Depth) | ArchC::SourceBit(ArchC::EpochSource::Unwatch);
+}
+
+namespace {
+struct PendingScanCounters {
+    std::atomic<std::uint64_t> hits{0}, live{0}, made{0}, verifyChecks{0}, verifyMismatches{0};
+    std::array<std::atomic<std::uint64_t>, 3> refused{};
+    std::atomic<std::uint64_t> regions{0}, scans{0};
+};
+
+PendingScanCounters& pendingScanCounters() {
+    static auto* made = [] {
+        auto* counters = new PendingScanCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_live", counters->live);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_made", counters->made);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_verify_checks", counters->verifyChecks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_verify_mismatches", counters->verifyMismatches);
+        static constexpr std::array<const char*, 3> refusedNames{"archc_replay_p3b_quiet_template_refused_drain", "archc_replay_p3b_quiet_template_refused_epoch", "archc_replay_p3b_quiet_template_refused_loss"};
+        for (std::size_t i = 0; i < refusedNames.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(refusedNames[i], counters->refused[i]);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_regions", counters->regions);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_template_scans", counters->scans);
+        return counters;
+    }();
+    return *made;
+}
+
+bool pendingScanTokensActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::ArchcReplayQuietTemplate) && ArchB::Switches::Enabled(ArchB::Feature::ArchcImageEpochs);
+}
+
+bool quietProofsActive() {
+    return pendingScanTokensActive() && !stampProofsVerify() && stampProofsActive();
+}
+
+struct QuietProofCounters {
+    std::atomic<std::uint64_t> hits{0}, made{0}, verifyChecks{0}, verifyMismatches{0};
+};
+
+QuietProofCounters& quietProofCounters() {
+    static auto* made = [] {
+        auto* counters = new QuietProofCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_proof_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_proof_made", counters->made);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_proof_verify_checks", counters->verifyChecks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_quiet_proof_verify_mismatches", counters->verifyMismatches);
+        return counters;
+    }();
+    return *made;
+}
+
+std::uint64_t quietProofCount(int which) {
+    auto& counters = quietProofCounters();
+    auto& counter = which == 0 ? counters.hits : which == 1 ? counters.verifyChecks : counters.verifyMismatches;
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool pendingScanVerifyNow() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_REPLAY_QUIET_TEMPLATE_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    if (period == 0) return false;
+    static std::atomic<std::uint64_t> uses{0};
+    return (uses.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0;
+}
+}
+
+bool ShaderResources::pendingScanHolds() {
+    if (!pendingScanToken.valid) return false;
+    auto& refused = pendingScanCounters().refused;
+    const auto refuse = [&](std::size_t why) {
+        refused[why].fetch_add(1, std::memory_order_relaxed);
+        pendingScanToken.valid = false;
+        return false;
+    };
+    if (!ArchC::ImageEpochs::Get().DrainIfNew()) return refuse(0);
+    if (pendingScanEpoch.load(std::memory_order_acquire) != pendingScanToken.epoch) return refuse(1);
+    if (ArchC::ImageEpochs::Get().Loss() != pendingScanToken.loss) return refuse(2);
+    return true;
+}
+
+bool ShaderResources::quietProofHolds() {
+    if (!quietProof.valid) return false;
+    const auto refuse = [&] {
+        quietProof.valid = false;
+        return false;
+    };
+    if (!stampProof.valid || stampProof.generation != quietProof.generation) return refuse();
+    if (TemplateAuditDue(lastFullWalk) || AnyPendingCpuWrites(context)) return false;
+    const auto forgotten = GuestMemory::ForgetSerial();
+    if ((forgotten & 1u) != 0 || forgotten != quietProof.forgotten || GuestMemory::UnwatchSerial() != quietProof.unwatched || DepthSurfacesSerial() != quietProof.depth || DepthSurfacesReleased() != quietProof.depthReleased || DepthStalePlanesSerial() != quietProof.stalePlanes) return refuse();
+    if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial()) && !pendingScanHolds()) return refuse();
+    if (!HostImportsUnchanged(context, quietProof.imports)) return refuse();
+    return true;
 }
 
 bool ShaderResources::archcTokenHolds() {
@@ -4307,9 +4439,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     const auto stampSerials = stampProofs ? currentStampSerials() : ResourceEpochProof{};
     const auto stampImports = stampProofs ? HostImportsIdentity(context, false) : HostImportsProof{};
     if (!stampProofs) setStampValid(false);
+    ArchC::ProbeAt(ArchC::Probe::RvPrelude);
+    // C_REPLAY_QUIET_TEMPLATE: whether this pass did anything a quiet proof would skip.
+    bool proofWork = false;
+    lastProofQuiet.store(false, std::memory_order_relaxed);
     for (const auto& region : directRegions) {
-        static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
-        CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (!FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)).empty()) proofWork = true;
+        if (CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin))) proofWork = true;
     }
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
@@ -4321,6 +4457,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
     markStage(0);
+    ArchC::ProbeAt(ArchC::Probe::RvComplete);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto epochBefore = epochProofs ? currentResourceEpochProof() : ResourceEpochProof{};
@@ -4491,6 +4628,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (stampReused) {
         for (const auto& entry : stampProof.images) entry.image->NoteProved();
     }
+    ArchC::ProbeAt(ArchC::Probe::RvStamp);
     if (!epochReused && !stampReused) {
         thread_local std::vector<PendingOverlap>* overlappingSlot = nullptr;
         auto& overlapping = ShaderRecompiler::ThreadOwned(overlappingSlot);
@@ -4589,21 +4727,68 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     };
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
-            thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
-            auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
-            regions.clear();
-            for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
-            for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
-            StorageTexture::ScanPending(regions);
-            // A region over a unit shadow's fresh results (a retile bumped the serial) is
-            // published by the flush, as one over a pending image is stored.
-            for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+            // C_REPLAY_QUIET_TEMPLATE (holding the GPU mutex): the scan below is skipped while its token holds.
+            // A pending image overlapping a region can only appear through the registry, which notes every
+            // insert as an ImageEpochs PendingInsert event over the image (bumping pendingScanEpoch); a fresh unit
+            // shadow only through a retile (MarkShadowed), noted the same way over its whole units; a dropped note
+            // shows as a loss.
+            auto& scanCounters = pendingScanCounters();
+            const bool scanToken = pendingScanTokensActive() && GuestMemory::GpuMutex().HeldByThisThread();
+            const bool scanHolds = scanToken && pendingScanHolds();
+            const bool scanVerify = scanHolds && pendingScanVerifyNow();
+            if (scanHolds && !scanVerify) {
+                scanCounters.hits.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                if (scanToken) scanCounters.live.fetch_add(1, std::memory_order_relaxed);
+                if (scanVerify) scanCounters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+                if (scanToken && !pendingScanToken.registered) {
+                    thread_local std::vector<ArchC::EpochRange>* scanRangesSlot = nullptr;
+                    auto& scanRanges = ShaderRecompiler::ThreadOwned(scanRangesSlot);
+                    scanRanges.clear();
+                    for (const auto& region : directRegions) scanRanges.push_back({region.begin, region.end});
+                    for (const auto& [begin, end] : guestMemory.Writes()) scanRanges.push_back({begin, end});
+                    ArchC::ImageEpochs::Get().RegisterOwner(&pendingScanEpoch, pendingScanEpoch, scanRanges, ArchC::SourceBit(ArchC::EpochSource::PendingInsert));
+                    pendingScanToken.registered = true;
+                }
+                const bool scanDrained = scanToken && ArchC::ImageEpochs::Get().DrainIfNew();
+                const auto scanEpoch = pendingScanEpoch.load(std::memory_order_acquire);
+                const auto scanLoss = ArchC::ImageEpochs::Get().Loss();
+                thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
+                auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
+                regions.clear();
+                for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
+                for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
+                StorageTexture::ScanPending(regions);
+                scanCounters.scans.fetch_add(1, std::memory_order_relaxed);
+                scanCounters.regions.fetch_add(regions.size(), std::memory_order_relaxed);
+                ArchC::ProbeAt(ArchC::Probe::RvScan);
+                // A region over a unit shadow's fresh results (a retile bumped the serial) is
+                // published by the flush, as one over a pending image is stored.
+                bool& flushed = proofWork;
+                for (const auto& region : regions) {
+                    if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+                        flushed = true;
+                        StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                    }
+                }
+                if (scanVerify && flushed) {
+                    const auto previous = scanCounters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+                    if (previous < 8) std::fprintf(stderr, "[archc] quiet template VERIFY mismatch: the pending scan found a region to flush while its token held\n");
+                }
+                if (scanToken) {
+                    pendingScanToken.valid = !flushed && scanDrained && ArchC::ImageEpochs::Get().DrainIfNew() && pendingScanEpoch.load(std::memory_order_acquire) == scanEpoch && ArchC::ImageEpochs::Get().Loss() == scanLoss;
+                    if (pendingScanToken.valid) {
+                        pendingScanToken.epoch = scanEpoch;
+                        pendingScanToken.loss = scanLoss;
+                        scanCounters.made.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
             }
         }
         if (HostImportsUnchanged(context, importsProof)) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
         } else {
+            proofWork = true;
             if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
             importsProof = HostImportsIdentity(context);
         }
@@ -4613,6 +4798,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
     markStage(4);
+    ArchC::ProbeAt(ArchC::Probe::RvImports);
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
@@ -4624,6 +4810,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             return finish(fast, false);
         }
     }
+    ArchC::ProbeAt(ArchC::Probe::RvStaging);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
@@ -4654,6 +4841,22 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     markStage(5);
+    // C_REPLAY_QUIET_TEMPLATE: arm the quiet proof after a stamp-memo pass that did nothing, of an object whose
+    // proof is buffers only.
+    const bool quietPass = stampReused && !proofWork && EpochRevalidate() && textures.empty() && storageTextures.empty() && describedRanges.empty() && stampProof.ranges.empty() && stampProof.images.empty() && stampProof.partials.empty() && stampProof.pending.empty();
+    lastProofQuiet.store(quietPass, std::memory_order_relaxed);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        quietProof.valid = false;
+        if (quietPass && quietProofsActive()) {
+            const auto now = currentStampSerials();
+            const auto identity = HostImportsIdentity(context, true);
+            const bool planes = std::none_of(directRegions.begin(), directRegions.end(), [](const auto& region) { return DepthStalePlaneOverlaps(region.begin, region.end); });
+            if (planes && (now.forgotten & 1u) == 0 && now.forgotten == stampProof.serials.forgotten && now.unwatched == stampProof.serials.unwatched && now.depth == stampProof.serials.depth && now.depthReleased == stampProof.serials.depthReleased && identity == importsProof && identity == stampProof.imports && identity.device != VK_NULL_HANDLE) {
+                quietProof = {true, stampProof.generation, now.unwatched, now.forgotten, now.depth, now.depthReleased, DepthStalePlanesSerial(), identity};
+                quietProofCounters().made.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     return finish(fast, true);
 }
 
@@ -6495,6 +6698,7 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 
 ShaderResources::~ShaderResources() {
     if (archcToken.registered) ArchC::ImageEpochs::Get().UnregisterOwner(this);
+    if (pendingScanToken.registered) ArchC::ImageEpochs::Get().UnregisterOwner(&pendingScanEpoch);
     release();
 }
 
@@ -6871,6 +7075,19 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+bool ShaderResources::MovedStillReadOnly(std::span<const MovedBuffer> moved, Recorder& recorder) const {
+    for (const auto& entry : moved) {
+        if (!entry.words.empty()) continue;
+        if (entry.allocation >= allocations.size()) return false;
+        const auto& item = allocations[entry.allocation];
+        const auto begin = entry.address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+        if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return false;
+    }
+    return true;
+}
+
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
     switch (refusal) {
         case MoveRefusal::None: return "none";
@@ -7195,6 +7412,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
     result->fragmentAllocation = entry.set->fragmentAllocation;
     result->cachedSet = entry.set;
     result->inPlaceReads = entry.reads;
+    result->movedProof = entry.proof;
     static const bool noNotes = std::getenv("APS5_ZC_MOVED_NO_READNOTES") != nullptr;
     if (!noNotes)
     for (const auto& [begin, end] : entry.reads) recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DispatchElement);

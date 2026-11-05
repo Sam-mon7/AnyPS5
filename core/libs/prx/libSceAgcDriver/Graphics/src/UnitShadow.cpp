@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -833,6 +834,8 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     auto& registry = Registry();
     std::uint64_t bytes = 0;
     std::uint64_t lost = 0;
+    // Arch C P3b: each range's whole units (what AnyShadowedOverlaps tests), noted as PendingInsert events below.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fresh;
     {
         std::lock_guard lock(registry.mutex);
         const auto shadow = find(registry, import);
@@ -841,6 +844,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         for (const auto& [begin, end, slab] : ranges) {
             if (end <= begin) continue;
             bytes += end - begin;
+            fresh.emplace_back(shadow->UnitRange(shadow->UnitOf(begin)).first, shadow->UnitRange(shadow->UnitOf(end - 1)).second);
             for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(end - 1); ++unit) {
                 const auto& current = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
                 if (current == nullptr || current != slab) {
@@ -866,8 +870,9 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     Stats().retiled.fetch_add(1, std::memory_order_relaxed);
     Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
-    // source, as they see a write-back.
+    // source, as they see a write-back; Arch C P3b's pending-scan tokens see it as a pending insert over the units.
     StorageTexture::BumpPendingSerial();
+    for (const auto& [begin, end] : fresh) ArchC::ImageEpochs::Note(begin, end, ArchC::EpochSource::PendingInsert, nullptr);
 }
 
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {

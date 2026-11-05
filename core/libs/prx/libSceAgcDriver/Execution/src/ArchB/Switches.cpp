@@ -60,6 +60,7 @@ constexpr Feature CLazyPublishPrerequisites[] = {Feature::WtFault, Feature::WtFa
 constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
+constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -161,6 +162,17 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::CLazyCopyback, "C_LAZY_COPYBACK", false, true, CLazyCopybackPrerequisites},
     {Feature::ArchcTemplateToken, "C_TEMPLATE_TOKEN", false, true, ArchcTemplateTokenPrerequisites},
     {Feature::ArchcDrawReplay, "C_DRAW_REPLAY", false, true, ArchcDrawReplayPrerequisites},
+    // Arch C P3b: per-replay cuts of a C_DRAW_REPLAY slot hit (each with _VERIFY=N, see Draw.cpp archcSlots).
+    // QUIET_TEMPLATE: the template's whole Revalidate is skipped while none of the serials its no-op pass
+    // depends on moved since the slot's last passing proof; DEPTH_EPOCH: a repeat DepthSurfaceView of the
+    // surface last drawn, with no depth event since, keeps only its write order; SLOT_BINDINGS: the slot keeps
+    // its moved list and cached moved set, re-checking only the live overlap conditions.
+    {Feature::ArchcReplayQuietTemplate, "C_REPLAY_QUIET_TEMPLATE", false, true, ArchcReplayCutPrerequisites},
+    {Feature::ArchcReplayDepthEpoch, "C_REPLAY_DEPTH_EPOCH", false, true, ArchcReplayCutPrerequisites},
+    {Feature::ArchcReplaySlotBindings, "C_REPLAY_SLOT_BINDINGS", false, true, ArchcReplayCutPrerequisites},
+    // SLOT_INPUTS: the input step takes the slot's validated fragment outputs and stages (same decode, same
+    // stage owners) instead of the validation memo and the state's pure validation checks.
+    {Feature::ArchcReplaySlotInputs, "C_REPLAY_SLOT_INPUTS", false, true, ArchcReplayCutPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

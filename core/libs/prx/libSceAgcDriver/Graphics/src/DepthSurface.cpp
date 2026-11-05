@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -489,6 +490,10 @@ public:
         pendingClear |= aspects;
     }
 
+    VkImageAspectFlags pendingClearAspects() const {
+        return pendingClear;
+    }
+
     void NotePlaneFill(VkImageAspectFlagBits aspect, float depth, std::uint8_t stencil) {
         pendingClear |= aspect;
         if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) depthFill = depth;
@@ -873,12 +878,12 @@ public:
         return changed;
     }
 
-    void SyncFromMemory(const GuestTextureResource& resource) {
+    bool SyncFromMemory(const GuestTextureResource& resource) {
         std::uint64_t generation = 0;
         const auto changed = WrittenUnits(resource, generation);
         if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
             unitGeneration.assign(unitGeneration.size(), generation);
-            return;
+            return false;
         }
         ClearStale(changed);
         {
@@ -904,6 +909,7 @@ public:
             copyPlane(mirrorPlane, mirror, false, false, true);
         }
         written = ++depthWrites;
+        return true;
     }
 
     void DropMirror() {
@@ -916,6 +922,11 @@ public:
     std::uint64_t unitBytes = 0;
     bool syncing = false;
     std::uint64_t scannedEpoch = 0;
+    // Arch C P3b (C_REPLAY_DEPTH_EPOCH): an ImageEpochs owner over the depth and stencil planes and the HTILE.
+    std::atomic<std::uint64_t> repeatEpoch{1};
+    bool repeatRegistered = false;
+    std::uint64_t PlaneBytes() const { return depthBytes(); }
+    std::uint64_t StencilPlaneBytes() const { return stencilBytes(); }
 
     const Context context;
     const DepthTarget target;
@@ -1176,6 +1187,10 @@ private:
     }
 
     void release() noexcept {
+        if (repeatRegistered) {
+            ArchC::ImageEpochs::Get().UnregisterOwner(this);
+            repeatRegistered = false;
+        }
         depthPlane = {};
         stencilPlane = {};
         releaseStencilCopy();
@@ -1652,7 +1667,11 @@ std::map<std::uint64_t, std::uint64_t>& htileReads() {
     return *reads;
 }
 
+// Arch C P3b: HTILE read memo erasures and new cleared-HTILE records (a repeat depth view's token needs neither).
+std::atomic<std::uint64_t> htileEvents{0};
+
 void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
+    htileEvents.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard lock(htileReadsMutex());
     auto& reads = htileReads();
     reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
@@ -1721,8 +1740,11 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
-VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
-    if (target.htileAddress == 0) return 0;
+VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target, bool* unchanged = nullptr) {
+    if (target.htileAddress == 0) {
+        if (unchanged != nullptr) *unchanged = true;
+        return 0;
+    }
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
@@ -1731,7 +1753,10 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
-        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) {
+            if (unchanged != nullptr) *unchanged = true;
+            return 0;
+        }
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
     if (pending && pendingFills) {
@@ -1880,6 +1905,14 @@ std::uint64_t DepthSurfacesReleased() {
     return surfacesReleased.load(std::memory_order_acquire);
 }
 
+std::uint64_t DepthStalePlanesSerial() {
+    return stalePlanesSerial.load(std::memory_order_acquire);
+}
+
+bool DepthStalePlaneOverlaps(std::uint64_t begin, std::uint64_t end) {
+    return overlapsStalePlane(begin, end);
+}
+
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
     const auto [blockWidth, blockHeight] = DepthBlockExtent(bytesPerTexel);
     const auto width = static_cast<std::uint64_t>((extent.width + blockWidth - 1) / blockWidth * blockWidth);
@@ -1994,10 +2027,143 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
+namespace {
+
+// Arch C P3b (C_REPLAY_DEPTH_EPOCH): a repeat DepthSurfaceView of the surface drawn last, for the same target and
+// write flag. The token is made after a full call that did nothing but its write order and plane-owner serials:
+// not created, the HTILE unchanged since its read (or none), no cleared HTILE taken, no pending clear, no mirror
+// sync, no scan, the planes already all stale when written, the plane owners this surface, and the surface's
+// epoch (planes and HTILE: CPU stores, holds, opens, forgets, tracker stamps, GPU notes, pending, depth and
+// unwatch events) unchanged through the call with every page armed (Arch C's token rule). While the epoch,
+// the epoch loss, the depth surface, stale plane, mirror and HTILE serials stay, no GPU write is pending over
+// the HTILE and the surface is still drawn last, owns its planes, has no pending clear and is not sampled
+// natively, the full call would do the same: the repeat keeps the write order and the owner serials only.
+struct DepthRepeat {
+    bool valid = false;
+    DepthSurface* surface = nullptr;
+    DepthTarget target{};
+    bool depthWritten = false;
+    std::uint64_t epoch = 0;
+    std::uint64_t loss = 0;
+    std::uint64_t surfaces = 0;
+    std::uint64_t released = 0;
+    std::uint64_t stale = 0;
+    std::uint64_t mirror = 0;
+    std::uint64_t htile = 0;
+};
+
+DepthRepeat depthRepeat;
+
+struct DepthRepeatCounters {
+    std::atomic<std::uint64_t> hits{0}, made{0}, verifyChecks{0}, verifyMismatches{0};
+};
+
+DepthRepeatCounters& depthRepeatCounters() {
+    static auto* made = [] {
+        auto* counters = new DepthRepeatCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_depth_epoch_hits", counters->hits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_depth_epoch_made", counters->made);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_depth_epoch_verify_checks", counters->verifyChecks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_p3b_depth_epoch_verify_mismatches", counters->verifyMismatches);
+        return counters;
+    }();
+    return *made;
+}
+
+bool depthRepeatActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::ArchcReplayDepthEpoch) && ArchB::Switches::Enabled(ArchB::Feature::ArchcImageEpochs) && ArchB::Switches::Enabled(ArchB::Feature::WtFault);
+}
+
+bool depthRepeatVerifyNow() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_REPLAY_DEPTH_EPOCH_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    if (period == 0) return false;
+    static std::atomic<std::uint64_t> uses{0};
+    return (uses.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0;
+}
+
+bool sameDepthTarget(const DepthTarget& a, const DepthTarget& b) {
+    return sameSurface(a, b) && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.depthSwizzle == b.depthSwizzle && a.clearDepth == b.clearDepth && a.clearStencil == b.clearStencil;
+}
+
+std::array<ArchC::EpochRange, 3> depthRepeatRanges(const DepthSurface& surface) {
+    const auto& target = surface.target;
+    auto planeBytes = surface.PlaneBytes();
+    if (mirrorable(target)) planeBytes = std::max<std::uint64_t>(planeBytes, SurfaceGuestBytes(mirrorResource(target)));
+    std::array<ArchC::EpochRange, 3> ranges{};
+    ranges[0] = {target.address, target.address + planeBytes};
+    if (target.stencilAddress != 0) ranges[1] = {target.stencilAddress, target.stencilAddress + surface.StencilPlaneBytes()};
+    if (target.htileAddress != 0) ranges[2] = {target.htileAddress, target.htileAddress + HtileMetadataBytes(target.extent)};
+    return ranges;
+}
+
+// Whether `surface` (drawn last) still holds both its planes in the owner maps.
+bool ownsPlanes(const DepthSurface& surface) {
+    const auto depth = depthOwners().find({surface.context.device, surface.target.address});
+    if (depth == depthOwners().end() || depth->second.surface != &surface) return false;
+    if (surface.target.stencilAddress == 0) return true;
+    const auto stencil = stencilOwners().find({surface.context.device, surface.target.stencilAddress});
+    return stencil != stencilOwners().end() && stencil->second.surface == &surface;
+}
+
+// The repeat, or VK_NULL_HANDLE for the full call (`verifying` set when VERIFY asks the full call to check it).
+VkImageView repeatDepthView(const Context& context, const DepthTarget& target, bool depthWritten, bool& verifying) {
+    verifying = false;
+    if (!depthRepeat.valid || !depthRepeatActive()) return VK_NULL_HANDLE;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::unique_lock lock(surfacesMutex());
+    auto& token = depthRepeat;
+    if (!token.valid) return VK_NULL_HANDLE;
+    if (surfacesReleased.load(std::memory_order_acquire) != token.released || surfacesSerial.load(std::memory_order_acquire) != token.surfaces || stalePlanesSerial.load(std::memory_order_acquire) != token.stale || mirrorEpoch != token.mirror || htileEvents.load(std::memory_order_acquire) != token.htile) {
+        token.valid = false;
+        return VK_NULL_HANDLE;
+    }
+    auto* surface = token.surface;
+    if (token.depthWritten != depthWritten || surface->context.device != context.device || !sameDepthTarget(token.target, target)) return VK_NULL_HANDLE;
+    if (!surface->active->load(std::memory_order_acquire) || surface != drawnDepth || surface->samplingActive || surface->pendingClearAspects() != 0 || (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) || (depthWritten && mirrorable(target) && (surface->staleUnits.empty() || surface->staleCount != surface->staleUnits.size())) || !ownsPlanes(*surface)) {
+        token.valid = false;
+        return VK_NULL_HANDLE;
+    }
+    if (RoutesToNativeDepthOwner(target)) return VK_NULL_HANDLE;
+    if (target.htileAddress != 0) {
+        auto* recorder = RecorderFor(context);
+        if (recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)))) return VK_NULL_HANDLE;
+    }
+    if (!ArchC::ImageEpochs::Get().DrainIfNew() || surface->repeatEpoch.load(std::memory_order_acquire) != token.epoch || ArchC::ImageEpochs::Get().Loss() != token.loss) {
+        token.valid = false;
+        return VK_NULL_HANDLE;
+    }
+    if (depthRepeatVerifyNow()) {
+        depthRepeatCounters().verifyChecks.fetch_add(1, std::memory_order_relaxed);
+        verifying = true;
+        return VK_NULL_HANDLE;
+    }
+    surface->retired = false;
+    surface->clearDepth = target.clearDepth;
+    surface->clearStencil = target.clearStencil;
+    depthOwners()[{context.device, target.address}] = {surface, ++planeBinds};
+    if (target.stencilAddress != 0) stencilOwners()[{context.device, target.stencilAddress}] = {surface, ++planeBinds};
+    surface->written = ++depthWrites;
+    drawnDepth = surface;
+    depthRepeatCounters().hits.fetch_add(1, std::memory_order_relaxed);
+    return surface->view;
+}
+
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten) {
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    bool repeatVerifying = false;
+    if (const auto repeated = repeatDepthView(context, target, depthWritten, repeatVerifying); repeated != VK_NULL_HANDLE) return repeated;
+    // C_REPLAY_DEPTH_EPOCH: what this call did (a token is made only when it did nothing a repeat skips).
+    const bool repeatCandidate = depthRepeatActive() && target.samples == 1u;
+    bool htileUnchanged = false;
+    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target, &htileUnchanged);
+    ArchC::ProbeAt(ArchC::Probe::DvHtile);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
+    ArchC::ProbeAt(ArchC::Probe::DvSettle);
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
@@ -2008,6 +2174,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         }
     }
     const bool created = surface == nullptr;
+    ArchC::ProbeAt(ArchC::Probe::DvFind);
     GuestAllocations::Lease creationLease;
     if (created) {
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
@@ -2045,6 +2212,24 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         }
         surface = surfaces().back().get();
     }
+    // C_REPLAY_DEPTH_EPOCH: the surface's epoch before the call's work (registered on its first candidate call).
+    bool repeatQuiet = repeatCandidate && !created && htileUnchanged && htileCleared == 0 && !cleared && !surface->samplingActive && surface->pendingClearAspects() == 0 && surface == drawnDepth && ownsPlanes(*surface) && (!mirrorable(target) || surface->scannedEpoch == mirrorEpoch) && (!depthWritten || !mirrorable(target) || (!surface->staleUnits.empty() && surface->staleCount == surface->staleUnits.size()));
+    std::uint64_t repeatEpochBefore = 0;
+    std::uint64_t repeatLossBefore = 0;
+    std::uint64_t repeatStaleBefore = 0;
+    bool repeatDrained = false;
+    if (repeatCandidate && !surface->repeatRegistered) {
+        const auto ranges = depthRepeatRanges(*surface);
+        ArchC::ImageEpochs::Get().RegisterOwner(surface, surface->repeatEpoch, ranges, ArchC::AllSources);
+        surface->repeatRegistered = true;
+        repeatQuiet = false;
+    }
+    if (repeatQuiet) {
+        repeatDrained = ArchC::ImageEpochs::Get().DrainIfNew();
+        repeatEpochBefore = surface->repeatEpoch.load(std::memory_order_acquire);
+        repeatLossBefore = ArchC::ImageEpochs::Get().Loss();
+        repeatStaleBefore = stalePlanesSerial.load(std::memory_order_acquire);
+    }
     surface->retired = false;
     const auto owner = depthOwners().find({context.device, target.address});
     const bool inherits = owner != depthOwners().end() && owner->second.surface->active->load(std::memory_order_acquire) && !owner->second.surface->retired;
@@ -2057,11 +2242,14 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
+    ArchC::ProbeAt(ArchC::Probe::DvPlanes);
+    if (mirrorable(target) && surface->SyncFromMemory(mirrorResource(target))) repeatQuiet = false;
+    ArchC::ProbeAt(ArchC::Probe::DvSync);
     surface->ApplyFastClear();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory();
+    ArchC::ProbeAt(ArchC::Probe::DvWritten);
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
@@ -2080,6 +2268,26 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         noteStalePlane(plane, plane + planeBytes);
     }
     drawnDepth = surface;
+    if (repeatCandidate) {
+        depthRepeat.valid = false;
+        if (repeatQuiet && repeatDrained && stalePlanesSerial.load(std::memory_order_acquire) == repeatStaleBefore && ArchC::ImageEpochs::Get().DrainIfNew() && surface->repeatEpoch.load(std::memory_order_acquire) == repeatEpochBefore && ArchC::ImageEpochs::Get().Loss() == repeatLossBefore) {
+            // Arch C's token rule: every page armed, so a later store faults (and bumps the epoch) at once.
+            const auto clock = GuestArena::GuestWtFaultClock_nid_no_patch();
+            bool armed = true;
+            for (const auto& range : depthRepeatRanges(*surface)) {
+                if (range.end > range.begin && GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(range.begin), static_cast<std::size_t>(range.end - range.begin), clock) != GuestArena::WtFaultAnswer::Unchanged) armed = false;
+            }
+            if (armed) {
+                depthRepeat = {true, surface, target, depthWritten, repeatEpochBefore, repeatLossBefore, surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), repeatStaleBefore, mirrorEpoch, htileEvents.load(std::memory_order_acquire)};
+                depthRepeatCounters().made.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (repeatVerifying && !depthRepeat.valid) {
+            const auto previous = depthRepeatCounters().verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+            if (previous < 8) std::fprintf(stderr, "[archc] depth epoch VERIFY mismatch: the full depth view did work where the repeat held\n");
+        }
+    }
+    ArchC::ProbeAt(ArchC::Probe::DvStale);
     return surface->view;
 }
 
@@ -2398,7 +2606,10 @@ bool NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::siz
         surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
         existing = true;
     }
-    if (!existing) clearedHtiles()[htileAddress] = bytes;
+    if (!existing) {
+        clearedHtiles()[htileAddress] = bytes;
+        htileEvents.fetch_add(1, std::memory_order_acq_rel);
+    }
     return completionCandidate;
 }
 

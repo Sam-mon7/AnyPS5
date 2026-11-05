@@ -37,7 +37,7 @@ struct Record {
     EpochCensus census;
 };
 
-constexpr std::array<const char*, static_cast<std::size_t>(EpochSource::Count)> SourceNames{"cpu_store", "hold", "open", "forget", "tracker_stamp", "gpu_note", "pending", "depth", "unwatch"};
+constexpr std::array<const char*, static_cast<std::size_t>(EpochSource::Count)> SourceNames{"cpu_store", "hold", "open", "forget", "tracker_stamp", "gpu_note", "pending", "depth", "unwatch", "pending_insert"};
 
 struct Counters {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochSource::Count)> invalidations{};

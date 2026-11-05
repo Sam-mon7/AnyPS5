@@ -85,6 +85,10 @@ enum class Feature : std::uint8_t {
     CLazyCopyback,
     ArchcTemplateToken,
     ArchcDrawReplay,
+    ArchcReplayQuietTemplate,
+    ArchcReplayDepthEpoch,
+    ArchcReplaySlotBindings,
+    ArchcReplaySlotInputs,
     Count
 };
 
