@@ -161,6 +161,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::CLazyCopyback, "C_LAZY_COPYBACK", false, true, CLazyCopybackPrerequisites},
     {Feature::ArchcTemplateToken, "C_TEMPLATE_TOKEN", false, true, ArchcTemplateTokenPrerequisites},
     {Feature::ArchcDrawReplay, "C_DRAW_REPLAY", false, true, ArchcDrawReplayPrerequisites},
+    // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
+    // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.
+    {Feature::CLazyFence, "C_LAZY_FENCE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

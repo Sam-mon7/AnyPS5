@@ -25,6 +25,8 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -167,13 +169,99 @@ struct SyncSiteWaits {
 };
 std::vector<SyncSiteWaits> syncSites;
 constexpr std::size_t NoSyncSite = static_cast<std::size_t>(-1);
-constexpr std::size_t SyncSiteLimit = 48;
+constexpr std::size_t SyncSiteLimit = 160;
 thread_local std::size_t activeSyncSite = NoSyncSite;
+
+bool FenceCensusOn() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_FENCE_CENSUS");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
 
 bool SyncSitesProfiled() {
     // APS5_NO_SYNC_SITES=1 leaves only the per-source and per-thread counts.
-    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_SYNC_SITES") == nullptr;
+    static const bool profiled = (std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_SYNC_SITES") == nullptr) || FenceCensusOn();
     return profiled;
+}
+
+struct FenceThread {
+    Recorder::FenceReason reason = Recorder::FenceReason::None;
+};
+
+FenceThread& fenceThread() {
+    static thread_local FenceThread* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
+struct FenceCensusKey {
+    std::uint32_t role;
+    int source;
+    const void* site;
+    std::uint8_t readSite;
+    std::uint32_t opcode;
+    std::uint8_t reason;
+    bool completion;
+    bool nested;
+    bool newest;
+    bool operator<(const FenceCensusKey& other) const {
+        return std::tie(role, source, site, readSite, opcode, reason, completion, nested, newest) < std::tie(other.role, other.source, other.site, other.readSite, other.opcode, other.reason, other.completion, other.nested, other.newest);
+    }
+};
+
+struct FenceCensusTotals {
+    std::uint64_t waits = 0, unsignaled = 0;
+    double ms = 0, unsignaledMs = 0;
+};
+
+struct FenceCensusState {
+    AgcDriver::Mutex mutex;
+    std::map<FenceCensusKey, FenceCensusTotals> byKey;
+    std::map<std::uint32_t, FenceCensusTotals> byRole;
+    std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point lastReport = started;
+};
+
+FenceCensusState& fenceCensus() {
+    static FenceCensusState state;
+    return state;
+}
+
+std::string PacketName(std::uint32_t opcode);
+
+constexpr std::uint32_t CommitterRole = 0xc0c0c0c0u;
+
+std::string FenceRoleName(std::uint32_t role) {
+    if (role == CommitterRole) return "committer";
+    if (role == 0xffffffffu) return "untagged";
+    char text[16];
+    std::snprintf(text, sizeof(text), "q0x%x", role);
+    return text;
+}
+
+void ReportFenceCensus(FenceCensusState& census, std::uint64_t presents) {
+    static const char* const sources[5] = {"idle", "pending-write", "recorded-store", "address-based", "other"};
+    static const char* const reasons[static_cast<std::size_t>(Recorder::FenceReason::Count)] = {"none", "label-store", "lazy-publish", "drawn-linear"};
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - census.started).count();
+    std::string line;
+    char text[320];
+    std::snprintf(text, sizeof(text), "[fence-census] t=%.1f presents=%llu roles:", seconds, static_cast<unsigned long long>(presents));
+    line += text;
+    for (const auto& [role, totals] : census.byRole) {
+        std::snprintf(text, sizeof(text), " %s %llu/%llu %.3f/%.3f ms", FenceRoleName(role).c_str(), static_cast<unsigned long long>(totals.waits), static_cast<unsigned long long>(totals.unsignaled), totals.ms, totals.unsignaledMs);
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::vector<std::pair<const FenceCensusKey*, const FenceCensusTotals*>> order;
+    for (const auto& [key, totals] : census.byKey) order.emplace_back(&key, &totals);
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second->ms > b.second->ms; });
+    for (std::size_t i = 0; i < order.size() && i < 48; ++i) {
+        const auto& key = *order[i].first;
+        const auto& totals = *order[i].second;
+        std::snprintf(text, sizeof(text), "[fence-census-site] t=%.1f %s %s +0x%llx %s %s %s%s%s%s waits %llu unsignaled %llu ms %.3f unsignaled-ms %.3f", seconds, FenceRoleName(key.role).c_str(), key.source >= 0 && key.source < 5 ? sources[key.source] : "none", key.site != nullptr ? GuestMemory::CodeOffset(key.site) : 0ull, GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(key.readSite)), PacketName(key.opcode).c_str(), reasons[key.reason], key.completion ? " completion" : "", key.nested ? " nested" : "", key.newest ? " newest" : "", static_cast<unsigned long long>(totals.waits), static_cast<unsigned long long>(totals.unsignaled), totals.ms, totals.unsignaledMs);
+        std::fprintf(stderr, "%s\n", text);
+    }
 }
 
 // Begins a sync's attribution: returns the previous active entry for the caller to restore, after
@@ -1611,6 +1699,232 @@ void Recorder::CountSync(int source, const void* site) {
 
 void Recorder::AnnounceSyncSite(const void* site) {
     announcedSite = site;
+}
+
+bool Recorder::FenceCensus() {
+    return FenceCensusOn();
+}
+
+Recorder::FenceReasonScope::FenceReasonScope(FenceReason reason) : active(FenceCensusOn()), previous(FenceReason::None) {
+    if (active) previous = std::exchange(fenceThread().reason, reason);
+}
+
+Recorder::FenceReasonScope::~FenceReasonScope() {
+    if (active) fenceThread().reason = previous;
+}
+
+namespace {
+
+struct LazyFenceCounters {
+    std::atomic<std::uint64_t> candidates{0}, deferred{0}, refusedCompletions{0}, refusedImport{0}, refusedNested{0}, late{0}, lateWaited{0}, unresolved{0}, torn{0}, verified{0}, verifyReads{0}, verifyMismatches{0}, verifyUnchecked{0};
+    LazyFenceCounters() {
+        const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { ArchB::Recorder::RegisterCounter(name, counter); };
+        add("c_lazy_fence_candidates", candidates);
+        add("c_lazy_fence_deferred", deferred);
+        add("c_lazy_fence_refused_completions", refusedCompletions);
+        add("c_lazy_fence_refused_import", refusedImport);
+        add("c_lazy_fence_refused_nested", refusedNested);
+        add("c_lazy_fence_late", late);
+        add("c_lazy_fence_late_waited", lateWaited);
+        add("c_lazy_fence_unresolved", unresolved);
+        add("c_lazy_fence_torn", torn);
+        add("c_lazy_fence_verified", verified);
+        add("c_lazy_fence_verify_reads", verifyReads);
+        add("c_lazy_fence_verify_mismatches", verifyMismatches);
+        add("c_lazy_fence_verify_unchecked", verifyUnchecked);
+    }
+};
+
+LazyFenceCounters& lazyFenceCounters() {
+    static LazyFenceCounters made;
+    return made;
+}
+
+struct LazyFenceThread {
+    int allowed = 0;
+    bool active = false;
+    bool resolved = false;
+    bool sampled = false;
+    bool inFlush = false;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t writer = 0;
+    Recorder* recorder = nullptr;
+    struct Access {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::uint64_t hash;
+    };
+    std::vector<Access> accesses;
+};
+
+LazyFenceThread& lazyFenceThread() {
+    static thread_local LazyFenceThread* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
+std::uint32_t LazyFenceVerifyEvery() {
+    static const std::uint32_t every = [] {
+        const char* text = std::getenv("APS5_ARCHB_C_LAZY_FENCE_VERIFY");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+    }();
+    return every;
+}
+
+constexpr std::size_t LazyFenceHashLimit = std::size_t{1} << 20u;
+
+std::optional<std::uint64_t> GuestHash(std::uint64_t address, std::size_t bytes) {
+    if (bytes > LazyFenceHashLimit || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return std::nullopt;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto* data = reinterpret_cast<const unsigned char*>(address);
+    for (std::size_t i = 0; i < bytes; ++i) hash = (hash ^ data[i]) * 0x100000001b3ull;
+    return hash;
+}
+
+void ResolveLazyFence(LazyFenceThread& state) {
+    if (!state.active || state.resolved) return;
+    state.resolved = true;
+    auto* recorder = state.recorder;
+    if (recorder == nullptr || Recorder::Active() != recorder || !GuestMemory::GpuMutex().HeldByThisThread()) {
+        lazyFenceCounters().torn.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!recorder->InFlightThrough(state.writer)) return;
+    lazyFenceCounters().lateWaited.fetch_add(1, std::memory_order_relaxed);
+    Recorder::AnnounceSyncSite(reinterpret_cast<const void*>(&ResolveLazyFence));
+    recorder->FinishUpTo(state.writer);
+}
+
+void BeforeLazyFenceAccess(std::uint64_t address, std::size_t bytes) {
+    auto& state = lazyFenceThread();
+    if (!state.active || state.resolved || bytes == 0 || address >= state.end || address + bytes <= state.begin) return;
+    if (state.sampled && state.inFlush) {
+        lazyFenceCounters().verifyReads.fetch_add(1, std::memory_order_relaxed);
+        const auto hash = GuestHash(address, bytes);
+        if (!hash.has_value()) {
+            lazyFenceCounters().verifyUnchecked.fetch_add(1, std::memory_order_relaxed);
+            ResolveLazyFence(state);
+            return;
+        }
+        if (state.accesses.size() < 256) state.accesses.push_back({address, bytes, *hash});
+        return;
+    }
+    lazyFenceCounters().late.fetch_add(1, std::memory_order_relaxed);
+    ResolveLazyFence(state);
+}
+
+}
+
+bool Recorder::LazyFenceEnabled() {
+    return ArchB::Switches::Enabled(ArchB::Feature::CLazyFence);
+}
+
+Recorder::LazyFenceScope::LazyFenceScope() : allowed(LazyFenceEnabled()) {
+    if (allowed) ++lazyFenceThread().allowed;
+}
+
+Recorder::LazyFenceScope::~LazyFenceScope() {
+    if (!allowed) return;
+    auto& state = lazyFenceThread();
+    if (--state.allowed != 0) return;
+    if (state.active && !state.resolved) lazyFenceCounters().unresolved.fetch_add(1, std::memory_order_relaxed);
+    state.active = false;
+    state.recorder = nullptr;
+    state.accesses.clear();
+}
+
+bool Recorder::DeferWriterWait(std::uint64_t address, std::size_t bytes, std::uint64_t writer, bool imported) {
+    if (writer == 0 || bytes == 0 || !LazyFenceEnabled()) return false;
+    auto& state = lazyFenceThread();
+    if (state.allowed == 0 || completionDepth != 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    auto& counters = lazyFenceCounters();
+    counters.candidates.fetch_add(1, std::memory_order_relaxed);
+    if (state.active && !state.resolved) {
+        counters.refusedNested.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!imported) {
+        counters.refusedImport.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto refuse = [&](const Batch& batch) {
+        counters.refusedCompletions.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> traces{[] {
+            const char* text = std::getenv("APS5_ARCHB_C_LAZY_FENCE_TRACE");
+            return text != nullptr ? std::atoi(text) : 0;
+        }()};
+        if (traces.load(std::memory_order_relaxed) <= 0 || traces.fetch_sub(1, std::memory_order_relaxed) <= 0) return false;
+        std::string sites;
+        for (const auto* site : batch.completionSites) {
+            char text[32];
+            std::snprintf(text, sizeof(text), " +0x%llx", GuestMemory::CodeOffset(site));
+            sites += text;
+        }
+        std::fprintf(stderr, "[lazy-fence] refused 0x%llx+0x%zx writer %llu: batch %llu has %zu completions (labels %u, stores %u, write-backs %u):%s\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(writer), static_cast<unsigned long long>(&batch == open.get() ? OpenSerial() : batch.serial), batch.completions.size(), batch.completionLabelCount, batch.completionStoreCount, batch.writeBackCompletionCount, sites.c_str());
+        return false;
+    };
+    const auto effects = [&](const Batch& batch) {
+        if (batch.completions.size() > batch.checkOnlyCompletions + batch.copiedWriterCompletions.size()) return true;
+        return std::any_of(batch.copiedWriterCompletions.begin(), batch.copiedWriterCompletions.end(), [&](const ShaderResources* resources) { return resources->CopiedWritesOverlap(address, bytes); });
+    };
+    if (writer == OpenSerial() && open != nullptr && effects(*open)) return refuse(*open);
+    for (const auto& batch : inFlight) {
+        if (batch->serial <= writer && effects(*batch)) return refuse(*batch);
+    }
+    if (writer == OpenSerial()) {
+        Submit();
+        writer = submissions;
+    }
+    static const bool installed = [] {
+        GuestMemory::SetDeferredFenceHook(&BeforeLazyFenceAccess);
+        return true;
+    }();
+    static_cast<void>(installed);
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto every = LazyFenceVerifyEvery();
+    state.active = true;
+    state.resolved = false;
+    state.sampled = every != 0 && sequence.fetch_add(1, std::memory_order_relaxed) % every == 0;
+    state.inFlush = true;
+    state.begin = address;
+    state.end = address + bytes;
+    state.writer = writer;
+    state.recorder = this;
+    state.accesses.clear();
+    counters.deferred.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+Recorder::LazyFenceCounts Recorder::LazyFenceTotals() {
+    const auto& c = lazyFenceCounters();
+    LazyFenceCounts counts;
+    counts.candidates = c.candidates.load();
+    counts.deferred = c.deferred.load();
+    counts.refusedCompletions = c.refusedCompletions.load();
+    counts.refusedNested = c.refusedNested.load();
+    counts.late = c.late.load();
+    counts.lateWaited = c.lateWaited.load();
+    counts.unresolved = c.unresolved.load();
+    counts.verified = c.verified.load();
+    counts.verifyMismatches = c.verifyMismatches.load();
+    return counts;
+}
+
+void Recorder::EndFlushDeferral() {
+    auto& state = lazyFenceThread();
+    if (!state.active || !state.inFlush) return;
+    state.inFlush = false;
+    if (!state.sampled || state.resolved) return;
+    auto& counters = lazyFenceCounters();
+    const auto accesses = std::move(state.accesses);
+    state.accesses.clear();
+    ResolveLazyFence(state);
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& access : accesses) {
+        const auto hash = GuestHash(access.address, access.bytes);
+        if (!hash.has_value()) counters.verifyUnchecked.fetch_add(1, std::memory_order_relaxed);
+        else if (*hash != access.hash) counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 double Recorder::ThreadWaitedMs() {
@@ -3853,10 +4167,13 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
     }
 }
 
-void Recorder::OnComplete(std::function<void()> action) {
+void Recorder::OnComplete(std::function<void()> action, bool checkOnly, const ShaderResources* copiedWriter) {
     ensureOpen();
     open->completions.push_back(std::move(action));
+    if (checkOnly) ++open->checkOnlyCompletions;
+    else if (copiedWriter != nullptr) open->copiedWriterCompletions.push_back(copiedWriter);
     ++open->writeBackCompletionCount;
+    if (LazyFenceEnabled()) open->completionSites.push_back(__builtin_return_address(0));
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -4563,6 +4880,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     } else {
         batch.completions.push_back([store = std::move(store)] { store([](const auto&) {}); });
     }
+    if (LazyFenceEnabled()) batch.completionSites.push_back(__builtin_return_address(0));
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
     // (a label whose range became unmapped is reported there, and a lost device throws before the
     // completions run): a label that will never land must not leave the workers reaping forever.
@@ -4591,6 +4909,7 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
+    if (LazyFenceEnabled()) batch.completionSites.push_back(__builtin_return_address(0));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
         GuestMemory::BreakProofs();
@@ -5357,6 +5676,37 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
+        struct CensusSite {
+            bool on;
+            bool signaled;
+            FenceCensusKey key;
+            std::chrono::steady_clock::time_point start;
+            ~CensusSite() {
+                if (!on) return;
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                auto& census = fenceCensus();
+                std::lock_guard lock(census.mutex);
+                for (auto* totals : {&census.byKey[key], &census.byRole[key.role]}) {
+                    ++totals->waits;
+                    totals->ms += ms;
+                    if (!signaled) {
+                        ++totals->unsignaled;
+                        totals->unsignaledMs += ms;
+                    }
+                }
+                if (start - census.lastReport > std::chrono::seconds(10)) {
+                    census.lastReport = start;
+                    ReportFenceCensus(census, Recorder::Presents());
+                }
+            }
+        } censusSite{FenceCensusOn(), true, {}, {}};
+        if (censusSite.on) {
+            const bool active = activeSyncSite != NoSyncSite && activeSyncSite < syncSites.size();
+            const auto packet = GuestMemory::CurrentPacket();
+            censusSite.key = FenceCensusKey{GuestMemory::IsCommitterThread() ? CommitterRole : GuestMemory::GpuLockThreadTag(), active ? syncSites[activeSyncSite].source : -1, active ? syncSites[activeSyncSite].site : nullptr, static_cast<std::uint8_t>(GuestMemory::CurrentReadSite()), packet.opcode, static_cast<std::uint8_t>(fenceThread().reason), completionDepth != 0, GuestMemory::GpuMutex().DepthOnThisThread() > 1, batch->serial == submissions};
+            censusSite.signaled = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+            censusSite.start = std::chrono::steady_clock::now();
+        }
         Timeline::GpuWaitScope timelineWait(batch->serial, id, batch->timelineId);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);

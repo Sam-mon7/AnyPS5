@@ -2369,6 +2369,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer, 
     handedUnits.clear();
     const auto handOverKeys = alias == nullptr && !scoped ? clearHandOver() : std::nullopt;
     if (profile) stepStart = std::chrono::steady_clock::now();
+    const Recorder::LazyFenceScope lazyFence;
     const bool flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
     if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshFlush, stepStart);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -4561,12 +4562,22 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    bool deferredWait = false;
+    struct EndDeferral {
+        const bool& deferred;
+        ~EndDeferral() {
+            if (deferred) Recorder::EndFlushDeferral();
+        }
+    } endDeferral{deferredWait};
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
         const auto waitBefore = profile ? Recorder::ThreadWaitedMs() : 0;
         try {
             recorder->Reap();
-            if (const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes); writer == recorder->OpenSerial()) {
+            const auto pendingWriter = recorder->PendingWriterSerial(address, bytes, ownNotes);
+            if (pendingWriter != 0 && recorder->DeferWriterWait(address, bytes, pendingWriter, std::all_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; }))) {
+                deferredWait = true;
+            } else if (const auto writer = pendingWriter; writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3, __builtin_return_address(0));
                 if (profile) ++ThreadLookupOutcomes().work[LookupOutcomes::FlushWaits];
                 recorder->Sync();
@@ -4928,6 +4939,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {
             if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
+    const Recorder::FenceReasonScope fenceReason(Recorder::FenceReason::LabelStore);
     ArchC::LazyPublish::BeforeLabelStores();
     for (const auto& [address, bytes] : ranges) {
         if (ArchC::LazyPublish::DeferLabelStore(address, bytes)) continue;
@@ -4940,6 +4952,7 @@ std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
     if (pending.drawnCount.load(std::memory_order_acquire) == 0 || Recorder::InCompletion()) return 0;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    const Recorder::FenceReasonScope fenceReason(Recorder::FenceReason::DrawnLinear);
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
         std::lock_guard lock(pending.mutex);
@@ -4971,6 +4984,7 @@ std::size_t StorageTexture::StoreDrawnLinearTouching(const char* reason, const s
     if (ranges.empty()) return 0;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    const Recorder::FenceReasonScope fenceReason(Recorder::FenceReason::DrawnLinear);
     std::size_t stored = 0;
     for (const auto& [address, bytes] : ranges) {
         if (FlushPending(address, bytes, nullptr, reason)) ++stored;

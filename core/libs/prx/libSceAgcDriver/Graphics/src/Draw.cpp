@@ -3085,12 +3085,12 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         recorder.OnComplete([resources, writers] {
             writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
             resources->WriteBackBuffers();
-        });
+        }, false, resources.get());
         writers->push_back(resources);
         GuestMemory::BreakProofs();
     } else if (completion) {
-        if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
-        else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); }, true);
+        else recorder.OnComplete([resources] { resources->WriteBackBuffers(); }, false, resources.get());
     }
     std::vector<bool> storeNow(residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {

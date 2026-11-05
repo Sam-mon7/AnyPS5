@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -128,6 +129,7 @@ std::map<std::uint64_t, Entry>::iterator containing(State& s, std::uint64_t addr
 }
 
 void publish(std::uint64_t begin, std::uint64_t end) {
+    const Recorder::FenceReasonScope fenceReason(Recorder::FenceReason::LazyPublish);
     GuestMemory::FlushGpuWrites(begin, static_cast<std::size_t>(end - begin));
     GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
 }

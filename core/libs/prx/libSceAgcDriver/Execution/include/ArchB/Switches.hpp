@@ -85,6 +85,7 @@ enum class Feature : std::uint8_t {
     CLazyCopyback,
     ArchcTemplateToken,
     ArchcDrawReplay,
+    CLazyFence,
     Count
 };
 

@@ -430,6 +430,9 @@ void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 // lock: lazy publication publishes and opens a lazy range there, so the access does not fault on it
 // under the GPU mutex.
 void SetLazyStoreHook(void (*hook)(std::uint64_t address, std::size_t bytes));
+// Arch C P5c (C_LAZY_FENCE): called first by the same driver stores and reads, so a deferred writer wait is
+// made before the access touches the range.
+void SetDeferredFenceHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 enum class TrackerEvent : std::uint8_t { Stamp, Unwatch, Forget };
 void SetStampObserver(void (*observer)(std::uint64_t begin, std::uint64_t end, TrackerEvent event));
 void SetArmObserver(void (*observer)());
