@@ -4,6 +4,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
+#include <atomic>
+#include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #ifdef _WIN32
@@ -261,6 +264,66 @@ bool RunAwaitedEarly(AgcDriver::VulkanDevice& device, std::uint64_t address, std
     return true;
 }
 
+// Arch C labels, C_LABEL_WAKE: a compute queue's WAIT_REG_MEM on another compute queue's label is left to reach its
+// sleep (spin 100 us), then the label is recorded. With the switch the recording thread signals the waiter's slot
+// event (one signal) and the wait returns; with it off, or with _VERIFY=1 (every signal dropped), no signal is sent and
+// the wait still returns through its timer step. No lock is held by the waiter while it sleeps; the recorder holds the
+// GPU mutex while it signals (no deadlock either way). The label lands with its value after the earlier work.
+bool RunLabelWake(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t writer, std::uint32_t waiter) {
+    namespace Wake = AgcDriver::ArchB::LabelWake;
+    const bool on = Wake::On();
+    const char* verifyText = std::getenv("APS5_ARCHB_C_LABEL_WAKE_VERIFY");
+    const bool dropped = verifyText != nullptr && std::string_view(verifyText) == "1";
+    const std::uint32_t value = 0x77000000u | writer;
+    const std::array<std::uint32_t, 4> pattern{9, 10, 11, 12};
+    const auto stamp = Access::Stamp();
+    const std::array<std::uint32_t, 7> packet{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value, 0xffffffffu, 0x19u};
+    const auto signalsBefore = Wake::SignalCount();
+    std::atomic<bool> returned{false};
+    std::chrono::steady_clock::time_point back{};
+    std::exception_ptr failure;
+    std::thread wait([&] {
+        try {
+            AgcDriver::GuestMemory::TagGpuLockThread(waiter);
+            Access::Wait(packet, waiter, stamp);
+            back = std::chrono::steady_clock::now();
+            returned.store(true, std::memory_order_release);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    Require(!returned.load(std::memory_order_acquire), "label wake: the wait returned before its label was recorded");
+    std::chrono::steady_clock::time_point recorded{};
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::TagGpuLockThread(writer);
+        AgcDriver::GuestMemory::SetCurrentPacket(0x37, writer);
+        if (!device.FillBuffer(address + 16384, 4096, pattern)) {
+            Access::Stamp();
+            wait.detach();
+            return false;
+        }
+        Require(device.WriteLabelOnGpu(address, std::as_bytes(std::span(&value, 1)), Access::Stamp(), writer, false) == 0, "label wake: the label was not recorded on the GPU");
+        recorded = std::chrono::steady_clock::now();
+    }
+    wait.join();
+    if (failure) std::rethrow_exception(failure);
+    const auto signals = Wake::SignalCount() - signalsBefore;
+    Require(signals == (on && !dropped ? 1u : 0u), "label wake: " + std::to_string(signals) + " signals for one recorded label");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.SubmitRecorded(false);
+        device.WaitIdle();
+        std::uint32_t actual = 0;
+        std::memcpy(&actual, reinterpret_cast<const void*>(address), 4);
+        Require(actual == value, "label wake: the label has the wrong value");
+        Require(std::memcmp(reinterpret_cast<const void*>(address + 16384), pattern.data(), sizeof(pattern)) == 0, "label wake: work before the label did not complete");
+    }
+    std::printf("label wake 0x%x <- 0x%x: %s, returned %.1f us after the record\n", waiter, writer, on ? (dropped ? "on, signal dropped" : "on") : "off", std::chrono::duration<double, std::micro>(back - recorded).count());
+    return true;
+}
+
 bool RunStateBatching(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t queue) {
     using namespace AgcDriver::DriverDetail;
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -341,6 +404,15 @@ int main(int argc, char** argv) {
                 if (!RunStateBatching(*device, base, queue)) return VulkanTestSkipped;
             }
             std::puts("label state batching tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--label-wake") {
+            std::uint64_t address = base;
+            for (const auto writer : {0x20u, 0x38u, 0x50u}) {
+                if (!RunLabelWake(*device, address, writer, writer == 0x28u ? 0x30u : 0x28u)) return VulkanTestSkipped;
+                address += 256;
+            }
+            std::puts("label wake tests passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--awaited-early") {

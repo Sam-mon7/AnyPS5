@@ -200,6 +200,9 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Arch C labels: a compute queue records a queued label another queue is already blocked on by a try before its next
     // self-locking packet (a dispatch), instead of at that packet's lock after its unlocked preparation.
     {Feature::CLabelAwaitedEarly, "C_LABEL_AWAITED_EARLY", false, true, {}},
+    // Arch C labels: a WAIT_REG_MEM past its spin also sleeps on its queue slot's event, which the thread recording a
+    // label over the awaited dword sets (the 200 us poll sleep ends early; what satisfies the wait is unchanged).
+    {Feature::CLabelWake, "C_LABEL_WAKE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

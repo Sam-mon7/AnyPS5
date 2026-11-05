@@ -97,6 +97,7 @@ enum class Feature : std::uint8_t {
     CStampScanToken,
     CLabelLazyPrewait,
     CLabelAwaitedEarly,
+    CLabelWake,
     Count
 };
 

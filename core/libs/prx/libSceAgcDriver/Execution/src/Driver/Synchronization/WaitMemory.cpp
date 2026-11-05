@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -23,11 +24,51 @@
 #include <tuple>
 #include <vector>
 
+namespace AgcDriver::ArchB::LabelWake {
+
+std::uint64_t SignalCount() {
+    return Signals().load(std::memory_order_relaxed);
+}
+
+}
+
 namespace AgcDriver::DriverDetail {
+
+#ifdef _WIN32
+namespace {
+
+HANDLE PollTimer() {
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return timer;
+}
+
+}
+#endif
+
+// C_LABEL_WAKE: PollSleep's 200 us step, ended early when a label over the awaited dword is recorded (the slot's event).
+void PollSleepOrWake(std::size_t slot) {
+#ifdef _WIN32
+    HANDLE timer = PollTimer();
+    HANDLE event = slot < ArchB::LabelWake::SlotCount ? static_cast<HANDLE>(ArchB::LabelWake::EventOf(slot)) : nullptr;
+    if (timer != nullptr && event != nullptr) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -2000;
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            const HANDLE handles[2] = {timer, event};
+            if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+                CancelWaitableTimer(timer);
+                ArchB::Recorder::Count("c_label_wake_woken");
+            }
+            return;
+        }
+    }
+#endif
+    PollSleep();
+}
 
 void PollSleep() {
 #ifdef _WIN32
-    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    HANDLE timer = PollTimer();
     if (timer != nullptr) {
         LARGE_INTEGER due{};
         due.QuadPart = -2000;
@@ -433,6 +474,19 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
+    // C_LABEL_WAKE: the slot's dword is published for the wait's whole poll loop (a label recorded during the spin
+    // leaves the event set, and the first sleep returns at once).
+    const bool labelWake = !requireMemory && ArchB::LabelWake::On();
+    const auto wakeSlot = ArchB::LabelWake::SlotOf(queue);
+    struct WakeArm {
+        bool armed;
+        std::size_t slot;
+        ~WakeArm() { if (armed) ArchB::LabelWake::Disarm(slot); }
+    } wakeArm{labelWake && wakeSlot < ArchB::LabelWake::SlotCount, wakeSlot};
+    if (wakeArm.armed) {
+        static_cast<void>(ArchB::LabelWake::EventOf(wakeSlot));
+        ArchB::LabelWake::Arm(wakeSlot, awaited, static_cast<std::uint32_t>(awaitedBytes));
+    }
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
@@ -457,7 +511,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             }
         } else if (pauseSpin || polls >= 4000) {
             stage4Wait.Blocking();
-            PollSleep();
+            if (wakeArm.armed) PollSleepOrWake(wakeSlot);
+            else PollSleep();
         } else {
             std::this_thread::yield();
         }
