@@ -73,6 +73,7 @@ struct MaskPlan {
 void BuildUncached(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, Refusals& refusals) {
     const auto refuse = [&](Refusal reason) { ++refusals[static_cast<std::size_t>(reason)]; };
     variant.feedback = {};
+    variant.feedbackPatches.clear();
     variant.userData = capture.snapshot.userData;
     if (capture.plan == nullptr || !capture.plan->srtPlanComplete || !capture.plan->resourceTrackingComplete || capture.plan->requiresSpecializationMemory || !capture.snapshot.srtPoison.empty() || capture.snapshot.nullRootReads != 0u) {
         refuse(Refusal::Plan);
@@ -142,7 +143,12 @@ void BuildUncached(DispatchVariant& variant, const ShaderRecompiler::ResourceCap
         readers[address].insert(value);
     }
     WordBitMasks flatMasks;
-    std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> accepted;
+    struct Accepted {
+        std::uint32_t position, bits;
+        bool memory;
+    };
+    std::map<std::pair<std::uint32_t, std::uint32_t>, Accepted> accepted;
+    std::vector<DispatchVariant::FeedbackPatch> flatPatches, shaderPatches;
     for (const auto& [value, uses] : candidates) {
         if (data.contains(value)) { refuse(Refusal::Data); continue; }
         if (uses.size() != 1u) { refuse(Refusal::Alias); continue; }
@@ -186,8 +192,13 @@ void BuildUncached(DispatchVariant& variant, const ShaderRecompiler::ResourceCap
         if (!matches) { refuse(Refusal::Value); continue; }
         if (position > std::numeric_limits<std::uint32_t>::max()) { refuse(Refusal::Unmapped); continue; }
         masks->emplace_back(static_cast<std::uint32_t>(position), candidate.bits);
-        accepted[{candidate.source, candidate.word}] = candidate.bits;
-        for (const auto& read : plan.srtReads) if (sourceValue(read.value) == value) flatMasks.emplace_back(read.flatOffset, candidate.bits);
+        const bool memory = masks == &variant.feedback.memory;
+        accepted[{candidate.source, candidate.word}] = {static_cast<std::uint32_t>(position), candidate.bits, memory};
+        for (const auto& read : plan.srtReads) {
+            if (sourceValue(read.value) != value) continue;
+            flatMasks.emplace_back(read.flatOffset, candidate.bits);
+            if (memory) flatPatches.push_back({static_cast<std::uint32_t>(position), 0, read.flatOffset, candidate.bits});
+        }
     }
     std::sort(variant.feedback.memory.begin(), variant.feedback.memory.end());
     std::sort(variant.feedback.userData.begin(), variant.feedback.userData.end());
@@ -201,7 +212,9 @@ void BuildUncached(DispatchVariant& variant, const ShaderRecompiler::ResourceCap
         for (const auto word : {5u, 6u}) {
             const auto bits = accepted.find({plan.info.images[image].source, word});
             if (bits == accepted.end() || !variant.compiled->registrationModule || image >= variant.compiled->runtimeImageCount) continue;
-            shaderDataMasks.emplace_back(variant.compiled->imageMetadataDword + static_cast<std::uint32_t>(image) * (sizeof(ShaderRecompiler::RuntimeAbi::ResourceMetadata) / 4u) + offsetof(ShaderRecompiler::RuntimeAbi::ResourceMetadata, descriptor) / 4u + word, bits->second);
+            const auto target = variant.compiled->imageMetadataDword + static_cast<std::uint32_t>(image * (sizeof(ShaderRecompiler::RuntimeAbi::ResourceMetadata) / 4u)) + static_cast<std::uint32_t>(offsetof(ShaderRecompiler::RuntimeAbi::ResourceMetadata, descriptor) / 4u) + word;
+            shaderDataMasks.emplace_back(target, bits->second.bits);
+            if (bits->second.memory) shaderPatches.push_back({bits->second.position, 0, target, bits->second.bits});
         }
     }
     variant.feedback.pushConstants = shaderDataMasks;
@@ -209,8 +222,19 @@ void BuildUncached(DispatchVariant& variant, const ShaderRecompiler::ResourceCap
     for (std::size_t binding = 0; binding < variant.compiled->bindings.size(); ++binding) {
         const auto& descriptor = variant.compiled->bindings[binding];
         auto& masks = variant.feedback.bindings[binding];
-        if (descriptor.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) masks = flatMasks;
-        else if (descriptor.role == ShaderRecompiler::DescriptorRole::ShaderData) masks = shaderDataMasks;
+        if (descriptor.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) {
+            masks = flatMasks;
+            for (auto patch : flatPatches) {
+                patch.binding = static_cast<std::uint32_t>(binding);
+                variant.feedbackPatches.push_back(patch);
+            }
+        } else if (descriptor.role == ShaderRecompiler::DescriptorRole::ShaderData) {
+            masks = shaderDataMasks;
+            for (auto patch : shaderPatches) {
+                patch.binding = static_cast<std::uint32_t>(binding);
+                variant.feedbackPatches.push_back(patch);
+            }
+        }
         else if (descriptor.role == ShaderRecompiler::DescriptorRole::GuestImages) {
             for (std::size_t offset = 0; offset + 8u <= descriptor.guestDescriptor.size(); offset += 8u) {
                 for (const auto word : {5u, 6u}) {
@@ -223,12 +247,29 @@ void BuildUncached(DispatchVariant& variant, const ShaderRecompiler::ResourceCap
                         if (!same) continue;
                         found = true;
                         const auto approved = accepted.find({plan.info.images[image].source, word});
-                        bits &= approved != accepted.end() ? approved->second : 0u;
+                        bits &= approved != accepted.end() ? approved->second.bits : 0u;
                     }
-                    if (found && bits != 0u) masks.emplace_back(static_cast<std::uint32_t>(offset + word), bits);
+                    if (found && bits != 0u) {
+                        masks.emplace_back(static_cast<std::uint32_t>(offset + word), bits);
+                        std::optional<std::uint32_t> source;
+                        for (std::size_t image = 0; image < capture.snapshot.images.size() && image < plan.info.images.size(); ++image) {
+                            const auto& words = capture.snapshot.images[image].dwords;
+                            bool same = true;
+                            for (std::size_t w = 0; w < 8u; ++w) if (((words[w] ^ descriptor.guestDescriptor[offset + w]) & (w == 3u ? ~0xfffu : ~0u)) != 0u) same = false;
+                            if (!same) continue;
+                            const auto approved = accepted.find({plan.info.images[image].source, word});
+                            if (approved == accepted.end() || !approved->second.memory || (source && *source != approved->second.position)) source = std::numeric_limits<std::uint32_t>::max();
+                            else if (!source) source = approved->second.position;
+                        }
+                        if (source && *source != std::numeric_limits<std::uint32_t>::max()) variant.feedbackPatches.push_back({*source, static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(offset + word), bits});
+                    }
                 }
             }
         }
+    }
+    for (auto patch : shaderPatches) {
+        patch.binding = std::numeric_limits<std::uint32_t>::max();
+        variant.feedbackPatches.push_back(patch);
     }
 }
 MaskPlan BuildPlan(const std::shared_ptr<const ShaderRecompiler::IrResourcePlan>& owner) {
@@ -351,6 +392,7 @@ const MaskPlan& CachedPlan(const std::shared_ptr<const ShaderRecompiler::IrResou
 BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, Refusals& refusals) {
     const auto refuse = [&](Refusal reason) { ++refusals[static_cast<std::size_t>(reason)]; };
     variant.feedback = {};
+    variant.feedbackPatches.clear();
     variant.userData = capture.snapshot.userData;
     if (capture.plan == nullptr || !capture.snapshot.srtPoison.empty() || capture.snapshot.nullRootReads != 0u) {
         refuse(Refusal::Plan);
@@ -383,10 +425,20 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
     ArchB::Recorder::Count("fix_tsharp_build_trace_reads", trace.size());
     const auto& plan = *capture.plan;
     WordBitMasks flatMasks;
-    std::vector<const MaskCandidate*> accepted;
+    struct Accepted {
+        const MaskCandidate* candidate;
+        std::uint32_t position;
+        bool memory;
+    };
+    std::vector<Accepted> accepted;
+    std::vector<DispatchVariant::FeedbackPatch> flatPatches, shaderPatches;
     const auto acceptedBits = [&](std::uint32_t source, std::uint32_t word) {
-        const auto found = std::ranges::find_if(accepted, [&](const auto* entry) { return entry->source == source && entry->word == word; });
-        return found == accepted.end() ? 0u : (*found)->bits;
+        const auto found = std::ranges::find_if(accepted, [&](const auto& entry) { return entry.candidate->source == source && entry.candidate->word == word; });
+        return found == accepted.end() ? 0u : found->candidate->bits;
+    };
+    const auto acceptedSource = [&](std::uint32_t source, std::uint32_t word) -> const Accepted* {
+        const auto found = std::ranges::find_if(accepted, [&](const auto& entry) { return entry.candidate->source == source && entry.candidate->word == word; });
+        return found == accepted.end() ? nullptr : &*found;
     };
     for (const auto& candidate : proof.candidates) {
         const auto* value = candidate.value;
@@ -427,8 +479,12 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
         if (!matches) { refuse(Refusal::Value); continue; }
         if (position > std::numeric_limits<std::uint32_t>::max()) { refuse(Refusal::Unmapped); continue; }
         masks->emplace_back(static_cast<std::uint32_t>(position), candidate.bits);
-        accepted.push_back(&candidate);
-        for (const auto offset : candidate.flatOffsets) flatMasks.emplace_back(offset, candidate.bits);
+        const bool memory = masks == &variant.feedback.memory;
+        accepted.push_back({&candidate, static_cast<std::uint32_t>(position), memory});
+        for (const auto offset : candidate.flatOffsets) {
+            flatMasks.emplace_back(offset, candidate.bits);
+            if (memory) flatPatches.push_back({static_cast<std::uint32_t>(position), 0, offset, candidate.bits});
+        }
     }
     std::sort(variant.feedback.memory.begin(), variant.feedback.memory.end());
     std::sort(variant.feedback.userData.begin(), variant.feedback.userData.end());
@@ -442,7 +498,10 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
         for (const auto word : {5u, 6u}) {
             const auto bits = acceptedBits(plan.info.images[image].source, word);
             if (bits == 0u || !variant.compiled->registrationModule || image >= variant.compiled->runtimeImageCount) continue;
-            shaderDataMasks.emplace_back(variant.compiled->imageMetadataDword + static_cast<std::uint32_t>(image) * (sizeof(ShaderRecompiler::RuntimeAbi::ResourceMetadata) / 4u) + offsetof(ShaderRecompiler::RuntimeAbi::ResourceMetadata, descriptor) / 4u + word, bits);
+            const auto target = variant.compiled->imageMetadataDword + static_cast<std::uint32_t>(image * (sizeof(ShaderRecompiler::RuntimeAbi::ResourceMetadata) / 4u)) + static_cast<std::uint32_t>(offsetof(ShaderRecompiler::RuntimeAbi::ResourceMetadata, descriptor) / 4u) + word;
+            shaderDataMasks.emplace_back(target, bits);
+            const auto* source = acceptedSource(plan.info.images[image].source, word);
+            if (source != nullptr && source->memory) shaderPatches.push_back({source->position, 0, target, bits});
         }
     }
     variant.feedback.pushConstants = shaderDataMasks;
@@ -450,8 +509,19 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
     for (std::size_t binding = 0; binding < variant.compiled->bindings.size(); ++binding) {
         const auto& descriptor = variant.compiled->bindings[binding];
         auto& masks = variant.feedback.bindings[binding];
-        if (descriptor.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) masks = flatMasks;
-        else if (descriptor.role == ShaderRecompiler::DescriptorRole::ShaderData) masks = shaderDataMasks;
+        if (descriptor.role == ShaderRecompiler::DescriptorRole::FlattenedSrt) {
+            masks = flatMasks;
+            for (auto patch : flatPatches) {
+                patch.binding = static_cast<std::uint32_t>(binding);
+                variant.feedbackPatches.push_back(patch);
+            }
+        } else if (descriptor.role == ShaderRecompiler::DescriptorRole::ShaderData) {
+            masks = shaderDataMasks;
+            for (auto patch : shaderPatches) {
+                patch.binding = static_cast<std::uint32_t>(binding);
+                variant.feedbackPatches.push_back(patch);
+            }
+        }
         else if (descriptor.role == ShaderRecompiler::DescriptorRole::GuestImages) {
             for (std::size_t offset = 0; offset + 8u <= descriptor.guestDescriptor.size(); offset += 8u) {
                 for (const auto word : {5u, 6u}) {
@@ -466,10 +536,27 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
                         const auto approved = acceptedBits(plan.info.images[image].source, word);
                         bits &= approved;
                     }
-                    if (found && bits != 0u) masks.emplace_back(static_cast<std::uint32_t>(offset + word), bits);
+                    if (found && bits != 0u) {
+                        masks.emplace_back(static_cast<std::uint32_t>(offset + word), bits);
+                        std::optional<std::uint32_t> source;
+                        for (std::size_t image = 0; image < capture.snapshot.images.size() && image < plan.info.images.size(); ++image) {
+                            const auto& words = capture.snapshot.images[image].dwords;
+                            bool same = true;
+                            for (std::size_t w = 0; w < 8u; ++w) if (((words[w] ^ descriptor.guestDescriptor[offset + w]) & (w == 3u ? ~0xfffu : ~0u)) != 0u) same = false;
+                            if (!same) continue;
+                            const auto* approved = acceptedSource(plan.info.images[image].source, word);
+                            if (approved == nullptr || !approved->memory || (source && *source != approved->position)) source = std::numeric_limits<std::uint32_t>::max();
+                            else if (!source) source = approved->position;
+                        }
+                        if (source && *source != std::numeric_limits<std::uint32_t>::max()) variant.feedbackPatches.push_back({*source, static_cast<std::uint32_t>(binding), static_cast<std::uint32_t>(offset + word), bits});
+                    }
                 }
             }
         }
+    }
+    for (auto patch : shaderPatches) {
+        patch.binding = std::numeric_limits<std::uint32_t>::max();
+        variant.feedbackPatches.push_back(patch);
     }
     return !variant.feedback.memory.empty() || !variant.feedback.userData.empty() ? BuildOutcome::Accepted : BuildOutcome::Refused;
 }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -27,6 +28,20 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(
         auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
         for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {
             if (variant.dataSlots[k] < descriptor.size()) descriptor[variant.dataSlots[k]] = words[variant.dataPositions[k]];
+        }
+    }
+    for (const auto& patch : variant.feedbackPatches) {
+        if (patch.position >= words.size()) continue;
+        if (patch.binding == std::numeric_limits<std::uint32_t>::max()) {
+            const auto offset = static_cast<std::size_t>(patch.word) * sizeof(std::uint32_t);
+            if (offset + sizeof(std::uint32_t) > patched->pushConstants.size()) continue;
+            std::uint32_t stored = 0;
+            std::memcpy(&stored, patched->pushConstants.data() + offset, sizeof(stored));
+            stored = (stored & ~patch.mask) | (words[patch.position] & patch.mask);
+            std::memcpy(patched->pushConstants.data() + offset, &stored, sizeof(stored));
+        } else if (patch.binding < patched->bindings.size() && patch.word < patched->bindings[patch.binding].guestDescriptor.size()) {
+            auto& stored = patched->bindings[patch.binding].guestDescriptor[patch.word];
+            stored = (stored & ~patch.mask) | (words[patch.position] & patch.mask);
         }
     }
     if (bufferBases && !variant.bufferBaseMasks.empty() && !PatchBufferBases(variant, words, *patched)) return nullptr;
@@ -198,7 +213,7 @@ GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer cons
     return verdict;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer, bool refreshFeedback) {
     namespace Gen = GuestMemory::Gen;
     variantCompared = false;
     variantExact = false;
@@ -212,7 +227,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     const bool masked = live != nullptr && (!variant.dataPositions.empty() || refreshBuffers);
     const bool feedback = feedbackMask && !validateLegacy() && !variant.feedback.memory.empty();
     if (feedbackMask && validateLegacy() && !variant.feedback.memory.empty()) ArchB::Recorder::Count("fix_tsharp_mask_refused_legacy");
-    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit, refreshBuffers ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.bufferBaseMasks) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}};
+    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit, refreshBuffers ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.bufferBaseMasks) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, refreshFeedback};
     if (bufferBases && validateLegacy() && !variant.bufferBaseMasks.empty()) ArchB::Recorder::Count("fix_buffer_base_refused_legacy");
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
@@ -320,7 +335,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
             Gen::CountDrawGen(consumer, Gen::DrawGen::Restamped);
         }
     }
-    return masked && !live->empty() ? EntryOutcome::EqualData : EntryOutcome::Equal;
+    return live != nullptr && !live->empty() ? EntryOutcome::EqualData : EntryOutcome::Equal;
 }
 
 }

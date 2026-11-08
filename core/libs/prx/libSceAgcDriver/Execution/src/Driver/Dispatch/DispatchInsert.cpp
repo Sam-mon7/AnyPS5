@@ -17,7 +17,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::uint64_t genAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint64_t legacyKey, bool pointerKeys, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::uint64_t genAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, bool feedbackMask, std::uint64_t feedbackKey, std::span<const std::uint32_t> userData) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -39,8 +39,10 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         // APS5_ARCHB_FIX_DISPATCH_RELOCATION (sampled per insert): runs split and tagged by the user
         // word they are read through, as for draw stages.
         const bool relocation = capture != nullptr && feedbackKey != 0 && !stampValidate() && ArchB::Switches::Enabled(ArchB::Feature::FixDispatchRelocation);
-        if (relocation) {
-            tagVariantRuns(*fresh, srtRegions, capture->userDataUse, true, 0, supplied);
+        const bool pointerCapture = pointerKeys && capture != nullptr && capture->plan != nullptr && feedbackKey != 0 && !stampValidate();
+        if (relocation || pointerCapture) {
+            tagVariantRuns(*fresh, srtRegions, capture->userDataUse, true, 0, supplied, pointerCapture);
+            if (pointerCapture) fresh->relocatableWords &= ~capture->plan->shaderUserWords;
             if (fresh->userData.empty()) fresh->userData = capture->snapshot.userData;
         } else {
             for (const auto& region : srtRegions) {
@@ -110,6 +112,32 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         }
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
+            bool pointerEntry = false;
+            if (pointerCapture && fresh->userData.size() == userData.size()) {
+                auto pointerWords = fresh->relocatableWords;
+                auto learned = dispatchPointerWords.find(feedbackKey);
+                if (learned != dispatchPointerWords.end()) {
+                    pointerWords &= learned->second;
+                    if (pointerWords != learned->second) {
+                        if (pointerWords == 0u) dispatchPointerWords.erase(learned);
+                        else learned->second = pointerWords;
+                    }
+                } else if (pointerWords != 0u) {
+                    if (dispatchPointerWords.size() >= dispatchCacheEntries()) dispatchPointerWords.clear();
+                    dispatchPointerWords.emplace(feedbackKey, pointerWords);
+                    ArchB::Recorder::Count("fix_dptr_learned");
+                }
+                if (pointerWords != 0u) {
+                    key = DispatchPointerKey(feedbackKey, userData, pointerWords);
+                    pointerEntry = true;
+                } else {
+                    key = legacyKey;
+                    ArchB::Recorder::Count("fix_dptr_refused_shape");
+                }
+            } else if (pointerKeys) {
+                key = legacyKey;
+                ArchB::Recorder::Count("fix_dptr_refused_no_proof");
+            }
             if (profile) {
                 if (capture != nullptr && capture->plan != nullptr) {
                     const auto& plan = *capture->plan;
@@ -178,26 +206,34 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 dispatchFeedbackKeys[feedbackKey] = key;
             }
             const auto found = dispatchCache.find(key);
-            if (found == dispatchCache.end()) {
+            auto compatible = found;
+            if (compatible != dispatchCache.end() && compatible->second->pointerKey != pointerEntry) {
+                eraseDispatchEntry(compatible);
+                compatible = dispatchCache.end();
+            }
+            if (compatible == dispatchCache.end()) {
                 auto created = std::make_shared<DispatchEntry>();
                 created->touched = dispatchCacheHits;
+                created->pointerKey = pointerEntry;
                 accountVariant(*fresh, true);
                 created->variants.push_back(std::move(fresh));
                 dispatchOrder.push_front(key);
                 created->order = dispatchOrder.begin();
                 dispatchCache.emplace(key, std::move(created));
-            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
+            } else if (compatible->second != missedEntry && !compatible->second->variants.empty() && compatible->second->variants.front()->runs == fresh->runs && SameCapturedWords(compatible->second->variants.front()->words, compatible->second->variants.front()->shared, fresh->words, fresh->shared)) {
 
-                attachVariant = found->second->variants.front();
+                attachVariant = compatible->second->variants.front();
             } else {
 
-                const auto& old = found->second;
+                const auto& old = compatible->second;
+                const auto variantLimit = pointerEntry ? MaxDispatchVariants : dispatchVariants();
                 auto replacement = std::make_shared<DispatchEntry>();
-                replacement->variants.reserve(dispatchVariants());
+                replacement->pointerKey = pointerEntry;
+                replacement->variants.reserve(variantLimit);
                 accountVariant(*fresh, true);
                 replacement->variants.push_back(std::move(fresh));
                 for (const auto& kept : old->variants) {
-                    if (replacement->variants.size() < dispatchVariants()) {
+                    if (replacement->variants.size() < variantLimit) {
                         replacement->variants.push_back(kept);
                     } else {
                         accountVariant(*kept, false);
@@ -208,7 +244,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 replacement->touched = dispatchCacheHits;
                 replacement->order = old->order;
                 dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, replacement->order);
-                found->second = std::move(replacement);
+                compatible->second = std::move(replacement);
             }
 
             static const bool lru = std::getenv("APS5_NO_DISPATCH_LRU") == nullptr;

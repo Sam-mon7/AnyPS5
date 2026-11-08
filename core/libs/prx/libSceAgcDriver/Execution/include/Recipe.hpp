@@ -41,6 +41,7 @@ struct Recipe {
     std::weak_ptr<Graphics::ShaderResources> templateRef;
     // The template's content key: touches the cache's LRU on a hit.
     Graphics::ResourceCache::Key key;
+    Graphics::ResourceCache::Key boundResourceKey;
     std::weak_ptr<ComputePipelineObjects> objects;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};
     bool pushes = false;

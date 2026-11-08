@@ -6,6 +6,14 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -14,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -560,6 +569,7 @@ void TsharpCachedProofs(bool user, bool refused) {
 }
 
 alignas(256) std::array<std::uint32_t, 16> FeedbackTable{};
+alignas(256) std::array<std::uint32_t, 16> FeedbackTableMoved{};
 alignas(256) std::array<std::byte, 4096> FeedbackTexture{};
 alignas(256) std::array<float, 32> FeedbackOutput{};
 alignas(8) Header FeedbackHeader{};
@@ -585,8 +595,9 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
     Registered(FeedbackHeader, FeedbackCode.data(), code.size() * 4, dispatch ? 0 : 1);
     if (!dispatch) Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     std::uint32_t unusedUserWord = 0;
+    const std::uint32_t* feedbackWords = FeedbackTable.data();
     const auto submit = [&](std::size_t count) {
-        const auto table = reinterpret_cast<std::uintptr_t>(FeedbackTable.data());
+        const auto table = reinterpret_cast<std::uintptr_t>(feedbackWords);
         const auto output = reinterpret_cast<std::uintptr_t>(FeedbackOutput.data());
         std::vector<std::uint32_t> words(user ? 17u : dispatch ? 6u : 2u);
         if (user) {
@@ -670,6 +681,16 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
         Require(stages == (enabled ? 2u : 1u), "partial stage reuse did not apply the feedback proof");
         Require(result() == 64, "partial feedback reuse changed rendered output");
     }
+    if (dispatch && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDispatchPointerKeys)) {
+        FeedbackTableMoved = FeedbackTable;
+        FeedbackTableMoved[6] ^= 0x80;
+        feedbackWords = FeedbackTableMoved.data();
+        const auto moved = submit(1);
+        Require(moved == hits + 1, "a moving pointer with changed feedback did not reuse its normalized entry");
+        Require(result() == 255, "a moving pointer with changed feedback retained stale prepared data");
+        hits = moved;
+        feedbackWords = FeedbackTable.data();
+    }
     for (const auto& [word, bits] : std::array<std::pair<std::size_t, std::uint32_t>, 7>{{{1, 3u << 30}, {2, 1u << 14}, {3, 1u}, {1, 1u << 20}, {5, 1u << 4}, {3, 1u << 16}, {3, 1u << 12}}}) {
         FeedbackTable[word] ^= bits;
         const auto missed = submit(1);
@@ -685,6 +706,10 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
     Require(count("fix_tsharp_mask_verify_mismatches") == 0, "feedback verification mismatched");
     Require(count("fix_tsharp_build_verify_mismatches") == 0, "cached feedback proof verification mismatched");
     Require(!enabled || !verify || dispatch || count("fix_tsharp_mask_verified") >= 3, "feedback-only hits were not verified");
+    if (dispatch && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDispatchPointerKeys)) {
+        Require(count("fix_dptr_verified") > 0, "feedback pointer-key hits were not verified");
+        Require(count("fix_dptr_verify_mismatches") == 0, "feedback pointer-key captured bytes mismatched");
+    }
     // APS5_ARCHB_PIPE_DISPATCH_ALIAS with queue 0 pipelined: a feedback-only user-data change misses the
     // exact key, and the lookup serves the feedback alias; the pre-check resolves the same entry, so the
     // dispatch is no miss (an item when the variant has a recipe; this test's variants have none), and
@@ -711,6 +736,16 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
 // the switch every moved pointer misses. With queue 0 pipelined (PIPE_Q0_COMMITTER) the relocated
 // dispatches still fall back from the pre-check (exact key absent) and then hit in the lookup.
 alignas(256) std::array<std::array<std::uint32_t, 16>, 5> RelocationTables{};
+constexpr std::size_t PointerBlockBytes = 65536;
+std::byte* PointerBlock = nullptr;
+
+std::span<std::uint32_t> PointerWords(std::size_t offset, std::size_t count) {
+    return {reinterpret_cast<std::uint32_t*>(PointerBlock + offset), count};
+}
+
+std::span<std::uint32_t, 16> PointerTable(std::size_t index) {
+    return std::span<std::uint32_t, 16>(reinterpret_cast<std::uint32_t*>(PointerBlock + 0x1000 + index * 0x100), 16);
+}
 alignas(256) std::array<std::byte, 4096> RelocationTexture{};
 
 void DispatchRelocationPath() {
@@ -771,6 +806,243 @@ void DispatchRelocationPath() {
     if (enabled) Require(count("fix_dispatch_relocation_hits") >= 2.0 && count("fix_dispatch_relocation_hits") <= 4.0, "relocation hits were not counted as expected");
     else Require(count("fix_dispatch_relocation_hits") == 0.0, "relocation hits without the switch");
     if (enabled && Switches::Enabled(Feature::PipeQ0Committer)) Require(count("pipe_q0_dispatch_miss_then_hit") >= 2, "relocated queue-0 dispatches were not served after the pre-check miss");
+}
+
+struct PointerDispatchResult {
+    std::uint64_t equal;
+    std::size_t entries;
+    unsigned value;
+};
+
+void PreparePointerDispatch(bool refresh) {
+#ifdef _WIN32
+    PointerBlock = static_cast<std::byte*>(VirtualAlloc(nullptr, PointerBlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    PointerBlock = static_cast<std::byte*>(std::aligned_alloc(PointerBlockBytes, PointerBlockBytes));
+#endif
+    Require(PointerBlock != nullptr, "could not allocate pointer-key guest memory");
+    std::memset(PointerBlock, 0, PointerBlockBytes);
+    GuestAllocations::Mutation().Add(PointerBlock, PointerBlockBytes, true, true, false);
+    if (refresh) {
+        FeedbackTexture.fill(std::byte{255});
+        const auto texture = reinterpret_cast<std::uintptr_t>(FeedbackTexture.data());
+        const std::array<std::uint32_t, 16> table{static_cast<std::uint32_t>(texture >> 8), static_cast<std::uint32_t>(texture >> 40) | (56u << 20u), 0, 0x90000fac, 0, 0, 0, 0, std::bit_cast<std::uint32_t>(0.25f), 0, 0, 0, 0x92, 0x00fff000, 0, 0};
+        for (std::size_t index = 0; index < 5; ++index) std::copy(table.begin(), table.end(), PointerTable(index).begin());
+        PointerTable(3)[8] = std::bit_cast<std::uint32_t>(0.5f);
+        const std::vector<std::uint32_t> code{0xf40c0202u, 0xfa000000u, 0xf4000402u, 0xfa000020u, 0xf4080502u, 0xfa000030u, 0xbf8cc07fu,
+            0x7e2802ffu, 0x3f000000u, 0x7e2a02ffu, 0x3f000000u, 0xf09c0f08u, 0x00a20a14u, 0xbf8c3f70u, 0x10001410u,
+            0x7e020280u, 0xe0700000u, 0x80000001u, 0xbf810000u};
+        std::copy(code.begin(), code.end(), FeedbackCode.begin());
+        Registered(FeedbackHeader, FeedbackCode.data(), code.size() * 4, 0);
+        return;
+    }
+    const auto inputWords = PointerWords(0, 32);
+    const auto otherWords = PointerWords(0x100, 32);
+    std::fill(inputWords.begin(), inputWords.end(), 63);
+    std::fill(otherWords.begin(), otherWords.end(), 127);
+    const auto input = reinterpret_cast<std::uintptr_t>(inputWords.data());
+    const std::array<std::uint32_t, 16> table{static_cast<std::uint32_t>(input), static_cast<std::uint32_t>(input >> 32) & 0xffffu, static_cast<std::uint32_t>(inputWords.size_bytes()), 0x31016facu};
+    for (std::size_t index = 0; index < 5; ++index) std::copy(table.begin(), table.end(), PointerTable(index).begin());
+    const auto other = reinterpret_cast<std::uintptr_t>(otherWords.data());
+    const std::array<std::uint32_t, 4> otherTable{static_cast<std::uint32_t>(other), static_cast<std::uint32_t>(other >> 32) & 0xffffu, static_cast<std::uint32_t>(otherWords.size_bytes()), 0x31016facu};
+    std::copy(otherTable.begin(), otherTable.end(), PointerTable(3).begin());
+    const std::vector<std::uint32_t> code{0xf4080200u, 0xfa000000u, 0xbf8cc07fu, 0x34020082u, 0xe0301000u, 0x80020201u, 0xbf8c3f70u, 0x4a060481u, 0xe0701000u, 0x80010301u, 0xbf810000u};
+    std::copy(code.begin(), code.end(), FeedbackCode.begin());
+    Registered(FeedbackHeader, FeedbackCode.data(), code.size() * 4, 0);
+}
+
+PointerDispatchResult SubmitPointerRefreshDispatch(std::span<const std::uint32_t, 16> from, bool indirect = false) {
+    const auto pointer = reinterpret_cast<std::uintptr_t>(from.data());
+    const auto outputWords = PointerWords(0x800, 32);
+    const std::span<float> outputValues(reinterpret_cast<float*>(outputWords.data()), outputWords.size());
+    const auto output = reinterpret_cast<std::uintptr_t>(outputWords.data());
+    const std::array<std::uint32_t, 6> words{static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32) & 0xffffu, static_cast<std::uint32_t>(outputWords.size_bytes()), 0x31016facu, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32)};
+    const auto address = reinterpret_cast<std::uintptr_t>(FeedbackCode.data());
+    std::vector<std::uint32_t> commands;
+    Append(commands, 0x76, {0x20c, static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40)});
+    Append(commands, 0x76, {0x207, 1, 1, 1});
+    Append(commands, 0x76, {0x213, static_cast<std::uint32_t>(words.size()) << 1});
+    for (std::size_t word = 0; word < words.size(); ++word) Append(commands, 0x76, {0x240u + static_cast<std::uint32_t>(word), words[word]});
+    if (indirect) {
+        const auto arguments = PointerWords(0x400, 3);
+        arguments[0] = 1;
+        arguments[1] = 1;
+        arguments[2] = 1;
+        const auto address = reinterpret_cast<std::uintptr_t>(arguments.data());
+        Append(commands, 0x16, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0x41});
+    } else {
+        Append(commands, 0x15, {1, 1, 1, 0x8041});
+    }
+    std::fill(outputValues.begin(), outputValues.end(), 0.0f);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "pointer-key refresh submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::FlushGpuWrites(output, outputWords.size_bytes());
+    auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    return {driver.DispatchCacheCounters().equal, driver.DispatchCacheSize().entries, static_cast<unsigned>(outputValues[0] * 255.0f + 0.5f)};
+}
+
+PointerDispatchResult SubmitPointerDispatch(std::span<const std::uint32_t, 16> from, std::uint32_t extra = 0) {
+    const auto pointer = reinterpret_cast<std::uintptr_t>(from.data());
+    const auto outputWords = PointerWords(0x200, 32);
+    const auto output = reinterpret_cast<std::uintptr_t>(outputWords.data());
+    const std::array<std::uint32_t, 9> words{static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32), 0, 0, static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32) & 0xffffu, static_cast<std::uint32_t>(outputWords.size_bytes()), 0x31016facu, extra};
+    const auto address = reinterpret_cast<std::uintptr_t>(FeedbackCode.data());
+    std::vector<std::uint32_t> commands;
+    Append(commands, 0x76, {0x20c, static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40)});
+    Append(commands, 0x76, {0x207, 1, 1, 1});
+    Append(commands, 0x76, {0x213, static_cast<std::uint32_t>(words.size()) << 1});
+    for (std::size_t w = 0; w < words.size(); ++w) Append(commands, 0x76, {0x240u + static_cast<std::uint32_t>(w), words[w]});
+    Append(commands, 0x15, {1, 1, 1, 0x8041});
+    std::fill(outputWords.begin(), outputWords.end(), 0);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "pointer-key dispatch submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::FlushGpuWrites(output, outputWords.size_bytes());
+    auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    return {driver.DispatchCacheCounters().equal, driver.DispatchCacheSize().entries, outputWords[0]};
+}
+
+double PointerCounter(const std::map<std::string, double>& counters, const char* name) {
+    const auto found = counters.find(name);
+    return found == counters.end() ? 0.0 : found->second;
+}
+
+std::string PointerRecipeFailures(const std::map<std::string, double>& counters) {
+    std::string result;
+    for (const auto& [name, value] : counters) {
+        if (!name.starts_with("fix_dptr_no_recipe_") || value == 0) continue;
+        result += " " + name + "=" + std::to_string(value);
+    }
+    return result;
+}
+
+void DispatchPointerKeysPath(std::string_view mode, const std::filesystem::path& control = {}) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Recorder;
+    using AgcDriver::ArchB::Switches;
+    using AgcDriver::DriverDetail::DrawPipeline;
+    Recorder::Boundary(true, 0, Recorder::Clock::now());
+    if (mode == "feedback") {
+        TsharpCachePath(true, false, false);
+        return;
+    }
+    PreparePointerDispatch(mode == "refresh" || mode.starts_with("bound-resource"));
+    if (mode == "toggle") {
+        const auto toggle = [&](unsigned sequence, bool enabled) {
+            std::ofstream(control, std::ios::trunc) << sequence << " FIX_DISPATCH_POINTER_KEYS=" << enabled << '\n';
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            Switches::PollControl();
+            Require(Switches::Enabled(Feature::FixDispatchPointerKeys) == enabled, "the dispatch pointer-key switch did not toggle");
+        };
+        toggle(1, true);
+        const auto on = SubmitPointerDispatch(PointerTable(0));
+        toggle(2, false);
+        const auto off = SubmitPointerDispatch(PointerTable(1));
+        toggle(3, true);
+        const auto onAgain = SubmitPointerDispatch(PointerTable(2));
+        toggle(4, false);
+        const auto offAgain = SubmitPointerDispatch(PointerTable(1));
+        Require(on.value == 64 && off.value == 64 && onAgain.value == 64 && offAgain.value == 64, "interleaved pointer-key paths changed the dispatch output");
+        Require(onAgain.equal == off.equal + 1 && offAgain.equal == onAgain.equal + 1, "interleaved pointer-key and legacy entries did not remain independently reusable");
+        return;
+    }
+    Require(Switches::Enabled(Feature::FixDispatchPointerKeys), "the dispatch pointer-key switch is off");
+    if (mode == "equal") {
+        std::copy(PointerTable(0).begin(), PointerTable(0).end(), PointerTable(3).begin());
+        const auto before = AgcDriver::DriverDetail::Driver::Get().DispatchCacheSize().entries;
+        SubmitPointerDispatch(PointerTable(0));
+        SubmitPointerDispatch(PointerTable(0));
+        Recorder::Collect(Recorder::Clock::now());
+        PointerDispatchResult result{};
+        for (std::size_t index = 1; index < 5; ++index) result = SubmitPointerDispatch(PointerTable(index));
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        Require(result.value == 64, "an equal moving table changed the dispatch output");
+        Require(result.entries == before + 1, "moving equal table pointers grew the dispatch cache");
+        Require(PointerCounter(counters, "fix_dptr_served") >= 4, "moving equal table pointers did not hit the normalized entry");
+        Require(PointerCounter(counters, "fix_dptr_pipelined") >= 4, "moving equal table pointers produced " + std::to_string(PointerCounter(counters, "fix_dptr_pipelined")) + " pipeline items, unbounded " + std::to_string(PointerCounter(counters, "fix_dptr_refused_unbounded_writes")) + ", recipe " + std::to_string(PointerCounter(counters, "fix_dptr_refused_no_recipe")) + ", queued " + std::to_string(PointerCounter(counters, "fix_dptr_refused_queued_write")) + ", rebase " + std::to_string(PointerCounter(counters, "fix_dptr_refused_rebase")));
+        Require(PointerCounter(counters, "fix_dptr_refused_no_recipe") == 0, "moving equal table pointers lost the cached recipe");
+        Require(PointerCounter(counters, "pipe_q0_dispatch_miss") <= 1, "moving equal table pointers kept missing the queue-0 pre-check");
+        Require(PointerCounter(counters, "fix_dptr_verify_mismatches") == 0, "pointer-key verification mismatched");
+        return;
+    }
+    if (mode == "refresh") {
+        const auto taught = SubmitPointerRefreshDispatch(PointerTable(0));
+        const auto refreshed = SubmitPointerRefreshDispatch(PointerTable(3));
+        std::copy(PointerTable(3).begin(), PointerTable(3).end(), PointerTable(4).begin());
+        const auto reused = SubmitPointerRefreshDispatch(PointerTable(4));
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        Require(taught.value == 64 && refreshed.value == 128 && reused.value == 128, "a moving table with different data wrote a stale value");
+        Require(refreshed.entries == taught.entries && reused.entries == taught.entries && PointerCounter(counters, "fix_dptr_data_refreshed") >= 2, "different table data changed entries from " + std::to_string(taught.entries) + " to " + std::to_string(reused.entries) + " and refreshed " + std::to_string(PointerCounter(counters, "fix_dptr_data_refreshed")) + " words");
+        Require(PointerCounter(counters, "fix_dptr_pipelined") >= 2, "refreshed pointer-key dispatches produced " + std::to_string(PointerCounter(counters, "fix_dptr_pipelined")) + " pipeline items, no-recipe " + std::to_string(PointerCounter(counters, "fix_dptr_refused_no_recipe")) + ", writes " + std::to_string(PointerCounter(counters, "fix_dptr_refused_unbounded_writes")) + ", rejected " + std::to_string(PointerCounter(counters, "fix_dptr_precheck_lookup_rejected")) + PointerRecipeFailures(counters));
+        Require(PointerCounter(counters, "fix_dptr_refused_no_recipe") == 0 && PointerCounter(counters, "fix_dptr_no_recipe_after_refresh") == 0, "a refreshed pointer-key dispatch lost its recipe");
+        Require(PointerCounter(counters, "fix_dptr_verify_mismatches") == 0, "refreshed pointer-key dispatch verification mismatched");
+        return;
+    }
+    if (mode == "bound-resource" || mode == "bound-resource-indirect") {
+        const bool indirect = mode == "bound-resource-indirect";
+        std::copy(PointerTable(0).begin(), PointerTable(0).end(), PointerTable(3).begin());
+        SubmitPointerRefreshDispatch(PointerTable(0), indirect);
+        SubmitPointerRefreshDispatch(PointerTable(0), indirect);
+        Recorder::Collect(Recorder::Clock::now());
+        PointerTable(3)[6] ^= 0xa5u;
+        const auto changed = SubmitPointerRefreshDispatch(PointerTable(3), indirect);
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        Require(changed.value == 64, "a pointer-key bound-resource rebuild changed the dispatch output");
+        Require(PointerCounter(counters, "fix_dptr_served") >= 1, "a pointer-key bound-resource change missed the normalized entry");
+        Require(PointerCounter(counters, "fix_dptr_recipe_rebuilt_bound_resources") >= 1, "a pointer-key bound-resource change rebuilt " + std::to_string(PointerCounter(counters, "fix_dptr_recipe_rebuilt_bound_resources")) + " recipes, served " + std::to_string(PointerCounter(counters, "fix_dptr_served")) + ", refreshed " + std::to_string(PointerCounter(counters, "fix_dptr_data_refreshed")) + ", pipelined " + std::to_string(PointerCounter(counters, "fix_dptr_pipelined")) + ", no-recipe " + std::to_string(PointerCounter(counters, "fix_dptr_refused_no_recipe")) + PointerRecipeFailures(counters));
+        Require(PointerCounter(counters, "fix_dptr_verify_mismatches") == 0, "a pointer-key bound-resource rebuild failed verification");
+        return;
+    }
+    if (mode == "validation") {
+        const auto before = AgcDriver::DriverDetail::Driver::Get().DispatchCacheSize().entries;
+        std::array<PointerDispatchResult, 5> results{};
+        for (std::size_t index = 0; index < results.size(); ++index) {
+            PointerTable(index)[2] = 64u + static_cast<std::uint32_t>(index) * 4u;
+            results[index] = SubmitPointerDispatch(PointerTable(index));
+        }
+        const auto equal = AgcDriver::DriverDetail::Driver::Get().DispatchCacheCounters().equal;
+        const auto reused = SubmitPointerDispatch(PointerTable(0));
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        Require(results[0].value == 64 && results[1].value == 64 && results[2].value == 64 && results[3].value == 128 && results[4].value == 64 && reused.value == 64, "content-prefiltered pointer dispatch changed output");
+        Require(reused.entries == before + 1 && reused.equal == equal + 1, "bounded pointer variants did not retain the first content shape");
+        Require(PointerCounter(counters, "fix_dptr_refused_content") >= 4, "different content was not rejected by the cheap prefilter");
+        Require(PointerCounter(counters, "fix_dptr_refused_validation") == 0, "different content reached full variant validation");
+        return;
+    }
+    if (mode == "non-buffer") {
+        const auto firstPointer = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(PointerTable(3).data()));
+        const auto secondPointer = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(PointerTable(4).data()));
+        const auto first = SubmitPointerDispatch(PointerTable(0), firstPointer);
+        const auto changed = SubmitPointerDispatch(PointerTable(0), secondPointer);
+        const auto moved = SubmitPointerDispatch(PointerTable(1), secondPointer);
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        Require(first.value == 64 && changed.value == 64 && moved.value == 64, "the non-buffer key test changed the dispatch output");
+        Require(changed.entries == first.entries + 1, "a changing non-buffer user word aliased the normalized key");
+        Require(moved.entries == changed.entries && PointerCounter(counters, "fix_dptr_served") == 1, "the pointer word and non-buffer word were not distinguished");
+        return;
+    }
+    if (mode == "queued-write") {
+        SubmitPointerDispatch(PointerTable(0));
+        auto release = std::make_shared<std::atomic<bool>>(false);
+        DrawPipeline::Queue0().Enqueue([release] {
+            while (!release->load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }, {{reinterpret_cast<std::uintptr_t>(PointerTable(1).data()), reinterpret_cast<std::uintptr_t>(PointerTable(1).data() + PointerTable(1).size())}});
+        const auto drains = DrawPipeline::DrainRequestsByOpcode(0x15);
+        std::thread releaser([release, drains] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (DrawPipeline::DrainRequestsByOpcode(0x15) == drains && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            release->store(true, std::memory_order_release);
+        });
+        const auto result = SubmitPointerDispatch(PointerTable(1));
+        releaser.join();
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        Require(result.value == 64, "a dispatch after a queued table write changed output");
+        Require(DrawPipeline::DrainRequestsByOpcode(0x15) > drains, "a pointer-key read overlapping a queued write did not drain");
+        Require(PointerCounter(counters, "fix_dptr_refused_queued_write") >= 1, "a queued-write refusal was not counted");
+        return;
+    }
+    throw std::runtime_error("unknown dispatch pointer-key test mode");
 }
 
 void PipelineStateReusePath(const std::filesystem::path& control) {
@@ -872,6 +1144,28 @@ int main(int argc, char** argv) {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
             DispatchRelocationPath();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--dispatch-pointer-keys-")) {
+            const auto mode = std::string_view(argv[1]).substr(std::string_view("--dispatch-pointer-keys-").size());
+            struct ControlFile {
+                std::filesystem::path path;
+                ~ControlFile() { if (!path.empty()) std::filesystem::remove(path); }
+            } control;
+            if (mode == "toggle") {
+                control.path = std::filesystem::temp_directory_path() / ("agc-dptr-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+#ifdef _WIN32
+                _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+                _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+#else
+                setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+                setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+#endif
+            }
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            DispatchPointerKeysPath(mode, control.path);
             AgcDriverShutdown_nid_postfix();
             return 0;
         }

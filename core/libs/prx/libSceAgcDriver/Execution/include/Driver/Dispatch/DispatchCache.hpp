@@ -54,6 +54,7 @@ struct DispatchVariant {
 
     AtomicSharedPtr<const Recipe> recipe;
     std::atomic<RecipeBuildFailure> recipeFailure{RecipeBuildFailure::NotAttempted};
+    std::shared_ptr<DispatchVariant> recipeOwner;
 
     static constexpr std::uint32_t NoFlatBinding = std::numeric_limits<std::uint32_t>::max();
     std::vector<std::uint32_t> dataPositions;
@@ -65,6 +66,10 @@ struct DispatchVariant {
     };
     WordBitMasks bufferBaseMasks;
     std::vector<BufferBasePatch> bufferBasePatches;
+    struct FeedbackPatch {
+        std::uint32_t position, binding, word, mask;
+    };
+    std::vector<FeedbackPatch> feedbackPatches;
     std::vector<std::uint32_t> userData;
 
     std::uint32_t pushOffset = 0;
@@ -72,6 +77,8 @@ struct DispatchVariant {
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::uint32_t rebasedRegions = 0;
+    std::vector<std::uint8_t> rebasedRuns;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> indirectCapture;
 
@@ -95,6 +102,7 @@ struct DispatchEntry {
     std::vector<std::shared_ptr<DispatchVariant>> variants;
 
     std::uint64_t touched = 0;
+    bool pointerKey = false;
 
     std::list<std::uint64_t>::iterator order;
 };
@@ -134,6 +142,7 @@ struct DataMask {
     std::span<const std::pair<std::uint32_t, std::uint32_t>> feedback;
     bool* feedbackHit = nullptr;
     std::span<const std::pair<std::uint32_t, std::uint32_t>> bufferBases;
+    bool refreshFeedback = false;
 };
 
 bool SameCapturedRuns(std::span<const std::pair<std::uint64_t, std::uint64_t>> before, std::span<const std::pair<std::uint64_t, std::uint64_t>> after);
@@ -166,6 +175,7 @@ void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::ui
 bool CapturedOverPendingWrite(std::span<const ShaderRecompiler::MemoryRegion> regions);
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
+std::uint64_t DispatchPointerKey(std::uint64_t identity, std::span<const std::uint32_t> userData, std::uint64_t pointerWords);
 
 }
 

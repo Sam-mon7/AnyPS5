@@ -6239,6 +6239,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
         recipe->device = state->device;
         recipe->templateRef = resources;
         recipe->key = contentKey;
+        recipe->boundResourceKey = Graphics::ShaderResources::ContentKey(shaders[0], false, true);
         recipe->objects = objects;
         recipe->pushBytes = pushBytes;
         recipe->pushes = pushStages != 0;
@@ -6256,7 +6257,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     return outcome;
 }
 
-RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup, std::shared_ptr<PrivateDispatch> privateDispatch) {
+RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords, const std::array<std::uint32_t, 3>& threadGroup, std::shared_ptr<PrivateDispatch> privateDispatch, bool pointerKey) {
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.DispatchRecipe", ArchB::Recorder::Phase::Record);
@@ -6281,6 +6282,10 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     // may replace the device between the two).
     if (recipe.device != state->device) {
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
+        return RecipeOutcome::Rebuild;
+    }
+    if ((pointerKey || refreshByWords) && Graphics::ShaderResources::ContentKey(shaders[0], false, true) != recipe.boundResourceKey) {
+        if (pointerKey) ArchB::Recorder::Count("fix_dptr_recipe_rebuilt_bound_resources");
         return RecipeOutcome::Rebuild;
     }
     if (hit->presyncSerial != 0) {

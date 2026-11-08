@@ -57,8 +57,8 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
     return hash;
 }
 
-void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
-    std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
+void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied, bool force) {
+    std::uint64_t relocatable = eligible && (force || drawRelocationEnabled()) ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
     const auto covered = [&](std::uint64_t address) {
@@ -336,6 +336,7 @@ std::shared_ptr<DispatchEntry> Driver::relocateDispatchEntry(std::unique_lock<Ag
         copy->feedback = variant->feedback;
         copy->bufferBaseMasks = variant->bufferBaseMasks;
         copy->bufferBasePatches = variant->bufferBasePatches;
+        copy->feedbackPatches = variant->feedbackPatches;
         copy->pushOffset = variant->pushOffset;
         copy->userDataMask = variant->userDataMask;
         copy->userData.assign(userData.begin(), userData.end());
@@ -356,6 +357,68 @@ std::shared_ptr<DispatchEntry> Driver::relocateDispatchEntry(std::unique_lock<Ag
     if (relocated->variants.empty()) return nullptr;
     ArchB::Recorder::Count("fix_dispatch_relocation_donors");
     return relocated;
+}
+
+std::shared_ptr<DispatchEntry> Driver::rebaseDispatchEntry(const std::shared_ptr<DispatchEntry>& entry, std::span<const std::uint32_t> userData) {
+    auto rebased = std::make_shared<DispatchEntry>();
+    rebased->pointerKey = true;
+    for (const auto& variant : entry->variants) {
+        if (variant == nullptr || variant->compiled == nullptr || variant->userData.size() != userData.size()) continue;
+        struct Move {
+            std::uint32_t index, from, to;
+        };
+        std::vector<Move> moves;
+        for (std::uint32_t index = 0; index < userData.size(); ++index) {
+            if (variant->userData[index] != userData[index]) moves.push_back({index, variant->userData[index], userData[index]});
+        }
+        if (moves.empty()) {
+            rebased->variants.push_back(variant);
+            continue;
+        }
+        const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.index < 64u && ((variant->relocatableWords >> move.index) & 1u) != 0u && move.from != 0u && move.to != 0u && ((move.from ^ move.to) & 3u) == 0u; });
+        if (!allowed) continue;
+        auto copy = std::make_shared<DispatchVariant>();
+        copy->runs = variant->runs;
+        copy->words = variant->words;
+        copy->forgetSerial = variant->forgetSerial;
+        copy->compiled = variant->compiled;
+        copy->meshIndexDescriptor = variant->meshIndexDescriptor;
+        copy->shader = variant->shader;
+        copy->recipe.store(variant->recipe.load(std::memory_order_acquire), std::memory_order_relaxed);
+        copy->recipeFailure.store(variant->recipeFailure.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        copy->recipeOwner = variant->recipeOwner != nullptr ? variant->recipeOwner : variant;
+        copy->dataPositions = variant->dataPositions;
+        copy->dataSlots = variant->dataSlots;
+        copy->flatBinding = variant->flatBinding;
+        copy->feedback = variant->feedback;
+        copy->bufferBaseMasks = variant->bufferBaseMasks;
+        copy->bufferBasePatches = variant->bufferBasePatches;
+        copy->feedbackPatches = variant->feedbackPatches;
+        copy->userData = variant->userData;
+        copy->pushOffset = variant->pushOffset;
+        copy->runBases = variant->runBases;
+        copy->relocatableWords = variant->relocatableWords;
+        copy->userDataMask = variant->userDataMask;
+        copy->rebasedRuns.assign(copy->runs.size(), 0);
+        copy->vertexInfo = variant->vertexInfo;
+        copy->indirectCapture = variant->indirectCapture;
+        for (const auto& move : moves) {
+            const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
+            copy->userData[move.index] = move.to;
+            for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
+                if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
+                copy->runs[run].first += delta;
+                copy->runs[run].second += delta;
+                copy->rebasedRuns[run] = 1;
+                ++copy->rebasedRegions;
+            }
+            for (std::uint32_t slot = 0; slot < variant->compiled->shaderDataUserWords.size(); ++slot) {
+                if (variant->compiled->shaderDataUserWords[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
+            }
+        }
+        rebased->variants.push_back(std::move(copy));
+    }
+    return rebased->variants.empty() ? nullptr : rebased;
 }
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {

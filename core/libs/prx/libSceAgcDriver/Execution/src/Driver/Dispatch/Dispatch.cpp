@@ -378,6 +378,16 @@ void NoteMissingRecipe(std::uint32_t queue, bool indirect, RecipeBuildFailure fa
     counts.clear();
 }
 
+const char* PointerRecipeFailureCounter(RecipeBuildFailure failure) {
+    constexpr std::array<const char*, static_cast<std::size_t>(RecipeBuildFailure::Count)> names{
+        "fix_dptr_no_recipe_not_attempted", "fix_dptr_no_recipe_built_missing", "fix_dptr_no_recipe_disabled", "fix_dptr_no_recipe_uncacheable",
+        "fix_dptr_no_recipe_overlay", "fix_dptr_no_recipe_address_table", "fix_dptr_no_recipe_lease", "fix_dptr_no_recipe_copied_writes",
+        "fix_dptr_no_recipe_not_reusable", "fix_dptr_no_recipe_completion", "fix_dptr_no_recipe_objects", "fix_dptr_no_recipe_key"
+    };
+    const auto index = static_cast<std::size_t>(failure);
+    return index < names.size() ? names[index] : names.front();
+}
+
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
     for (const auto& region : captured) {
         const auto address = region.guestAddress;
@@ -402,6 +412,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
     const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
+    const bool dispatchPointerKeys = ArchB::Switches::Enabled(ArchB::Feature::FixDispatchPointerKeys);
     // APS5_ARCHB_FIX_ALLOC_CHURN, once per dispatch (the pipelined commit takes the same value).
     const bool allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
     const ArchB::AllocChurnScope allocChurnScope(allocChurn);
@@ -698,6 +709,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    const auto legacyKey = key;
+    bool pointerKey = false;
+    if (dispatchPointerKeys && !noDispatchCache && !stampValidate()) {
+        std::lock_guard cacheLock(dispatchCacheMutex);
+        if (const auto found = dispatchPointerWords.find(feedbackKey); found != dispatchPointerWords.end()) {
+            key = DispatchPointerKey(feedbackKey, userData, found->second);
+            pointerKey = true;
+        } else {
+            ArchB::Recorder::Count("fix_dptr_refused_unknown");
+        }
+    }
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -725,21 +747,28 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         {
             std::lock_guard cacheLock(dispatchCacheMutex);
             auto found = dispatchCache.find(key);
-            if (found == dispatchCache.end() && feedbackMask && feedbackKey != 0 && !noDispatchCache && !stampValidate()) {
+            if (found != dispatchCache.end() && found->second->pointerKey != pointerKey) found = dispatchCache.end();
+            std::shared_ptr<DispatchEntry> pipelineEntry = found != dispatchCache.end() ? found->second : nullptr;
+            if (pointerKey && pipelineEntry != nullptr) {
+                pipelineEntry = rebaseDispatchEntry(pipelineEntry, userData);
+                if (pipelineEntry == nullptr) ArchB::Recorder::Count("fix_dptr_refused_rebase");
+            }
+            if (!pointerKey && found == dispatchCache.end() && feedbackMask && feedbackKey != 0 && !noDispatchCache && !stampValidate()) {
                 if (const auto alias = dispatchFeedbackKeys.find(feedbackKey); alias != dispatchFeedbackKeys.end()) {
                     if (const auto aliased = dispatchCache.find(alias->second); aliased != dispatchCache.end()) {
                         aliasAvailable = true;
                         if (ArchB::Switches::Enabled(ArchB::Feature::PipeDispatchAlias)) {
                             found = aliased;
+                            pipelineEntry = aliased->second;
                             aliasEntry = true;
                             NoteQ0Dispatch(Q0Dispatch::AliasResolved);
                         }
                     }
                 }
             }
-            if (found != dispatchCache.end()) {
+            if (pipelineEntry != nullptr) {
                 entryFound = true;
-                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+                for (const auto& variant : pipelineEntry->variants) appendEntryRegions(*variant, reads);
             }
         }
         if (!entryFound || noDispatchCache || stampValidate()) {
@@ -753,6 +782,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) {
+                if (pointerKey) ArchB::Recorder::Count("fix_dptr_refused_queued_write");
                 NoteItemFallback(ItemFallback::Reads);
                 NoteQ0Dispatch(Q0Dispatch::Reads);
             }
@@ -777,7 +807,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, feedbackMask, feedbackKey, userData);
+        lookupDispatch(address, submission, key, pointerKey, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, feedbackMask, feedbackKey, userData);
     }
     timing.Mark("lookup_cache");
     if (pipelineCandidate && fallbackCause == DrawPipeline::DrainCause::DispatchMiss && cached) NoteQ0Dispatch(Q0Dispatch::MissThenHit);
@@ -798,13 +828,26 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             itemWrites = DispatchWriteRanges(*compiledResult, bounded, narrowWrites);
             pipelined = bounded;
             if (!bounded) {
+                if (pointerKey && cached) ArchB::Recorder::Count("fix_dptr_refused_unbounded_writes");
                 NoteItemFallback(ItemFallback::Writes);
                 NoteQ0Dispatch(Q0Dispatch::Writes);
             }
             else if (narrowWrites && compiledResult->bdaAbiVersion != 0) DrawPipeline::CountNarrowedDispatchWrites();
             if (!bounded && PipeDrainDiag()) NoteUnboundedDispatchWrites(*compiledResult, true);
             fallbackCause = DrawPipeline::DrainCause::DispatchWrites;
+        } else if (!cached) {
+            if (pointerKey) ArchB::Recorder::Count("fix_dptr_precheck_lookup_rejected");
+            NoteItemFallback(ItemFallback::Miss);
+            NoteQ0Dispatch(Q0Dispatch::Miss);
+            fallbackCause = DrawPipeline::DrainCause::DispatchMiss;
         } else {
+            if (pointerKey) {
+                ArchB::Recorder::Count("fix_dptr_refused_no_recipe");
+                ArchB::Recorder::Count(keepVariant == nullptr ? "fix_dptr_no_recipe_no_variant" : "fix_dptr_no_recipe_served");
+                if (keepVariant != nullptr) ArchB::Recorder::Count(PointerRecipeFailureCounter(keepVariant->recipeFailure.load(std::memory_order_relaxed)));
+                if (dataHit) ArchB::Recorder::Count("fix_dptr_no_recipe_after_refresh");
+                if (indirectSource().arguments != 0) ArchB::Recorder::Count("fix_dptr_no_recipe_indirect");
+            }
             NoteItemFallback(ItemFallback::NoRecipe);
             NoteQ0Dispatch(Q0Dispatch::NoRecipe);
             fallbackCause = DrawPipeline::DrainCause::DispatchNoRecipe;
@@ -880,7 +923,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, genAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, feedbackMask, feedbackKey);
+        insertDispatch(address, key, legacyKey, dispatchPointerKeys, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, genAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, feedbackMask, feedbackKey, userData);
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -912,6 +955,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         return;
     }
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult, feedbackMask);
+    if (pointerKey && cached && verifyDispatchPointerSample()) verifyDispatchPointerHit(snapshot, codeOffset, request, memory, address, *keepVariant, captured, *compiledResult, feedbackMask, dataHit);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
@@ -959,13 +1003,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (profile && cached && keepVariant != nullptr && !stampValidate() && keepVariant->recipe.load(std::memory_order_acquire) == nullptr) NoteMissingRecipe(submission.queue, indirectArguments != 0, keepVariant->recipeFailure.load(std::memory_order_relaxed));
 
     if (pipelined) {
+        if (pointerKey) ArchB::Recorder::Count("fix_dptr_pipelined");
         const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
+        const auto recipeOwner = keepVariant->recipeOwner != nullptr ? keepVariant->recipeOwner : keepVariant;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto ticket = GuestMemory::Gen::Required();
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue([this, allocChurn, partialSnapshot, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
+        DrawPipeline::Queue0().Enqueue([this, allocChurn, partialSnapshot, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, recipeOwner, dataHit, pointerKey, epoch, ticket, htileClearCompletion, computeSync] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);
@@ -1018,7 +1064,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     }
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
-                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, {}, nullptr, pointerKey);
                         if (recipeResult == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
                             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
@@ -1027,21 +1073,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             continue;
                         }
                     } else {
-                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, profile ? &recipeFailure : nullptr);
+                        localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, profile || pointerKey ? &recipeFailure : nullptr);
                     }
                     Stage4::Mark(Stage4::Bucket::DispatchDevice);
                     break;
                 }
                 if (Stage4::ResolveCensus()) Stage4::NoteTemplate(keepVariant.get(), recipeHit == nullptr);
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
-                if (profile && recipeHit == nullptr) keepVariant->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
+                if ((profile || pointerKey) && recipeHit == nullptr) recipeOwner->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
                 if (builtRecipe != nullptr) {
                     if (dataHit) {
                         auto own = std::make_shared<Recipe>(*builtRecipe);
                         own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
                         builtRecipe = std::move(own);
                     }
-                    keepVariant->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                    recipeOwner->recipe.store(std::move(builtRecipe), std::memory_order_release);
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
                 }
             } catch (const std::exception& error) {
@@ -1063,7 +1109,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
     std::shared_ptr<const Recipe> builtRecipe;
     RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    const auto recipeOwner = keepVariant != nullptr && keepVariant->recipeOwner != nullptr ? keepVariant->recipeOwner : keepVariant != nullptr ? keepVariant : attachVariant;
+    auto* const attachTo = stampValidate() ? nullptr : recipeOwner.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
     const auto keysFill = indirectArguments == 0 && !partialLastGroup ? MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) : std::nullopt;
@@ -1131,7 +1178,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const GuestMemory::ReadSiteScope deviceSite(GuestMemory::ReadSite::DispatchDevice);
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
-                const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup, std::move(privateDispatch));
+                const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup, std::move(privateDispatch), pointerKey);
                 if (result == RecipeOutcome::Rebuild) {
 
                     recipeHit = nullptr;
@@ -1140,10 +1187,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 }
                 if (indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else if (indirectArguments != 0) {
-                const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadGroup, profile ? &recipeFailure : nullptr);
+                const auto outcome = localDevice->DispatchIndirect(compiled, indirectArguments, snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr, threadGroup, profile || pointerKey ? &recipeFailure : nullptr);
                 countIndirect(outcome.cpuReason, outcome.argumentReadMs);
             } else {
-                localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, profile ? &recipeFailure : nullptr, std::move(privateDispatch));
+                localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : (attachTo != nullptr ? &builtRecipe : nullptr), htileClearCompletion, profile || pointerKey ? &recipeFailure : nullptr, std::move(privateDispatch));
             }
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
@@ -1152,7 +1199,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto note = keysRecorder->LastWriteNote(keysFill->base, keysFill->bytes);
             if (note != 0 && note != keysNoteBefore) Graphics::NoteKeysFillOnGpu(keysFill->base, keysFill->bytes, *filledKeys);
         }
-        if (profile && attachTo != nullptr && recipeHit == nullptr) attachTo->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
+        if ((profile || pointerKey) && attachTo != nullptr && recipeHit == nullptr) attachTo->recipeFailure.store(recipeFailure, std::memory_order_relaxed);
         if (builtRecipe != nullptr) {
             if (dataHit) {
 

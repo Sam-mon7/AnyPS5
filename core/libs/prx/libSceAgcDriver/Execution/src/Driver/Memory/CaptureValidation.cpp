@@ -95,6 +95,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             const auto position = static_cast<std::uint32_t>(first + i);
             if (((stored ^ fresh) & ~WordMask(data->feedback, position)) == 0u) {
                 if (data->feedbackHit != nullptr) *data->feedbackHit = true;
+                if (data->refreshFeedback && data->live != nullptr) data->live->emplace_back(position, fresh);
                 continue;
             }
             const bool bufferBase = ((stored ^ fresh) & ~WordMask(data->bufferBases, position)) == 0u;
