@@ -100,6 +100,7 @@ enum class Feature : std::uint8_t {
     CLabelLazyPrewait,
     CLabelAwaitedEarly,
     CLabelWake,
+    FixDerivedIndexCache,
     Count
 };
 

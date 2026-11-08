@@ -1828,6 +1828,65 @@ struct ReplayInputsHint {
     VkPipelineStageFlags shaderStages = 0;
 };
 
+struct DerivedIndexKey {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t address = 0;
+    std::uint32_t count = 0;
+    std::uint32_t indexSize = 0;
+    bool quadList = false;
+    bool lastProvoking = false;
+    bool clamp = false;
+    bool skipRestart = false;
+    std::uint32_t limit = 0;
+    bool operator==(const DerivedIndexKey&) const = default;
+};
+
+struct DerivedIndexKeyHash {
+    std::size_t operator()(const DerivedIndexKey& key) const noexcept {
+        std::uint64_t hash = 1469598103934665603ull;
+        for (const std::uint64_t word : {static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(key.device)), key.address, static_cast<std::uint64_t>(key.count), static_cast<std::uint64_t>(key.indexSize) | (static_cast<std::uint64_t>(key.quadList) << 8u) | (static_cast<std::uint64_t>(key.lastProvoking) << 9u) | (static_cast<std::uint64_t>(key.clamp) << 10u) | (static_cast<std::uint64_t>(key.skipRestart) << 11u) | (static_cast<std::uint64_t>(key.limit) << 32u)}) hash = (hash ^ word) * 1099511628211ull;
+        return static_cast<std::size_t>(hash);
+    }
+};
+
+struct DerivedIndexEntry {
+    std::shared_ptr<Buffer> buffer;
+    std::uint32_t maxIndex = 0;
+    std::uint64_t generation = 0;
+    std::size_t size = 0;
+};
+
+struct DerivedIndexCache {
+    VkDevice device = VK_NULL_HANDLE;
+    std::unordered_map<DerivedIndexKey, DerivedIndexEntry, DerivedIndexKeyHash> entries;
+    std::size_t bytes = 0;
+    std::vector<std::byte> source;
+};
+
+constexpr std::size_t DerivedIndexCacheBytes = 256ull << 20u;
+
+DerivedIndexCache& derivedIndexCache(VkDevice device) {
+    thread_local DerivedIndexCache* cache = nullptr;
+    if (cache == nullptr) cache = new DerivedIndexCache();
+    if (cache->device != device) {
+        if (!cache->entries.empty()) {
+            auto* abandoned = new DerivedIndexCache();
+            abandoned->entries.swap(cache->entries);
+        }
+        cache->bytes = 0;
+        cache->device = device;
+    }
+    return *cache;
+}
+
+bool derivedIndexVerify() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_DERIVED_INDEX_CACHE_VERIFY");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawOutcome& outcome, DrawTimer& timer, const DrawRecipe* recipe, const DrawPreparation* preparation = nullptr, const ReplayInputsHint* hint = nullptr) {
     const auto* handoff = recipe == nullptr && preparation != nullptr && preparation->device == context.device && preparation->resolved && resolveHandoff() ? preparation : nullptr;
     DrawInputs inputs;
@@ -1929,10 +1988,35 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const std::uint32_t corners = state.quadList ? 6u : 3u;
         const std::uint32_t outputIndexCount = primitives * corners;
         const std::size_t expandedIndexBytes = static_cast<std::size_t>(outputIndexCount) * sizeof(std::uint32_t);
-        auto indexCopy = std::make_shared<Buffer>(context, expandedIndexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        auto* outIndices = reinterpret_cast<std::uint32_t*>(indexCopy->Bytes().data());
         std::uint32_t maxIdx = 0;
         const bool lastProvoking = state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+        const bool expandedCache = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache);
+        const DerivedIndexKey expandedKey{context.device, draw.indexed ? draw.indexAddress : 0u, draw.indexCount, draw.indexed ? static_cast<std::uint32_t>(draw.indexSize) : 0u, state.quadList, lastProvoking};
+        std::uint64_t expandedGeneration = 0;
+        std::shared_ptr<Buffer> cachedIndices;
+        if (expandedCache) {
+            auto& cache = derivedIndexCache(context.device);
+            if (draw.indexed) {
+                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                expandedGeneration = GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+            }
+            if (draw.indexed && expandedGeneration == 0) {
+                AgcDriver::ArchB::Recorder::Count("fix_dic_refused_untracked");
+            } else if (const auto found = cache.entries.find(expandedKey); found != cache.entries.end()) {
+                if (!draw.indexed || GuestMemory::UnchangedSince(draw.indexAddress, static_cast<std::size_t>(indexBytes), found->second.generation)) {
+                    cachedIndices = found->second.buffer;
+                    maxIdx = found->second.maxIndex;
+                    AgcDriver::ArchB::Recorder::Count("fix_dic_hits");
+                } else {
+                    AgcDriver::ArchB::Recorder::Count("fix_dic_changed");
+                }
+            } else {
+                AgcDriver::ArchB::Recorder::Count("fix_dic_absent");
+            }
+        }
+        const bool verifyHit = cachedIndices != nullptr && derivedIndexVerify();
+        auto indexCopy = cachedIndices != nullptr && !verifyHit ? cachedIndices : std::make_shared<Buffer>(context, expandedIndexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        auto* outIndices = reinterpret_cast<std::uint32_t*>(indexCopy->Bytes().data());
         const auto expand = [&](const auto& source) {
             for (std::uint32_t primitive = 0; primitive < primitives; ++primitive) {
                 auto* out = outIndices + static_cast<std::size_t>(primitive) * corners;
@@ -1971,7 +2055,31 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 for (std::uint32_t corner = 0; corner < corners; ++corner) maxIdx = std::max(maxIdx, out[corner]);
             }
         };
-        if (draw.indexed) {
+        const std::uint32_t cachedMax = maxIdx;
+        if (verifyHit) maxIdx = 0;
+        if (cachedIndices != nullptr && !verifyHit) {
+            if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+            Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "expanded draw vertex range overflow");
+        } else if (draw.indexed && expandedCache) {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+            auto& source = derivedIndexCache(context.device).source;
+            source.resize(static_cast<std::size_t>(indexBytes));
+            GuestMemory::Read(draw.indexAddress, std::span(source), draw.indexSize);
+            if (draw.indexSize == 2) {
+                expand([&](std::uint32_t idx) -> std::uint32_t {
+                    std::uint16_t v = 0;
+                    std::memcpy(&v, source.data() + static_cast<std::size_t>(idx) * 2u, 2);
+                    return v;
+                });
+            } else {
+                expand([&](std::uint32_t idx) -> std::uint32_t {
+                    std::uint32_t v = 0;
+                    std::memcpy(&v, source.data() + static_cast<std::size_t>(idx) * 4u, 4);
+                    return v;
+                });
+            }
+            Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "indexed draw vertex range overflow");
+        } else if (draw.indexed) {
             GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
             GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
             const auto readIndex = [&](std::uint32_t idx) -> std::uint32_t {
@@ -1991,6 +2099,24 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             const std::uint32_t lastVertex = state.quadList ? primitives * 4u - 1u : primitives + 1u;
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - lastVertex, "auto draw vertex range overflow");
             expand([](std::uint32_t idx) { return idx; });
+        }
+        if (verifyHit) {
+            const bool same = maxIdx == cachedMax && std::memcmp(cachedIndices->Bytes().data(), indexCopy->Bytes().data(), expandedIndexBytes) == 0;
+            AgcDriver::ArchB::Recorder::Count("fix_dic_verified");
+            if (!same) AgcDriver::ArchB::Recorder::Count("fix_dic_verify_mismatches");
+        }
+        if (expandedCache && cachedIndices == nullptr && (!draw.indexed || expandedGeneration != 0)) {
+            auto& cache = derivedIndexCache(context.device);
+            if (cache.bytes + expandedIndexBytes > DerivedIndexCacheBytes) {
+                cache.entries.clear();
+                cache.bytes = 0;
+                AgcDriver::ArchB::Recorder::Count("fix_dic_flushes");
+            }
+            auto [slot, inserted] = cache.entries.try_emplace(expandedKey);
+            if (!inserted) cache.bytes -= slot->second.size;
+            slot->second = DerivedIndexEntry{indexCopy, maxIdx, expandedGeneration, expandedIndexBytes};
+            cache.bytes += expandedIndexBytes;
+            AgcDriver::ArchB::Recorder::Count("fix_dic_stored");
         }
         inputs.maxIndex = maxIdx + draw.firstVertex;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
@@ -2031,10 +2157,57 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
                 GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-                auto clamped = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-                const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
-                GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
-                highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                const bool clampCache = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache);
+                DerivedIndexKey clampKey{context.device, draw.indexAddress, draw.indexCount, static_cast<std::uint32_t>(draw.indexSize)};
+                clampKey.clamp = true;
+                clampKey.skipRestart = skipRestart;
+                clampKey.limit = limit;
+                std::uint64_t clampGeneration = 0;
+                std::shared_ptr<Buffer> cachedClamp;
+                std::optional<std::uint32_t> cachedHighest;
+                if (clampCache) {
+                    auto& cache = derivedIndexCache(context.device);
+                    clampGeneration = GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                    if (clampGeneration == 0) {
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_clamp_refused_untracked");
+                    } else if (const auto found = cache.entries.find(clampKey); found != cache.entries.end()) {
+                        if (GuestMemory::UnchangedSince(draw.indexAddress, static_cast<std::size_t>(indexBytes), found->second.generation)) {
+                            cachedClamp = found->second.buffer;
+                            cachedHighest = found->second.maxIndex;
+                            AgcDriver::ArchB::Recorder::Count("fix_dic_clamp_hits");
+                        } else {
+                            AgcDriver::ArchB::Recorder::Count("fix_dic_clamp_changed");
+                        }
+                    } else {
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_clamp_absent");
+                    }
+                }
+                const bool clampVerify = cachedClamp != nullptr && derivedIndexVerify();
+                auto clamped = cachedClamp != nullptr && !clampVerify ? cachedClamp : std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                if (cachedClamp != nullptr && !clampVerify) {
+                    GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+                    highest = cachedHighest;
+                } else {
+                    const auto bytes = clamped->Bytes().first(static_cast<std::size_t>(indexBytes));
+                    GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+                    highest = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
+                    if (clampVerify) {
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_verified");
+                        if (highest != cachedHighest || std::memcmp(cachedClamp->Bytes().data(), bytes.data(), bytes.size()) != 0) AgcDriver::ArchB::Recorder::Count("fix_dic_verify_mismatches");
+                    } else if (clampCache && clampGeneration != 0 && highest) {
+                        auto& cache = derivedIndexCache(context.device);
+                        if (cache.bytes + bytes.size() > DerivedIndexCacheBytes) {
+                            cache.entries.clear();
+                            cache.bytes = 0;
+                            AgcDriver::ArchB::Recorder::Count("fix_dic_flushes");
+                        }
+                        auto [slot, inserted] = cache.entries.try_emplace(clampKey);
+                        if (!inserted) cache.bytes -= slot->second.size;
+                        slot->second = DerivedIndexEntry{clamped, *highest, clampGeneration, bytes.size()};
+                        cache.bytes += bytes.size();
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_clamp_stored");
+                    }
+                }
                 import = nullptr;
                 zeroCopyCopied = false;
                 copy = DrawInputCopy{};
