@@ -2,6 +2,7 @@
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -547,6 +548,7 @@ struct ShaderPreparationTransaction::State {
     static thread_local State* active;
     std::unique_lock<std::mutex> lock{writers, std::defer_lock};
     std::map<PreparedShaders*, Change> changes;
+    std::vector<std::function<void()>> afterCommit;
     bool failed = false;
 
     void Hold() {
@@ -604,6 +606,10 @@ void ShaderPreparationTransaction::Hold() {
     root->Hold();
 }
 
+void ShaderPreparationTransaction::AfterCommit(std::function<void()> action) {
+    root->afterCommit.push_back(std::move(action));
+}
+
 void ShaderPreparationTransaction::Commit() {
     require(!committed && !root->failed, "shader preparation transaction was aborted");
     if (state != nullptr) {
@@ -630,6 +636,9 @@ void ShaderPreparationTransaction::Commit() {
             std::swap(destination.rectangleRequested, change.prepared.rectangleRequested);
             destination.deferred = destination.deferred || change.prepared.deferred;
         }
+        locks.clear();
+        for (auto& action : state->afterCommit) action();
+        state->afterCommit.clear();
     }
     committed = true;
 }
@@ -1076,35 +1085,132 @@ ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::Recomp
 
 }
 
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+namespace {
+
+std::uint64_t InvocationMemoHash(const ShaderRecompiler::RecompileRequest& request, std::size_t codeOffset, std::uint64_t codeHash);
+void RememberInvocation(const ShaderSnapshot& snapshot, std::uint64_t hash, std::size_t codeOffset, std::span<const std::uint64_t> key, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle);
+
+std::shared_ptr<ShaderHitMemoState> ShaderMemoState(const ShaderSnapshot& snapshot) {
+    auto state = snapshot.prepared->hitMemo.load(std::memory_order_acquire);
+    if (state != nullptr) return state;
+    auto created = std::make_shared<ShaderHitMemoState>();
+    if (snapshot.prepared->hitMemo.compare_exchange_strong(state, created, std::memory_order_release, std::memory_order_acquire)) return created;
+    return state;
+}
+
+void RememberConvertedSample(const std::shared_ptr<ShaderHitMemoState>& state, std::size_t codeOffset) {
+    auto current = state->convertedSamples.load(std::memory_order_acquire);
+    for (;;) {
+        if (std::ranges::find(*current, codeOffset) != current->end()) return;
+        auto next = std::make_shared<std::vector<std::size_t>>(*current);
+        next->push_back(codeOffset);
+        std::shared_ptr<const std::vector<std::size_t>> published = std::move(next);
+        if (state->convertedSamples.compare_exchange_weak(current, std::move(published), std::memory_order_release, std::memory_order_acquire)) return;
+    }
+}
+
+}
+
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool memo) {
+    PerformanceTimer timing("Shader.InvocationFor");
+    ArchB::Recorder::Count("fix_shader_memo_invocation_calls");
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
     auto linked = LinkUserDataCallees(request);
     if (linked.code.empty()) linked.code = LinkGraphicsUserDataTail(request, snapshot);
+    timing.Mark("link");
     auto source = request;
     if (!linked.code.empty()) {
         source.shader.code = linked.code;
         source.context.linkedCallFallbacks = linked.fallbacks;
     }
-    std::unique_lock lock(snapshot.prepared->mutex);
-    AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    if (std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end()) source.context.convertedSamples = true;
+    const auto memoState = memo ? ShaderMemoState(snapshot) : nullptr;
+    if (memo) {
+        const auto converted = memoState->convertedSamples.load(std::memory_order_acquire);
+        source.context.convertedSamples = std::ranges::find(*converted, codeOffset) != converted->end();
+    }
     auto invocationRequest = source;
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
-    ShaderRecompiler::BuildPreparedShaderKey(source, key);
+    bool keyBuilt = false;
+    std::uint64_t memoHash = 0;
+    bool memoEligible = memo;
+    if (memoEligible && ShaderRecompiler::DebugProbeActive()) {
+        ArchB::Recorder::Count("fix_shader_memo_invocation_refused_probe");
+        memoEligible = false;
+    }
+    if (memoEligible) {
+        std::uint64_t codeHash = snapshot.CodeDigest();
+        if (!linked.code.empty()) {
+            codeHash = 0xcbf29ce484222325ull;
+            for (const auto word : linked.code) codeHash = (codeHash ^ word) * 0x100000001b3ull;
+        }
+        memoHash = InvocationMemoHash(source, codeOffset, codeHash);
+        const auto memoEntries = memoState->invocations.load(std::memory_order_acquire);
+        for (const auto& entry : *memoEntries) {
+            if (entry.hash != memoHash || entry.codeOffset != codeOffset) continue;
+            if (!keyBuilt) {
+                ShaderRecompiler::BuildPreparedShaderKey(source, key);
+                keyBuilt = true;
+            }
+            if (!std::ranges::equal(entry.key, key)) {
+                ArchB::Recorder::Count("fix_shader_memo_invocation_refused_hash_collision");
+                continue;
+            }
+            const auto preparedCode = ShaderRecompiler::GetPreparedCode(*entry.handle);
+            if (!std::ranges::equal(preparedCode, source.shader.code)) {
+                ArchB::Recorder::Count("fix_shader_memo_invocation_refused_code_collision");
+                continue;
+            }
+            invocationRequest = source;
+            invocationRequest.shader.code = preparedCode;
+            if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) {
+                ArchB::Recorder::Count("fix_shader_memo_invocation_hits");
+                timing.Mark("memo");
+                return std::move(*invocation);
+            }
+            ArchB::Recorder::Count("fix_shader_memo_invocation_refused_validation");
+        }
+        ArchB::Recorder::Count("fix_shader_memo_invocation_misses");
+    }
+    std::unique_lock lock(snapshot.prepared->mutex);
+    AwaitRegisteredPreparation(*snapshot.prepared, lock);
+    const bool converted = std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end();
+    if (converted != source.context.convertedSamples) {
+        source.context.convertedSamples = converted;
+        invocationRequest = source;
+        keyBuilt = false;
+        if (memoEligible) {
+            RememberConvertedSample(memoState, codeOffset);
+            std::uint64_t codeHash = snapshot.CodeDigest();
+            if (!linked.code.empty()) {
+                codeHash = 0xcbf29ce484222325ull;
+                for (const auto word : linked.code) codeHash = (codeHash ^ word) * 0x100000001b3ull;
+            }
+            memoHash = InvocationMemoHash(source, codeOffset, codeHash);
+        }
+    }
+    if (!keyBuilt) {
+        ShaderRecompiler::BuildPreparedShaderKey(source, key);
+        keyBuilt = true;
+    }
+    timing.Mark("key");
     PreparedAtUse preparedAtUse;
     if (!snapshot.prepared->deferredAbis.empty() || snapshot.prepared->deferredPreparing) preparedAtUse = PrepareDeferredAbis(snapshot, lock);
+    timing.Mark("lock");
     for (auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (!linked.code.empty() && !std::ranges::equal(invocationRequest.shader.code, linked.code)) continue;
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) {
             NoteMatchedEntry(entry, preparedAtUse);
+            if (memoEligible) RememberInvocation(snapshot, memoHash, codeOffset, key, entry.handle);
+            timing.Mark("matched");
             return std::move(*invocation);
         }
     }
+    timing.Mark("scan");
     NoteOwnPreparation(preparedAtUse);
     ReportPreparedAtUse(snapshot, source);
     auto handle = PrepareShaderWithDiagnostics(source);
@@ -1112,7 +1218,9 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
     if (!invocation.has_value()) throw std::runtime_error("AGC driver: an artifact prepared at use does not match its invocation");
+    if (memoEligible) RememberInvocation(snapshot, memoHash, codeOffset, key, handle);
     snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
+    timing.Mark("prepared");
     return std::move(*invocation);
 }
 
@@ -1125,7 +1233,10 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(Shade
     {
         std::lock_guard lock(snapshot.prepared->mutex);
         auto& offsets = snapshot.prepared->convertedSamples;
-        if (std::ranges::find(offsets, codeOffset) == offsets.end()) offsets.push_back(codeOffset);
+        if (std::ranges::find(offsets, codeOffset) == offsets.end()) {
+            offsets.push_back(codeOffset);
+            if (const auto state = snapshot.prepared->hitMemo.load(std::memory_order_acquire)) RememberConvertedSample(state, codeOffset);
+        }
     }
     invocation = InvocationFor(snapshot, codeOffset, request);
     return memory.Capture(invocation);
@@ -1211,6 +1322,98 @@ void BuildRegisteredAbiKey(const QueueState& state, const VulkanDevice& device, 
     for (const auto* registers : {&state.shader, &state.context, &state.userConfig}) {
         key.push_back(registers->size());
         registers->ForEach([&](std::uint32_t offset, std::uint32_t value) { key.push_back((static_cast<std::uint64_t>(offset) << 32u) | value); });
+    }
+}
+
+std::uint64_t RegisteredAbiMemoHash(std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive, const VulkanDevice& device) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto append = [&](std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+    append(device.Serial());
+    append(ShaderRecompiler::DebugProbeActive());
+    append(ShaderRecompiler::RayTracingStrict());
+    append(ShaderRecompiler::RayTracingMiss());
+    append(context.size());
+    for (const auto reg : context) append((static_cast<std::uint64_t>(reg.offset) << 32u) | reg.value);
+    append(primitive.size());
+    for (const auto reg : primitive) append((static_cast<std::uint64_t>(reg.offset) << 32u) | reg.value);
+    return hash;
+}
+
+void AppendRegisteredAbiMemoRegisters(std::vector<std::uint64_t>& key, const Registers& base, std::span<const ShaderRegister> patch, std::vector<std::pair<std::uint32_t, std::uint32_t>>& merged) {
+    merged.clear();
+    merged.reserve(base.size() + patch.size());
+    base.ForEach([&](std::uint32_t offset, std::uint32_t value) { merged.emplace_back(offset, value); });
+    for (const auto reg : patch) {
+        const auto found = std::ranges::lower_bound(merged, reg.offset, {}, &std::pair<std::uint32_t, std::uint32_t>::first);
+        if (found != merged.end() && found->first == reg.offset) found->second = reg.value;
+        else merged.insert(found, {reg.offset, reg.value});
+    }
+    key.push_back(merged.size());
+    for (const auto [offset, value] : merged) key.push_back((static_cast<std::uint64_t>(offset) << 32u) | value);
+}
+
+void BuildRegisteredAbiMemoKey(const RegisteredShaderState& state, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive, const VulkanDevice& device, std::vector<std::uint64_t>& key) {
+    key.clear();
+    key.reserve(7u + state.shader.size() + state.context.size() + context.size() + state.userConfig.size() + primitive.size());
+    key.insert(key.end(), {device.Serial(), ShaderRecompiler::DebugProbeActive(), ShaderRecompiler::RayTracingStrict(), ShaderRecompiler::RayTracingMiss()});
+    key.push_back(state.shader.size());
+    state.shader.ForEach([&](std::uint32_t offset, std::uint32_t value) { key.push_back((static_cast<std::uint64_t>(offset) << 32u) | value); });
+    struct AddedRegistersStorage {};
+    auto& added = HostThreadLocal<std::vector<std::pair<std::uint32_t, std::uint32_t>>, AddedRegistersStorage>();
+    AppendRegisteredAbiMemoRegisters(key, state.context, context, added);
+    AppendRegisteredAbiMemoRegisters(key, state.userConfig, primitive, added);
+}
+
+bool RegisteredAbiMemoHit(const ShaderSnapshot& snapshot, std::uint64_t hash, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive, const VulkanDevice& device, std::vector<std::uint64_t>& key) {
+    const auto entries = ShaderMemoState(snapshot)->abis.load(std::memory_order_acquire);
+    bool built = false;
+    for (const auto& entry : *entries) {
+        if (entry.hash != hash) continue;
+        if (!built) {
+            BuildRegisteredAbiMemoKey(*snapshot.registeredState, context, primitive, device, key);
+            built = true;
+        }
+        if (entry.key == key) return true;
+        ArchB::Recorder::Count("fix_shader_memo_resolve_refused_hash_collision");
+    }
+    return false;
+}
+
+void RememberRegisteredAbi(const ShaderSnapshot& snapshot, std::uint64_t hash, std::span<const std::uint64_t> key) {
+    const auto state = ShaderMemoState(snapshot);
+    auto current = state->abis.load(std::memory_order_acquire);
+    for (;;) {
+        if (std::ranges::any_of(*current, [&](const auto& entry) { return entry.hash == hash && std::ranges::equal(entry.key, key); })) return;
+        if (current->size() >= 16u) {
+            ArchB::Recorder::Count("fix_shader_memo_resolve_refused_capacity");
+            return;
+        }
+        auto next = std::make_shared<std::vector<ShaderHitMemoState::AbiEntry>>(*current);
+        next->push_back({hash, {key.begin(), key.end()}});
+        std::shared_ptr<const std::vector<ShaderHitMemoState::AbiEntry>> published = std::move(next);
+        if (state->abis.compare_exchange_weak(current, std::move(published), std::memory_order_release, std::memory_order_acquire)) return;
+    }
+}
+
+std::uint64_t InvocationMemoHash(const ShaderRecompiler::RecompileRequest& request, std::size_t codeOffset, std::uint64_t codeHash) {
+    auto hash = ShaderRecompiler::RecompileCacheKey::ContextHash(request);
+    hash = (hash ^ codeHash) * 0x100000001b3ull;
+    return (hash ^ codeOffset) * 0x100000001b3ull;
+}
+
+void RememberInvocation(const ShaderSnapshot& snapshot, std::uint64_t hash, std::size_t codeOffset, std::span<const std::uint64_t> key, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle) {
+    const auto state = ShaderMemoState(snapshot);
+    auto current = state->invocations.load(std::memory_order_acquire);
+    for (;;) {
+        if (std::ranges::any_of(*current, [&](const auto& entry) { return entry.hash == hash && entry.codeOffset == codeOffset && entry.handle == handle && std::ranges::equal(entry.key, key); })) return;
+        if (current->size() >= 16u) {
+            ArchB::Recorder::Count("fix_shader_memo_invocation_refused_capacity");
+            return;
+        }
+        auto next = std::make_shared<std::vector<ShaderHitMemoState::InvocationEntry>>(*current);
+        next->push_back({hash, codeOffset, {key.begin(), key.end()}, handle});
+        std::shared_ptr<const std::vector<ShaderHitMemoState::InvocationEntry>> published = std::move(next);
+        if (state->invocations.compare_exchange_weak(current, std::move(published), std::memory_order_release, std::memory_order_acquire)) return;
     }
 }
 
@@ -1875,6 +2078,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     BindTitleThread();
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveGraphicsStagesAbi");
+    ArchB::Recorder::Count("fix_shader_memo_resolve_graphics_stages_calls");
     ShaderPreparationTransaction transaction;
     CheckFailure();
     require(!stages.empty(), "graphics ABI has no shader headers");
@@ -2026,9 +2230,13 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveAbi");
     ShaderPreparationTransaction transaction;
+    const bool memo = ArchB::Switches::Enabled(ArchB::Feature::FixShaderHitMemo);
+    ArchB::Recorder::Count("fix_shader_memo_resolve_calls");
     CheckFailure();
     const auto fields = GuestShaderFields(shader);
+    timing.Mark("header");
     if (fields.type != 0 && fields.type != 1) {
+        if (memo) ArchB::Recorder::Count("fix_shader_memo_resolve_refused_type");
         const std::array<const Shader*, 1> stages{shader};
         ResolveGraphicsStagesAbi(stages, context, primitive);
         transaction.Commit();
@@ -2042,26 +2250,49 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         snapshot = RegisteredHeader(*shaders, shader);
         require(snapshot != nullptr, "static ABI refers to a replaced shader header");
     }
+    timing.Mark("snapshot");
     require(snapshot->registeredState != nullptr, "registered shader state is missing");
     QueueState state{};
-    state.shader = snapshot->registeredState->shader;
-    state.context = snapshot->registeredState->context;
-    state.userConfig = snapshot->registeredState->userConfig;
-    for (const auto reg : context) state.context[reg.offset] = reg.value;
-    for (const auto reg : primitive) state.userConfig[reg.offset] = reg.value;
+    const auto buildState = [&] {
+        state.shader = snapshot->registeredState->shader;
+        state.context = snapshot->registeredState->context;
+        state.userConfig = snapshot->registeredState->userConfig;
+        for (const auto reg : context) state.context[reg.offset] = reg.value;
+        for (const auto reg : primitive) state.userConfig[reg.offset] = reg.value;
+    };
+    if (!memo) buildState();
+    timing.Mark("state");
     const auto localDevice = device.Load();
     require(localDevice != nullptr, "shader registration device is missing");
     if (DeferFailedRegistration(*snapshot)) {
+        if (memo) ArchB::Recorder::Count("fix_shader_memo_resolve_refused_failed");
         transaction.Commit();
         return;
     }
     struct RegisteredAbiKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, RegisteredAbiKeyStorage>();
+    std::uint64_t memoHash = 0;
+    if (memo) {
+        memoHash = RegisteredAbiMemoHash(context, primitive, *localDevice);
+        if (RegisteredAbiMemoHit(*snapshot, memoHash, context, primitive, *localDevice, key)) {
+            ArchB::Recorder::Count("fix_shader_memo_resolve_hits");
+            transaction.Commit();
+            timing.Mark("memo");
+            return;
+        }
+        ArchB::Recorder::Count("fix_shader_memo_resolve_misses");
+        buildState();
+    }
     BuildRegisteredAbiKey(state, *localDevice, key);
+    timing.Mark("key");
+    const auto commit = [&] {
+        if (memo) transaction.AfterCommit([snapshot, memoHash, memoKey = std::vector<std::uint64_t>(key)] { RememberRegisteredAbi(*snapshot, memoHash, memoKey); });
+        transaction.Commit();
+    };
     if (LazyShaderPreparation()) {
         const auto& resolved = transaction.Read(*snapshot).registeredAbis;
         if (std::ranges::find(resolved, key) != resolved.end()) {
-            transaction.Commit();
+            commit();
             return;
         }
         std::optional<std::string> invalid;
@@ -2074,7 +2305,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         if (invalid) DeferPipelineStage(prepared, *snapshot, invalid->c_str());
         prepared.registeredAbis.push_back(key);
         prepared.deferred = true;
-        transaction.Commit();
+        commit();
         if (invalid) return;
         PreparedShaders::DeferredAbi deferred{key, {}, {}, localDevice};
         for (const auto reg : context) deferred.context.emplace_back(reg.offset, reg.value);
@@ -2096,14 +2327,15 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         }
     };
     const bool committedAbi = CommittedAbi(*snapshot, key);
+    timing.Mark("committed");
     if (committedAbi && !transaction.Tracks(*snapshot)) {
-        transaction.Commit();
+        commit();
         return;
     }
     auto entries = committedAbi ? std::vector<PreparedShaders::Entry>{} : prepare();
     const auto& registeredAbis = transaction.Read(*snapshot).registeredAbis;
     if (std::ranges::find(registeredAbis, key) != registeredAbis.end()) {
-        transaction.Commit();
+        commit();
         return;
     }
     if (committedAbi) entries = prepare();
@@ -2114,7 +2346,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     }
     if (deferral) DeferPipelineStage(prepared, *snapshot, deferral->c_str());
     prepared.registeredAbis.push_back(key);
-    transaction.Commit();
+    commit();
 }
 
 alignas(256) static const std::uint32_t NullPixelCode[64] = {0xbf810000u};
@@ -2168,6 +2400,7 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
     BindTitleThread();
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveGraphicsAbi");
+    ArchB::Recorder::Count("fix_shader_memo_resolve_graphics_calls");
     CheckFailure();
     if ((primitiveType != 0 && primitiveType != 7 && primitiveType != 17) || pixel == nullptr) return;
     ShaderPreparationTransaction transaction;

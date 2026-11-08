@@ -206,6 +206,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // Arch C labels: a WAIT_REG_MEM past its spin also sleeps on its queue slot's event, which the thread recording a
     // label over the awaited dword sets (the 200 us poll sleep ends early; what satisfies the wait is unchanged).
     {Feature::CLabelWake, "C_LABEL_WAKE", false, true, {}},
+    {Feature::FixShaderHitMemo, "FIX_SHADER_HIT_MEMO", false, true, {}},
     {Feature::FixDerivedIndexCache, "FIX_DERIVED_INDEX_CACHE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};

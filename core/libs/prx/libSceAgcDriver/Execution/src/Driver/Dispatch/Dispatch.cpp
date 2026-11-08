@@ -398,6 +398,7 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool shaderHitMemo = ArchB::Switches::Enabled(ArchB::Feature::FixShaderHitMemo);
     const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
@@ -826,7 +827,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const bool splitCapture = profile && submission.queue == 0 && !resolving;
             std::array<std::chrono::steady_clock::time_point, 4> captureMarks{};
             if (splitCapture) captureMarks[0] = std::chrono::steady_clock::now();
-            auto invocation = InvocationFor(snapshot, codeOffset, request);
+            auto invocation = InvocationFor(snapshot, codeOffset, request, shaderHitMemo);
             timing.Mark("prepared_invocation");
             if (splitCapture) captureMarks[1] = std::chrono::steady_clock::now();
 

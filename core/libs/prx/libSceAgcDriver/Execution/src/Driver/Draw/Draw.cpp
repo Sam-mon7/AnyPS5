@@ -155,6 +155,7 @@ struct DrawTail {
     bool bufferBases = false;
     bool allocChurn = false;
     bool partialSnapshot = false;
+    bool shaderHitMemo = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -477,6 +478,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
     const ArchB::AllocChurnScope allocChurnScope(tail.allocChurn);
     tail.partialSnapshot = ArchB::Switches::Enabled(ArchB::Feature::FixPartialSnapshot);
+    tail.shaderHitMemo = ArchB::Switches::Enabled(ArchB::Feature::FixShaderHitMemo);
     const ArchB::PartialSnapshotScope partialSnapshotScope(tail.partialSnapshot);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
@@ -1285,7 +1287,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         break;
                     }
                 }
-                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, tail.shaderHitMemo, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate);
@@ -1394,7 +1396,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (programResults[0]->meshBarycentrics != meshBarycentrics) {
             const auto pushBytes = programResults[0]->pushConstants.size();
             const auto exports = programResults[0]->parameterExports;
-            compiledStages.push_back(materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, traceToken, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+            compiledStages.push_back(materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, traceToken, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, tail.shaderHitMemo, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[0] = compiledStages.back().get();
             stages[0].program = programResults[0];
@@ -1529,7 +1531,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const bool sameVertex = previousVertexInfo.has_value() == vertexInfos[programIndex].has_value() && (!previousVertexInfo || sameVertexInfo(*previousVertexInfo, *vertexInfos[programIndex]));
                 const auto* capture = !graphics.stages.mesh && !graphics.stages.tessellation && sameVertex ? stageCaptures[programIndex].capture.get() : nullptr;
                 RefreshIndirectStage(result, capture, programs[programIndex], vertexInfos[programIndex], [&] {
-                    return materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
+                    return materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, tail.shaderHitMemo, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
                 });
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");

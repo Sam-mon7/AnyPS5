@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERPREPARATION_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERPREPARATION_HPP
 
+#include <functional>
 #include <memory>
 
 namespace AgcDriver::DriverDetail {
@@ -18,6 +19,7 @@ public:
     const PreparedShaderState& Read(const ShaderSnapshot& snapshot) const;
     bool Tracks(const ShaderSnapshot& snapshot) const;
     void Hold();
+    void AfterCommit(std::function<void()> action);
     void Commit();
 
 private:

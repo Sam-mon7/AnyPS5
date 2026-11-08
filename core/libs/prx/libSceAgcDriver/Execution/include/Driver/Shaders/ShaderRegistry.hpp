@@ -34,6 +34,7 @@ class VulkanDevice;
 namespace AgcDriver::DriverDetail {
 
 struct ShaderSnapshot;
+struct ShaderHitMemoState;
 
 class ShaderRegistry {
     using Chunk = std::map<std::uint64_t, std::vector<std::shared_ptr<const ShaderSnapshot>>>;
@@ -168,6 +169,7 @@ struct PreparedShaders : PreparedShaderState {
     std::exception_ptr failure;
     std::atomic<bool> demanded{false};
     std::atomic<std::uint64_t> recorderDigest{0};
+    std::atomic<std::shared_ptr<ShaderHitMemoState>> hitMemo;
     bool pending = false;
     std::vector<std::size_t> convertedSamples;
 };
@@ -178,6 +180,22 @@ struct RegisteredShaderState {
     Registers userConfig;
 
     bool operator==(const RegisteredShaderState&) const = default;
+};
+
+struct ShaderHitMemoState {
+    struct AbiEntry {
+        std::uint64_t hash;
+        std::vector<std::uint64_t> key;
+    };
+    struct InvocationEntry {
+        std::uint64_t hash;
+        std::size_t codeOffset;
+        std::vector<std::uint64_t> key;
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    };
+    std::atomic<std::shared_ptr<const std::vector<AbiEntry>>> abis{std::make_shared<const std::vector<AbiEntry>>()};
+    std::atomic<std::shared_ptr<const std::vector<InvocationEntry>>> invocations{std::make_shared<const std::vector<InvocationEntry>>()};
+    std::atomic<std::shared_ptr<const std::vector<std::size_t>>> convertedSamples{std::make_shared<const std::vector<std::size_t>>()};
 };
 
 struct ShaderSnapshot {
@@ -236,7 +254,7 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool memo = false);
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::PreparedShaderInvocation& invocation);
 
 }

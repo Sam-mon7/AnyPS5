@@ -1481,13 +1481,132 @@ void DispatchAheadPrewarm() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "s_code_end");
 }
 
+void ShaderHitMemoInvocation(AgcDriver::VulkanDevice& device) {
+    alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
+    std::array<std::uint32_t, 4> users{};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{reinterpret_cast<std::uintptr_t>(code.data()), 0, 0, {code.begin(), code.end()}, {}};
+    snapshot.header.resize(sizeof(Shader));
+    ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, snapshot.codeAddress, snapshot.code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    snapshot.prepared->entries.push_back({0, ShaderRecompiler::PrepareShader(request)});
+    const auto memoEntries = [&] {
+        const auto state = snapshot.prepared->hitMemo.load();
+        return state == nullptr ? 0u : state->invocations.load()->size();
+    };
+    const auto off = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request, false);
+    Require(memoEntries() == 0, "disabled invocation memo published an entry");
+    const auto first = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request, true);
+    Require(memoEntries() == 1, "first invocation did not publish a memo entry");
+    const auto repeated = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request, true);
+    Require(memoEntries() == 1, "repeated invocation missed its memo entry");
+    std::unique_lock preparedLock(snapshot.prepared->mutex);
+    auto unlockedHit = std::async(std::launch::async, [&] { return AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request, true); });
+    const auto unlockedStatus = unlockedHit.wait_for(std::chrono::seconds(2));
+    preparedLock.unlock();
+    Require(unlockedStatus == std::future_status::ready, "invocation memo hit waited for the prepared shader mutex");
+    static_cast<void>(unlockedHit.get());
+    ShaderRecompiler::SrtRuntime runtime{};
+    runtime.userData = users;
+    const auto offCapture = off.Capture(runtime);
+    const auto firstCapture = first.Capture(runtime);
+    const auto repeatedCapture = repeated.Capture(runtime);
+    Require(firstCapture->plan == offCapture->plan && repeatedCapture->plan == offCapture->plan, "memoized invocation did not reuse the fresh resource plan");
+    const auto offResult = off.Materialize(*offCapture);
+    const auto firstResult = first.Materialize(*firstCapture);
+    const auto repeatedResult = repeated.Materialize(*repeatedCapture);
+    Require(firstResult == offResult && repeatedResult == offResult, "memoized invocation did not produce the fresh bindings byte-for-byte");
+    auto changed = request;
+    changed.context.compute->numThreads[0] = 2;
+    const auto changedInvocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, changed, true);
+    const auto changedCapture = changedInvocation.Capture(runtime);
+    Require(memoEntries() == 2 && changedCapture->plan != firstCapture->plan, "changed static input reused the previous invocation plan");
+    static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request, false));
+    Require(memoEntries() == 2, "disabled invocation path changed the memo");
+    static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request, true));
+    Require(memoEntries() == 2, "re-enabled invocation path did not reuse the memo");
+    auto changedTarget = request;
+    changedTarget.target.nonConstantImageOffsets = !changedTarget.target.nonConstantImageOffsets;
+    static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, changedTarget, true));
+    Require(memoEntries() == 3, "changed device target reused the previous invocation memo");
+}
+
+void ShaderHitMemoResolve() {
+    Require(std::getenv("APS5_ARCHB_FIX_SHADER_HIT_MEMO") != nullptr, "shader hit memo switch is not enabled");
+    alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        std::array<ShaderRegister, 1> context{{{0x1b6, 0}}};
+        ShaderSpecialRegs specials{};
+    } header;
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.shader.cx_registers = header.context.data();
+    header.shader.num_cx_registers = header.context.size();
+    header.shader.specials = &header.specials;
+    header.specials.dispatch_modifier = 0x8000;
+    header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    const auto registered = [&] {
+        const auto registry = AgcDriver::DriverDetail::Driver::Get().RegisteredShaders();
+        Require(registry != nullptr, "shader hit memo registration published no registry");
+        auto snapshot = AgcDriver::DriverDetail::RegisteredHeader(*registry, &header.shader);
+        Require(snapshot != nullptr, "shader hit memo registration published no snapshot");
+        return snapshot;
+    };
+    const auto first = registered();
+    const auto abiEntries = [](const auto& snapshot) {
+        const auto state = snapshot->prepared->hitMemo.load();
+        return state == nullptr ? 0u : state->abis.load()->size();
+    };
+    Require(abiEntries(first) == 0, "new shader snapshot inherited an ABI memo");
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+    Require(abiEntries(first) == 1, "first ABI resolve did not publish a memo entry");
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, {});
+    Require(abiEntries(first) == 1, "repeated ABI resolve missed its memo entry");
+    const std::array<ShaderRegister, 1> changed{{{0x1b6, 1}}};
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, changed, {});
+    Require(abiEntries(first) == 2, "changed context register reused an ABI memo entry");
+    const std::array<ShaderRegister, 1> added{{{1, 7}}};
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, changed, added);
+    Require(abiEntries(first) == 3, "added primitive register reused an ABI memo entry");
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, changed, added);
+    Require(abiEntries(first) == 3, "added primitive register missed its ABI memo entry");
+    const std::array<ShaderRegister, 1> aborted{{{0x1b6, 9}}};
+    {
+        AgcDriver::ShaderPreparationScope scope({&header.shader});
+        AgcDriverResolveShaderAbi_nid_postfix(&header.shader, aborted, {});
+        Require(abiEntries(first) == 3, "nested ABI resolve published a memo entry before the outer commit");
+    }
+    Require(abiEntries(first) == 3, "aborted preparation scope published an ABI memo entry");
+    {
+        AgcDriver::ShaderPreparationScope scope({&header.shader});
+        AgcDriverResolveShaderAbi_nid_postfix(&header.shader, aborted, {});
+        scope.Commit();
+    }
+    Require(abiEntries(first) == 4, "committed preparation scope did not publish its ABI memo entry");
+    header.context[0].value = 2;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    const auto replaced = registered();
+    Require(replaced != first && abiEntries(replaced) == 0, "re-registered shader retained the replaced snapshot memo");
+    AgcDriverResolveShaderAbi_nid_postfix(&header.shader, changed, {});
+    Require(abiEntries(replaced) == 1, "re-registered shader did not build a new ABI memo");
+    AgcDriverShutdown_nid_postfix();
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
         const std::string_view abiMode = argc == 2 ? argv[1] : "";
         const bool abiDeferred = abiMode == "--abi-deferred-compute" || abiMode == "--abi-deferred-concurrent" || abiMode == "--abi-deferred-pixel" || abiMode == "--abi-deferred-stages" || abiMode == "--abi-deferred-rectangle" || abiMode == "--abi-deferred-undecodable-state" || abiMode == "--abi-deferred-registration-failure" || abiMode == "--abi-deferred-vertex-inputs" || abiMode == "--abi-deferred-rectangle-pairs";
-        Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--dispatch-ahead-prewarm" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
+        Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--dispatch-ahead-prewarm" || std::string_view(argv[1]) == "--lazy" || std::string_view(argv[1]) == "--shader-hit-memo-invocation" || std::string_view(argv[1]) == "--shader-hit-memo-resolve")), "invalid test arguments");
         if (abiDeferred) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             if (abiMode == "--abi-deferred-compute") AbiDeferredCompute();
@@ -1531,6 +1650,21 @@ int main(int argc, char** argv) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             DeferredUndecodableRegistration();
             std::cout << "deferred undecodable shader tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shader-hit-memo-invocation") {
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            ShaderHitMemoInvocation(*device);
+            std::cout << "shader invocation hit memo tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shader-hit-memo-resolve") {
+            auto available = OpenVulkanTestDevice();
+            if (!available) return VulkanTestSkipped;
+            available.reset();
+            ShaderHitMemoResolve();
+            std::cout << "shader ABI hit memo tests passed\n";
             return 0;
         }
         auto device = OpenVulkanTestDevice();
