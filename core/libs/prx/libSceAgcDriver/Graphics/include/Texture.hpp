@@ -120,6 +120,9 @@ public:
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
+    void UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached);
+    void VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor) const;
+    static std::uint64_t PartialSnapshotVerifyMismatches();
 
 private:
     void release() noexcept;
@@ -158,6 +161,7 @@ private:
     bool copiedOnce = false;
     bool srgbExpand = false;
     GuestTextureResource sourceDescriptor{};
+    VkImageAspectFlags snapshotAspect = VK_IMAGE_ASPECT_COLOR_BIT;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkFormat blockFormat = VK_FORMAT_UNDEFINED;

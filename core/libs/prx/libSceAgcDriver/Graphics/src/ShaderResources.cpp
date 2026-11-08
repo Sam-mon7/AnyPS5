@@ -1038,6 +1038,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     key.clearSnapshot = ClearSnapshotCacheEnabled() && source == nullptr && IsDccClear(*keys);
     std::lock_guard lock(cache.mutex);
     const CacheHold held(sampledCacheHeld);
+    const auto createTexture = [&](auto&&... args) {
+        const CacheHold reclaimable(sampledCacheReclaimable);
+        return std::make_shared<Texture>(context, std::forward<decltype(args)>(args)...);
+    };
     dropUncachedViews(cache);
     std::vector<std::byte> recycled;
     // Why a large sampled texture is made (see LargeTextureReport): an ordinary lookup returns a cached
@@ -1085,6 +1089,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             };
             const auto unchanged = [&] {
                 if (!sameCommitted(it->committed)) return false;
+                if (AgcDriver::ArchB::PartialSnapshotActive() && Recorder::SnapshotWriteOverlaps(address, static_cast<std::size_t>(it->surfaceBytes))) return false;
                 return hasCommitted ? !Recorder::SnapshotWriteOverlaps(address, static_cast<std::size_t>(it->surfaceBytes)) && GuestMemory::UnchangedCommittedSince(committedRanges(), it->generation) : GuestMemory::UnchangedSince(address, static_cast<std::size_t>(it->surfaceBytes), it->generation);
             };
             const auto kept = [&] {
@@ -1097,7 +1102,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) return 0;
                 if (unchanged()) return hasCommitted ? 2 : 1;
                 if (kept()) return 3;
-                if (equalsCommitted()) return 4;
+                if ((!AgcDriver::ArchB::PartialSnapshotActive() || DescribeSurface(resource).layers < 2u) && equalsCommitted()) return 4;
                 return -1;
             }();
             if (acceptance >= 0) {
@@ -1112,6 +1117,98 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return it->texture;
             }
         }
+        if (AgcDriver::ArchB::PartialSnapshotActive()) {
+            const char* refusal = nullptr;
+            SurfaceGeometry geometry;
+            if (it->source != nullptr || it->texture->ViewsStorageImage()) refusal = "fix_psnap_refused_view";
+            else if (source != nullptr) refusal = "fix_psnap_refused_storage_source";
+            else if (it->surfaceBytes != guestBytes) refusal = "fix_psnap_refused_size";
+            else if (it->keys != DccKeys::Uncompressed || *keys != DccKeys::Uncompressed) refusal = "fix_psnap_refused_dcc";
+            else if (!sameCommitted(it->committed)) refusal = "fix_psnap_refused_committed";
+            else if (it->generation == 0 || it->untracked[0] != 0) refusal = "fix_psnap_refused_generation";
+            else if (it->texture->Released()) refusal = "fix_psnap_refused_released";
+            else if (Recorder::Active() == nullptr) refusal = "fix_psnap_refused_recorder";
+            else if (srgbExpand) refusal = "fix_psnap_refused_srgb";
+            else if (IsRepackedTextureFormat(resource.format)) refusal = "fix_psnap_refused_repacked";
+            else {
+                geometry = DescribeSurface(resource);
+                if (resource.dimension == TextureDimension::k3D || geometry.thick || geometry.imageDepth != 1u) refusal = "fix_psnap_refused_3d";
+                else if (geometry.layers < 2u || geometry.imageLayers != geometry.layers || geometry.layerBytes == 0u || geometry.GuestLayerOffset(geometry.layers) != geometry.guestBytes) refusal = "fix_psnap_refused_layout";
+                else {
+                    for (std::uint32_t layer = 0; layer <= geometry.layers && refusal == nullptr; ++layer) {
+                        if (geometry.GuestLayerOffset(layer) != static_cast<std::uint64_t>(layer) * geometry.layerBytes) refusal = "fix_psnap_refused_layout";
+                    }
+                }
+            }
+            std::uint64_t refreshedGeneration = 0;
+            std::optional<CommittedRanges> refreshedCommitted;
+            std::vector<std::uint32_t> changedLayers;
+            if (refusal == nullptr) {
+                GuestMemory::FlushGpuWrites(address, bytes);
+                if (StorageTexture::FindPending(address, guestBytes) != nullptr) refusal = "fix_psnap_refused_storage_source";
+            }
+            if (refusal == nullptr && TextureClearKeys(resource, guestBytes) != DccKeys::Uncompressed) refusal = "fix_psnap_refused_dcc";
+            if (refusal == nullptr) {
+                refreshedGeneration = GuestMemory::CollectWrites(address, bytes);
+                if (refreshedGeneration == 0) {
+                    CommittedRanges ranges;
+                    refreshedGeneration = GuestMemory::CollectCommittedWrites(address, bytes, ranges);
+                    if (refreshedGeneration != 0) refreshedCommitted = std::move(ranges);
+                }
+                if (refreshedGeneration == 0) refusal = "fix_psnap_refused_generation";
+                else if (it->committed != refreshedCommitted) refusal = "fix_psnap_refused_committed";
+            }
+            if (refusal == nullptr) {
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+                if (!GuestMemory::ChangedPages(address, bytes, it->generation, changed)) refusal = "fix_psnap_refused_pages";
+                else {
+                    for (const auto& [runBegin, runEnd] : changed) {
+                        const auto begin = std::max(runBegin, address);
+                        const auto end = std::min(runEnd, address + bytes);
+                        if (begin >= end) continue;
+                        const auto first = static_cast<std::uint32_t>((begin - address) / geometry.layerBytes);
+                        const auto last = static_cast<std::uint32_t>((end - 1u - address) / geometry.layerBytes);
+                        if (last >= geometry.layers) {
+                            refusal = "fix_psnap_refused_layout";
+                            break;
+                        }
+                        for (auto layer = first; layer <= last; ++layer) {
+                            if (changedLayers.empty() || changedLayers.back() != layer) changedLayers.push_back(layer);
+                        }
+                    }
+                    if (refusal == nullptr && changedLayers.empty()) refusal = "fix_psnap_refused_empty";
+                    else if (refusal == nullptr && changedLayers.size() * 2u > geometry.layers) refusal = "fix_psnap_refused_majority";
+                }
+            }
+            if (refusal == nullptr) {
+                it->texture->UpdateSnapshotLayers(*context.detiler, resource, changedLayers, it->bytes);
+                it->generation = refreshedGeneration;
+                it->committed = std::move(refreshedCommitted);
+                it->untracked = {};
+                it->keys = DccKeys::Uncompressed;
+                AgcDriver::ArchB::Recorder::Count("fix_psnap_updates");
+                AgcDriver::ArchB::Recorder::Count("fix_psnap_layers", static_cast<double>(changedLayers.size()));
+                AgcDriver::ArchB::Recorder::Count("fix_psnap_bytes", static_cast<double>(geometry.layerBytes * changedLayers.size()));
+                static const bool verify = [] {
+                    const char* value = std::getenv("APS5_ARCHB_FIX_PARTIAL_SNAPSHOT_VERIFY");
+                    return value != nullptr && std::string_view(value) == "1";
+                }();
+                static std::atomic<std::uint64_t> verifySamples{0};
+                if (verify && (verifySamples.fetch_add(1, std::memory_order_relaxed) & 63u) == 0u) {
+                    std::vector<std::byte> full(bytes);
+                    ReadTextureSurface(resource, DccKeys::Uncompressed, full);
+                    const auto reference = createTexture(*context.detiler, resource, components, full, depthCompare);
+                    it->texture->VerifySnapshot(*reference, resource);
+                    AgcDriver::ArchB::Recorder::Count("fix_psnap_verify_updates");
+                }
+                touchTexture(cache, it);
+                logTextureLookup(*it, resource, refreshedGeneration);
+                reportTextureCounters();
+                if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+                return it->texture;
+            }
+            AgcDriver::ArchB::Recorder::Count(refusal);
+        }
         if (large) largeWhy = LargeTextureStaleReason(*it, source.get(), guestBytes, *keys, stagedFlushed, hasCommitted ? &committedRanges() : nullptr, address);
         if (it->bytes.size() == bytes) recycled = std::move(it->bytes);
         else parkSnapshot(cache, it->bytes);
@@ -1123,10 +1220,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     CachedTexture entry{key, address, source != nullptr ? std::vector<std::byte>{} : (recycled.empty() ? std::vector<std::byte>(bytes) : std::move(recycled)), nullptr, *keys, snapshotGeneration};
     storeCommitted(entry.committed);
     entry.surfaceBytes = bytes;
-    const auto createTexture = [&](auto&&... args) {
-        const CacheHold reclaimable(sampledCacheReclaimable);
-        return std::make_shared<Texture>(context, std::forward<decltype(args)>(args)...);
-    };
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -1148,6 +1241,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
+        if (AgcDriver::ArchB::PartialSnapshotActive()) AgcDriver::ArchB::Recorder::Count("fix_psnap_full_makes");
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);

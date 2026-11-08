@@ -53,6 +53,7 @@ enum class Feature : std::uint8_t {
     PipeDrawLookupMemo,
     FixStableFailedWide,
     FixSnapshotPageRefresh,
+    FixPartialSnapshot,
     FixSnapshotCandidates,
     FixMovedWordUpload,
     FixUnstampedAlias,
@@ -136,6 +137,18 @@ public:
     ~AllocChurnScope();
     AllocChurnScope(const AllocChurnScope&) = delete;
     AllocChurnScope& operator=(const AllocChurnScope&) = delete;
+
+private:
+    bool previous;
+};
+
+bool PartialSnapshotActive() noexcept;
+class PartialSnapshotScope {
+public:
+    explicit PartialSnapshotScope(bool active) noexcept;
+    ~PartialSnapshotScope();
+    PartialSnapshotScope(const PartialSnapshotScope&) = delete;
+    PartialSnapshotScope& operator=(const PartialSnapshotScope&) = delete;
 
 private:
     bool previous;

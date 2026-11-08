@@ -109,6 +109,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::PipeDrawLookupMemo, "PIPE_DRAW_LOOKUP_MEMO", false, true, PipeDrawLookupMemoPrerequisites},
     {Feature::FixStableFailedWide, "FIX_STABLE_FAILED_WIDE", false, true, {}},
     {Feature::FixSnapshotPageRefresh, "FIX_SNAPSHOT_PAGE_REFRESH", false, true, {}},
+    {Feature::FixPartialSnapshot, "FIX_PARTIAL_SNAPSHOT", false, true, {}},
     {Feature::FixSnapshotCandidates, "FIX_SNAPSHOT_CANDIDATES", false, true, {}},
     {Feature::FixMovedWordUpload, "FIX_MOVED_WORD_UPLOAD", false, true, {}},
     {Feature::FixUnstampedAlias, "FIX_UNSTAMPED_ALIAS", false, true, {}},
@@ -386,6 +387,7 @@ bool Switches::Enabled(Feature feature) {
 
 namespace {
 struct AllocChurnSlot {};
+struct PartialSnapshotSlot {};
 }
 
 bool AllocChurnActive() noexcept {
@@ -398,6 +400,18 @@ AllocChurnScope::AllocChurnScope(bool active) noexcept : previous(HostThreadSlot
 
 AllocChurnScope::~AllocChurnScope() {
     HostThreadSlot<bool, AllocChurnSlot>::Set(previous);
+}
+
+bool PartialSnapshotActive() noexcept {
+    return HostThreadSlot<bool, PartialSnapshotSlot>::Get();
+}
+
+PartialSnapshotScope::PartialSnapshotScope(bool active) noexcept : previous(HostThreadSlot<bool, PartialSnapshotSlot>::Get()) {
+    HostThreadSlot<bool, PartialSnapshotSlot>::Set(active);
+}
+
+PartialSnapshotScope::~PartialSnapshotScope() {
+    HostThreadSlot<bool, PartialSnapshotSlot>::Set(previous);
 }
 
 void Switches::CountUpperBoundHit(Feature feature) {

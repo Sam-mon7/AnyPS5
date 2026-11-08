@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
@@ -231,6 +232,26 @@ std::array<std::uint32_t, 8> Descriptor(std::uint64_t address, std::uint32_t sid
         0u,
         0u,
     };
+}
+
+std::array<std::uint32_t, 8> ArrayDescriptor(std::uint64_t address, std::uint32_t side = 64, std::uint32_t layers = 4, std::uint32_t levels = 3) {
+    auto words = Descriptor(address, side);
+    words[3] = (words[3] & ~((0xfu << 16u) | (0xfu << 28u))) | ((levels - 1u) << 16u) | (13u << 28u);
+    words[4] = layers - 1u;
+    words[5] = (levels - 1u) << 4u;
+    return words;
+}
+
+std::array<std::uint32_t, 8> VolumeDescriptor(std::uint64_t address, std::uint32_t side = 64, std::uint32_t depth = 4) {
+    auto words = Descriptor(address, side);
+    words[3] = (words[3] & ~(0xfu << 28u)) | (10u << 28u);
+    words[4] = depth - 1u;
+    return words;
+}
+
+void WriteBytes(std::uint64_t address, std::size_t bytes, std::byte value) {
+    const std::vector data(bytes, value);
+    AgcDriver::GuestMemory::Write(address, data);
 }
 
 void Run(const Context& context, ReservedSurface& surface) {
@@ -814,6 +835,88 @@ void PendingStores(Context context, ReservedSurface& surface) {
     Require(*unrelated, "the unrelated pending completion did not run when synchronized");
 }
 
+void PartialSnapshot(Context context, ReservedSurface& surface, std::string_view mode) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    auto words = mode == "3d" ? VolumeDescriptor(surface.Address()) : ArrayDescriptor(surface.Address());
+    auto geometry = DescribeSurface(DecodeTextureResource(words));
+    std::unique_ptr<ReservedSurface> metadata;
+    if (mode == "dcc") {
+        metadata = std::make_unique<ReservedSurface>(BlockBytes);
+        metadata->Commit(0, BlockBytes);
+        std::memset(metadata->Data(), 0xff, BlockBytes);
+        words[6] = (1u << 21u) | (static_cast<std::uint32_t>((metadata->Address() >> 8u) & 0xffu) << 24u);
+        words[7] = static_cast<std::uint32_t>(metadata->Address() >> 16u);
+        geometry = DescribeSurface(DecodeTextureResource(words));
+    }
+    std::array<std::uint32_t, 8> changedSizeWords{};
+    auto committedBytes = geometry.guestBytes;
+    if (mode == "size") {
+        changedSizeWords = ArrayDescriptor(surface.Address(), 128);
+        committedBytes = std::max(committedBytes, DescribeSurface(DecodeTextureResource(changedSizeWords)).guestBytes);
+    }
+    Require(committedBytes <= LargeSurfaceBytes && committedBytes % BlockBytes == 0, "the partial snapshot fixture surface is invalid");
+    for (std::size_t offset = 0; offset < committedBytes; offset += BlockBytes) surface.Commit(offset, BlockBytes);
+    std::memset(surface.Data(), 0x5a, static_cast<std::size_t>(committedBytes));
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto lookup = [&](const auto& descriptor, bool active) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const AgcDriver::ArchB::PartialSnapshotScope scope(active);
+        return CachedSampledTexture(context, descriptor);
+    };
+    auto previous = lookup(words, true);
+    Require(previous != nullptr && !previous->ViewsStorageImage(), "the partial snapshot fixture did not create a sampled snapshot");
+    Require(lookup(words, true) == previous, "the unchanged partial snapshot fixture was not cached");
+    const auto mismatches = Texture::PartialSnapshotVerifyMismatches();
+    if (mode == "cpu") {
+        WriteBytes(surface.Address() + geometry.GuestLayerOffset(1), static_cast<std::size_t>(geometry.layerBytes), std::byte{0x11});
+        Require(lookup(words, true) == previous, "a CPU layer rewrite replaced the partial snapshot");
+    } else if (mode == "pending") {
+        const auto address = surface.Address() + geometry.GuestLayerOffset(2) + 4096;
+        std::vector<std::byte> original(reinterpret_cast<const std::byte*>(surface.Data() + geometry.GuestLayerOffset(2) + 4096), reinterpret_cast<const std::byte*>(surface.Data() + geometry.GuestLayerOffset(2) + 8192));
+        const auto landed = std::make_shared<bool>(false);
+        recorder.NotePendingWrite(address, original.size());
+        recorder.OnComplete([address, landed, original = std::move(original)] {
+            const std::vector<std::byte> current(original.size(), std::byte{0x22});
+            AgcDriver::GuestMemory::WriteChanged(address, current, original);
+            *landed = true;
+        });
+        recorder.Submit();
+        Require(lookup(words, true) == previous, "a pending GPU layer write replaced the partial snapshot");
+        Require(*landed, "the partial snapshot update did not wait for its pending GPU write");
+    } else if (mode == "boundary") {
+        const auto boundary = surface.Address() + geometry.GuestLayerOffset(1);
+        WriteBytes(boundary - 4096, 8192, std::byte{0x33});
+        Require(lookup(words, true) == previous, "a layer-boundary rewrite replaced the partial snapshot");
+    } else if (mode == "full") {
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) WriteBytes(surface.Address() + geometry.GuestLayerOffset(layer), 4096, std::byte{static_cast<unsigned char>(0x40 + layer)});
+        Require(lookup(words, true) != previous, "a rewrite of every layer used the partial snapshot path");
+    } else if (mode == "committed") {
+        surface.Decommit(static_cast<std::size_t>(geometry.GuestLayerOffset(1)), static_cast<std::size_t>(geometry.layerBytes));
+        Require(lookup(words, true) != previous, "a changed committed range used the partial snapshot path");
+    } else if (mode == "dcc") {
+        WriteBytes(metadata->Address(), DccKeyBytes(geometry.guestBytes), std::byte{0});
+        Require(lookup(words, true) != previous, "changed DCC keys used the partial snapshot path");
+    } else if (mode == "size") {
+        Require(lookup(changedSizeWords, true) != previous, "a changed surface size used the partial snapshot path");
+    } else if (mode == "3d") {
+        WriteBytes(surface.Address(), 4096, std::byte{0x55});
+        Require(lookup(words, true) != previous, "a 3D texture used the partial snapshot path");
+    } else if (mode == "toggle") {
+        WriteBytes(surface.Address() + geometry.GuestLayerOffset(0), static_cast<std::size_t>(geometry.layerBytes), std::byte{0x61});
+        previous = lookup(words, false);
+        WriteBytes(surface.Address() + geometry.GuestLayerOffset(1), static_cast<std::size_t>(geometry.layerBytes), std::byte{0x62});
+        Require(lookup(words, true) == previous, "the enabled partial snapshot switch did not keep the texture selected at lookup entry");
+        WriteBytes(surface.Address() + geometry.GuestLayerOffset(2), static_cast<std::size_t>(geometry.layerBytes), std::byte{0x63});
+        Require(lookup(words, false) != previous, "the disabled partial snapshot switch kept a stale texture");
+    } else throw std::runtime_error("unknown partial snapshot test mode");
+    recorder.Sync();
+    Require(Texture::PartialSnapshotVerifyMismatches() == mismatches, "the partial snapshot differs from a fresh full snapshot");
+}
+
 #ifdef _WIN32
 void KeySynchronization(Context context, ReservedSurface& partial) {
     PlaceholderImages placeholders(context);
@@ -900,7 +1003,8 @@ int main(int argc, char** argv) {
             context.detiler = &detiler;
             const bool large = argc == 2 && std::string_view(argv[1]) == "--large-tracked";
             const bool largeAlias = argc == 2 && std::string_view(argv[1]) == "--large-alias";
-            ReservedSurface surface(large || largeAlias ? LargeSurfaceBytes : SurfaceBytes);
+            const bool partialSnapshot = argc == 2 && std::string_view(argv[1]).starts_with("--psnap-");
+            ReservedSurface surface(large || largeAlias || partialSnapshot ? LargeSurfaceBytes : SurfaceBytes);
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (large) {
                 LargeTracked(context, surface, LargeSurfaceBytes);
@@ -933,7 +1037,8 @@ int main(int argc, char** argv) {
                 std::puts("skipped, only Windows host imports leave the write watch with a hint");
                 return Skipped;
 #endif
-            } else Run(context, surface);
+            } else if (partialSnapshot) PartialSnapshot(context, surface, std::string_view(argv[1]).substr(8));
+            else Run(context, surface);
             ClearCachedTextures(context.device);
         }
         device.reset();

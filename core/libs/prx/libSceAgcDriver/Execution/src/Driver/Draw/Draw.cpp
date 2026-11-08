@@ -154,6 +154,7 @@ struct DrawTail {
     bool imageTableBitScanKeys = false;
     bool bufferBases = false;
     bool allocChurn = false;
+    bool partialSnapshot = false;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -475,6 +476,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // of the draw, and the finisher and pipelined commits take the same value from the tail.
     tail.allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
     const ArchB::AllocChurnScope allocChurnScope(tail.allocChurn);
+    tail.partialSnapshot = ArchB::Switches::Enabled(ArchB::Feature::FixPartialSnapshot);
+    const ArchB::PartialSnapshotScope partialSnapshotScope(tail.partialSnapshot);
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
@@ -1070,6 +1073,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
             const ArchB::AllocChurnScope allocChurnScope(job.allocChurn);
+            const ArchB::PartialSnapshotScope partialSnapshotScope(job.partialSnapshot);
             DrawPipeline::FollowEpoch(job.epoch, job.ticket);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             ArchB::Recorder::Work recorderWork(job.recorderKey, ArchB::Recorder::Phase::Prepare, false);
@@ -1547,9 +1551,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 const auto commitPacket = tail.packetOpcode;
                 const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
                 const auto ticket = GuestMemory::Gen::Required();
-                auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, ticket, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, ticket, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
                     ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
                     const ArchB::AllocChurnScope allocChurnScope(allocChurn);
+                    const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);
                     PerformanceTimer recorderTiming("Driver.DrawCommit");
                     DrawPipeline::FollowEpoch(epoch, ticket);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
@@ -1606,13 +1611,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
         // and the commit hands `resolution` to its preparation.
         const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
-        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
+        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
             if (resolving) {
                 DrawPipeline::FollowResolveEpoch(epoch);
                 return localDevice->ResolveDraw(decode->state, drawParameters, stages, recipe.get(), memoVirtualQuery, resolution, *resolveReads);
             }
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
+            const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);
             PerformanceTimer recorderTiming("Driver.DrawCommit");
             DrawPipeline::FollowEpoch(epoch, ticket);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
