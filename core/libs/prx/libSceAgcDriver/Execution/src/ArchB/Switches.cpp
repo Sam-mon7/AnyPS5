@@ -90,6 +90,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::GenLockfree, "GEN_LOCKFREE", false, true, GenLockfreePrerequisites},
     {Feature::GenDrawValidation, "GEN_DRAW_VALIDATION", false, true, GenDrawValidationPrerequisites},
     {Feature::PipeQ0Committer, "PIPE_Q0_COMMITTER", false, true, {}},
+    {Feature::ParallelDrawPrep, "PARALLEL_DRAW_PREP", false, true, {}},
     {Feature::PipeKeepIndirectRegs, "PIPE_KEEP_INDIRECT_REGS", false, true, PipeKeepIndirectRegsPrerequisites},
     {Feature::PipeIndirectGpuArgs, "PIPE_INDIRECT_GPU_ARGS", false, true, PipeIndirectGpuArgsPrerequisites},
     {Feature::PipeNarrowDrawWrites, "PIPE_NARROW_DRAW_WRITES", false, true, PipeNarrowDrawWritesPrerequisites},

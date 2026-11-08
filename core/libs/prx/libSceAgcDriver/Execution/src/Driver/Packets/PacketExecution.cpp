@@ -183,6 +183,14 @@ void Driver::execute(const Submission& submission) {
     // the whole submission runs one way. The switch also selects dispatch items for queue 0.
     bool pipeSwitch = false;
     const bool pipelined = submission.queue == 0 && DrawPipeline::SampleQueue0(pipeSwitch);
+    if (submission.queue == 0) {
+        const bool parallel = pipelined && ArchB::Switches::Enabled(ArchB::Feature::ParallelDrawPrep);
+        if (parallel != DrawFinisher::ParallelActive()) {
+            DrawFinisher::Get().Drain();
+            if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Transition);
+            DrawFinisher::SetParallelActive(parallel);
+        }
+    }
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     DrawPipeline::Active() = pipelined;
     GuestMemory::SetCollectShareProducer(pipelined);

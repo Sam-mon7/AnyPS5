@@ -169,7 +169,7 @@ public:
     std::optional<ItemKind> NewestWriter(std::uint64_t address, std::size_t bytes, Range* overlapped = nullptr);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     Watch WatchWrites();
-    bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
+    bool WrittenSince(const Watch& watch, const std::vector<Range>& reads, bool includeFinisher = true);
     std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
     void NoteDecodeDrain() { decodeDrains.fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
@@ -260,6 +260,15 @@ public:
         std::vector<std::byte> labelBytes;
     };
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
+    enum class ParallelFallback : std::uint8_t { CachePublish, Drain, Label, MutableGlobal, Unbounded, Footprint, Count };
+    class PreparationScope {
+    public:
+        PreparationScope();
+        ~PreparationScope();
+
+    private:
+        bool previous;
+    };
     static bool Overlap();
     bool PendingOverlaps(std::uint64_t begin, std::uint64_t end);
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
@@ -272,26 +281,51 @@ public:
     static DrawFinisher& Get();
     static bool Enabled();
     static bool OnFinisherThread();
+    static bool OnPreparationThread();
+    static bool ParallelActive();
+    static void SetParallelActive(bool active);
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
     // Like DrawPipeline: never waits while the caller holds the GPU mutex (Enqueue goes past the
     // depth; Drain and Settle wait with the hold given up).
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
+    std::uint64_t EnqueueParallel(Job prepare, Job publish, Pending held);
+    static void CountParallelEligible();
+    static void CountParallelFallback(ParallelFallback reason);
+    static void CountParallelStaleRebuilt();
+    static void CountParallelStaleFallback();
+    static void CountParallelVerifyMismatch();
+    static std::uint64_t ParallelDispatchedCount();
+    static std::uint64_t ParallelVerifyEvery();
     void Drain();
     void Settle();
     void ReleaseRan();
 
 private:
+    struct Slot {
+        std::uint64_t ordinal = 0;
+        Job prepare;
+        Job publish;
+        std::exception_ptr failure;
+        bool parallel = false;
+        bool ready = false;
+    };
     DrawFinisher() = default;
     void run();
+    void runWorker(std::size_t index);
+    void startWorkers();
     void waitEmpty(bool rethrow);
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
-    std::deque<Job> jobs;
+    std::deque<std::shared_ptr<Slot>> jobs;
+    std::deque<std::shared_ptr<Slot>> workerJobs;
     std::deque<Pending> pending;
-    std::vector<Job> ran;
+    std::vector<std::shared_ptr<Slot>> ran;
+    std::array<std::thread, 3> workers;
+    bool workersStarted = false;
+    std::uint64_t nextOrdinal = 0;
     std::exception_ptr failure;
     bool running = false;
     bool sleeping = false;

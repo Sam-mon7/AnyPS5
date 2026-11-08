@@ -33,6 +33,7 @@
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::DriverDetail::DrawFinisher;
 using AgcDriver::DriverDetail::DrawPipeline;
 
 constexpr std::byte Kept{0x40};
@@ -127,6 +128,10 @@ void AppendIndirect(std::vector<std::uint32_t>& commands) {
     Append(commands, 0x24, {0, BaseVertexLocation, 0, 2});
 }
 
+void AppendGpuIndirect(std::vector<std::uint32_t>& commands) {
+    Append(commands, 0x24, {0, 0x280, 0, 2});
+}
+
 void AppendLabel(std::vector<std::uint32_t>& commands, std::uint32_t* target, std::uint32_t value) {
     const auto address = reinterpret_cast<std::uintptr_t>(target);
     commands.insert(commands.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value, 0, 0});
@@ -202,16 +207,18 @@ void DrawDirectReference() {
     Require(direct != 0 && direct != DirectMemory.size(), "the direct draw covered " + std::to_string(direct) + " of " + std::to_string(DirectMemory.size()) + " bytes, expected an edge through the target");
 }
 
-void IndirectDrawsQueueBehindTheCommitter() {
+void IndirectDrawsQueueBehindTheCommitter(bool gpu = false) {
     FirstMemory.fill(Kept);
     SecondMemory.fill(Kept);
     std::vector<std::uint32_t> commands;
     AppendState(commands);
     AppendRecords(commands, Records.data());
-    AppendTarget(commands, FirstMemory, Clipped);
-    AppendIndirect(commands);
-    AppendTarget(commands, SecondMemory, Clipped);
-    AppendIndirect(commands);
+    AppendTarget(commands, FirstMemory, gpu ? 0 : Clipped);
+    if (gpu) AppendGpuIndirect(commands);
+    else AppendIndirect(commands);
+    AppendTarget(commands, SecondMemory, gpu ? 0 : Clipped);
+    if (gpu) AppendGpuIndirect(commands);
+    else AppendIndirect(commands);
     Blocker blocker;
     SubmitBehind(blocker, commands, 3);
     const auto start = std::chrono::steady_clock::now();
@@ -428,7 +435,13 @@ int main(int argc, char** argv) {
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         DrawDirectReference();
-        if (mode == "--gpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(true);
+        if (mode == "--parallel-prep") {
+            IndirectDrawsQueueBehindTheCommitter(true);
+            IndirectDrawsQueueBehindTheCommitter(true);
+            const auto before = DrawFinisher::ParallelDispatchedCount();
+            IndirectDrawsQueueBehindTheCommitter(true);
+            Require(DrawFinisher::ParallelDispatchedCount() > before, "GPU-side indirect draws did not use parallel preparation");
+        } else if (mode == "--gpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(true);
         else if (mode == "--cpu-args-written") IndirectArgumentsWrittenByAQueuedDraw(false);
         else if (mode == "--sliced-depth-outside") SlicedDepthWriterBeforeIndirectDraw(false);
         else if (mode == "--sliced-depth-inside") SlicedDepthWriterBeforeIndirectDraw(true);

@@ -6125,7 +6125,7 @@ void prelockPrecollect(const ShaderResources& cached, bool memoVirtualQuery) {
 }
 }
 
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation* resolved) {
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, DrawPreparation* resolved, bool workerSafe) {
     // Stage 4 M4: the committer's unlocked preparation (precollects, template find, target proofs).
     Stage4::Mark(Stage4::Bucket::Pre);
     struct Stage4Prelock {
@@ -6201,7 +6201,7 @@ DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm
         prepared.resourceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
         const bool handoff = ArchB::Switches::Enabled(ArchB::Feature::PrelockFindHandoff);
         if (handoff) prepared.resolvedCacheSerial = SharedResourceCache().Mutations();
-        cached = SharedResourceCache().Find(prepared.resourceKey);
+        cached = workerSafe ? SharedResourceCache().Peek(prepared.resourceKey) : SharedResourceCache().Find(prepared.resourceKey);
         if (handoff) {
             prepared.resolvedFind = true;
             prepared.resolvedTemplate = cached;

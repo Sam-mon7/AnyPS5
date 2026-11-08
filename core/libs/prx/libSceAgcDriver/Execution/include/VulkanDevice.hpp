@@ -376,7 +376,7 @@ public:
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
-    Graphics::DrawPreparation PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false, Graphics::DrawPreparation* resolved = nullptr);
+    Graphics::DrawPreparation PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false, Graphics::DrawPreparation* resolved = nullptr, bool workerSafe = false);
     std::uint64_t ResolveDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, const DrawRecipe* recipe, bool memoVirtualQuery, Graphics::DrawPreparation& out, std::vector<std::pair<std::uint64_t, std::uint64_t>>& reads);
     RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr, Graphics::DrawPreparation* preparation = nullptr, bool pipelineStateReuse = false);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect

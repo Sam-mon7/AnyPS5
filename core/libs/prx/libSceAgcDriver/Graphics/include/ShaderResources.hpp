@@ -943,6 +943,7 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Peek(const Key& key) const;
     // The hash the cache's index uses (ResourceCacheMemo keys its table with it).
     static std::size_t HashKey(const Key& key) noexcept { return KeyHash{}(key); }
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the

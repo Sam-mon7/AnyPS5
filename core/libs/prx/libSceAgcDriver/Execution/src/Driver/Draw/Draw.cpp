@@ -122,6 +122,30 @@ std::string_view TrimmedReason(std::string_view reason) {
 }
 
 
+struct ParallelPreparedInput {
+    std::uint64_t address = 0;
+    std::vector<std::byte> bytes;
+    std::uint64_t generation = 0;
+    bool operator==(const ParallelPreparedInput& other) const {
+        return address == other.address && bytes == other.bytes;
+    }
+};
+
+struct ParallelPreparedView {
+    std::vector<ParallelPreparedInput> inputs;
+    std::vector<std::uint32_t> resources;
+    std::vector<std::uint64_t> stages;
+    std::vector<std::byte> pushConstants;
+    std::vector<std::uint32_t> pushedWords;
+    std::uintptr_t recipe = 0;
+    std::uintptr_t resourceTemplate = 0;
+    std::uintptr_t pipeline = 0;
+    std::uint64_t drawKey = 0;
+    bool operator==(const ParallelPreparedView& other) const {
+        return inputs == other.inputs && resources == other.resources && stages == other.stages && pushConstants == other.pushConstants && pushedWords == other.pushedWords && recipe == other.recipe && pipeline == other.pipeline && drawKey == other.drawKey;
+    }
+};
+
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     ArchB::Recorder::Key recorderKey;
@@ -140,6 +164,7 @@ struct DrawTail {
     bool registerKey = false;
     bool ubPointerFree = false;
     bool ubSkipCpuIndirect = false;
+    bool indirectClassifiedGpu = false;
     // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS, sampled once per draw: the enqueue did not drain for arguments
     // queued items write; CPU reads of them drain first (drainBeforeArgumentRead).
     bool indirectGpuArgs = false;
@@ -199,6 +224,16 @@ struct DrawTail {
     std::string* rejected = nullptr;
     std::uint64_t traceToken = 0;
     VulkanDevice::DrawTraceContext trace{};
+    bool parallelPrepare = false;
+    bool parallelVerify = false;
+    bool parallelRecipeMiss = false;
+    bool parallelRecipeSelected = false;
+    std::shared_ptr<const DrawRecipe> parallelRecipe;
+    std::function<void()> preparedPublish;
+    ParallelPreparedView preparedView;
+    std::vector<ParallelPreparedInput> preparedBaseline;
+    DrawPipeline::Watch preparedWatch;
+    bool preparedOrdered = false;
     std::string ownRejected;
     GpuLock* gpuLock = nullptr;
     GpuLock ownLock{GuestMemory::GpuMutex(), std::defer_lock};
@@ -398,6 +433,139 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     held.writes = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
     held.unknown = false;
     return held;
+}
+
+std::shared_ptr<DrawTail> cloneDrawTail(const DrawTail& source, ShaderMemory::PendingWriteQuery pendingWrite, ShaderMemory::PendingWriteObserver observe, ShaderMemory::HookWaitCounter hookWaits, ShaderMemory::PendingWriteQuery pendingSpan) {
+    auto copy = std::make_shared<DrawTail>();
+    copy->recorderKey = source.recorderKey;
+    copy->profile = source.profile;
+    copy->cacheOutcome = source.cacheOutcome;
+    copy->phaseMs = source.phaseMs;
+    copy->captures = source.captures;
+    copy->phaseLap = source.phaseLap;
+    copy->phaseTiming.profile = source.phaseTiming.profile;
+    copy->drawParameters = source.drawParameters;
+    copy->pipelined = source.pipelined;
+    copy->traceIndirect = source.traceIndirect;
+    copy->dumpTarget = source.dumpTarget;
+    copy->dumpSlot1 = source.dumpSlot1;
+    copy->localDevice = source.localDevice;
+    copy->registerKey = source.registerKey;
+    copy->ubPointerFree = source.ubPointerFree;
+    copy->ubSkipCpuIndirect = source.ubSkipCpuIndirect;
+    copy->indirectClassifiedGpu = source.indirectClassifiedGpu;
+    copy->indirectGpuArgs = source.indirectGpuArgs;
+    copy->narrowDrawWrites = source.narrowDrawWrites;
+    copy->narrowSlicedDepth = source.narrowSlicedDepth;
+    copy->feedbackMask = source.feedbackMask;
+    copy->pipelineStateReuse = source.pipelineStateReuse;
+    copy->memoVirtualQuery = source.memoVirtualQuery;
+    copy->imageTableSnapshotReuse = source.imageTableSnapshotReuse;
+    copy->imageTableBitScanKeys = source.imageTableBitScanKeys;
+    copy->bufferBases = source.bufferBases;
+    copy->allocChurn = source.allocChurn;
+    copy->partialSnapshot = source.partialSnapshot;
+    copy->drawKey = source.drawKey;
+    copy->entry = source.entry;
+    copy->decode = source.decode;
+    copy->relocatedDecode = source.relocatedDecode;
+    copy->dataEntry = source.dataEntry;
+    copy->shapeKey = source.shapeKey;
+    copy->pixel = source.pixel;
+    copy->writablePrograms = source.writablePrograms;
+    copy->programs = source.programs == &source.writablePrograms ? &copy->writablePrograms : &copy->decode->programs;
+    copy->memory = source.memory;
+    copy->linked = source.linked;
+    copy->vertexInfos = source.vertexInfos;
+    copy->decodeReads = source.decodeReads;
+    copy->shaderMemory = std::make_unique<ShaderMemory>(copy->memory, pendingWrite, observe, hookWaits, pendingSpan, copy->feedbackMask || copy->bufferBases);
+    copy->shaderMemory->SetImageTableSnapshotReuse(copy->imageTableSnapshotReuse);
+    copy->shaderMemory->SetImageTableBitScanKeys(copy->imageTableBitScanKeys);
+    copy->programResults.assign(source.programResults.size(), nullptr);
+    copy->stageCaptures.resize(source.stageCaptures.size());
+    copy->matched = source.matched;
+    copy->matchedRegions = source.matchedRegions;
+    copy->fresh.resize(source.fresh.size());
+    copy->recompiled.assign(source.recompiled.size(), false);
+    copy->dataCandidates = source.dataCandidates;
+    copy->reused.assign(source.reused.size(), false);
+    copy->stageData = source.stageData;
+    copy->drawHit = source.drawHit;
+    copy->verifyHit = source.verifyHit;
+    copy->stageEntries = source.stageEntries;
+    copy->patchedStages = source.patchedStages;
+    copy->submission = source.submission;
+    copy->submissionQueue = source.submissionQueue;
+    copy->submissionSerial = source.submissionSerial;
+    copy->packetOffset = source.packetOffset;
+    copy->packetOpcode = source.packetOpcode;
+    copy->reg207 = source.reg207;
+    copy->epoch = source.epoch;
+    copy->ticket = source.ticket;
+    copy->traceToken = source.traceToken;
+    copy->trace = source.trace;
+    copy->parallelVerify = source.parallelVerify;
+    copy->parallelRecipeSelected = source.parallelRecipeSelected;
+    copy->parallelRecipe = source.parallelRecipe;
+    copy->preparedBaseline = source.preparedBaseline;
+    copy->preparedWatch = source.preparedWatch;
+    copy->preparedOrdered = source.preparedOrdered;
+    return copy;
+}
+
+void captureParallelInputs(DrawTail& tail, std::span<const ShaderRecompiler::MemoryRegion> regions) {
+    constexpr std::size_t MaxPreparedBytes = 16u * 1024u * 1024u;
+    tail.preparedView.inputs.clear();
+    tail.preparedView.inputs.reserve(regions.size());
+    std::size_t total = 0;
+    for (const auto& captured : regions) {
+        if (captured.bytes.size() > MaxPreparedBytes - total) throw DrawFinisher::ParallelFallback::Footprint;
+        total += captured.bytes.size();
+        ParallelPreparedInput input;
+        input.address = captured.guestAddress;
+        input.bytes.assign(captured.bytes.begin(), captured.bytes.end());
+        input.generation = GuestMemory::CollectWrites(input.address, input.bytes.size());
+        tail.preparedView.inputs.push_back(std::move(input));
+    }
+}
+
+bool parallelPreparedCurrent(const DrawTail& tail) {
+    if (!tail.preparedOrdered) {
+        for (const auto& baseline : tail.preparedBaseline) {
+            if (baseline.generation != 0 && !GuestMemory::UnchangedSince(baseline.address, baseline.bytes.size(), baseline.generation)) return false;
+            if (GuestMemory::CompareMapped(baseline.address, baseline.bytes) != GuestMemory::Compare::Equal) return false;
+        }
+        for (const auto& input : tail.preparedView.inputs) {
+            std::size_t matched = 0;
+            while (matched < input.bytes.size()) {
+                const auto address = input.address + matched;
+                const auto baseline = std::find_if(tail.preparedBaseline.begin(), tail.preparedBaseline.end(), [&](const ParallelPreparedInput& candidate) { return candidate.address <= address && address - candidate.address < candidate.bytes.size(); });
+                if (baseline == tail.preparedBaseline.end()) return false;
+                const auto offset = static_cast<std::size_t>(address - baseline->address);
+                const auto count = std::min(input.bytes.size() - matched, baseline->bytes.size() - offset);
+                if (!std::equal(input.bytes.begin() + static_cast<std::ptrdiff_t>(matched), input.bytes.begin() + static_cast<std::ptrdiff_t>(matched + count), baseline->bytes.begin() + static_cast<std::ptrdiff_t>(offset))) return false;
+                matched += count;
+            }
+        }
+    }
+    std::vector<DrawPipeline::Range> ranges;
+    ranges.reserve(tail.preparedView.inputs.size());
+    for (const auto& input : tail.preparedView.inputs) {
+        ranges.emplace_back(input.address, input.address + input.bytes.size());
+        if (input.generation != 0 && !GuestMemory::UnchangedSince(input.address, input.bytes.size(), input.generation)) return false;
+        if (GuestMemory::CompareMapped(input.address, input.bytes) != GuestMemory::Compare::Equal) return false;
+    }
+    return !DrawPipeline::Queue0().WrittenSince(tail.preparedWatch, ranges, false);
+}
+
+void forceFreshParallelRebuild(DrawTail& tail) {
+    tail.drawHit = false;
+    tail.verifyHit = false;
+    std::fill(tail.matched.begin(), tail.matched.end(), nullptr);
+    for (auto& regions : tail.matchedRegions) regions.clear();
+    for (auto& candidates : tail.dataCandidates) candidates.clear();
+    tail.stageData.assign(tail.stageData.size(), {});
+    tail.patchedStages = false;
 }
 
 bool EmptyIndirectSkip() {
@@ -1061,7 +1229,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.dumpTarget = dumpTarget;
     tail.dumpSlot1 = dumpSlot1;
     tail.packetOffset = packetOffset;
-    const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    if (drawParameters.indirect && drawHit && !programs.empty() && !matched.empty() && matched.front() != nullptr) {
+        const auto compiled = !stageData.empty() && stageData.front().compiled != nullptr ? stageData.front().compiled : matched.front()->compiled;
+        if (compiled != nullptr) {
+            tail.indirectClassifiedGpu = !ClassifyIndirectDraw(*compiled, graphics, programs.front(), vertexInfos.front(), localDevice, drawParameters, traceIndirect).has_value();
+            if (tail.indirectClassifiedGpu && EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = false;
+        }
+    }
+    const bool handOff = pipelined && (!DrawFinisher::ParallelActive() || drawHit) && (!drawParameters.indirect || tail.indirectClassifiedGpu) && !profile && !lockedPrepare && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.ticket = GuestMemory::Gen::Required();
@@ -1070,6 +1245,182 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
+        std::optional<DrawFinisher::ParallelFallback> baselineFallback;
+        if (DrawFinisher::ParallelActive() && !GuestMemory::GpuMutex().HeldByThisThread()) {
+            DrawFinisher::CountParallelEligible();
+            try {
+                std::vector<ShaderRecompiler::MemoryRegion> baseline = tail.memory;
+                for (const auto& regions : tail.matchedRegions) baseline.insert(baseline.end(), regions.begin(), regions.end());
+                for (const auto& reads : tail.decodeReads) {
+                    for (const auto& read : reads) baseline.push_back({read.address, read.Bytes()});
+                }
+                captureParallelInputs(tail, baseline);
+                tail.preparedBaseline = std::move(tail.preparedView.inputs);
+                tail.preparedView = {};
+            } catch (DrawFinisher::ParallelFallback reason) {
+                baselineFallback = reason;
+                DrawFinisher::CountParallelFallback(reason);
+            }
+        }
+        if (DrawFinisher::ParallelActive() && !GuestMemory::GpuMutex().HeldByThisThread() && !baselineFallback.has_value()) {
+            tail.parallelRecipeSelected = true;
+            if (tail.registerKey && !drawParameters.indirect && !tail.patchedStages && Graphics::DrawRecipes()) {
+                std::vector<std::shared_ptr<DispatchVariant>> recipeStages(tail.matched.begin(), tail.matched.end());
+                if (!std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) tail.parallelRecipe = findDrawRecipe(tail.drawKey, recipeStages);
+            }
+            struct ParallelState {
+                std::shared_ptr<DrawTail> prepared;
+                std::optional<DrawFinisher::ParallelFallback> fallback;
+                std::exception_ptr failure;
+            };
+            static std::atomic<std::uint64_t> verifySequence{0};
+            const auto verifyEvery = DrawFinisher::ParallelVerifyEvery();
+            tail.preparedWatch = DrawPipeline::Queue0().WatchWrites();
+            const bool unbounded = held.unknown;
+            auto state = std::make_shared<ParallelState>();
+            DrawFinisher::Get().EnqueueParallel([this, tailHolder, state, unbounded] {
+                if (unbounded) {
+                    state->fallback = DrawFinisher::ParallelFallback::Unbounded;
+                    return;
+                }
+                auto prepared = cloneDrawTail(*tailHolder, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+                prepared->parallelPrepare = true;
+                const ArchB::AllocChurnScope allocChurnScope(prepared->allocChurn);
+                const ArchB::PartialSnapshotScope partialSnapshotScope(prepared->partialSnapshot);
+                DrawPipeline::FollowEpoch(prepared->epoch, prepared->ticket);
+                GuestMemory::SetCurrentPacket(prepared->packetOpcode, prepared->submissionQueue);
+                ArchB::Recorder::Work recorderWork(prepared->recorderKey, ArchB::Recorder::Phase::Prepare, false);
+                PerformanceTimer finishTiming("Driver.DrawFinishParallel");
+                try {
+                    if (finishDraw(*prepared, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(prepared->ownRejected);
+                    state->prepared = std::move(prepared);
+                } catch (DrawFinisher::ParallelFallback reason) {
+                    state->fallback = reason;
+                } catch (...) {
+                    try {
+                        captureParallelInputs(*prepared, prepared->shaderMemory->Regions());
+                        state->prepared = std::move(prepared);
+                        state->failure = std::current_exception();
+                    } catch (DrawFinisher::ParallelFallback reason) {
+                        state->fallback = reason;
+                    }
+                }
+            }, [this, tailHolder, state, verifyEvery] {
+                const auto clone = [&] { return cloneDrawTail(*tailHolder, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan); };
+                const auto finish = [&](const std::shared_ptr<DrawTail>& job) {
+                    const ArchB::AllocChurnScope allocChurnScope(job->allocChurn);
+                    const ArchB::PartialSnapshotScope partialSnapshotScope(job->partialSnapshot);
+                    DrawPipeline::FollowEpoch(job->epoch, job->ticket);
+                    GuestMemory::SetCurrentPacket(job->packetOpcode, job->submissionQueue);
+                    ArchB::Recorder::Work recorderWork(job->recorderKey, ArchB::Recorder::Phase::Prepare, false);
+                    PerformanceTimer finishTiming("Driver.DrawFinishOrdered");
+                    if (finishDraw(*job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job->ownRejected);
+                };
+                const auto serial = [&](bool fresh) {
+                    auto job = clone();
+                    if (fresh) forceFreshParallelRebuild(*job);
+                    finish(job);
+                };
+                const auto propagate = [&](const std::exception_ptr& failure) {
+                    try {
+                        std::rethrow_exception(failure);
+                    } catch (const std::exception& error) {
+                        CaptureTrace::Log("draw-error submission=%llu offset=%zu parallel-prep=1 reason=%.256s", static_cast<unsigned long long>(tailHolder->submissionSerial), tailHolder->packetOffset, error.what());
+                        throw std::runtime_error("draw at submission " + std::to_string(tailHolder->submissionSerial) + " offset " + std::to_string(tailHolder->packetOffset) + " (parallel preparation): " + error.what());
+                    }
+                };
+                if (state->fallback.has_value()) {
+                    DrawFinisher::CountParallelFallback(*state->fallback);
+                    serial(false);
+                    return;
+                }
+                auto prepared = state->prepared;
+                const bool stale = !parallelPreparedCurrent(*prepared);
+                if (state->failure != nullptr && !stale) propagate(state->failure);
+                if (stale) {
+                    DrawFinisher::CountParallelStaleRebuilt();
+                    try {
+                        auto rebuilt = clone();
+                        forceFreshParallelRebuild(*rebuilt);
+                        rebuilt->preparedWatch = DrawPipeline::Queue0().WatchWrites();
+                        rebuilt->preparedOrdered = true;
+                        rebuilt->parallelPrepare = true;
+                        DrawFinisher::PreparationScope scope;
+                        try {
+                            finish(rebuilt);
+                        } catch (DrawFinisher::ParallelFallback) {
+                            throw;
+                        } catch (...) {
+                            const auto failure = std::current_exception();
+                            captureParallelInputs(*rebuilt, rebuilt->shaderMemory->Regions());
+                            if (parallelPreparedCurrent(*rebuilt)) propagate(failure);
+                            throw DrawFinisher::ParallelFallback::MutableGlobal;
+                        }
+                        if (!parallelPreparedCurrent(*rebuilt)) throw DrawFinisher::ParallelFallback::MutableGlobal;
+                        prepared = std::move(rebuilt);
+                    } catch (DrawFinisher::ParallelFallback reason) {
+                        DrawFinisher::CountParallelFallback(reason);
+                        DrawFinisher::CountParallelStaleFallback();
+                        serial(true);
+                        return;
+                    }
+                }
+                prepared->parallelVerify = verifyEvery != 0 && (verifySequence.fetch_add(1, std::memory_order_relaxed) + 1) % verifyEvery == 0;
+                if (prepared->parallelVerify) {
+                    auto verified = clone();
+                    verified->parallelPrepare = true;
+                    DrawFinisher::PreparationScope scope;
+                    finish(verified);
+                    if (prepared->preparedView != verified->preparedView) {
+                        DrawFinisher::CountParallelVerifyMismatch();
+                        static std::atomic<int> reported{0};
+                        if (reported.fetch_add(1, std::memory_order_relaxed) < 40) {
+                            const auto& a = prepared->preparedView;
+                            const auto& b = verified->preparedView;
+                            std::string fields;
+                            if (a.inputs.size() != b.inputs.size()) {
+                                fields += " inputs.count=" + std::to_string(a.inputs.size()) + "/" + std::to_string(b.inputs.size());
+                                const auto listOnly = [&fields](const char* tag, const std::vector<ParallelPreparedInput>& mine, const std::vector<ParallelPreparedInput>& other) {
+                                    for (const auto& x : mine) {
+                                        if (std::any_of(other.begin(), other.end(), [&](const ParallelPreparedInput& y) { return y.address == x.address && y.bytes.size() == x.bytes.size(); })) continue;
+                                        char line[96];
+                                        std::snprintf(line, sizeof(line), " %s:%llx+%zu", tag, static_cast<unsigned long long>(x.address), x.bytes.size());
+                                        fields += line;
+                                    }
+                                };
+                                listOnly("worker-only", a.inputs, b.inputs);
+                                listOnly("serial-only", b.inputs, a.inputs);
+                                if (a.resources.size() != b.resources.size()) fields += " resources.count=" + std::to_string(a.resources.size()) + "/" + std::to_string(b.resources.size());
+                            }
+                            else for (std::size_t i = 0; i < a.inputs.size(); ++i) {
+                                const auto& x = a.inputs[i];
+                                const auto& y = b.inputs[i];
+                                if (x == y) continue;
+                                char line[256];
+                                std::snprintf(line, sizeof(line), " input[%zu] addr=%llx/%llx size=%zu/%zu bytes=%s gen=%llu/%llu", i, static_cast<unsigned long long>(x.address), static_cast<unsigned long long>(y.address), x.bytes.size(), y.bytes.size(), x.bytes == y.bytes ? "same" : "differ", static_cast<unsigned long long>(x.generation), static_cast<unsigned long long>(y.generation));
+                                fields += line;
+                            }
+                            if (a.resources != b.resources) fields += " resources";
+                            if (a.stages != b.stages) fields += " stages";
+                            if (a.pushConstants != b.pushConstants) fields += " pushConstants";
+                            if (a.pushedWords != b.pushedWords) fields += " pushedWords";
+                            if (a.recipe != b.recipe) fields += " recipe";
+                            if (a.resourceTemplate != b.resourceTemplate) fields += " resourceTemplate";
+                            if (a.pipeline != b.pipeline) fields += " pipeline";
+                            if (a.drawKey != b.drawKey) fields += " drawKey";
+                            std::fprintf(stderr, "[par-prep] verify mismatch submission=%llu offset=%zu:%s\n", static_cast<unsigned long long>(prepared->submissionSerial), prepared->packetOffset, fields.c_str());
+                        }
+                        static const bool fatal = std::getenv("APS5_ARCHB_PARALLEL_DRAW_PREP_VERIFY_FATAL") != nullptr;
+                        if (fatal) throw std::runtime_error("parallel draw preparation verification mismatch");
+                        verified->preparedPublish();
+                        return;
+                    }
+                }
+                prepared->preparedPublish();
+            }, std::move(held));
+            timing.Mark("draw_parallel_handed_off");
+            return drawn();
+        }
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
             const ArchB::AllocChurnScope allocChurnScope(job.allocChurn);
@@ -1089,6 +1440,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
     noteFinisherHandOff(false);
+    if (DrawFinisher::Enabled()) {
+        if (!pipelined) ArchB::Recorder::Count("finisher_inline_unpipelined");
+        else if (drawParameters.indirect) ArchB::Recorder::Count("finisher_inline_indirect");
+        else if (!deferredLabels().labels.empty()) ArchB::Recorder::Count("finisher_inline_labels");
+        else ArchB::Recorder::Count("finisher_inline_other");
+    }
     if (DrawFinisher::Busy()) {
         DrawFinisher::Get().Drain();
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
@@ -1296,12 +1653,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
-            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), vertexInfos.front(), localDevice, drawParameters, traceIndirect);
+            if (!tail.indirectClassifiedGpu) indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), vertexInfos.front(), localDevice, drawParameters, traceIndirect);
             if (tail.ubSkipCpuIndirect && indirectCpu) {
                 ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipCpuIndirect);
                 return drawn();
             }
-            if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
+            if (!tail.indirectClassifiedGpu && EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -1316,6 +1673,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
 
+    if (tail.parallelPrepare && !DrawFinisher::OnFinisherThread() && (partialFeedbackHit || dataEntry != nullptr)) throw DrawFinisher::ParallelFallback::MutableGlobal;
     if (partialFeedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -1347,7 +1705,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         static std::array<std::atomic<std::uint64_t>, 4096> lastData{};
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
-    const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
+    const bool shapeCandidate = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0;
+    if (tail.parallelPrepare && !DrawFinisher::OnFinisherThread() && shapeCandidate) throw DrawFinisher::ParallelFallback::MutableGlobal;
+    const bool shapeNeedsEntry = shapeCandidate && refreshSeenTwice();
+    if (tail.parallelPrepare && !DrawFinisher::OnFinisherThread() && !drawHit) throw DrawFinisher::ParallelFallback::CachePublish;
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.feedbackMask, tail.bufferBases);
     timing.Mark("shader_compile_and_link");
 
@@ -1355,8 +1716,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (const auto& read : reads) memory.push_back({read.address, read.Bytes()});
     }
 
-    if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
+    if (!tail.parallelPrepare) {
+        if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
+        if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
+    }
 
     bool rectListBuilt = false;
 
@@ -1424,6 +1787,30 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (const auto& region : memory) snapshots.push_back({region.guestAddress, region.bytes});
     };
     snapshot();
+    const auto holdParallelInputs = [&](const Graphics::DrawPreparation& preparation, const std::shared_ptr<const DrawRecipe>& recipe) {
+        auto& view = tail.preparedView;
+        view = {};
+        std::vector<ShaderRecompiler::MemoryRegion> regions;
+        regions.reserve(snapshots.size());
+        for (const auto& captured : snapshots) regions.push_back({captured.address, captured.bytes});
+        captureParallelInputs(tail, regions);
+        view.resources = preparation.resourceKey;
+        view.resourceTemplate = reinterpret_cast<std::uintptr_t>(preparation.resolvedTemplate != nullptr ? preparation.resolvedTemplate.get() : preparation.cached.lock().get());
+        view.pipeline = reinterpret_cast<std::uintptr_t>(preparation.speculatedPipeline.get());
+        view.recipe = reinterpret_cast<std::uintptr_t>(recipe.get());
+        view.drawKey = drawKey;
+        for (const auto& stage : stages) {
+            view.stages.push_back(static_cast<std::uint64_t>(stage.stage));
+            view.stages.push_back(stage.program != nullptr ? stage.program->variantId : 0);
+            view.stages.push_back(stage.pushConstantOffset);
+            view.stages.push_back(stage.program != nullptr ? stage.program->pushConstants.size() : 0);
+            if (stage.program != nullptr) view.pushConstants.insert(view.pushConstants.end(), stage.program->pushConstants.begin(), stage.program->pushConstants.end());
+        }
+        for (const auto& program : programs) {
+            view.pushedWords.push_back(static_cast<std::uint32_t>(program.userData.size()));
+            view.pushedWords.insert(view.pushedWords.end(), program.userData.begin(), program.userData.end());
+        }
+    };
     timing.Mark("post_compile_prepare");
     DrawLockTiming lockTiming{profile};
     const auto prepareForDraw = [&](const Pm4::DrawParameters& parameters, const DrawRecipe* recipe = nullptr) {
@@ -1588,9 +1975,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
     const int nostageWhy = drawParameters.indirect || !recipeStages.empty() ? -1 : !registerKey ? 0 : patchedStages ? 1 : !Graphics::DrawRecipes() ? 2 : drawHit ? 3 : 4;
     std::shared_ptr<const DrawRecipe> recipe;
-    if (drawHit && !recipeStages.empty()) {
+    if (tail.parallelPrepare && tail.parallelRecipeSelected) {
+        recipe = tail.parallelRecipe;
+    } else if (drawHit && !recipeStages.empty()) {
         recipe = findDrawRecipe(drawKey, recipeStages);
-        if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
+        if (recipe == nullptr) {
+            if (tail.parallelPrepare) tail.parallelRecipeMiss = true;
+            else VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
+        }
     }
     if (recipe == nullptr) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
@@ -1598,20 +1990,27 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             return DrawVerdict::Rejected;
         }
     }
-    if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
+    Graphics::DrawPreparation parallelPreparation;
+    if (tail.parallelPrepare) {
+        parallelPreparation = localDevice->PrepareDraw(graphics, drawParameters, stages, recipe.get(), tail.memoVirtualQuery, nullptr, true);
+        holdParallelInputs(parallelPreparation, recipe);
+    }
+    if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.parallelPrepare || tail.queue == nullptr || deferredLabels().labels.empty())) {
         phaseTiming.Phase(DrawRowVectors);
         auto writes = queuedDrawWrites(tail, graphics, stages);
         if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = tail.packetOpcode;
-        const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        const auto ticket = DrawFinisher::OnFinisherThread() ? tail.ticket : GuestMemory::Gen::Required();
+        const auto epoch = tail.parallelPrepare || DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto ticket = tail.parallelPrepare || DrawFinisher::OnFinisherThread() ? tail.ticket : GuestMemory::Gen::Required();
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         // Stage 4.1/4.2 (APS5_ARCHB_PIPE_RESOLVE_SPLIT, sampled per draw): the item's resolve runs the
         // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
         // and the commit hands `resolution` to its preparation.
-        const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
-        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
+        const bool prelocked = tail.parallelPrepare;
+        const bool recipeMiss = tail.parallelRecipeMiss;
+        const bool resolveSplit = !prelocked && DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
+        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, prelocked, resolution = std::move(parallelPreparation)](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
             if (resolving) {
                 DrawPipeline::FollowResolveEpoch(epoch);
                 return localDevice->ResolveDraw(decode->state, drawParameters, stages, recipe.get(), memoVirtualQuery, resolution, *resolveReads);
@@ -1662,7 +2061,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             const bool nostageCensus = nostageWhy >= 0 && Graphics::ArchcNostageCensus();
             if (nostageCensus) Graphics::ArchcNostageArm(nostageWhy);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, trace, pipelineStateReuse, memoVirtualQuery, prelocked || resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr, prelocked);
             if (nostageCensus) Graphics::ArchcNostageArm(-1);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
             return 0;
@@ -1673,7 +2072,17 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             resolveSlot = std::make_shared<DrawPipeline::ResolveSlot>();
             resolveSlot->run = [held](std::vector<DrawPipeline::Range>& resolveReads) { return (*held)(true, &resolveReads); };
         }
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
+        auto publish = [held, writes = std::move(writes), reads = std::move(reads), resolveSlot = std::move(resolveSlot), recipeMiss]() mutable {
+            if (recipeMiss) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
+            DrawPipeline::Queue0().Enqueue([held] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
+        };
+        if (prelocked) {
+            tail.preparedPublish = std::move(publish);
+            phaseTiming.Phase(DrawRowLockWait);
+            timing.Mark("draw_prepared_parallel");
+            return drawn();
+        }
+        publish();
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -1770,7 +2179,7 @@ struct Probe {
 
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery, Graphics::DrawPreparation* resolved, const Graphics::DrawSlotIdentity* identity) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, VulkanDevice::DrawTraceContext trace, bool pipelineStateReuse, bool memoVirtualQuery, Graphics::DrawPreparation* resolved, const Graphics::DrawSlotIdentity* identity, bool prelocked) {
     archcSlotCensus::Probe slotProbe;
     if (slotProbe.on) {
         static_cast<void>(Graphics::ArchcTakeRecipeBuild());
@@ -1785,7 +2194,9 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     const auto nostageNow = [] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
     std::array<std::uint64_t, 6> nostageAt{};
     if (nostageTimed) nostageAt[0] = nostageNow();
-    if (Graphics::DrawPrelockEnabled() && !replayLikely) {
+    if (prelocked && resolved != nullptr) {
+        lockTiming.preparation = std::move(*resolved);
+    } else if (Graphics::DrawPrelockEnabled() && !replayLikely) {
         const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         static const bool aheadCensus = GuestMemory::CollectAheadCensus() || GuestMemory::CommitterCollectCensus();
         struct PrelockPhase {

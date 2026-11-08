@@ -279,23 +279,35 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x100, DrawPipeline::DrainCause::CapturePending);
+        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) {
+            if (DrawFinisher::OnPreparationThread()) throw DrawFinisher::ParallelFallback::Drain;
+            pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x100, DrawPipeline::DrainCause::CapturePending);
+        }
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    if (DrawFinisher::OnPreparationThread() && pending.Overlaps(address, bytes)) throw DrawFinisher::ParallelFallback::Drain;
+    const auto policy = Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    if (DrawFinisher::OnPreparationThread() && policy == ShaderMemory::PendingWrite::Sync) throw reason == &ValidateCounters::syncedLabel ? DrawFinisher::ParallelFallback::Label : DrawFinisher::ParallelFallback::MutableGlobal;
+    return policy;
 }
 
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) return ShaderMemory::PendingWrite::Sync;
+        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) {
+            if (DrawFinisher::OnPreparationThread()) throw DrawFinisher::ParallelFallback::Drain;
+            return ShaderMemory::PendingWrite::Sync;
+        }
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    if (DrawFinisher::OnPreparationThread() && pending.Overlaps(address, bytes)) throw DrawFinisher::ParallelFallback::Drain;
+    const auto policy = Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    if (DrawFinisher::OnPreparationThread() && policy == ShaderMemory::PendingWrite::Sync) throw reason == &ValidateCounters::syncedLabel ? DrawFinisher::ParallelFallback::Label : DrawFinisher::ParallelFallback::MutableGlobal;
+    return policy;
 }
 
 }

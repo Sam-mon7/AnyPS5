@@ -210,6 +210,44 @@ void runResolveSlot(DrawPipeline::ResolveSlot& slot) {
 namespace {
 thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
+thread_local bool preparationThread = false;
+std::atomic<bool> parallelPrepActive{false};
+
+struct ParallelPrepCounters {
+    std::atomic<std::uint64_t> eligible{0};
+    std::atomic<std::uint64_t> dispatched{0};
+    std::atomic<std::uint64_t> readyInOrder{0};
+    std::atomic<std::uint64_t> outOfOrder{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::ParallelFallback::Count)> fallbacks{};
+    std::atomic<std::uint64_t> staleRebuilt{0};
+    std::atomic<std::uint64_t> staleFallback{0};
+    std::atomic<std::uint64_t> prefixWaitNs{0};
+    std::atomic<std::uint64_t> workerBusyNs{0};
+    std::atomic<std::uint64_t> concurrent{0};
+    std::atomic<std::uint64_t> maxConcurrent{0};
+    std::atomic<std::uint64_t> verifyMismatches{0};
+
+    ParallelPrepCounters() {
+        ArchB::Recorder::RegisterCounter("par_prep_eligible", eligible);
+        ArchB::Recorder::RegisterCounter("par_prep_dispatched", dispatched);
+        ArchB::Recorder::RegisterCounter("par_prep_ready_in_order", readyInOrder);
+        ArchB::Recorder::RegisterCounter("par_prep_out_of_order_completions", outOfOrder);
+        constexpr std::array<const char*, static_cast<std::size_t>(DrawFinisher::ParallelFallback::Count)> names{
+                "par_prep_serial_fallback_cache_publish", "par_prep_serial_fallback_drain", "par_prep_serial_fallback_label", "par_prep_serial_fallback_mutable_global", "par_prep_serial_fallback_unbounded", "par_prep_serial_fallback_footprint"};
+        for (std::size_t i = 0; i < names.size(); ++i) ArchB::Recorder::RegisterCounter(names[i], fallbacks[i]);
+        ArchB::Recorder::RegisterCounter("par_prep_stale_rebuilt", staleRebuilt);
+        ArchB::Recorder::RegisterCounter("par_prep_stale_fallback", staleFallback);
+        ArchB::Recorder::RegisterCounter("par_prep_prefix_wait_ns", prefixWaitNs);
+        ArchB::Recorder::RegisterCounter("par_prep_worker_busy_ns", workerBusyNs);
+        ArchB::Recorder::RegisterCounter("par_prep_max_concurrent", maxConcurrent);
+        ArchB::Recorder::RegisterCounter("par_prep_verify_mismatches", verifyMismatches);
+    }
+};
+
+ParallelPrepCounters& parallelPrepCounters() {
+    static auto* counters = new ParallelPrepCounters();
+    return *counters;
+}
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -333,6 +371,58 @@ bool DrawFinisher::OnFinisherThread() {
     return finisherThread;
 }
 
+DrawFinisher::PreparationScope::PreparationScope() : previous(preparationThread) {
+    preparationThread = true;
+}
+
+DrawFinisher::PreparationScope::~PreparationScope() {
+    preparationThread = previous;
+}
+
+bool DrawFinisher::OnPreparationThread() {
+    return preparationThread;
+}
+
+bool DrawFinisher::ParallelActive() {
+    return parallelPrepActive.load(std::memory_order_acquire);
+}
+
+void DrawFinisher::SetParallelActive(bool active) {
+    parallelPrepActive.store(active, std::memory_order_release);
+}
+
+void DrawFinisher::CountParallelEligible() {
+    parallelPrepCounters().eligible.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::CountParallelFallback(ParallelFallback reason) {
+    parallelPrepCounters().fallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::CountParallelStaleRebuilt() {
+    parallelPrepCounters().staleRebuilt.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::CountParallelStaleFallback() {
+    parallelPrepCounters().staleFallback.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::CountParallelVerifyMismatch() {
+    parallelPrepCounters().verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t DrawFinisher::ParallelDispatchedCount() {
+    return parallelPrepCounters().dispatched.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DrawFinisher::ParallelVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_ARCHB_PARALLEL_DRAW_PREP_VERIFY");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
 void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }
@@ -341,7 +431,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
-    auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
+    auto& reclaim = HostThreadLocal<std::vector<std::shared_ptr<Slot>>, ReclaimStorage>();
     reclaim.clear();
     std::unique_lock lock(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
@@ -351,7 +441,11 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) noteOvercommit("draw finisher", jobs.size());
         else idle.wait(lock, [&] { return jobs.size() < depth; });
     }
-    jobs.push_back(std::move(job));
+    auto slot = std::make_shared<Slot>();
+    slot->ordinal = nextOrdinal++;
+    slot->publish = std::move(job);
+    slot->ready = true;
+    jobs.push_back(std::move(slot));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
@@ -361,31 +455,117 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             run();
         });
     }
-    if (sleeping) wake.notify_one();
+    wake.notify_all();
+}
+
+std::uint64_t DrawFinisher::EnqueueParallel(Job prepare, Job publish, Pending held) {
+    finisherProducer = true;
+    constexpr std::size_t depth = 16;
+    struct ParallelReclaimStorage {};
+    auto& reclaim = HostThreadLocal<std::vector<std::shared_ptr<Slot>>, ParallelReclaimStorage>();
+    reclaim.clear();
+    std::unique_lock lock(mutex);
+    if (!ran.empty()) std::swap(ran, reclaim);
+    if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+    if (jobs.size() >= depth) {
+        if (GuestMemory::GpuMutex().HeldByThisThread()) noteOvercommit("parallel draw preparation", jobs.size());
+        else idle.wait(lock, [&] { return jobs.size() < depth; });
+    }
+    startWorkers();
+    auto slot = std::make_shared<Slot>();
+    slot->ordinal = nextOrdinal++;
+    slot->prepare = std::move(prepare);
+    slot->publish = std::move(publish);
+    slot->parallel = true;
+    jobs.push_back(slot);
+    workerJobs.push_back(slot);
+    pending.push_back(std::move(held));
+    outstanding.fetch_add(1, std::memory_order_release);
+    parallelPrepCounters().dispatched.fetch_add(1, std::memory_order_relaxed);
+    if (!running) {
+        running = true;
+        thread = std::thread([this] {
+            finisherThread = true;
+            run();
+        });
+    }
+    wake.notify_all();
+    return slot->ordinal;
+}
+
+void DrawFinisher::startWorkers() {
+    if (workersStarted) return;
+    workersStarted = true;
+    for (std::size_t i = 0; i < workers.size(); ++i) workers[i] = std::thread([this, i] { runWorker(i); });
+}
+
+void DrawFinisher::runWorker(std::size_t index) {
+    const auto name = std::string("draw prepare ") + std::to_string(index);
+    PerformanceTrace::BindThread(name.c_str());
+    GuestMemory::MarkDriverThread();
+    GuestMemory::TagGpuLockThread(0);
+    for (;;) {
+        std::shared_ptr<Slot> slot;
+        {
+            std::unique_lock lock(mutex);
+            wake.wait(lock, [&] { return !workerJobs.empty(); });
+            slot = std::move(workerJobs.front());
+            workerJobs.pop_front();
+        }
+        auto& counters = parallelPrepCounters();
+        const auto start = std::chrono::steady_clock::now();
+        const auto concurrent = counters.concurrent.fetch_add(1, std::memory_order_relaxed) + 1;
+        auto maximum = counters.maxConcurrent.load(std::memory_order_relaxed);
+        while (maximum < concurrent && !counters.maxConcurrent.compare_exchange_weak(maximum, concurrent, std::memory_order_relaxed)) {
+        }
+        std::exception_ptr error;
+        try {
+            PreparationScope scope;
+            slot->prepare();
+        } catch (...) {
+            error = std::current_exception();
+        }
+        counters.concurrent.fetch_sub(1, std::memory_order_relaxed);
+        counters.workerBusyNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        {
+            std::lock_guard lock(mutex);
+            slot->failure = error;
+            slot->ready = true;
+            const auto current = std::find(jobs.begin(), jobs.end(), slot);
+            if (std::any_of(jobs.begin(), current, [](const std::shared_ptr<Slot>& earlier) { return earlier->parallel && !earlier->ready; })) counters.outOfOrder.fetch_add(1, std::memory_order_relaxed);
+        }
+        wake.notify_all();
+    }
 }
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
     for (;;) {
-        Job* job = nullptr;
+        std::shared_ptr<Slot> slot;
         bool failed = false;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
+            const auto waitStart = std::chrono::steady_clock::now();
+            const bool waited = jobs.front()->parallel && !jobs.front()->ready;
+            if (waited) wake.wait(lock, [&] { return jobs.front()->ready; });
+            if (waited) parallelPrepCounters().prefixWaitNs.fetch_add(elapsedNs(waitStart), std::memory_order_relaxed);
             sleeping = false;
-            job = &jobs.front();
+            slot = jobs.front();
             failed = failure != nullptr;
         }
         std::exception_ptr error;
         try {
-            if (!failed) (*job)();
+            if (!failed && slot->failure != nullptr) std::rethrow_exception(slot->failure);
+            if (!failed) slot->publish();
         } catch (...) {
             error = std::current_exception();
         }
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
+        if (slot->parallel && error == nullptr && !failed) parallelPrepCounters().readyInOrder.fetch_add(1, std::memory_order_relaxed);
         ran.push_back(std::move(jobs.front()));
         jobs.pop_front();
         pending.pop_front();
@@ -422,7 +602,7 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::ReleaseRan() {
-    std::vector<Job> done;
+    std::vector<std::shared_ptr<Slot>> done;
     std::lock_guard lock(mutex);
     std::swap(done, ran);
 }
@@ -1264,13 +1444,13 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     return watch;
 }
 
-bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
+bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads, bool includeFinisher) {
     const auto overlaps = [&reads](const std::vector<Range>& writes) {
         return std::any_of(reads.begin(), reads.end(), [&writes](const Range& read) {
             return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
         });
     };
-    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
+    if (includeFinisher && DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     std::lock_guard lock(mutex);
     if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
     const auto retiredNow = retiredItems.load(std::memory_order_relaxed);

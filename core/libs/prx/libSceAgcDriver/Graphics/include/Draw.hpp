@@ -75,7 +75,7 @@ struct DrawPreparation {
 };
 
 bool DrawPrelockEnabled();
-DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false, DrawPreparation* resolved = nullptr);
+DrawPreparation PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe = nullptr, bool memoVirtualQuery = false, DrawPreparation* resolved = nullptr, bool workerSafe = false);
 // Stage 4.1/4.2: the part of a draw commit that needs no GPU mutex and none of the draw's own target
 // state (template key and find, the template's precollects, the fragment-output validation memo and
 // the pipeline lookup), into `out`; `reads` receives the template's described ranges. Returns a plan

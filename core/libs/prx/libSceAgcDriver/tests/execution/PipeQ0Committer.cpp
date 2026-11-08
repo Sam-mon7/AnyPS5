@@ -237,6 +237,117 @@ void Registers(bool keep) {
     std::cout << (keep ? "register table kept the pipeline" : "register table drained the pipeline") << '\n';
 }
 
+void ParallelOrdering() {
+    std::mutex mutex;
+    std::vector<std::size_t> published;
+    for (std::size_t i = 0; i < 48; ++i) {
+        DrawFinisher::Get().EnqueueParallel([i] {
+            const auto delay = i == 0 ? 40u : static_cast<unsigned>((i * 17u) % 7u);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        }, [&, i] {
+            std::lock_guard lock(mutex);
+            published.push_back(i);
+        }, {});
+    }
+    DrawFinisher::Get().Drain();
+    check(published.size() == 48, "parallel preparation did not publish every slot");
+    for (std::size_t i = 0; i < published.size(); ++i) check(published[i] == i, "parallel preparation published out of ordinal order");
+}
+
+void ParallelStale() {
+    std::array<std::byte, 64> input{};
+    input[0] = std::byte{1};
+    const auto since = GuestMemory::CollectWrites(reinterpret_cast<std::uintptr_t>(input.data()), input.size());
+    std::vector<std::byte> captured;
+    std::uint64_t generation = 0;
+    std::exception_ptr failure;
+    std::atomic<bool> capturedReady{false};
+    std::atomic<bool> release{false};
+    std::atomic<int> rebuilt{0};
+    DrawFinisher::Get().EnqueueParallel([&] {
+        captured.assign(input.begin(), input.end());
+        generation = GuestMemory::CollectWrites(reinterpret_cast<std::uintptr_t>(input.data()), input.size());
+        capturedReady.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+        failure = std::make_exception_ptr(std::runtime_error("stale worker input"));
+    }, [&] {
+        const bool current = (since == 0 || GuestMemory::UnchangedSince(reinterpret_cast<std::uintptr_t>(input.data()), input.size(), since)) && (generation == 0 || GuestMemory::UnchangedSince(reinterpret_cast<std::uintptr_t>(input.data()), input.size(), generation)) && GuestMemory::CompareMapped(reinterpret_cast<std::uintptr_t>(input.data()), captured) == GuestMemory::Compare::Equal;
+        if (!current) {
+            captured.assign(input.begin(), input.end());
+            generation = GuestMemory::CollectWrites(reinterpret_cast<std::uintptr_t>(input.data()), input.size());
+            failure = nullptr;
+            rebuilt.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (failure != nullptr) std::rethrow_exception(failure);
+    }, {});
+    while (!capturedReady.load(std::memory_order_acquire)) std::this_thread::yield();
+    input[0] = std::byte{2};
+    release.store(true, std::memory_order_release);
+    DrawFinisher::Get().Drain();
+    check(rebuilt.load() == 1 && captured == std::vector<std::byte>(input.begin(), input.end()), "an in-flight input exception was not rebuilt in order");
+}
+
+void ParallelFallback() {
+    std::mutex mutex;
+    std::vector<DrawFinisher::ParallelFallback> published;
+    const auto enqueue = [&](DrawFinisher::ParallelFallback reason) {
+        auto fallback = std::make_shared<std::optional<DrawFinisher::ParallelFallback>>();
+        DrawFinisher::Get().EnqueueParallel([fallback, reason] {
+            try {
+                throw reason;
+            } catch (DrawFinisher::ParallelFallback caught) {
+                *fallback = caught;
+            }
+        }, [&, fallback] {
+            check(fallback->has_value(), "parallel fallback did not reach the sequencer");
+            std::lock_guard lock(mutex);
+            published.push_back(**fallback);
+        }, {});
+    };
+    enqueue(DrawFinisher::ParallelFallback::Drain);
+    enqueue(DrawFinisher::ParallelFallback::Label);
+    DrawFinisher::Get().Drain();
+    check(published == std::vector{DrawFinisher::ParallelFallback::Drain, DrawFinisher::ParallelFallback::Label}, "drain and label fallbacks were not published in order");
+}
+
+void ParallelSwitch() {
+    DrawFinisher::SetParallelActive(true);
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    DrawFinisher::Get().EnqueueParallel([&] {
+        started.store(true, std::memory_order_release);
+        while (!release.load(std::memory_order_acquire)) std::this_thread::yield();
+    }, [] {}, {});
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    std::thread flip([&] {
+        DrawFinisher::Get().Drain();
+        DrawFinisher::SetParallelActive(false);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    check(DrawFinisher::ParallelActive(), "parallel preparation switched before its boundary drained");
+    release.store(true, std::memory_order_release);
+    flip.join();
+    check(!DrawFinisher::ParallelActive() && !DrawFinisher::Busy(), "parallel preparation did not switch off at a drained boundary");
+}
+
+void ParallelException() {
+    std::atomic<int> published{0};
+    DrawFinisher::Get().EnqueueParallel([] {}, [&] { published.fetch_add(1); }, {});
+    DrawFinisher::Get().EnqueueParallel([] { throw std::runtime_error("parallel worker failure"); }, [&] { published.fetch_add(1); }, {});
+    DrawFinisher::Get().EnqueueParallel([] {}, [&] { published.fetch_add(1); }, {});
+    bool caught = false;
+    try {
+        DrawFinisher::Get().Drain();
+    } catch (const std::runtime_error& error) {
+        caught = std::string_view(error.what()) == "parallel worker failure";
+    }
+    check(caught, "parallel worker exception did not propagate from the sequencer");
+    check(published.load() == 1, "a slot published after a parallel worker exception");
+    DrawFinisher::Get().Enqueue([&] { published.fetch_add(1); });
+    DrawFinisher::Get().Drain();
+    check(published.load() == 2, "the finisher did not recover after propagating a worker exception");
+}
+
 }
 
 // Stage 4.1/4.2: one resolvable item. Its resolve notes the thread and reads `read`; its commit notes
@@ -365,6 +476,11 @@ int main(int argc, char** argv) {
         else if (mode == "--keep-registers") Registers(true);
         else if (mode == "--registers-drain") Registers(false);
         else if (mode.starts_with("--resolve")) Resolve(mode);
+        else if (mode == "--parallel-ordering") ParallelOrdering();
+        else if (mode == "--parallel-stale") ParallelStale();
+        else if (mode == "--parallel-fallback") ParallelFallback();
+        else if (mode == "--parallel-switch") ParallelSwitch();
+        else if (mode == "--parallel-exception") ParallelException();
         else throw std::runtime_error("unknown mode");
         return 0;
     } catch (const std::exception& error) {
