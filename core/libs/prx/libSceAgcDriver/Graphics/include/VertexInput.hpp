@@ -367,36 +367,29 @@ inline std::optional<std::uint32_t> ZeroFetchVertex(std::span<const ShaderRecomp
     return zeroFrom;
 }
 
-inline std::optional<std::uint32_t> ClampDrawIndices(std::span<std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint32_t limit) {
-    Require(indexSize == 2 || indexSize == 4, "unsupported index size");
-    const auto restartIndex = indexSize == 2 ? 0xffffu : 0xffffffffu;
-    std::optional<std::uint32_t> highest;
-    for (std::size_t offset = 0; offset + indexSize <= indices.size(); offset += indexSize) {
-        std::uint32_t index = 0;
-        if (indexSize == 2) {
-            std::uint16_t value = 0;
-            std::memcpy(&value, indices.data() + offset, sizeof(value));
-            index = value;
-        } else {
-            std::memcpy(&index, indices.data() + offset, sizeof(index));
-        }
-        if (skipRestart && index == restartIndex) continue;
-        if (index > limit) {
-            index = limit;
-            if (indexSize == 2) {
-                const auto value = static_cast<std::uint16_t>(index);
-                std::memcpy(indices.data() + offset, &value, sizeof(value));
-            } else {
-                std::memcpy(indices.data() + offset, &index, sizeof(index));
-            }
-        }
-        highest = std::max(highest.value_or(0u), index);
+template <typename TIndex>
+[[gnu::always_inline]] inline std::optional<std::uint32_t> ClampDrawIndicesOf(std::byte* data, std::size_t count, bool skipRestart, std::uint32_t limit) {
+    constexpr TIndex restartIndex = std::numeric_limits<TIndex>::max();
+    const TIndex cap = static_cast<TIndex>(std::min<std::uint32_t>(limit, restartIndex));
+    const bool capped = limit < restartIndex;
+    TIndex highest = 0;
+    TIndex kept = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        TIndex index;
+        std::memcpy(&index, data + i * sizeof(TIndex), sizeof(TIndex));
+        const TIndex skip = skipRestart && index == restartIndex ? TIndex(~TIndex{0}) : TIndex{0};
+        const TIndex clamped = capped && index > cap ? cap : index;
+        const TIndex out = static_cast<TIndex>((index & skip) | (clamped & static_cast<TIndex>(~skip)));
+        std::memcpy(data + i * sizeof(TIndex), &out, sizeof(TIndex));
+        highest = std::max(highest, static_cast<TIndex>(clamped & static_cast<TIndex>(~skip)));
+        kept |= static_cast<TIndex>(~skip);
     }
+    if (kept == 0) return std::nullopt;
     return highest;
 }
 
 template <typename TIndex>
-std::optional<std::uint32_t> HighestDrawIndexOf(std::span<const std::byte> indices, bool skipRestart) {
+[[gnu::always_inline]] inline std::optional<std::uint32_t> HighestDrawIndexBody(std::span<const std::byte> indices, bool skipRestart) {
     constexpr auto restartIndex = std::numeric_limits<TIndex>::max();
     const auto count = indices.size() / sizeof(TIndex);
     const auto* data = indices.data();
@@ -420,6 +413,48 @@ std::optional<std::uint32_t> HighestDrawIndexOf(std::span<const std::byte> indic
     }
     if (kept == 0) return std::nullopt;
     return highest;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+template <typename TIndex>
+[[gnu::target("avx2")]] inline std::optional<std::uint32_t> ClampDrawIndicesAvx2(std::byte* data, std::size_t count, bool skipRestart, std::uint32_t limit) {
+    return ClampDrawIndicesOf<TIndex>(data, count, skipRestart, limit);
+}
+
+template <typename TIndex>
+[[gnu::target("avx2")]] inline std::optional<std::uint32_t> HighestDrawIndexAvx2(std::span<const std::byte> indices, bool skipRestart) {
+    return HighestDrawIndexBody<TIndex>(indices, skipRestart);
+}
+
+inline bool IndexScanAvx2() {
+    static const bool supported = [] {
+        __builtin_cpu_init();
+        return __builtin_cpu_supports("avx2") != 0;
+    }();
+    return supported;
+}
+#endif
+
+template <typename TIndex>
+std::optional<std::uint32_t> ClampDrawIndicesDispatch(std::byte* data, std::size_t count, bool skipRestart, std::uint32_t limit) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (IndexScanAvx2()) return ClampDrawIndicesAvx2<TIndex>(data, count, skipRestart, limit);
+#endif
+    return ClampDrawIndicesOf<TIndex>(data, count, skipRestart, limit);
+}
+
+inline std::optional<std::uint32_t> ClampDrawIndices(std::span<std::byte> indices, std::uint32_t indexSize, bool skipRestart, std::uint32_t limit) {
+    Require(indexSize == 2 || indexSize == 4, "unsupported index size");
+    const auto count = indices.size() / indexSize;
+    return indexSize == 2 ? ClampDrawIndicesDispatch<std::uint16_t>(indices.data(), count, skipRestart, limit) : ClampDrawIndicesDispatch<std::uint32_t>(indices.data(), count, skipRestart, limit);
+}
+
+template <typename TIndex>
+std::optional<std::uint32_t> HighestDrawIndexOf(std::span<const std::byte> indices, bool skipRestart) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (IndexScanAvx2()) return HighestDrawIndexAvx2<TIndex>(indices, skipRestart);
+#endif
+    return HighestDrawIndexBody<TIndex>(indices, skipRestart);
 }
 
 inline std::optional<std::uint32_t> HighestDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {

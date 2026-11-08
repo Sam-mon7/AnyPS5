@@ -2129,16 +2129,72 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
+        std::shared_ptr<Buffer> zeroIndices;
+        if (draw.indexSize == 4 && !skipRestart && !state.stages.mesh && draw.indexCount != 0 && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache)) {
+            if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes); zeroFrom && *zeroFrom <= draw.firstVertex) {
+                GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+                auto& cache = derivedIndexCache(context.device);
+                constexpr std::size_t ProbeBytes = 64u << 10u;
+                cache.source.resize(ProbeBytes);
+                bool wide = false;
+                for (std::size_t offset = 0; offset < static_cast<std::size_t>(indexBytes) && !wide; offset += ProbeBytes) {
+                    const auto chunk = std::span(cache.source).first(std::min(ProbeBytes, static_cast<std::size_t>(indexBytes) - offset));
+                    GuestMemory::Read(draw.indexAddress + offset, chunk, 4);
+                    for (std::size_t i = 0; i + 4 <= chunk.size(); i += 4) {
+                        std::uint32_t value;
+                        std::memcpy(&value, chunk.data() + i, 4);
+                        if (value >= ZeroFetchSlack) {
+                            wide = true;
+                            break;
+                        }
+                    }
+                }
+                if (wide) {
+                    DerivedIndexKey zeroKey{context.device, 0u, draw.indexCount, 4u};
+                    zeroKey.clamp = true;
+                    if (const auto found = cache.entries.find(zeroKey); found != cache.entries.end()) {
+                        zeroIndices = found->second.buffer;
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_zero_hits");
+                    } else {
+                        zeroIndices = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                        std::memset(zeroIndices->Bytes().data(), 0, static_cast<std::size_t>(indexBytes));
+                        if (cache.bytes + static_cast<std::size_t>(indexBytes) > DerivedIndexCacheBytes) {
+                            cache.entries.clear();
+                            cache.bytes = 0;
+                            AgcDriver::ArchB::Recorder::Count("fix_dic_flushes");
+                        }
+                        cache.entries[zeroKey] = DerivedIndexEntry{zeroIndices, 0u, 0u, static_cast<std::size_t>(indexBytes)};
+                        cache.bytes += static_cast<std::size_t>(indexBytes);
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_zero_made");
+                    }
+                    if (derivedIndexVerify()) {
+                        std::vector<std::byte> full(static_cast<std::size_t>(indexBytes));
+                        GuestMemory::Read(draw.indexAddress, full, 4);
+                        const auto clampedHighest = ClampDrawIndices(full, 4, false, 0u);
+                        AgcDriver::ArchB::Recorder::Count("fix_dic_verified");
+                        if (clampedHighest != std::optional<std::uint32_t>(0u) || std::memcmp(full.data(), zeroIndices->Bytes().data(), full.size()) != 0) AgcDriver::ArchB::Recorder::Count("fix_dic_verify_mismatches");
+                    }
+                } else {
+                    AgcDriver::ArchB::Recorder::Count("fix_dic_zero_narrow");
+                }
+            }
+        }
+        const auto* import = zeroIndices != nullptr ? nullptr : InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
         bool zeroCopyCopied = false;
-        if (import == nullptr) {
+        if (zeroIndices != nullptr) {
+            copy.buffer = zeroIndices;
+        } else if (import == nullptr) {
             copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
             zeroCopyCopied = true;
         }
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
-        if (import != nullptr) {
+        if (zeroIndices != nullptr) {
+            highest = 0u;
+        } else if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
@@ -2152,8 +2208,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.nothing = true;
             return inputs;
         }
-        constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
-        if (const auto zeroFrom = state.stages.mesh ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
+        if (const auto zeroFrom = state.stages.mesh || zeroIndices != nullptr ? std::nullopt : ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
             if (*highest >= limit && *highest - limit >= ZeroFetchSlack) {
                 GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
