@@ -76,6 +76,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::UbPointerFreeDrawKeys, "UB_POINTER_FREE_DRAW_KEYS", false, true, {}},
     {Feature::UbSkipCpuIndirect, "UB_SKIP_CPU_INDIRECT", false, true, {}},
     {Feature::UbSkipDispatchProofWalk, "UB_SKIP_DISPATCH_PROOF_WALK", false, true, {}},
+    {Feature::UbSkipQ0LabelWaits, "UB_SKIP_Q0_LABEL_WAITS", false, true, {}},
     {Feature::FixTsharpFeedbackMask, "FIX_TSHARP_FEEDBACK_MASK", false, true, {}},
     {Feature::FixPipelineStateReuse, "FIX_PIPELINE_STATE_REUSE", false, true, {}},
     {Feature::FixVqMemo, "FIX_VQ_MEMO", false, true, {}},
@@ -217,6 +218,7 @@ constexpr std::pair<Feature, const char*> UpperBoundCounters[] = {
     {Feature::UbPointerFreeDrawKeys, "ub_pointer_free_draw_keys_hits"},
     {Feature::UbSkipCpuIndirect, "ub_skip_cpu_indirect_hits"},
     {Feature::UbSkipDispatchProofWalk, "ub_skip_dispatch_proof_walk_hits"},
+    {Feature::UbSkipQ0LabelWaits, "ub_skip_q0_label_waits_hits"},
 };
 std::atomic<std::int64_t> delayMicros{0};
 std::filesystem::path controlFile;

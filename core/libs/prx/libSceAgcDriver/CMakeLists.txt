@@ -404,6 +404,7 @@ add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
 add_dependencies(libSceAgcDriver agc_trace_revision)
+target_compile_options(libSceAgcDriver PRIVATE -g1)
 
 target_include_directories(libSceAgcDriver PRIVATE
         ${LIBS_INCLUDE_DIR}

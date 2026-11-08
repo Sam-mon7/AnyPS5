@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
@@ -248,6 +249,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     if (heldAtSubmit) {
         epochPoint.reason = GuestMemory::Gen::TicketReason::WaitEntry;
         finishProfile(Graphics::Recorder::WaitEnd::Held);
+        return;
+    }
+    if (queue == 0 && ArchB::Switches::Enabled(ArchB::Feature::UbSkipQ0LabelWaits)) {
+        ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipQ0LabelWaits);
+        finishProfile(Graphics::Recorder::WaitEnd::Entry);
         return;
     }
     labelCensus.Blocked();
