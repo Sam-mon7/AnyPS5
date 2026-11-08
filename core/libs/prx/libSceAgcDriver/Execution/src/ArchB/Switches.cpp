@@ -61,6 +61,7 @@ constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
+constexpr Feature ArchcReplayMovedPointerPrerequisites[] = {Feature::ArchcDrawReplay, Feature::ArchcReplayPatchSlots};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
@@ -181,6 +182,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // bindings live, so the words reach only the moved data buffers. CONTINUE: a continued pass skips
     // Pipeline::Continue when the reuse state already holds the slot's pipeline, layout and inputs.
     {Feature::ArchcReplayPatchSlots, "C_REPLAY_PATCH_SLOTS", false, true, ArchcReplayCutPrerequisites},
+    {Feature::ArchcReplayMovedPointers, "C_REPLAY_MOVED_POINTERS", false, true, ArchcReplayMovedPointerPrerequisites},
     {Feature::ArchcReplayContinue, "C_REPLAY_CONTINUE", false, true, ArchcReplayCutPrerequisites},
     // Arch C P5c: a storage refresh's flush of aliased pending results records their write-back without
     // first waiting for the range's pending GPU writer; a driver access to the range in the refresh waits.

@@ -27,6 +27,8 @@ struct DrawSlotStage {
 struct DrawSlotIdentity {
     std::shared_ptr<const void> state;
     std::vector<DrawSlotStage> stages;
+    bool movedPointers = false;
+    bool movedPointerCandidate = false;
 };
 
 struct DrawTraceContext {

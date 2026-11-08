@@ -195,6 +195,7 @@ private:
     static void applyShaderDataPatches(DispatchVariant& variant);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
+    const char* relocateDrawEntry(const QueueState& queue, const std::shared_ptr<DrawEntry>& donor, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, std::vector<std::pair<const DispatchVariant*, std::shared_ptr<DispatchVariant>>>* origins);
     void reportDrawRelocation();
     // APS5_ARCHB_FIX_DISPATCH_RELOCATION: the draw relocation alias for dispatches. A dispatch-cache
     // insert tags its variant's runs by the user word each is read through (tagVariantRuns), learns

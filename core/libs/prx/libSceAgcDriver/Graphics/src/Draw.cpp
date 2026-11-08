@@ -4219,6 +4219,9 @@ struct PreparedDraw {
     const DrawSlotIdentity* identity = nullptr;
     bool slotVerify = false;
     bool slotVerifyPatch = false;
+    bool slotVerifyMovedPointers = false;
+    std::optional<std::array<std::byte, PipelinePushConstantBytes>> slotVerifyPush;
+    VkShaderStageFlags slotVerifyPushStages = 0;
     bool slotWordless = false;
     bool slotCapture = false;
 };
@@ -4438,6 +4441,16 @@ bool verifyNow() {
     return ++checks % period == 0;
 }
 
+bool movedPointerVerifyNow() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_C_REPLAY_MOVED_POINTERS_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    if (period == 0) return false;
+    thread_local std::uint64_t checks = 0;
+    return ++checks % period == 0;
+}
+
 bool stepTiming() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_STEPS");
@@ -4629,11 +4642,13 @@ bool sameIdentity(const Slot& slot, VkDevice device, const State& state, const P
 
 struct Seen {
     const void* state = nullptr;
-    std::array<const void*, MaxStages> programs{};
+    std::array<const void*, MaxStages> owners{};
+    std::array<const void*, MaxStages> variants{};
+    std::array<std::uint8_t, MaxStages> patched{};
     Pm4::DrawParameters draw{};
 };
 
-void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+MissKind classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
     thread_local std::unordered_map<std::uint64_t, Seen>* byShapeSlot = nullptr;
     auto& byShape = ShaderRecompiler::ThreadOwned(byShapeSlot);
     std::uint64_t shape = 0x5348u;
@@ -4644,12 +4659,16 @@ void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& d
     auto& seen = byShape[shape];
     Seen now;
     now.state = identity.state.get();
-    for (std::size_t i = 0; i < shaders.size() && i < MaxStages; ++i) now.programs[i] = shaders[i].program;
+    for (std::size_t i = 0; i < identity.stages.size() && i < MaxStages; ++i) {
+        now.owners[i] = identity.stages[i].owner.get();
+        now.variants[i] = identity.stages[i].variant.get();
+        now.patched[i] = static_cast<std::uint8_t>((identity.stages[i].patched ? 1u : 0u) | (identity.stages[i].bufferBases ? 2u : 0u));
+    }
     now.draw = draw;
     MissKind kind = MissOther;
     if (seen.state == nullptr) kind = MissOther;
     else if (seen.state != now.state) kind = MissState;
-    else if (seen.programs != now.programs) kind = MissPrograms;
+    else if (seen.owners != now.owners || seen.variants != now.variants || seen.patched != now.patched) kind = MissPrograms;
     else if (draw.indirect && seen.draw.indirect && draw.indirect->arguments != seen.draw.indirect->arguments) kind = MissArguments;
     else if (!sameDraw(seen.draw, draw)) kind = MissDraw;
     counters().misses[kind].fetch_add(1, std::memory_order_relaxed);
@@ -4679,6 +4698,18 @@ void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& d
     if (arguments.size() > 1000000) arguments.clear();
     if (draws.size() > 1000000) draws.clear();
     if (byShape.size() > 65536) byShape.clear();
+    return kind;
+}
+
+void countMovedPointerMiss(MissKind kind) {
+    using AgcDriver::ArchB::Recorder;
+    switch (kind) {
+        case MissState: Recorder::Count("c_rmp_refused_new_state"); break;
+        case MissPrograms: Recorder::Count("c_rmp_refused_new_programs"); break;
+        case MissArguments: Recorder::Count("c_rmp_refused_new_arguments"); break;
+        case MissDraw: Recorder::Count("c_rmp_refused_new_draw"); break;
+        default: Recorder::Count("c_rmp_refused_new_other"); break;
+    }
 }
 
 bool sightedBefore(std::uint64_t key) {
@@ -4749,7 +4780,7 @@ std::uint64_t hashImages(std::uint64_t hash, std::span<const std::pair<VkImage, 
     return hash;
 }
 
-std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
+std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot, const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = nullptr, VkShaderStageFlags pushStages = 0) {
     std::array<std::uint64_t, ComponentCount> parts{};
     auto& targets = parts[ComponentTargets];
     for (const auto* raw : slot.targetRaw) targets = mix(targets, reinterpret_cast<std::uintptr_t>(raw));
@@ -4775,10 +4806,11 @@ std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
     pass = hashImages(pass, slot.pass.images);
     pass = hashImages(pass, slot.pass.attachments);
     auto& push = parts[ComponentPush];
-    push = mix(push, slot.pushStages);
-    for (std::size_t offset = 0; offset < slot.push.size(); offset += 8) {
+    const auto& bytes = pushBytes != nullptr ? *pushBytes : slot.push;
+    push = mix(push, pushBytes != nullptr ? pushStages : slot.pushStages);
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 8) {
         std::uint64_t word = 0;
-        std::memcpy(&word, slot.push.data() + offset, std::min<std::size_t>(8, slot.push.size() - offset));
+        std::memcpy(&word, bytes.data() + offset, std::min<std::size_t>(8, bytes.size() - offset));
         push = mix(push, word);
     }
     return parts;
@@ -4823,11 +4855,29 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     const auto& identity = *prepared.identity;
     const bool wordless = prepared.slotWordless && wordlessIdentity(identity);
     const auto key = keyOf(context.device, identity, draw, shaders, wordless);
-    const auto mismatch = [&](std::size_t component) {
+    const auto mismatch = [&](std::size_t component, const Slot* recorded = nullptr) {
         auto& counts = counters();
         counts.mismatched[component].fetch_add(1, std::memory_order_relaxed);
         if (prepared.slotVerifyPatch) cutMismatch(CutPatchSlots, component < ComponentCount ? ComponentNames[component] : "ineligible");
-        if (counts.verifyMismatches.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: %s (indirect 0x%llx)\n", component < ComponentCount ? ComponentNames[component] : "ineligible", static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
+        if (prepared.slotVerifyMovedPointers) AgcDriver::ArchB::Recorder::Count("c_rmp_verify_mismatches");
+        if (counts.verifyMismatches.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+        if (component == ComponentPush && recorded != nullptr && prepared.slotVerifyPush.has_value()) {
+            std::size_t offset = 0;
+            while (offset < recorded->push.size()) {
+                std::uint32_t replay = 0;
+                std::uint32_t ordinary = 0;
+                std::memcpy(&replay, prepared.slotVerifyPush->data() + offset, sizeof(replay));
+                std::memcpy(&ordinary, recorded->push.data() + offset, sizeof(ordinary));
+                if (replay != ordinary) {
+                    std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: push stages 0x%x/0x%x dword +0x%zx replay 0x%x ordinary 0x%x (indirect 0x%llx)\n", prepared.slotVerifyPushStages, recorded->pushStages, offset, replay, ordinary, static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
+                    return;
+                }
+                offset += sizeof(replay);
+            }
+            std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: push stages replay 0x%x ordinary 0x%x (indirect 0x%llx)\n", prepared.slotVerifyPushStages, recorded->pushStages, static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
+            return;
+        }
+        std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: %s (indirect 0x%llx)\n", component < ComponentCount ? ComponentNames[component] : "ineligible", static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
     };
     const auto refuse = [&](Ineligible why) {
         noteIneligible(why);
@@ -4846,7 +4896,21 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     if (!pass.filled) return refuse(IneligiblePass);
     const auto& pipeline = prepared.pipeline;
     const bool lds = PixelFunctionLdsSubgroup(shaders) != 0u || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
-    if (!prepared.stencilReferences.empty() || !prepared.stencilReplay.empty() || state.stencilReplayReference || pipeline == nullptr || pipeline->SplitsFaces() || pipeline->SplitsSecondChannel() || pipeline->ReordersSamples() || prepared.depthLocations.has_value() || !prepared.reordered.empty() || state.stages.mesh || state.stages.tessellation || lds || prepared.framebuffer == nullptr) return refuse(IneligibleShape);
+    const auto refuseShape = [&](const char* counter) {
+        if (identity.movedPointerCandidate) AgcDriver::ArchB::Recorder::Count(counter);
+        return refuse(IneligibleShape);
+    };
+    if (!prepared.stencilReferences.empty() || !prepared.stencilReplay.empty() || state.stencilReplayReference) return refuseShape("c_rmp_refused_shape_stencil");
+    if (pipeline == nullptr) return refuseShape("c_rmp_refused_shape_pipeline");
+    if (pipeline->SplitsFaces()) return refuseShape("c_rmp_refused_shape_faces");
+    if (pipeline->SplitsSecondChannel()) return refuseShape("c_rmp_refused_shape_second_channel");
+    if (pipeline->ReordersSamples()) return refuseShape("c_rmp_refused_shape_samples");
+    if (prepared.depthLocations.has_value()) return refuseShape("c_rmp_refused_shape_depth_locations");
+    if (!prepared.reordered.empty()) return refuseShape("c_rmp_refused_shape_reordered");
+    if (state.stages.mesh) return refuseShape("c_rmp_refused_shape_mesh");
+    if (state.stages.tessellation) return refuseShape("c_rmp_refused_shape_tessellation");
+    if (lds) return refuseShape("c_rmp_refused_shape_lds");
+    if (prepared.framebuffer == nullptr) return refuseShape("c_rmp_refused_shape_framebuffer");
     for (const auto& binding : prepared.targets) {
         if (binding.resident == nullptr || binding.proxied || binding.multisampled || binding.color.partialWriteMask != 0 || archcTargets::shapeRefusal(binding.color) != archcTargets::FastRefusalCount) return refuse(IneligibleTargets);
     }
@@ -4932,7 +4996,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         const auto now = fingerprint(slot);
         for (std::size_t component = 0; component < ComponentCount; ++component) {
             if (now[component] != (*predicted)[component]) {
-                mismatch(component);
+                mismatch(component, &slot);
                 break;
             }
         }
@@ -4959,6 +5023,26 @@ ReplayScratch& scratch() {
     return ShaderRecompiler::ThreadOwned(slot);
 }
 
+void countMovedPointerRefusal(Refusal why) {
+    using AgcDriver::ArchB::Recorder;
+    switch (why) {
+        case RefusedNew: Recorder::Count("c_rmp_refused_replay_new"); break;
+        case RefusedSwitches: Recorder::Count("c_rmp_refused_replay_switches"); break;
+        case RefusedRecorder: Recorder::Count("c_rmp_refused_replay_recorder"); break;
+        case RefusedInputs: Recorder::Count("c_rmp_refused_replay_inputs"); break;
+        case RefusedTargets: Recorder::Count("c_rmp_refused_replay_targets"); break;
+        case RefusedDepth: Recorder::Count("c_rmp_refused_replay_depth"); break;
+        case RefusedTemplate: Recorder::Count("c_rmp_refused_replay_template"); break;
+        case RefusedProof: Recorder::Count("c_rmp_refused_replay_proof"); break;
+        case RefusedMoved: Recorder::Count("c_rmp_refused_replay_moved"); break;
+        case RefusedArgs: Recorder::Count("c_rmp_refused_replay_args"); break;
+        case RefusedObjects: Recorder::Count("c_rmp_refused_replay_objects"); break;
+        case RefusedTemplateGone: Recorder::Count("c_rmp_refused_replay_template_gone"); break;
+        case RefusedTemplateMembership: Recorder::Count("c_rmp_refused_replay_template_membership"); break;
+        default: break;
+    }
+}
+
 DrawOutcome& replayOutcome() {
     return scratch().outcome;
 }
@@ -4981,19 +5065,39 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     StepClock clock;
     const auto refuse = [&](Refusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
+        if (identity.movedPointerCandidate) countMovedPointerRefusal(why);
         lastOutcome() = why == RefusedNew ? OutcomeNew : OutcomeRefused;
         scratch().inputs = DrawInputs{};
         scratch().targets.clear();
         return false;
     };
-    if (!usableIdentity(identity, state, shaders) || draw.indirect == std::nullopt || state.colors.size() > 64) return refuse(RefusedNew);
+    if (!usableIdentity(identity, state, shaders)) {
+        if (identity.movedPointerCandidate) AgcDriver::ArchB::Recorder::Count("c_rmp_refused_new_identity");
+        return refuse(RefusedNew);
+    }
+    if (draw.indirect == std::nullopt) {
+        if (identity.movedPointerCandidate) AgcDriver::ArchB::Recorder::Count("c_rmp_refused_new_path");
+        return refuse(RefusedNew);
+    }
+    if (state.colors.size() > 64) {
+        if (identity.movedPointerCandidate) AgcDriver::ArchB::Recorder::Count("c_rmp_refused_new_colors");
+        return refuse(RefusedNew);
+    }
     auto* slot = lookup(context.device, state, draw, shaders, identity, pipelineStateReuse);
     if (slot == nullptr) {
-        if (stepTiming()) classifyMiss(identity, draw, shaders);
+        if (stepTiming() || identity.movedPointerCandidate) {
+            const auto kind = classifyMiss(identity, draw, shaders);
+            if (identity.movedPointerCandidate) countMovedPointerMiss(kind);
+        }
         if (archcNostage::enabled()) patchCensus(context.device, identity, draw, shaders, table().slots.contains(keyOf(context.device, identity, draw, shaders, true)));
-        prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders));
-        prepared.slotWordless = false;
-        if (!prepared.slotCapture && wordlessIdentity(identity)) prepared.slotWordless = prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders, true));
+        if (identity.movedPointers && wordlessIdentity(identity)) {
+            prepared.slotWordless = true;
+            prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders, true));
+        } else {
+            prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders));
+            prepared.slotWordless = false;
+            if (!prepared.slotCapture && wordlessIdentity(identity)) prepared.slotWordless = prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders, true));
+        }
         return refuse(RefusedNew);
     }
     prepared.slotCapture = true;
@@ -5029,6 +5133,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (inputs.nothing) {
         work.inputs = DrawInputs{};
         clock.Finish();
+        if (identity.movedPointerCandidate) AgcDriver::ArchB::Recorder::Count("c_rmp_served");
         counts.hits.fetch_add(1, std::memory_order_relaxed);
         lastOutcome() = OutcomeReplayed;
         return true;
@@ -5056,6 +5161,16 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         SharedResourceCache().Remove(slot->contentKey);
         countCache(&DrawProfile::cacheInvalidated);
         return refuse(RefusedProof);
+    }
+    std::optional<std::array<std::byte, PipelinePushConstantBytes>> movedPointerPush;
+    VkShaderStageFlags movedPointerPushStages = 0;
+    if (identity.movedPointerCandidate) {
+        movedPointerPush.emplace();
+        movedPointerPushStages = PushConstantStages(shaders);
+        if (movedPointerPushStages != 0) {
+            *movedPointerPush = AssemblePushConstants(shaders);
+            resources->PatchPushConstants(*movedPointerPush);
+        }
     }
     clock.Mark(StepProof);
     // C_REPLAY_SLOT_BINDINGS: a non-static list is the slot's last live list while its live conditions hold.
@@ -5088,10 +5203,17 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     clock.Mark(StepArgs);
     const bool patchVerify = slot->wordless && cutVerifyNow(CutPatchSlots);
-    if (patchVerify || verifyNow()) {
+    const bool movedPointerVerify = identity.movedPointerCandidate && movedPointerVerifyNow();
+    if (patchVerify || movedPointerVerify || verifyNow()) {
         counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         prepared.slotVerify = true;
         prepared.slotVerifyPatch = patchVerify;
+        prepared.slotVerifyMovedPointers = movedPointerVerify;
+        if (movedPointerPush.has_value()) {
+            prepared.slotVerifyPush = *movedPointerPush;
+            prepared.slotVerifyPushStages = movedPointerPushStages;
+        }
+        if (movedPointerVerify) AgcDriver::ArchB::Recorder::Count("c_rmp_verified");
         lastOutcome() = OutcomeVerified;
         work.inputs = DrawInputs{};
         work.targets.clear();
@@ -5244,7 +5366,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         resources->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout());
     }
     ArchC::ProbeAt(ArchC::Probe::RcBind);
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, &slot->push, slot->pushStages, 0, false, reuse);
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, movedPointerPush.has_value() ? &*movedPointerPush : &slot->push, movedPointerPush.has_value() ? movedPointerPushStages : slot->pushStages, 0, false, reuse);
     ArchC::ProbeAt(ArchC::Probe::RcPush);
     const auto ownTiming = Recorder::GpuDrawTimingEnabled() && state.renderLayers <= 1u ? recorder->BeginGpuTimingInPass(timingDrawKey(shaders, passTimingKey)) : Recorder::NoTiming;
     std::uint32_t subdraw = 0;
@@ -5262,6 +5384,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     clock.Finish();
     slot->replayedLast = true;
     if (slot->wordless) cutHit(CutPatchSlots);
+    if (identity.movedPointerCandidate) AgcDriver::ArchB::Recorder::Count("c_rmp_served");
     counts.hits.fetch_add(1, std::memory_order_relaxed);
     lastOutcome() = OutcomeReplayed;
     return true;
@@ -5755,7 +5878,13 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         const bool inputsInPlace = inputs.vertexBuffers.empty() && inputs.indices == nullptr;
         std::optional<std::array<std::uint64_t, archcSlots::ComponentCount>> predicted;
         if (slotCapture && prepared.slotVerify) {
-            if (auto* slot = archcSlots::lookup(context.device, state, draw, shaders, *prepared.identity, prepared.pipelineStateReuse)) predicted = archcSlots::fingerprint(*slot);
+            if (auto* slot = archcSlots::lookup(context.device, state, draw, shaders, *prepared.identity, prepared.pipelineStateReuse)) {
+                if (!prepared.slotVerifyPush.has_value()) {
+                    prepared.slotVerifyPush = slot->push;
+                    prepared.slotVerifyPushStages = slot->pushStages;
+                }
+                predicted = archcSlots::fingerprint(*slot, &*prepared.slotVerifyPush, prepared.slotVerifyPushStages);
+            }
         }
         record.slotCapture = slotCapture ? &passCapture : nullptr;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace, prepared.pipelineStateReuse);

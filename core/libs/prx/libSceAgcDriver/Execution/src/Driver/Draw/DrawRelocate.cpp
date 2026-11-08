@@ -187,10 +187,15 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         drawAliases.erase(found);
         return;
     }
-    if (cached->second->decode == nullptr) return;
-    const auto donor = cached->second;
+    const auto reason = relocateDrawEntry(queue, cached->second, entry, decode, patches, nullptr);
+    if (reason == nullptr) ++counters.donors;
+    else if (std::strcmp(reason, "unchanged") != 0) ++counters.refused;
+}
+
+const char* Driver::relocateDrawEntry(const QueueState& queue, const std::shared_ptr<DrawEntry>& donor, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, std::vector<std::pair<const DispatchVariant*, std::shared_ptr<DispatchVariant>>>* origins) {
+    if (donor == nullptr || donor->decode == nullptr) return "decode";
     const auto& programs = donor->decode->programs;
-    if (donor->stages.size() != programs.size()) return;
+    if (donor->stages.size() != programs.size()) return "stages";
     struct Move {
         std::size_t program;
         std::uint32_t index, from, to;
@@ -203,8 +208,12 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             if (current != program.userData[index]) moves.push_back({i, index, program.userData[index], current});
         }
     }
-    if (moves.empty()) return;
-    ++counters.donors;
+    if (moves.empty()) return "unchanged";
+    for (const auto& move : moves) {
+        if (move.index >= 64 || std::none_of(donor->stages[move.program].begin(), donor->stages[move.program].end(), [&](const auto& variant) { return variant != nullptr && (variant->relocatableWords >> move.index & 1u) != 0; })) return "non_pointer";
+        if (move.from == 0 || move.to == 0) return "null";
+        if (((move.from ^ move.to) & 3u) != 0) return "alignment";
+    }
     auto relocated = std::make_shared<DrawEntry>();
     relocated->decode = donor->decode;
     relocated->stages.resize(donor->stages.size());
@@ -216,11 +225,8 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         }
         for (const auto& variant : donor->stages[i]) {
             if (variant == nullptr || variant->compiled == nullptr) continue;
-            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && (variant->relocatableWords >> move.index & 1u) != 0 && move.from != 0 && move.to != 0 && ((move.from ^ move.to) & 3u) == 0); });
-            if (!allowed) {
-                ++counters.refused;
-                continue;
-            }
+            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (variant->relocatableWords >> move.index & 1u) != 0; });
+            if (!allowed) continue;
             auto copy = std::make_shared<DispatchVariant>();
             copy->runs = variant->runs;
             copy->runBases = variant->runBases;
@@ -233,10 +239,17 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->dataPositions = variant->dataPositions;
             copy->dataSlots = variant->dataSlots;
             copy->flatBinding = variant->flatBinding;
+            copy->feedback = variant->feedback;
+            copy->bufferBaseMasks = variant->bufferBaseMasks;
+            copy->bufferBasePatches = variant->bufferBasePatches;
             copy->pushOffset = variant->pushOffset;
+            copy->userDataMask = variant->userDataMask;
             copy->vertexInfo = variant->vertexInfo;
+            copy->indirectCapture = variant->indirectCapture;
+            copy->userData = variant->userData.empty() ? programs[i].userData : variant->userData;
             for (const auto& move : moves) {
                 if (move.program != i) continue;
+                if (move.index < copy->userData.size()) copy->userData[move.index] = move.to;
                 const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
                 for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
                     if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
@@ -248,13 +261,16 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
                     if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
                 }
             }
+            if (origins != nullptr) origins->emplace_back(copy.get(), variant);
             relocated->stages[i].push_back(std::move(copy));
         }
+        if (relocated->stages[i].empty()) return "no_variant";
     }
     patches.clear();
     for (const auto& move : moves) patches.push_back({move.program, move.index, move.to});
     entry = std::move(relocated);
     decode = donor->decode;
+    return nullptr;
 }
 
 std::shared_ptr<const DrawRelocation> Driver::dispatchRelocationShape(const DispatchVariant& variant) {

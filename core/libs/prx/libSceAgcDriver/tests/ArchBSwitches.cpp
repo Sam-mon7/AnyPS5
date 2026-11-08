@@ -109,6 +109,19 @@ void toggleCase(const std::string& name) {
     if (stagingCarry) setEnvironment("APS5_ARCHB_GPU_STAGING_CARRY", nullptr);
     const bool crossCarry = name == "CGpuStagingCarry";
     if (crossCarry) setEnvironment("APS5_ARCHB_C_GPU_STAGING_CARRY", nullptr);
+    const bool replayMovedPointers = name == "ArchcReplayMovedPointers";
+    if (replayMovedPointers) {
+        setEnvironment("APS5_ARCHB_WT_FAULT", "1");
+        setEnvironment("APS5_ARCHB_WT_FAULT_CONSUMERS", "1");
+        setEnvironment("APS5_ARCHB_PIPE_RESOLVE_PROOFS", "1");
+        setEnvironment("APS5_ARCHB_PIPE_Q0_COMMITTER", "1");
+        setEnvironment("APS5_ARCHB_C_IMAGE_EPOCHS", "1");
+        setEnvironment("APS5_ARCHB_C_TARGET_FASTPATH", "1");
+        setEnvironment("APS5_ARCHB_C_TEMPLATE_TOKEN", "1");
+        setEnvironment("APS5_ARCHB_C_DRAW_REPLAY", "1");
+        setEnvironment("APS5_ARCHB_C_REPLAY_PATCH_SLOTS", "1");
+        setEnvironment("APS5_ARCHB_C_REPLAY_MOVED_POINTERS", nullptr);
+    }
     const bool wtFaultConsumers = name == "WtFaultConsumers";
     if (wtFaultConsumers) {
         // WT_FAULT and WT_FAULT_VERIFY are startup-only; CONSUMERS is runtime and requires WT_FAULT.
@@ -178,6 +191,22 @@ void toggleCase(const std::string& name) {
         check(!Switches::Enabled(Feature::WtFaultConsumers) && Switches::Enabled(Feature::WtFault), "CONSUMERS did not turn off, or WT_FAULT followed it");
         write("3 WT_FAULT_CONSUMERS=1");
         check(Switches::Enabled(Feature::WtFaultConsumers), "CONSUMERS did not turn back on");
+    } else if (replayMovedPointers) {
+        bool listed = false;
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature != Feature::ArchcReplayMovedPointers) continue;
+            listed = true;
+            check(std::string(entry.name) == "C_REPLAY_MOVED_POINTERS" && !entry.defaultOn && entry.runtime && entry.prerequisites.size() == 2 && entry.prerequisites[0] == Feature::ArchcDrawReplay && entry.prerequisites[1] == Feature::ArchcReplayPatchSlots, "C_REPLAY_MOVED_POINTERS switch contract");
+        }
+        check(listed && !Switches::Enabled(Feature::ArchcReplayMovedPointers), "C_REPLAY_MOVED_POINTERS must be listed and default off");
+        write("1 C_REPLAY_MOVED_POINTERS=1");
+        check(Switches::Enabled(Feature::ArchcReplayMovedPointers), "C_REPLAY_MOVED_POINTERS did not turn on with its prerequisites");
+        write("2 C_REPLAY_MOVED_POINTERS=0");
+        check(!Switches::Enabled(Feature::ArchcReplayMovedPointers), "C_REPLAY_MOVED_POINTERS did not turn off");
+        write("3 C_REPLAY_MOVED_POINTERS=1");
+        check(Switches::Enabled(Feature::ArchcReplayMovedPointers), "C_REPLAY_MOVED_POINTERS did not turn back on");
+        write("4 C_REPLAY_PATCH_SLOTS=0");
+        check(!Switches::Enabled(Feature::ArchcReplayMovedPointers), "C_REPLAY_MOVED_POINTERS stayed on without C_REPLAY_PATCH_SLOTS");
     } else if (name == "VqMemo" || imageTable || bitScanKeys || bookkeeping || pipeQ0 || dispatchRelocation || stableFailed || stableWide || pageRefresh || partialSnapshot || candidates || movedUpload || unstampedAlias || keyWriter || stagingCarry || crossCarry) {
         const auto feature = crossCarry ? Feature::CGpuStagingCarry : stagingCarry ? Feature::GpuStagingCarry : keyWriter ? Feature::FixPipelineKeyWriter : unstampedAlias ? Feature::FixUnstampedAlias : movedUpload ? Feature::FixMovedWordUpload : candidates ? Feature::FixSnapshotCandidates : partialSnapshot ? Feature::FixPartialSnapshot : pageRefresh ? Feature::FixSnapshotPageRefresh : stableWide ? Feature::FixStableFailedWide : stableFailed ? Feature::FixStableFailedCollects : dispatchRelocation ? Feature::FixDispatchRelocation : pipeQ0 ? Feature::PipeQ0Committer : bookkeeping ? Feature::FixWriteTrackingBookkeeping : bitScanKeys ? Feature::FixImageTableBitScanKeys : imageTable ? Feature::FixImageTableSnapshotReuse : Feature::FixVqMemo;
         const std::string token = crossCarry ? "C_GPU_STAGING_CARRY" : stagingCarry ? "GPU_STAGING_CARRY" : keyWriter ? "FIX_PIPELINE_KEY_WRITER" : unstampedAlias ? "FIX_UNSTAMPED_ALIAS" : movedUpload ? "FIX_MOVED_WORD_UPLOAD" : candidates ? "FIX_SNAPSHOT_CANDIDATES" : partialSnapshot ? "FIX_PARTIAL_SNAPSHOT" : pageRefresh ? "FIX_SNAPSHOT_PAGE_REFRESH" : stableWide ? "FIX_STABLE_FAILED_WIDE" : stableFailed ? "FIX_STABLE_FAILED_COLLECTS" : dispatchRelocation ? "FIX_DISPATCH_RELOCATION" : pipeQ0 ? "PIPE_Q0_COMMITTER" : bookkeeping ? "FIX_WRITE_TRACKING_BOOKKEEPING" : bitScanKeys ? "FIX_IMAGE_TABLE_BITSCAN_KEYS" : imageTable ? "FIX_IMAGE_TABLE_SNAPSHOT_REUSE" : "FIX_VQ_MEMO";

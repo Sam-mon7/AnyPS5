@@ -48,6 +48,7 @@
 #include "Cover_frag_spv.h"
 #include "VertexRange_vert_spv.h"
 #include "VertexRangeProducer_frag_spv.h"
+#include "SampleOrderTestReplayMoved_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "BdaAbi.hpp"
 #include "BdaShader.hpp"
@@ -11732,7 +11733,7 @@ int archcTargetTests(const Device& device, Recorder& recorder, std::string_view 
     throw std::runtime_error("unknown Arch C target scenario");
 }
 
-int archcReplayTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+int archcReplayTests(const Device& device, Recorder& outerRecorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
     if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
@@ -11740,7 +11741,7 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
     const char* verifyText = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_VERIFY");
     const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
     constexpr std::size_t unit = 65536;
-    constexpr std::size_t bytes = unit * 2;
+    constexpr std::size_t bytes = unit * 4;
     void* watched = AllocateWatched(bytes, unit);
     if (watched == nullptr) return 77;
     struct Release {
@@ -11751,9 +11752,21 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
     std::fill_n(block, bytes, std::byte{0});
     const auto address = reinterpret_cast<std::uint64_t>(block);
     auto context = device.GetContext();
-    context.recorder = &recorder;
     TextureDetiler detiler(context);
     context.detiler = &detiler;
+    std::unique_ptr<DescriptorCache> descriptorCache;
+    std::unique_ptr<Recorder> localRecorder;
+    Recorder* activeRecorder = &outerRecorder;
+    const bool movedScenario = scenario == "moved_same" || scenario == "moved_different" || scenario == "moved_non_pointer" || scenario == "moved_interleaved";
+    if (movedScenario) {
+        descriptorCache = std::make_unique<DescriptorCache>(context);
+        context.descriptorCache = descriptorCache.get();
+        localRecorder = std::make_unique<Recorder>(context);
+        localRecorder->Activate();
+        activeRecorder = localRecorder.get();
+    }
+    Recorder& recorder = *activeRecorder;
+    context.recorder = activeRecorder;
     {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true, true);
@@ -11914,6 +11927,106 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
         WaitForOptimizedPipelines(context.device);
         Require(counts().hits == before.hits, "a draw whose identity does not own its stages was replayed");
         std::cout << "agc_archc_replay_identity: ok\n";
+        return 0;
+    }
+    if (movedScenario) {
+        const bool movedOn = on && Switches::Enabled(Feature::ArchcReplayPatchSlots) && Switches::Enabled(Feature::ArchcReplayMovedPointers);
+        constexpr std::size_t resourceBytes = 64 * 64 * sizeof(std::uint32_t);
+        const std::array resourceAddresses{arguments + 4100, address + unit * 2, address + unit * 3};
+        std::fill_n(reinterpret_cast<std::byte*>(resourceAddresses[0]), resourceBytes, std::byte{0x31});
+        std::fill_n(reinterpret_cast<std::byte*>(resourceAddresses[1]), resourceBytes, std::byte{0x31});
+        std::fill_n(reinterpret_cast<std::byte*>(resourceAddresses[2]), resourceBytes, std::byte{0x72});
+        for (const auto resource : resourceAddresses) AgcDriver::GuestMemory::MarkWritten(resource, resourceBytes);
+        const auto resourceProgram = [&](std::uint64_t resource) {
+            auto program = shader(SAMPLE_ORDER_TEST_REPLAYMOVED_SPV, 304);
+            program->pushConstants.resize(PipelinePushSlotBytes);
+            ShaderRecompiler::DescriptorBinding binding;
+            binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+            binding.descriptorSet = 0;
+            binding.binding = 0;
+            binding.count = 1;
+            binding.guestDescriptor = {static_cast<std::uint32_t>(resource), static_cast<std::uint32_t>(resource >> 32u) & 0xffffu, resourceBytes, 0x31000000u};
+            auto flags = binding.Flags();
+            flags.bufferWritten = {false};
+            binding.SetFlags(std::move(flags));
+            program->bindings.push_back(std::move(binding));
+            return program;
+        };
+        const std::array resources{resourceProgram(resourceAddresses[0]), resourceProgram(resourceAddresses[1]), resourceProgram(resourceAddresses[2])};
+        const auto variant = std::make_shared<int>(1);
+        const auto identityFor = [&](std::size_t index, bool candidate) {
+            DrawSlotIdentity identity{whole, {{vertex}, {resources[0], variant, {static_cast<std::uint32_t>(resourceAddresses[index])}, true, false}}, true, candidate};
+            return identity;
+        };
+        const auto movedDraw = [&](std::size_t index, const DrawSlotIdentity& identity) {
+            const std::array live{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, resources[index].get(), PipelinePushSlotBytes}};
+            Draw(context, *whole, indirect, live, {}, nullptr, nullptr, nullptr, false, &identity);
+            WaitForOptimizedPipelines(context.device);
+        };
+        const auto originalIdentity = identityFor(0, false);
+        for (int i = 0; i < 5; ++i) {
+            movedDraw(0, originalIdentity);
+            settle();
+        }
+        movedDraw(0, originalIdentity);
+        settle();
+        const auto verifyMovedText = std::getenv("APS5_ARCHB_C_REPLAY_MOVED_POINTERS_VERIFY");
+        const bool verifyMoved = verifyMovedText != nullptr && std::string_view(verifyMovedText) == "1";
+        if (scenario == "moved_non_pointer") {
+            const std::array live{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, resources[1].get(), PipelinePushSlotBytes}};
+            const DrawSlotIdentity unproved{whole, {{vertex}, {resources[1]}}, true, false};
+            const auto before = counts();
+            Draw(context, *whole, indirect, live, {}, nullptr, nullptr, nullptr, false, &unproved);
+            WaitForOptimizedPipelines(context.device);
+            Require(counts().hits == before.hits, "a non-pointer user word change replayed a pointer slot");
+            settle();
+            std::cout << "agc_archb_fix_replay_moved_pointers_non_pointer: ok\n";
+            return 0;
+        }
+        if (scenario == "moved_interleaved") {
+            const char* control = std::getenv("APS5_ARCHB_CONTROL_FILE");
+            Require(control != nullptr, "the interleaved moved-pointer test has no control file");
+            const auto toggle = [&](unsigned sequence, bool enabled) {
+                std::ofstream(control, std::ios::trunc) << sequence << " C_REPLAY_MOVED_POINTERS=" << enabled << '\n';
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                Switches::PollControl();
+                Require(Switches::Enabled(Feature::ArchcReplayMovedPointers) == enabled, "the moved-pointer replay switch did not toggle");
+            };
+            const auto secondIdentity = identityFor(1, true);
+            const auto before = counts();
+            movedDraw(1, secondIdentity);
+            const auto afterOn = counts();
+            if (movedOn && !verifyMoved) Require(afterOn.hits == before.hits + 1, "the first moved pointer was not replayed");
+            settle();
+            toggle(1, false);
+            const std::array live{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, resources[1].get(), PipelinePushSlotBytes}};
+            const DrawSlotIdentity sampledOff{whole, {{vertex}, {resources[1]}}, Switches::Enabled(Feature::ArchcReplayMovedPointers), false};
+            Draw(context, *whole, indirect, live, {}, nullptr, nullptr, nullptr, false, &sampledOff);
+            WaitForOptimizedPipelines(context.device);
+            Require(counts().hits == afterOn.hits, "a draw sampled with the moved-pointer switch off used its slot");
+            settle();
+            toggle(2, true);
+            const auto beforeAgain = counts();
+            movedDraw(2, identityFor(2, true));
+            if (movedOn && !verifyMoved) Require(counts().hits == beforeAgain.hits + 1, "the moved-pointer slot did not survive an interleaved off draw");
+            settle();
+            std::filesystem::remove(control);
+            std::cout << "agc_archb_fix_replay_moved_pointers_interleaved: ok\n";
+            return 0;
+        }
+        const auto index = scenario == "moved_same" ? 1u : 2u;
+        const auto before = counts();
+        movedDraw(index, identityFor(index, true));
+        const auto after = counts();
+        if (movedOn && !verifyMoved) Require(after.hits == before.hits + 1, "the moved pointer did not replay");
+        if (verifyMoved) Require(after.hits == before.hits && after.verifyChecks == before.verifyChecks + 1 && after.verifyMismatches == before.verifyMismatches, "moved-pointer VERIFY did not check the legacy build cleanly");
+        const auto read = texels(*whole);
+        const auto expected = scenario == "moved_same" ? std::byte{0x31} : std::byte{0x72};
+        for (std::size_t texel = 0; texel < 64 * 64; ++texel) {
+            Require(read[texel * 4] == expected && read[texel * 4 + 1] == std::byte{0} && read[texel * 4 + 2] == std::byte{0} && read[texel * 4 + 3] == std::byte{255}, "the replay did not draw from the moved pointer's current contents");
+        }
+        std::cout << (scenario == "moved_same" ? "agc_archb_fix_replay_moved_pointers_same: ok\n" : "agc_archb_fix_replay_moved_pointers_different: ok\n");
         return 0;
     }
     throw std::runtime_error("unknown Arch C replay scenario");

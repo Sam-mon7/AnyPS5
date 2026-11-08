@@ -119,6 +119,16 @@ std::string_view TrimmedReason(std::string_view reason) {
     return reason;
     }
 
+void CountMovedPointerRefusal(const char* reason) {
+    if (std::strcmp(reason, "decode") == 0) ArchB::Recorder::Count("c_rmp_refused_decode");
+    else if (std::strcmp(reason, "stages") == 0) ArchB::Recorder::Count("c_rmp_refused_stages");
+    else if (std::strcmp(reason, "unchanged") == 0) ArchB::Recorder::Count("c_rmp_refused_unchanged");
+    else if (std::strcmp(reason, "non_pointer") == 0) ArchB::Recorder::Count("c_rmp_refused_non_pointer");
+    else if (std::strcmp(reason, "null") == 0) ArchB::Recorder::Count("c_rmp_refused_null");
+    else if (std::strcmp(reason, "alignment") == 0) ArchB::Recorder::Count("c_rmp_refused_alignment");
+    else ArchB::Recorder::Count("c_rmp_refused_no_variant");
+}
+
 }
 
 
@@ -140,6 +150,8 @@ struct DrawTail {
     bool registerKey = false;
     bool ubPointerFree = false;
     bool ubSkipCpuIndirect = false;
+    bool replayMovedPointers = false;
+    bool movedPointerCandidate = false;
     // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS, sampled once per draw: the enqueue did not drain for arguments
     // queued items write; CPU reads of them drain first (drainBeforeArgumentRead).
     bool indirectGpuArgs = false;
@@ -472,6 +484,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     tail.imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     tail.bufferBases = ArchB::Switches::Enabled(ArchB::Feature::FixBufferBaseRefresh);
+    tail.replayMovedPointers = ArchB::Switches::Enabled(ArchB::Feature::ArchcReplayMovedPointers);
     // APS5_ARCHB_FIX_ALLOC_CHURN, once per draw: this thread's allocation sites follow it for the rest
     // of the draw, and the finisher and pipelined commits take the same value from the tail.
     tail.allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
@@ -622,6 +635,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     std::uint64_t drawIdentity = 0, drawAlias = 0;
     std::vector<DrawUserPatch> userPatches;
+    std::vector<std::pair<const DispatchVariant*, std::shared_ptr<DispatchVariant>>> movedPointerOrigins;
+    std::shared_ptr<DrawEntry> movedPointerDonor;
+    std::uint64_t movedPointerDonorKey = 0;
+    bool movedPointerRelocated = false;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
@@ -671,7 +688,24 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 cacheLock.lock();
             }
             if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
-            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
+            if (tail.replayMovedPointers && drawParameters.indirect) {
+                if (!Graphics::ArchcReplayActive()) {
+                    ArchB::Recorder::Count("c_rmp_refused_replay_inactive");
+                } else if (const auto shape = drawShapes.find(shapeKey); shape == drawShapes.end()) {
+                    ArchB::Recorder::Count("c_rmp_refused_no_shape");
+                } else if (const auto kept = drawCache.find(shape->second); kept == drawCache.end() || kept->second->shape != shapeKey) {
+                    ArchB::Recorder::Count("c_rmp_refused_no_entry");
+                } else if (const auto reason = relocateDrawEntry(queue, kept->second, entry, decode, userPatches, &movedPointerOrigins); reason != nullptr) {
+                    CountMovedPointerRefusal(reason);
+                    movedPointerOrigins.clear();
+                } else {
+                    tail.movedPointerCandidate = true;
+                    movedPointerDonor = kept->second;
+                    movedPointerDonorKey = shape->second;
+                    movedPointerRelocated = true;
+                }
+            }
+            if (entry == nullptr && drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
                 ++trial.lookups;
@@ -704,6 +738,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         maybeReportDrawCache(profile);
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
+        if (tail.movedPointerCandidate) ArchB::Recorder::Count("c_rmp_refused_stale_program");
+        tail.movedPointerCandidate = false;
+        movedPointerOrigins.clear();
         userPatches.clear();
         std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);
@@ -911,6 +948,24 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
     }
+    if (tail.movedPointerCandidate && !drawHit) {
+        ArchB::Recorder::Count("c_rmp_refused_validation");
+        tail.movedPointerCandidate = false;
+    }
+    if (tail.movedPointerCandidate) {
+        for (std::size_t i = 0; i < matched.size(); ++i) {
+            if (matched[i] == nullptr) continue;
+            const auto origin = std::find_if(movedPointerOrigins.begin(), movedPointerOrigins.end(), [&](const auto& item) { return item.first == matched[i].get(); });
+            if (origin != movedPointerOrigins.end()) stageData[i].replayVariant = origin->second;
+        }
+        std::lock_guard cacheLock(drawCacheMutex);
+        const auto donor = drawCache.find(movedPointerDonorKey);
+        if (donor != drawCache.end() && donor->second == movedPointerDonor && drawCacheHits - donor->second->touched > drawCacheEntries() / 8) {
+            drawOrder.splice(drawOrder.begin(), drawOrder, donor->second->order);
+            donor->second->touched = drawCacheHits;
+            ++drawEntryCounters.touches;
+        }
+    }
     if (censusStage < programs.size()) {
         const char* reason = drawHit ? "hit" : verifyHit ? "verify" : entry == nullptr ? "absent" : "miss-other";
         {
@@ -989,8 +1044,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         applyShaderDataPatches(*matched[i]);
         if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words, stageData[i].bufferBaseHit);
     }
+    if (tail.movedPointerCandidate) {
+        for (std::size_t i = 0; i < matched.size(); ++i) {
+            if (matched[i] == nullptr || stageData[i].replayVariant == nullptr || stageData[i].compiled != nullptr) continue;
+            stageData[i].words = matched[i]->words;
+            stageData[i].compiled = matched[i]->compiled;
+        }
+    }
     const auto relocatedDecode = decode;
-    if (!userPatches.empty()) {
+    if (!userPatches.empty() && !movedPointerRelocated) {
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
@@ -1611,7 +1673,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
         // and the commit hands `resolution` to its preparation.
         const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
-        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
+        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, replayMovedPointers = tail.replayMovedPointers, movedPointerCandidate = tail.movedPointerCandidate, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
             if (resolving) {
                 DrawPipeline::FollowResolveEpoch(epoch);
                 return localDevice->ResolveDraw(decode->state, drawParameters, stages, recipe.get(), memoVirtualQuery, resolution, *resolveReads);
@@ -1643,17 +1705,30 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 };
                 identified = decode != nullptr;
                 slotIdentity.state = decode != nullptr && decode->stateOrigin != nullptr ? std::shared_ptr<const void>(decode->stateOrigin) : std::shared_ptr<const void>(decode);
+                slotIdentity.movedPointers = replayMovedPointers;
+                slotIdentity.movedPointerCandidate = movedPointerCandidate;
                 slotIdentity.stages.reserve(stages.size());
                 for (const auto& stage : stages) {
                     Graphics::DrawSlotStage entry;
                     for (std::size_t i = 0; i < stageData.size() && i < matched.size(); ++i) {
                         if (stageData[i].compiled == nullptr || stageData[i].compiled.get() != stage.program || matched[i] == nullptr || matched[i]->compiled == nullptr) continue;
-                        entry.owner = matched[i]->compiled;
-                        entry.variant = matched[i];
+                        const auto kept = stageData[i].replayVariant != nullptr ? stageData[i].replayVariant : matched[i];
+                        entry.owner = kept->compiled;
+                        entry.variant = kept;
                         entry.words = stageData[i].words;
                         entry.patched = true;
                         entry.bufferBases = stageData[i].bufferBaseHit;
                         break;
+                    }
+                    if (!entry.patched && replayMovedPointers) {
+                        for (const auto& variant : matched) {
+                            if (variant == nullptr || variant->compiled == nullptr || variant->compiled.get() != stage.program || variant->relocatableWords == 0) continue;
+                            entry.owner = variant->compiled;
+                            entry.variant = variant;
+                            entry.words = variant->words;
+                            entry.patched = true;
+                            break;
+                        }
                     }
                     if (!entry.patched) entry.owner = ownerOf(stage.program);
                     if (entry.owner == nullptr) identified = false;
