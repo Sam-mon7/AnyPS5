@@ -88,7 +88,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 entry.address = label->address;
                 entry.decodedNs = ArchB::LabelCensus::On() ? ArchB::LabelCensus::Now() : 0;
                 if (Timeline::Enabled) {
-                    Timeline::DeferredOrigins().push_back({Timeline::Packet, Timeline::Opcode});
+                    Timeline::DeferredOrigins().push_back({Timeline::Packet(), Timeline::Opcode()});
                     Timeline::Store(Timeline::Kind::LabelDeferred, label->address, bytes, 0);
                 }
                 entry.size = bytes.size();

@@ -4,6 +4,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -97,11 +98,15 @@ bool Driver::vouchedValidation() {
 namespace {
 // Whether the calling thread's last validateVariant reached the byte compare (the shadow tells a
 // decision taken on the bytes from a refusal by a gate or a serial).
-thread_local bool variantCompared = false;
+struct VariantComparedSlot {};
+bool variantCompared() { return HostThreadSlot<bool, VariantComparedSlot>::Get(); }
+void variantCompared(bool value) { HostThreadSlot<bool, VariantComparedSlot>::Set(value); }
 // Whether the calling thread's last validateVariant proved the guest bytes of every run equal to the
 // variant's words exactly (Equal with no live data word, no masked feedback bit and no pending GPU
 // write over a run): only then may a since move (CompareAndRestamp).
-thread_local bool variantExact = false;
+struct VariantExactSlot {};
+bool variantExact() { return HostThreadSlot<bool, VariantExactSlot>::Get(); }
+void variantExact(bool value) { HostThreadSlot<bool, VariantExactSlot>::Set(value); }
 
 // Slice S7 (GEN_DRAW_VALIDATION): the generation verdict over the variant's runs at its since and
 // the calling thread's ticket. Clean needs every block tracked, covered by a resetting walk that
@@ -119,7 +124,7 @@ GuestMemory::Gen::DrawGen generationVerdict(const DispatchVariant& variant, cons
 }
 
 bool VariantValidationExact() {
-    return variantExact;
+    return variantExact();
 }
 
 void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::uint64_t ticket) {
@@ -169,7 +174,7 @@ GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer cons
     const auto verdict = evaluate(false, &needsSweep, &reason);
     bool unchanged;
     if (outcome == EntryOutcome::Equal) unchanged = true;
-    else if (outcome == EntryOutcome::EqualData || (variantCompared && (outcome == EntryOutcome::Differing || outcome == EntryOutcome::Inaccessible))) unchanged = false;
+    else if (outcome == EntryOutcome::EqualData || (variantCompared() && (outcome == EntryOutcome::Differing || outcome == EntryOutcome::Inaccessible))) unchanged = false;
     else {
         Gen::CountRefused(consumer);
         return verdict;
@@ -200,8 +205,8 @@ GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer cons
 
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer) {
     namespace Gen = GuestMemory::Gen;
-    variantCompared = false;
-    variantExact = false;
+    variantCompared(false);
+    variantExact(false);
     if (live != nullptr) live->clear();
     if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
@@ -214,8 +219,10 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (feedbackMask && validateLegacy() && !variant.feedback.memory.empty()) ArchB::Recorder::Count("fix_tsharp_mask_refused_legacy");
     const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit, refreshBuffers ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.bufferBaseMasks) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}};
     if (bufferBases && validateLegacy() && !variant.bufferBaseMasks.empty()) ArchB::Recorder::Count("fix_buffer_base_refused_legacy");
-    thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
+    struct VouchedSlot {};
+    auto* vouchedSlot = HostThreadSlot<std::vector<VouchedRegions>*, VouchedSlot>::Get();
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
+    HostThreadSlot<std::vector<VouchedRegions>*, VouchedSlot>::Set(&vouched);
     vouched.clear();
     if (!variant.shared.empty() && vouchedValidation() && !validateLegacy() && variant.runs.size() == regions.size()) VouchSharedRegions(variant.shared, regions.size(), &QueryPendingSpan, vouched);
     PendingView pending;
@@ -223,8 +230,10 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (refreshBuffers && std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) ArchB::Recorder::Count("fix_buffer_base_pending");
     if (feedback && std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) ArchB::Recorder::Count("fix_tsharp_mask_refused_pending");
     std::erase_if(vouched, [&](const VouchedRegions& range) { return pending.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low)); });
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* checkedSlot = nullptr;
+    struct CheckedSlot {};
+    auto* checkedSlot = HostThreadSlot<std::vector<std::pair<std::uint64_t, std::uint64_t>>*, CheckedSlot>::Get();
     auto& checked = ShaderRecompiler::ThreadOwned(checkedSlot);
+    HostThreadSlot<std::vector<std::pair<std::uint64_t, std::uint64_t>>*, CheckedSlot>::Set(&checked);
     checked.clear();
     if (!vouched.empty()) {
         for (std::size_t index = 0, range = 0; index < variant.runs.size(); ++index) {
@@ -268,7 +277,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
 
     pending.Load();
     bool unmapped = false;
-    variantCompared = true;
+    variantCompared(true);
     // Slice S7 (GEN_DRAW_VALIDATION), after every gate above (drains, pending syncs, image flushes,
     // queued labels), where the byte compare would run: a Clean generation verdict means the guest
     // bytes of every run are the variant's words, which is what an exact compare would find (Equal,
@@ -291,8 +300,8 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
                 if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
                 if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
                 Gen::CountDrawGen(consumer, Gen::DrawGen::Clean);
-                variantCompared = false;
-                variantExact = true;
+                variantCompared(false);
+                variantExact(true);
                 return EntryOutcome::Equal;
             }
         }
@@ -312,10 +321,10 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
-    variantExact = exact && verdict != Gen::DrawGen::Pending && !std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); });
+    variantExact(exact && verdict != Gen::DrawGen::Pending && !std::ranges::any_of(variant.runs, [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); }));
     if (generations && !verifying) {
         Gen::CountDrawGen(consumer, verdict);
-        if (variantExact && before != 0) {
+        if (variantExact() && before != 0) {
             RestampVariant(variant, before, ticket);
             Gen::CountDrawGen(consumer, Gen::DrawGen::Restamped);
         }

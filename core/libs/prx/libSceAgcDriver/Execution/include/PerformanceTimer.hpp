@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -242,36 +243,39 @@ private:
 
 class PerformanceContext {
 public:
-    explicit PerformanceContext(FrameTiming* frame) : previous(current) {
-        current = frame;
+    explicit PerformanceContext(FrameTiming* frame) : previous(Current()) {
+        HostThreadSlot<FrameTiming*, CurrentSlot>::Set(frame);
     }
 
     PerformanceContext(const PerformanceContext&) = delete;
     PerformanceContext& operator=(const PerformanceContext&) = delete;
 
     ~PerformanceContext() {
-        current = previous;
+        HostThreadSlot<FrameTiming*, CurrentSlot>::Set(previous);
     }
 
     static FrameTiming* Current() {
-        return current;
+        return HostThreadSlot<FrameTiming*, CurrentSlot>::Get();
     }
 
 private:
-    inline static thread_local FrameTiming* current = nullptr;
+    struct CurrentSlot {};
     FrameTiming* previous;
 };
 
 class PerformanceTimer {
 public:
-    explicit PerformanceTimer(const char* scope, ArchB::Recorder::Phase phase = ArchB::Recorder::Phase::Inherit) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope) {
+    explicit PerformanceTimer(const char* scope, ArchB::Recorder::Phase phase = ArchB::Recorder::Phase::Inherit) : frame(PerformanceContext::Current()), trace(PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr), scope(scope), cheap(ArchB::CheapClock::Active()) {
         if (frame != nullptr) {
             total = frame->Get(scope, "total");
         }
         const bool record = ArchB::Recorder::Enabled();
-        if (frame != nullptr || trace != nullptr || record) start = Clock::now();
+        if (frame != nullptr || trace != nullptr || record) start = ArchB::CheapClock::Now(cheap);
         previous = start;
-        if (record) AgcDriverRecorderScopeBegin_nid_no_patch(&recorder, scope, start.time_since_epoch().count(), static_cast<std::uint8_t>(phase));
+        if (record) {
+            if (cheap) AgcDriverRecorderCount_nid_no_patch("fix_cheap_timers_scopes", 1);
+            AgcDriverRecorderScopeBegin_nid_no_patch(&recorder, scope, start.time_since_epoch().count(), static_cast<std::uint8_t>(phase));
+        }
     }
 
     PerformanceTimer(const PerformanceTimer&) = delete;
@@ -284,7 +288,7 @@ public:
     void Finish() {
         zone.End();
         if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
-        const auto end = Clock::now();
+        const auto end = ArchB::CheapClock::Now(cheap);
         if (recorder.Active()) AgcDriverRecorderScopeEnd_nid_no_patch(&recorder, end.time_since_epoch().count());
         if (trace != nullptr) trace->Add(scope, nullptr, start, end);
         trace = nullptr;
@@ -299,13 +303,13 @@ public:
     void RecorderPhase(ArchB::Recorder::Phase phase) { recorder.SetPhase(phase); }
 
     void FinishPacket(std::uint64_t serial, std::size_t offset, std::uint32_t opcode, std::size_t words) {
-        if (frame != nullptr) frame->NotePacket(serial, offset, opcode, words, Clock::now() - start);
+        if (frame != nullptr) frame->NotePacket(serial, offset, opcode, words, ArchB::CheapClock::Now(cheap) - start);
         Finish();
     }
 
     void Mark(const char* stage, std::uint64_t bytes = 0) {
         if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
-        const auto now = Clock::now();
+        const auto now = ArchB::CheapClock::Now(cheap);
         if (recorder.Active()) AgcDriverRecorderScopeMark_nid_no_patch(&recorder, stage, now.time_since_epoch().count());
         if (trace != nullptr) trace->Add(scope, stage, previous, now);
         if (frame != nullptr) {
@@ -327,6 +331,7 @@ private:
     FrameTiming::Metric* tail = nullptr;
     Clock::time_point start{};
     Clock::time_point previous{};
+    bool cheap;
 };
 
 }

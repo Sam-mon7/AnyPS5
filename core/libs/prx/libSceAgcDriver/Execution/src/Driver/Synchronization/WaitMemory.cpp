@@ -325,7 +325,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         if (Timeline::Enabled) {
             for (std::size_t offset = 0; offset < awaitedBytes; offset += 4) Timeline::Emit(Timeline::Kind::WaitSource,
-                awaited + offset, (hit->value >> (offset * 8u)) & 0xffffffffu, Timeline::LabelStamps[offset / 4], 4, 0, Timeline::LabelQueues[offset / 4]);
+                awaited + offset, (hit->value >> (offset * 8u)) & 0xffffffffu, Timeline::LabelStamps()[offset / 4], 4, 0, Timeline::LabelQueues()[offset / 4]);
         }
         submitWriter(hit->queue, !unlockedHit);
         finishProfile(Graphics::Recorder::WaitEnd::Recorder);

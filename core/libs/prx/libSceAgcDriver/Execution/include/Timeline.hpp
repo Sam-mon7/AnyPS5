@@ -21,6 +21,9 @@
 #include <span>
 #include <thread>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 
 namespace AgcDriver::Timeline {
 
@@ -45,7 +48,7 @@ inline const char* const Directory = std::getenv("APS5_TIMELINE");
 inline const bool Enabled = Directory != nullptr && *Directory != '\0';
 
 inline std::uint64_t Now() {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ArchB::CheapClock::Now(ArchB::CheapClock::Active()).time_since_epoch()).count());
 }
 
 class Buffer {
@@ -156,36 +159,60 @@ inline Writer& Output() {
     return *writer;
 }
 
-inline thread_local Buffer* Local = nullptr;
-inline thread_local std::uint32_t Queue = 0xffffffffu;
-inline thread_local std::uint32_t Opcode = 0;
-inline thread_local std::uint64_t Packet = 0;
-inline thread_local std::uint64_t Serial = 0;
-inline thread_local std::uint32_t LockSite = 0;
-inline thread_local std::array<std::uint64_t, 2> LabelStamps{};
-inline thread_local std::array<std::uint32_t, 2> LabelQueues{};
 struct Origin {
     std::uint64_t packet;
     std::uint32_t opcode;
 };
+
+struct ThreadState {
+    Buffer* local = nullptr;
+    std::uint32_t queue = 0xffffffffu;
+    std::uint32_t opcode = 0;
+    std::uint64_t packet = 0;
+    std::uint64_t serial = 0;
+    std::uint32_t lockSite = 0;
+    std::array<std::uint64_t, 2> labelStamps{};
+    std::array<std::uint32_t, 2> labelQueues{};
+    std::vector<Origin> deferredOrigins;
+};
+
+struct ThreadStateSlot {};
+struct ThreadStateStorage {};
+
+inline ThreadState& State() {
+    auto* state = HostThreadSlot<ThreadState*, ThreadStateSlot>::Get();
+    if (state == nullptr) {
+        state = &HostThreadLocal<ThreadState, ThreadStateStorage>();
+        HostThreadSlot<ThreadState*, ThreadStateSlot>::Set(state);
+    }
+    return *state;
+}
+
+inline std::uint32_t& Queue() { return State().queue; }
+inline std::uint32_t& Opcode() { return State().opcode; }
+inline std::uint64_t& Packet() { return State().packet; }
+inline std::uint32_t& LockSite() { return State().lockSite; }
+inline std::array<std::uint64_t, 2>& LabelStamps() { return State().labelStamps; }
+inline std::array<std::uint32_t, 2>& LabelQueues() { return State().labelQueues; }
+
 inline std::vector<Origin>& DeferredOrigins() {
-    thread_local std::vector<Origin>* slot = nullptr;
-    if (slot == nullptr) slot = new std::vector<Origin>();
-    return *slot;
+    return State().deferredOrigins;
 }
 
 inline void Bind(std::uint32_t queue) {
     if (!Enabled) return;
-    Queue = queue;
-    if (Local == nullptr) Local = Output().Register();
+    auto& state = State();
+    state.queue = queue;
+    if (state.local == nullptr) state.local = Output().Register();
 }
 
 inline std::uint64_t Emit(Kind kind, std::uint64_t a = 0, std::uint64_t b = 0, std::uint64_t c = 0, std::uint64_t d = 0,
                           std::uint64_t batch = 0, std::uint32_t flags = 0) {
     if (!Enabled) return 0;
-    if (Local == nullptr) Bind(Queue);
-    const auto id = (static_cast<std::uint64_t>(Local->Thread()) << 48u) | ++Serial;
-    Local->Push({Now(), id, a, b, c, d, Queue, static_cast<std::uint32_t>(kind), Opcode, flags, Packet, batch});
+    auto& state = State();
+    if (state.local == nullptr) Bind(state.queue);
+    const auto id = (static_cast<std::uint64_t>(state.local->Thread()) << 48u) | ++state.serial;
+    state.local->Push({Now(), id, a, b, c, d, state.queue, static_cast<std::uint32_t>(kind), state.opcode, flags, state.packet, batch});
     return id;
 }
 
@@ -203,16 +230,18 @@ class PacketScope {
 public:
     PacketScope(std::uint32_t opcode, std::uint64_t submission, std::uint64_t offset) {
         if (!Enabled) return;
-        previous = Packet;
-        previousOpcode = Opcode;
-        Opcode = opcode;
-        Packet = Emit(Kind::PacketBegin, submission, offset);
+        auto& state = State();
+        previous = state.packet;
+        previousOpcode = state.opcode;
+        state.opcode = opcode;
+        state.packet = Emit(Kind::PacketBegin, submission, offset);
     }
     ~PacketScope() {
         if (!Enabled) return;
-        Emit(Kind::PacketEnd, Packet);
-        Packet = previous;
-        Opcode = previousOpcode;
+        auto& state = State();
+        Emit(Kind::PacketEnd, state.packet);
+        state.packet = previous;
+        state.opcode = previousOpcode;
     }
 private:
     std::uint64_t previous = 0;
@@ -222,9 +251,9 @@ private:
 class ContextScope {
 public:
     ContextScope(std::uint64_t packet, std::uint32_t opcode) {
-        if (Enabled) { previous = Packet; previousOpcode = Opcode; Packet = packet; Opcode = opcode; }
+        if (Enabled) { auto& state = State(); previous = state.packet; previousOpcode = state.opcode; state.packet = packet; state.opcode = opcode; }
     }
-    ~ContextScope() { if (Enabled) { Packet = previous; Opcode = previousOpcode; } }
+    ~ContextScope() { if (Enabled) { auto& state = State(); state.packet = previous; state.opcode = previousOpcode; } }
 private:
     std::uint64_t previous;
     std::uint32_t previousOpcode;

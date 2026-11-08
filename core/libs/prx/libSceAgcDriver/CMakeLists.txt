@@ -241,6 +241,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Switches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/CheapClock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
@@ -513,7 +514,7 @@ if(BUILD_TESTING)
         "inline bool RecorderFixtureHandoff(const std::array<bool, 10>& values) { return ${recorderHandoff}; }\n")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "Execution/src/Driver/Draw/Draw.cpp")
     add_test_executable(agc_archb_c09a_recorder_tests tests/ArchBRecorder.cpp
-        Execution/src/ArchB/Recorder.cpp Execution/src/PerformanceTraceThread.cpp)
+        Execution/src/ArchB/Recorder.cpp Execution/src/ArchB/CheapClock.cpp Execution/src/HostAllocator.cpp Execution/src/PerformanceTraceThread.cpp)
     target_include_directories(agc_archb_c09a_recorder_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(agc_archb_c09a_recorder_tests PRIVATE libc)
     configure_windows_unwind(agc_archb_c09a_recorder_tests)
@@ -525,10 +526,31 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    foreach(cheapTimerCase IN ITEMS cheap_clock cheap_timer_flip cheap_benchmark)
+        add_test(NAME agc_archb_fix_cheap_timers_${cheapTimerCase} COMMAND agc_archb_c09a_recorder_tests ${cheapTimerCase})
+        set_tests_properties(agc_archb_fix_cheap_timers_${cheapTimerCase} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archb_fix_cheap_timers_${cheapTimerCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     if(Python3_Interpreter_FOUND)
         add_test(NAME agc_archb_c09a_stats_reads_recorder COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/ArchBRecorderStats.py)
         set_tests_properties(agc_archb_c09a_stats_reads_recorder PROPERTIES TIMEOUT 30)
+    endif()
+
+    if(WIN32)
+        add_test_executable(agc_archb_fix_slab_alloc_tests tests/HostSlabAllocator.cpp Execution/src/HostAllocator.cpp)
+        target_include_directories(agc_archb_fix_slab_alloc_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_compile_definitions(agc_archb_fix_slab_alloc_tests PRIVATE APS5_HOST_SLAB_COUNT=1024)
+        target_link_libraries(agc_archb_fix_slab_alloc_tests PRIVATE libc)
+        configure_windows_unwind(agc_archb_fix_slab_alloc_tests)
+        foreach(slabCase IN ITEMS classes cross_thread foreign toggle exhaustion stress benchmark)
+            add_test(NAME agc_archb_fix_slab_alloc_${slabCase} COMMAND agc_archb_fix_slab_alloc_tests ${slabCase})
+            set_tests_properties(agc_archb_fix_slab_alloc_${slabCase} PROPERTIES TIMEOUT 30 ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
     endif()
 
     add_test_executable(agc_archb_c01_present_counters_tests tests/PresentCounters.cpp)
@@ -556,7 +578,7 @@ if(BUILD_TESTING)
     endif()
 
     add_test_executable(agc_archb_c01_switches_tests tests/ArchBSwitches.cpp
-        Execution/src/ArchB/Switches.cpp ../libSceVideoOut/src/Telemetry.cpp)
+        Execution/src/ArchB/Switches.cpp Execution/src/ArchB/CheapClock.cpp ../libSceVideoOut/src/Telemetry.cpp)
     target_include_directories(agc_archb_c01_switches_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
     target_compile_definitions(agc_archb_c01_switches_tests PRIVATE APS5_ARCHB_SWITCHES_TEST)
     target_link_libraries(agc_archb_c01_switches_tests PRIVATE libc)
@@ -572,6 +594,13 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_c01_switches COMMAND agc_archb_c01_switches_tests)
     add_test(NAME agc_archb_fix_v1_switch COMMAND agc_archb_c01_switches_tests --toggle VqMemo)
     add_test(NAME agc_archb_fix_alloc_churn_switch COMMAND agc_archb_c01_switches_tests --toggle AllocChurn)
+    add_test(NAME agc_archb_fix_slab_alloc_switch COMMAND agc_archb_c01_switches_tests --toggle FixHostSlabAlloc)
+    add_test(NAME agc_archb_fix_cheap_timers_switch COMMAND agc_archb_c01_switches_tests --toggle FixCheapTimers)
+    set_tests_properties(agc_archb_fix_slab_alloc_switch agc_archb_fix_cheap_timers_switch PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_slab_alloc_switch agc_archb_fix_cheap_timers_switch PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_archb_fix_wt_bookkeeping_switch COMMAND agc_archb_c01_switches_tests --toggle WriteTrackingBookkeeping)
     add_test(NAME agc_archb_gen_table_switch COMMAND agc_archb_c01_switches_tests --toggle GenTable)
     add_test(NAME agc_archb_gen_shadow_switch COMMAND agc_archb_c01_switches_tests --toggle GenShadow)

@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -398,6 +400,10 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool hostSlabAlloc = ArchB::Switches::Enabled(ArchB::Feature::FixHostSlabAlloc);
+    const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
+    const bool cheapTimers = ArchB::Switches::Enabled(ArchB::Feature::FixCheapTimers);
+    const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
     const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
@@ -965,7 +971,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue([this, allocChurn, partialSnapshot, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
+        DrawPipeline::Queue0().Enqueue([this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
+            const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
+            const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);

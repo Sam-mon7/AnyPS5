@@ -177,8 +177,12 @@ std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 // Stage 4.2: the committer's tracker-mutex acquisitions that waited and the time waited (resolver
 // walks hold the same mutex).
-thread_local std::atomic<std::uint64_t>* trackerTimedWaits = nullptr;
-thread_local std::atomic<std::uint64_t>* trackerTimedWaitNs = nullptr;
+struct TrackerTimedWaitsSlot {};
+struct TrackerTimedWaitNsSlot {};
+std::atomic<std::uint64_t>* trackerTimedWaits() { return HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitsSlot>::Get(); }
+void trackerTimedWaits(std::atomic<std::uint64_t>* value) { HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitsSlot>::Set(value); }
+std::atomic<std::uint64_t>* trackerTimedWaitNs() { return HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitNsSlot>::Get(); }
+void trackerTimedWaitNs(std::atomic<std::uint64_t>* value) { HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitNsSlot>::Set(value); }
 std::atomic<std::uint64_t> committerTrackerWaits{0};
 std::atomic<std::uint64_t> committerTrackerWaitNs{0};
 std::atomic<std::uint64_t> resolverTrackerWaits{0};
@@ -1861,11 +1865,13 @@ public:
                 lock = std::unique_lock<AgcDriver::Mutex>(tracker.mutex, std::adopt_lock);
                 return;
             }
-            if (trackerTimedWaits != nullptr && !lock.try_lock()) {
-                const auto start = std::chrono::steady_clock::now();
+            auto* waits = trackerTimedWaits();
+            if (waits != nullptr && !lock.try_lock()) {
+                const bool cheap = ArchB::CheapClock::Active();
+                const auto start = ArchB::CheapClock::Now(cheap);
                 lock.lock();
-                trackerTimedWaits->fetch_add(1, std::memory_order_relaxed);
-                trackerTimedWaitNs->fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+                waits->fetch_add(1, std::memory_order_relaxed);
+                trackerTimedWaitNs()->fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ArchB::CheapClock::Now(cheap) - start).count()), std::memory_order_relaxed);
                 return;
             }
             if (!lock.owns_lock()) lock.lock();
@@ -2119,8 +2125,10 @@ struct EpochCollectMap {
 };
 
 EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
-    thread_local EpochCollectMap* slot = nullptr;
+    struct Slot {};
+    auto* slot = HostThreadSlot<EpochCollectMap*, Slot>::Get();
     auto& map = ShaderRecompiler::ThreadOwned(slot);
+    HostThreadSlot<EpochCollectMap*, Slot>::Set(&map);
     if (map.ranges.Epoch() != epoch) {
         // Decided per epoch at its first collect, which often comes from a packet outside any draw
         // (the epoch starts at an ordering point), so the live switch counts as well as the draw's.
@@ -2936,8 +2944,9 @@ CollectHitCache& collectHitCache() {
     return *cache;
 }
 
-// The queue-0 committer's collect counters (see GuestMemory.hpp).
-thread_local bool committerThread = false;
+struct CommitterThreadSlot {};
+bool committerThread() { return HostThreadSlot<bool, CommitterThreadSlot>::Get(); }
+void committerThread(bool value) { HostThreadSlot<bool, CommitterThreadSlot>::Set(value); }
 // Stage 4.2 (APS5_ARCHB_PIPE_RESOLVE_POOL): a draw resolver thread. Its walks (made after the item's
 // ordering point, like queue 0's) go into the collect-share table, which the committer then reads
 // even with PIPE_COLLECT_SHARE off; APS5_PIPE_RESOLVE_SHARE=0 leaves both out.
@@ -3501,8 +3510,8 @@ StableFailedCollectCounters& counters() {
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     const Stage4::TrackerScope stage4Scope(false, address, bytes);
-    const aheadCensus::Scope aheadScope(committerThread && memoized && aheadCensus::enabled());
-    committerCensus::Call committerCall(committerThread && committerCensus::enabled(), site, memoized);
+    const aheadCensus::Scope aheadScope(committerThread() && memoized && aheadCensus::enabled());
+    committerCensus::Call committerCall(committerThread() && committerCensus::enabled(), site, memoized);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -3516,7 +3525,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (committerCall.on) committerCall.range(first, stop, epoch);
-    if (committerThread && useMemo) CommitterCollects().collects.fetch_add(1, std::memory_order_relaxed);
+    if (committerThread() && useMemo) CommitterCollects().collects.fetch_add(1, std::memory_order_relaxed);
     // Write generations: an uncached collect sweeps at a private fresh ticket (rule V4); a memoized
     // one is modeled under the shadow: what EnsureSwept would sweep at the thread's ticket, judged
     // before this call's own walk can cover anything.
@@ -3539,7 +3548,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (!bookkeeping::verify()) {
                 bookkeeping::count(bookkeeping::Hits);
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
+                if (committerThread()) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
                 committerCall.hit(committerCensus::OutcomeHitCache);
                 census::note(census::OutcomeHit);
                 return tracker.stable.load(std::memory_order_acquire);
@@ -3552,7 +3561,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (cached != nullptr) *cached = {first, stop, epoch, unwatched, mapping};
         if (verifyHit) bookkeeping::count(bookkeeping::Verified);
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-        if (committerThread) {
+        if (committerThread()) {
             CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
             // APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY: every 32nd own-memo hit is walked anyway, the
             // baseline rate of writes landing inside an epoch for the covered-walk mismatches.
@@ -3724,8 +3733,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     };
     // APS5_ARCHB_PIPE_COLLECT_SHARE: the committer skips a walk queue 0 already made for this epoch;
     // queue 0 records its walks. Not with the write-generation table (its sweep model follows walks).
-    const bool shareCommitter = committerThread && useMemo && !Gen::Active() && (collectShare::active() || resolveShareActive());
-    const bool shareProducer = !committerThread && !Gen::Active() && ((collectShare::producer && collectShare::active()) || (resolverThread && resolveShareActive()));
+    const bool shareCommitter = committerThread() && useMemo && !Gen::Active() && (collectShare::active() || resolveShareActive());
+    const bool shareProducer = !committerThread() && !Gen::Active() && ((collectShare::producer && collectShare::active()) || (resolverThread && resolveShareActive()));
     bool shareCovered = false;
 #ifdef _WIN32
     if (shareCommitter) {
@@ -3747,7 +3756,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         } else counters.sharePartialPages.fetch_add(coveredPages, std::memory_order_relaxed);
     }
 #endif
-    if (committerThread && useMemo) {
+    if (committerThread() && useMemo) {
         CommitterCollects().walks.fetch_add(1, std::memory_order_relaxed);
         CommitterCollects().walkPages.fetch_add((stop - first) / page, std::memory_order_relaxed);
     }
@@ -3870,7 +3879,7 @@ void BumpCollectEpoch(Gen::TicketReason reason) {
     // APS5_ARCHB_PIPE_COLLECT_SHARE: a committer's own ordering point (an unlocked wait) also bounds
     // the queue-0 walks that may stand in for its own; following a commit's token resets the
     // requirement until FollowCollectShare names the token's point.
-    if (committerThread) {
+    if (committerThread()) {
         if (reason == Gen::TicketReason::Committer) collectShare::required = collectShare::Unknown;
         else {
             collectShare::floor = std::max(collectShare::floor, epoch);
@@ -3892,16 +3901,16 @@ CommitterCollectCounters& CommitterCollects() {
 }
 
 void MarkCommitterThread() {
-    committerThread = true;
-    trackerTimedWaits = &committerTrackerWaits;
-    trackerTimedWaitNs = &committerTrackerWaitNs;
+    committerThread(true);
+    trackerTimedWaits(&committerTrackerWaits);
+    trackerTimedWaitNs(&committerTrackerWaitNs);
     MarkDriverThread();
 }
 
 void MarkResolverThread() {
     resolverThread = true;
-    trackerTimedWaits = &resolverTrackerWaits;
-    trackerTimedWaitNs = &resolverTrackerWaitNs;
+    trackerTimedWaits(&resolverTrackerWaits);
+    trackerTimedWaitNs(&resolverTrackerWaitNs);
     MarkDriverThread();
 }
 
@@ -4128,7 +4137,7 @@ WtFaultStatus WtFault() {
 }
 
 bool IsCommitterThread() {
-    return committerThread;
+    return committerThread();
 }
 
 void SetCollectShareProducer(bool producer) {
@@ -4136,7 +4145,7 @@ void SetCollectShareProducer(bool producer) {
 }
 
 void FollowCollectShare(std::uint64_t clock) {
-    if (!committerThread) return;
+    if (!committerThread()) return;
     collectShare::required = clock == 0 ? collectShare::Unknown : std::max(clock, collectShare::floor);
 }
 
@@ -4153,7 +4162,7 @@ bool CommitterCollectCensus() {
 }
 
 void BeginCommitterCensusItem(std::uint8_t kind) {
-    if (!committerThread || !committerCensus::enabled()) return;
+    if (!committerThread() || !committerCensus::enabled()) return;
     auto& census = committerCensus::state();
     ++census.itemSerial;
     census.itemKind = kind;
@@ -4175,7 +4184,7 @@ CollectAheadCensusCounters& CollectAheadCensusCounts() {
 }
 
 void SetCommitterPrelock(bool prelock) {
-    if (!committerThread) return;
+    if (!committerThread()) return;
     aheadCensus::prelock = prelock;
     if (prelock && !aheadCensus::item.prepared) {
         aheadCensus::item.prepared = true;
@@ -4200,7 +4209,7 @@ std::uint64_t UnwatchSerial() {
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
-    if (committerThread) {
+    if (committerThread()) {
         collectShare::floor = std::max(collectShare::floor, latest);
         if (collectShare::required != collectShare::Unknown) collectShare::required = std::max(collectShare::required, latest);
     }
@@ -5464,6 +5473,7 @@ struct GpuLockStats {
     std::uint64_t labelsInHold = 0;
     std::size_t holdSite = 0;
     std::chrono::steady_clock::time_point holdStart;
+    bool holdCheap = false;
     std::uint64_t heldNs = 0;
     // This thread's column of the holder matrix (-1 until its first hold), and what its contended
     // acquisitions waited behind: holds by (holder, site) that ended during the waits.
@@ -5479,8 +5489,13 @@ struct GpuLockStats {
 };
 
 GpuLockStats& LockStats() {
-    thread_local GpuLockStats stats;
-    return stats;
+    struct Slot {};
+    auto* stats = HostThreadSlot<GpuLockStats*, Slot>::Get();
+    if (stats == nullptr) {
+        ShaderRecompiler::ThreadOwned(stats);
+        HostThreadSlot<GpuLockStats*, Slot>::Set(stats);
+    }
+    return *stats;
 }
 
 bool GpuLockProfiled() {
@@ -5499,12 +5514,13 @@ void BeginHold(std::size_t site) {
     auto& stats = LockStats();
     stats.holdSite = site;
     stats.labelsInHold = 0;
-    stats.holdStart = std::chrono::steady_clock::now();
+    stats.holdCheap = ArchB::CheapClock::Active();
+    stats.holdStart = ArchB::CheapClock::Now(stats.holdCheap);
 }
 
 void EndHold() {
     auto& stats = LockStats();
-    const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
+    const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(ArchB::CheapClock::Now(stats.holdCheap) - stats.holdStart).count();
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     stats.heldNs += static_cast<std::uint64_t>(heldNs);
     ++stats.siteHolds[stats.holdSite];
@@ -5676,8 +5692,15 @@ thread_local std::uint64_t holdLogBegin = 0;
 #endif
 
 std::atomic<std::uint64_t> gpuHoldSerial{0};
-thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
-thread_local std::uint64_t recorderHoldGeneration = 0;
+struct RecorderHoldStartSlot {};
+struct RecorderHoldGenerationSlot {};
+struct RecorderHoldCheapSlot {};
+std::uint64_t recorderHoldStart() { return HostThreadSlot<std::uint64_t, RecorderHoldStartSlot>::Get(); }
+void recorderHoldStart(std::uint64_t value) { HostThreadSlot<std::uint64_t, RecorderHoldStartSlot>::Set(value); }
+std::uint64_t recorderHoldGeneration() { return HostThreadSlot<std::uint64_t, RecorderHoldGenerationSlot>::Get(); }
+void recorderHoldGeneration(std::uint64_t value) { HostThreadSlot<std::uint64_t, RecorderHoldGenerationSlot>::Set(value); }
+bool recorderHoldCheap() { return HostThreadSlot<bool, RecorderHoldCheapSlot>::Get(); }
+void recorderHoldCheap(bool value) { HostThreadSlot<bool, RecorderHoldCheapSlot>::Set(value); }
 
 // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY (GuestMemory.hpp, SetGpuLockPriorityHook).
 std::atomic<bool (*)()> gpuLockPriorityHook{nullptr};
@@ -5755,9 +5778,13 @@ void GpuMutexType::acquired() {
 #ifdef _WIN32
         if (HoldLog::Instance() != nullptr) holdLogBegin = HoldLog::Now();
 #endif
-        recorderHoldGeneration = ArchB::Recorder::Generation();
-        recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
+        if (ArchB::Recorder::Enabled()) {
+            recorderHoldGeneration(ArchB::Recorder::Generation());
+            const bool cheap = ArchB::CheapClock::Active();
+            recorderHoldCheap(cheap);
+            recorderHoldStart(static_cast<std::uint64_t>(ArchB::CheapClock::Now(cheap).time_since_epoch().count()));
+        } else recorderHoldStart(0);
+        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite());
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         const bool skipInvalidation = ArchB::Switches::Enabled(ArchB::Feature::UbNoLockInvalidation);
         bool skipped = false;
@@ -5782,8 +5809,8 @@ bool GpuMutexType::try_lock() {
     const bool timelineOuter = Timeline::Enabled && !HeldByThisThread();
     if (timelineOuter) {
         const auto site = LockStats().nextSite;
-        Timeline::LockSite = static_cast<std::uint32_t>(site == GpuLockSite::Other ? GpuLockSite::Try : site) + 1;
-        Timeline::Emit(Timeline::Kind::LockBegin, 1, 0, 0, 0, 0, Timeline::LockSite);
+        Timeline::LockSite() = static_cast<std::uint32_t>(site == GpuLockSite::Other ? GpuLockSite::Try : site) + 1;
+        Timeline::Emit(Timeline::Kind::LockBegin, 1, 0, 0, 0, 0, Timeline::LockSite());
     }
     struct TimelineTry {
         bool outer;
@@ -5849,14 +5876,15 @@ std::uint64_t ThreadGpuHeldNs() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
-        if (recorderHoldStart != std::chrono::steady_clock::time_point{} && recorderHoldGeneration == ArchB::Recorder::Generation()) {
-            ArchB::Recorder::Count("gpu_mutex_hold_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - recorderHoldStart).count());
-            recorderHoldStart = {};
+        if (const auto start = recorderHoldStart(); start != 0 && recorderHoldGeneration() == ArchB::Recorder::Generation()) {
+            const auto now = static_cast<std::uint64_t>(ArchB::CheapClock::Now(recorderHoldCheap()).time_since_epoch().count());
+            ArchB::Recorder::Count("gpu_mutex_hold_ms", static_cast<double>(now - start) / 1e6);
+            recorderHoldStart(0);
         }
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
-        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
+        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite());
 #ifdef _WIN32
         if (auto* log = HoldLog::Instance(); log != nullptr && holdLogBegin != 0) {
             log->Push(LockStats().tag, holdLogBegin, HoldLog::Now());
@@ -5896,8 +5924,8 @@ void GpuMutexType::lock() {
     PerformanceTimer recorderTiming("GpuMutex.wait");
     recorderTiming.RecorderCounter("gpu_mutex_wait_ms");
     if (Timeline::Enabled && !HeldByThisThread()) {
-        Timeline::LockSite = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
-        Timeline::Emit(Timeline::Kind::LockBegin, 0, 0, 0, 0, 0, Timeline::LockSite);
+        Timeline::LockSite() = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
+        Timeline::Emit(Timeline::Kind::LockBegin, 0, 0, 0, 0, 0, Timeline::LockSite());
     }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;

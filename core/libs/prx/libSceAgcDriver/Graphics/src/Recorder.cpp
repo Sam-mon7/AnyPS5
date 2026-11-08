@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
@@ -1764,8 +1765,13 @@ struct LazyFenceThread {
 };
 
 LazyFenceThread& lazyFenceThread() {
-    static thread_local LazyFenceThread* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct Slot {};
+    auto* state = HostThreadSlot<LazyFenceThread*, Slot>::Get();
+    if (state == nullptr) {
+        ShaderRecompiler::ThreadOwned(state);
+        HostThreadSlot<LazyFenceThread*, Slot>::Set(state);
+    }
+    return *state;
 }
 
 std::uint32_t LazyFenceVerifyEvery() {
@@ -4846,8 +4852,8 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             hit.generation = std::min(hit.generation, entry->generation);
         }
         if (Timeline::Enabled) {
-            Timeline::LabelStamps[offset / 4] = entry->stamp;
-            Timeline::LabelQueues[offset / 4] = entry->queue;
+            Timeline::LabelStamps()[offset / 4] = entry->stamp;
+            Timeline::LabelQueues()[offset / 4] = entry->queue;
         }
         hit.value |= static_cast<std::uint64_t>(entry->value) << (offset * 8u);
         if (offset == 0) {
