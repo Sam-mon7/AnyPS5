@@ -401,6 +401,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
+    const bool dispatchProofDepth = ArchB::Switches::Enabled(ArchB::Feature::FixDispatchProofDepth);
+    const ArchB::DispatchProofDepthScope dispatchProofDepthScope(dispatchProofDepth);
     const bool feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     // APS5_ARCHB_FIX_ALLOC_CHURN, once per dispatch (the pipelined commit takes the same value).
     const bool allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
@@ -965,10 +967,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue([this, allocChurn, partialSnapshot, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
+        DrawPipeline::Queue0().Enqueue([this, allocChurn, partialSnapshot, dispatchProofDepth, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, computeSync] {
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);
+            const ArchB::DispatchProofDepthScope dispatchProofDepthScope(dispatchProofDepth);
             PerformanceTimer recorderTiming("Driver.DispatchCommit");
             DrawPipeline::FollowEpoch(epoch, ticket);
             GuestMemory::SetCurrentPacket(0x15, queueId);

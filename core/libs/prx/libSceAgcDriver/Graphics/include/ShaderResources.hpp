@@ -734,6 +734,8 @@ private:
     std::uint64_t depthWalkSerial = 0;
     std::uint64_t depthWalkReleased = 0;
     bool depthProofAccepted = false;
+    bool dispatchDepthProofAccepted = false;
+    bool dispatchDepthProofRefused = false;
     bool depthProofAccepts(std::uint64_t address, std::uint64_t bytes);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writeOnlyRanges;
     bool drawBuild = false;

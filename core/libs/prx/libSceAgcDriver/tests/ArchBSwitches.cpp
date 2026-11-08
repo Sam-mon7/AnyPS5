@@ -129,6 +129,7 @@ void toggleCase(const std::string& name) {
         setEnvironment((std::string("APS5_ARCHB_") + pipeCut->token).c_str(), "1");
     }
     if (name == "AllocChurn") setEnvironment("APS5_ARCHB_FIX_ALLOC_CHURN", nullptr);
+    if (name == "DispatchProofDepth") setEnvironment("APS5_ARCHB_FIX_DISPATCH_PROOF_DEPTH", nullptr);
     const bool genTable = name == "GenTable";
     // Switches that require GEN_TABLE (slice S1 GEN_SHADOW, S2 GEN_LOCKFREE): same contract.
     const struct GenDependent {
@@ -243,6 +244,35 @@ void toggleCase(const std::string& name) {
         check(Switches::Enabled(Feature::PipeQ0Committer) && Switches::Enabled(feature), "the committer and " + token + " did not turn on together");
         write("3 PIPE_Q0_COMMITTER=0");
         check(!Switches::Enabled(Feature::PipeQ0Committer) && !Switches::Enabled(feature), token + " stayed on after the committer switch turned off");
+    } else if (name == "DispatchProofDepth") {
+        using AgcDriver::ArchB::DispatchProofDepthActive;
+        using AgcDriver::ArchB::DispatchProofDepthScope;
+        bool listed = false;
+        for (const auto& entry : Switches::Table()) {
+            if (entry.feature != Feature::FixDispatchProofDepth) continue;
+            listed = true;
+            check(std::string(entry.name) == "FIX_DISPATCH_PROOF_DEPTH" && !entry.defaultOn && entry.runtime && entry.prerequisites.empty(), "dispatch depth proof switch contract");
+        }
+        check(listed, "dispatch depth proof switch is listed");
+        check(!Switches::Enabled(Feature::FixDispatchProofDepth), "dispatch depth proof must default off");
+        write("1 FIX_DISPATCH_PROOF_DEPTH=1");
+        check(Switches::Enabled(Feature::FixDispatchProofDepth) && !DispatchProofDepthActive(), "dispatch depth proof did not turn on or leaked outside a dispatch");
+        {
+            const DispatchProofDepthScope dispatch(Switches::Enabled(Feature::FixDispatchProofDepth));
+            check(DispatchProofDepthActive(), "a dispatch did not sample the enabled depth proof");
+            write("2 FIX_DISPATCH_PROOF_DEPTH=0");
+            check(!Switches::Enabled(Feature::FixDispatchProofDepth) && DispatchProofDepthActive(), "a runtime toggle changed the depth proof inside a dispatch");
+            bool otherThread = true;
+            std::thread([&] { otherThread = DispatchProofDepthActive(); }).join();
+            check(!otherThread, "a dispatch depth proof scope leaked to another thread");
+        }
+        check(!DispatchProofDepthActive(), "a dispatch depth proof scope leaked outside a dispatch");
+        {
+            const DispatchProofDepthScope dispatch(Switches::Enabled(Feature::FixDispatchProofDepth));
+            check(!DispatchProofDepthActive(), "the next dispatch did not sample the disabled depth proof");
+        }
+        write("3 FIX_DISPATCH_PROOF_DEPTH=1");
+        check(Switches::Enabled(Feature::FixDispatchProofDepth), "dispatch depth proof did not turn back on");
     } else if (name == "AllocChurn") {
         using AgcDriver::ArchB::AllocChurnActive;
         using AgcDriver::ArchB::AllocChurnScope;

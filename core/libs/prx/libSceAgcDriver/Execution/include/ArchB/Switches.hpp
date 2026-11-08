@@ -28,6 +28,7 @@ enum class Feature : std::uint8_t {
     FixBufferBaseRefresh,
     FixAllocChurn,
     FixComputeSyncUnlocked,
+    FixDispatchProofDepth,
     FixWriteTrackingBookkeeping,
     GenTable,
     GenShadow,
@@ -150,6 +151,18 @@ public:
     ~PartialSnapshotScope();
     PartialSnapshotScope(const PartialSnapshotScope&) = delete;
     PartialSnapshotScope& operator=(const PartialSnapshotScope&) = delete;
+
+private:
+    bool previous;
+};
+
+bool DispatchProofDepthActive() noexcept;
+class DispatchProofDepthScope {
+public:
+    explicit DispatchProofDepthScope(bool active) noexcept;
+    ~DispatchProofDepthScope();
+    DispatchProofDepthScope(const DispatchProofDepthScope&) = delete;
+    DispatchProofDepthScope& operator=(const DispatchProofDepthScope&) = delete;
 
 private:
     bool previous;

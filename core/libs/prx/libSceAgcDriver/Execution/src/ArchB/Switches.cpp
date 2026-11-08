@@ -84,6 +84,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixBufferBaseRefresh, "FIX_BUFFER_BASE_REFRESH", false, true, {}},
     {Feature::FixAllocChurn, "FIX_ALLOC_CHURN", false, true, {}},
     {Feature::FixComputeSyncUnlocked, "FIX_COMPUTE_SYNC_UNLOCKED", false, true, {}},
+    {Feature::FixDispatchProofDepth, "FIX_DISPATCH_PROOF_DEPTH", false, true, {}},
     {Feature::FixWriteTrackingBookkeeping, "FIX_WRITE_TRACKING_BOOKKEEPING", false, true, {}},
     {Feature::GenTable, "GEN_TABLE", false, true, {}},
     {Feature::GenShadow, "GEN_SHADOW", false, true, GenShadowPrerequisites},
@@ -389,6 +390,7 @@ bool Switches::Enabled(Feature feature) {
 namespace {
 struct AllocChurnSlot {};
 struct PartialSnapshotSlot {};
+struct DispatchProofDepthSlot {};
 }
 
 bool AllocChurnActive() noexcept {
@@ -413,6 +415,18 @@ PartialSnapshotScope::PartialSnapshotScope(bool active) noexcept : previous(Host
 
 PartialSnapshotScope::~PartialSnapshotScope() {
     HostThreadSlot<bool, PartialSnapshotSlot>::Set(previous);
+}
+
+bool DispatchProofDepthActive() noexcept {
+    return HostThreadSlot<bool, DispatchProofDepthSlot>::Get();
+}
+
+DispatchProofDepthScope::DispatchProofDepthScope(bool active) noexcept : previous(HostThreadSlot<bool, DispatchProofDepthSlot>::Get()) {
+    HostThreadSlot<bool, DispatchProofDepthSlot>::Set(active);
+}
+
+DispatchProofDepthScope::~DispatchProofDepthScope() {
+    HostThreadSlot<bool, DispatchProofDepthSlot>::Set(previous);
 }
 
 void Switches::CountUpperBoundHit(Feature feature) {

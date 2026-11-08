@@ -10099,6 +10099,110 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     Require(!DepthSurfaceHolds(context, layered, texture.get()), "a layered depth lookup took the fast proof instead of the full walk");
 }
 
+void dispatchProofDepthTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t depthSide = 64;
+    constexpr std::uint32_t viewSide = 32;
+    constexpr std::size_t bytes = 131072;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "cannot allocate the dispatch depth proof block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto viewAddress = address + 256;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            ClearDepthSurfaces(context.device);
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            ReleaseWatched(block, bytes);
+        }
+    } unregister{base, block};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    context.hostImportAlignment = 0;
+    context.nullDescriptors = true;
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    DepthTarget target{address, 0, {depthSide, depthSide}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    target.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the dispatch proof depth surface has no view");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageSamplers = {0};
+    binding.guestDescriptor = {
+        static_cast<std::uint32_t>(viewAddress >> 8u),
+        static_cast<std::uint32_t>((viewAddress >> 40u) & 0xffu) | (22u << 20u) | (((viewSide - 1u) & 3u) << 30u),
+        ((viewSide - 1u) >> 2u) | ((viewSide - 1u) << 14u),
+        0xfacu | (9u << 28u),
+        0u,
+        0u,
+        0u,
+        0u,
+    };
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    const auto makeResources = [&] {
+        auto resources = std::make_unique<ShaderResources>(context, compute);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        return resources;
+    };
+    auto resources = makeResources();
+    Require(AgcDriver::GuestMemory::Watched(viewAddress, viewSide * viewSide * 4u), "the dispatch depth proof view is not write-watched");
+    const auto prove = [&](bool active) {
+        AgcDriver::ArchB::DispatchProofDepthScope scope(active);
+        ShaderResources::ProofReport report;
+        const bool valid = resources->Revalidate(compute, &report);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        return std::pair{valid, report};
+    };
+    const auto first = prove(false);
+    Require(first.first && first.second.path == ShaderResources::ProofPath::Full, "the disabled dispatch depth proof skipped or failed the full walk");
+    const auto accepted = prove(true);
+    Require(accepted.first && accepted.second.path == ShaderResources::ProofPath::Fast, std::string("the dispatch depth proof did not serve an unchanged overlapping view: ") + ShaderResources::FastFailName(accepted.second.fastFail) + DescribeDepthOverlaps(context.device, viewAddress, viewSide * viewSide * 4u));
+    const auto disabled = prove(false);
+    Require(disabled.first && disabled.second.path == ShaderResources::ProofPath::Full, "a runtime-off dispatch used the depth proof sampled by the prior dispatch");
+    const auto restored = prove(true);
+    Require(restored.first && restored.second.path == ShaderResources::ProofPath::Fast, "a runtime-on dispatch did not restore the depth proof");
+    static_cast<std::byte*>(block)[256] = std::byte{0x5a};
+    Require(prove(true).second.path == ShaderResources::ProofPath::Full, "the dispatch depth proof accepted CPU-written image memory");
+    resources = makeResources();
+    Require(prove(false).second.path == ShaderResources::ProofPath::Full, "the rebuilt dispatch depth resource did not walk");
+    Require(prove(true).second.path == ShaderResources::ProofPath::Fast, "the dispatch depth proof did not recover after the CPU-written resource was rebuilt");
+    ClearDepthSurfaces(context.device);
+    Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the rewritten dispatch proof depth surface has no view");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    Require(prove(true).second.path == ShaderResources::ProofPath::Full, "the dispatch depth proof accepted a replaced depth-surface epoch");
+    resources = makeResources();
+    Require(prove(false).second.path == ShaderResources::ProofPath::Full, "the rebuilt dispatch depth epoch did not walk");
+    Require(prove(true).second.path == ShaderResources::ProofPath::Fast, "the dispatch depth proof did not recover after the depth-surface rewrite was rebuilt");
+    std::cout << "Dispatch depth proof acceptance and refusal tests passed\n";
+}
+
 }
 
 class SampleProgram {
@@ -13704,6 +13808,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-proof-depth-only") {
+            dispatchProofDepthTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
             if (device.GetContext().hostImportAlignment == 0) return 77;
             const auto before = Recorder::StoreCounts().stores;

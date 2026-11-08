@@ -3556,6 +3556,30 @@ struct DepthProofCounters {
     std::atomic<std::uint64_t> blocked{0}, accepted{0}, wouldAccept{0}, noWalk{0}, surfaces{0}, stale{0}, unlocked{0}, verified{0}, mismatches{0};
 };
 
+enum class DispatchDepthRefusal : std::size_t { NoWalk, Surfaces, DepthState, Unlocked, Collect, Cache, Changed, Pending, Keys, Audit, Other, Count };
+
+struct DispatchDepthProofCounters {
+    std::atomic<std::uint64_t> served{0}, verifyChecks{0}, verifyMismatches{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DispatchDepthRefusal::Count)> refused{};
+};
+
+DispatchDepthProofCounters& dispatchDepthProofCounters() {
+    static auto* made = [] {
+        auto* c = new DispatchDepthProofCounters();
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_dproof_served", c->served);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_dproof_verify_checks", c->verifyChecks);
+        AgcDriver::ArchB::Recorder::RegisterCounter("fix_dproof_verify_mismatches", c->verifyMismatches);
+        static constexpr std::array<const char*, static_cast<std::size_t>(DispatchDepthRefusal::Count)> names{"fix_dproof_refused_no_walk", "fix_dproof_refused_surfaces", "fix_dproof_refused_depth_state", "fix_dproof_refused_unlocked", "fix_dproof_refused_collect", "fix_dproof_refused_cache", "fix_dproof_refused_changed", "fix_dproof_refused_pending", "fix_dproof_refused_keys", "fix_dproof_refused_audit", "fix_dproof_refused_other"};
+        for (std::size_t i = 0; i < names.size(); ++i) AgcDriver::ArchB::Recorder::RegisterCounter(names[i], c->refused[i]);
+        return c;
+    }();
+    return *made;
+}
+
+void refuseDispatchDepthProof(DispatchDepthRefusal reason) {
+    dispatchDepthProofCounters().refused[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
 DepthProofCounters& depthProofCounters() {
     static auto* made = [] {
         auto* c = new DepthProofCounters();
@@ -3570,21 +3594,29 @@ DepthProofCounters& depthProofCounters() {
 }
 
 bool depthProofOn() {
-    return ArchB::Switches::Enabled(ArchB::Feature::CComputeDepthProof);
+    return ArchB::Switches::Enabled(ArchB::Feature::CComputeDepthProof) || ArchB::DispatchProofDepthActive();
 }
 
 bool depthProofVerifyNow() {
-    static const std::uint64_t period = [] {
+    static const std::uint64_t archcPeriod = [] {
         const char* value = std::getenv("APS5_ARCHB_C_COMPUTE_DEPTH_PROOF_VERIFY");
         return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
     }();
+    static const std::uint64_t dispatchPeriod = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_DISPATCH_PROOF_DEPTH_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    const bool dispatch = ArchB::DispatchProofDepthActive();
+    const auto period = dispatch ? dispatchPeriod : archcPeriod;
     if (period == 0) return false;
-    static std::atomic<std::uint64_t> uses{0};
+    static std::atomic<std::uint64_t> archcUses{0}, dispatchUses{0};
+    auto& uses = dispatch ? dispatchUses : archcUses;
     return (uses.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0;
 }
 }
 
 bool ShaderResources::depthProofAccepts(std::uint64_t address, std::uint64_t bytes) {
+    const bool dispatch = !drawBuild && ArchB::DispatchProofDepthActive();
     const bool on = depthProofOn();
     const bool census = ComputeCensus();
     if (!on && !census) return false;
@@ -3594,13 +3626,32 @@ bool ShaderResources::depthProofAccepts(std::uint64_t address, std::uint64_t byt
         counter.fetch_add(1, std::memory_order_relaxed);
         return false;
     };
-    if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(c.unlocked);
-    if (depthWalkSerial == 0) return refuse(c.noWalk);
-    if (DepthSurfacesSerial() != depthWalkSerial || DepthSurfacesReleased() != depthWalkReleased) return refuse(c.surfaces);
-    if (DepthSurfaceBlocksMemoryProof(context.device, address, bytes)) return refuse(c.stale);
+    const auto refuseDispatch = [&](DispatchDepthRefusal reason) {
+        dispatchDepthProofAccepted = false;
+        if (dispatchDepthProofRefused) return;
+        dispatchDepthProofRefused = true;
+        refuseDispatchDepthProof(reason);
+    };
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (dispatch) refuseDispatch(DispatchDepthRefusal::Unlocked);
+        return refuse(c.unlocked);
+    }
+    if (depthWalkSerial == 0) {
+        if (dispatch) refuseDispatch(DispatchDepthRefusal::NoWalk);
+        return refuse(c.noWalk);
+    }
+    if (DepthSurfacesSerial() != depthWalkSerial || DepthSurfacesReleased() != depthWalkReleased) {
+        if (dispatch) refuseDispatch(DispatchDepthRefusal::Surfaces);
+        return refuse(c.surfaces);
+    }
+    if (DepthSurfaceBlocksMemoryProof(context.device, address, bytes)) {
+        if (dispatch) refuseDispatch(DispatchDepthRefusal::DepthState);
+        return refuse(c.stale);
+    }
     if (!on) return refuse(c.wouldAccept);
     c.accepted.fetch_add(1, std::memory_order_relaxed);
     depthProofAccepted = true;
+    dispatchDepthProofAccepted |= dispatch && !dispatchDepthProofRefused;
     return true;
 }
 
@@ -3609,6 +3660,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     overlapping.clear();
     accepted = false;
     depthProofAccepted = false;
+    dispatchDepthProofAccepted = false;
+    dispatchDepthProofRefused = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto forgetBefore = GuestMemory::ForgetSerial();
     const auto fail = [&reason](FastFail why) {
@@ -4785,6 +4838,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     bool stampReused = false;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (dispatchDepthProofAccepted) {
+            if (fast && ok) dispatchDepthProofCounters().served.fetch_add(1, std::memory_order_relaxed);
+            else if (!dispatchDepthProofRefused) refuseDispatchDepthProof(DispatchDepthRefusal::Other);
+            dispatchDepthProofAccepted = false;
+        }
+        dispatchDepthProofRefused = false;
         if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : stampReused ? "proof_fast_pass_stamp_memo" : "proof_fast_pass_stamps") : "proof_full_pass");
         if (!ok) setStampValid(false);
         if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
@@ -4964,6 +5023,22 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
         if (report != nullptr) report->fastFail = static_cast<std::size_t>(reason);
         if (!fast) {
+            if (dispatchDepthProofAccepted) {
+                const auto refusal = [&] {
+                    switch (reason) {
+                        case FastFail::Collect: return DispatchDepthRefusal::Collect;
+                        case FastFail::Evicted: case FastFail::Replaced: return DispatchDepthRefusal::Cache;
+                        case FastFail::Changed: return DispatchDepthRefusal::Changed;
+                        case FastFail::Pending: return DispatchDepthRefusal::Pending;
+                        case FastFail::Keys: case FastFail::ClearedView: case FastFail::StorageKeys: return DispatchDepthRefusal::Keys;
+                        case FastFail::Audit: return DispatchDepthRefusal::Audit;
+                        default: return DispatchDepthRefusal::Other;
+                    }
+                }();
+                if (!dispatchDepthProofRefused) refuseDispatchDepthProof(refusal);
+                dispatchDepthProofAccepted = false;
+                dispatchDepthProofRefused = true;
+            }
             countFullWalk(reason);
             if (!fullWalk()) {
                 const auto failure = [&] {
@@ -4980,6 +5055,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         } else if (depthProofAccepted && depthProofVerifyNow()) {
             auto& c = depthProofCounters();
             c.verified.fetch_add(1, std::memory_order_relaxed);
+            if (dispatchDepthProofAccepted) dispatchDepthProofCounters().verifyChecks.fetch_add(1, std::memory_order_relaxed);
             thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* depthVersionsSlot = nullptr;
             auto& versions = ShaderRecompiler::ThreadOwned(depthVersionsSlot);
             versions.clear();
@@ -4992,7 +5068,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (!same || moved != versions.end() || textures != texturesBefore) {
                 const auto count = c.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (count <= 8) std::fprintf(stderr, "[archc] C_COMPUTE_DEPTH_PROOF VERIFY mismatch: the full walk %s\n", !same ? "returned another object" : "uploaded");
+                if (dispatchDepthProofAccepted) dispatchDepthProofCounters().verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+                if (count <= 8) std::fprintf(stderr, "[archc] %s VERIFY mismatch: the full walk %s\n", dispatchDepthProofAccepted ? "FIX_DISPATCH_PROOF_DEPTH" : "C_COMPUTE_DEPTH_PROOF", !same ? "returned another object" : "uploaded");
                 if (!same) return finish(false, false, ProofFailure::Changed);
             }
         } else if (ownRefreshed || accepted) {
