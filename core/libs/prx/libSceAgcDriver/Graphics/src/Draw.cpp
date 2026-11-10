@@ -57,6 +57,10 @@
 #include <unordered_set>
 #include <utility>
 
+namespace AgcDriver::GuestMemory {
+void PrepareDriverRead_nid_no_patch(std::uint64_t address, std::size_t bytes);
+}
+
 namespace AgcDriver::Graphics {
 
 void WriteCheckpointMarker(const Context& context, VkCommandBuffer commands, std::uint64_t serial, std::uint32_t queue);
@@ -1894,8 +1898,13 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
                 return copy;
             }
         }
+        const bool indexRefresh = use >= Recorder::SnapshotUse::Index16 && use <= Recorder::SnapshotUse::Index32Restart && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache);
+        if (indexRefresh) {
+            GuestMemory::PrepareDriverRead_nid_no_patch(address, bytes);
+            copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        }
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, Recorder::ArmedSnapshotsActive() ? copy.generation : 0);
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, Recorder::ArmedSnapshotsActive() || indexRefresh ? copy.generation : 0);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
         if (copy.buffer != nullptr) {
             copy.reused = true;

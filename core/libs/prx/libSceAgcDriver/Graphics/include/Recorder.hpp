@@ -1232,6 +1232,7 @@ private:
         // refreshed or exact): every page armed by the fault tracker no later than it has held no CPU
         // store since (ArmedDrawSnapshot).
         std::uint64_t verifiedAt = 0;
+        std::vector<std::optional<std::uint32_t>> indexHighest;
     };
     struct DrawSnapshotPool {
         std::list<DrawSnapshotKey> recency;
@@ -1261,6 +1262,7 @@ private:
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool ownedDrawInputHolds(std::uint64_t address, std::size_t bytes, const OwnedDrawInputProof& proof) const;
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    bool refreshIndexSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, SnapshotUse use);
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;

@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
@@ -4086,6 +4087,22 @@ namespace {
 std::size_t SnapshotPool(Recorder::SnapshotUse use) {
     return use == Recorder::SnapshotUse::Storage ? 0 : 1;
 }
+
+void NoteIndexSnapshotHit(std::uint64_t address, Buffer& buffer, Recorder::SnapshotUse use, std::uint32_t derived) {
+    AgcDriver::ArchB::Recorder::Count("fix_dic_input_hits");
+    static const bool verify = [] {
+        const auto* value = std::getenv("APS5_ARCHB_FIX_DERIVED_INDEX_CACHE_VERIFY");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (!verify) return;
+    const auto held = buffer.Bytes();
+    const auto indexSize = use == Recorder::SnapshotUse::Index16 || use == Recorder::SnapshotUse::Index16Restart ? 2u : 4u;
+    const bool restart = use == Recorder::SnapshotUse::Index16Restart || use == Recorder::SnapshotUse::Index32Restart;
+    const auto highest = HighestDrawIndex(held, indexSize, restart);
+    const auto value = restart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u);
+    AgcDriver::ArchB::Recorder::Count("fix_dic_verified");
+    if (value != derived || !GuestMemory::EqualsCommittedUnsynced(address, held)) AgcDriver::ArchB::Recorder::Count("fix_dic_verify_mismatches");
+}
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
@@ -4164,7 +4181,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     const auto guestBytes = use == SnapshotUse::PaddedVertex ? static_cast<std::size_t>(found->second.derived) : bytes;
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, guestBytes, found->second.generation)) {
         const auto refreshStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool refreshed = sameRegistry && generation != 0 && use == SnapshotUse::Storage && refreshDrawSnapshot(found->second, address, bytes);
+        const bool refreshed = sameRegistry && generation != 0 && (use == SnapshotUse::Storage ? refreshDrawSnapshot(found->second, address, bytes) : AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache) && refreshIndexSnapshot(found->second, address, bytes, use));
         if (diag) {
             auto& counters = SnapshotDiag();
             counters.compareNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - refreshStart).count()), std::memory_order_relaxed);
@@ -4182,8 +4199,12 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     }
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
-    if (derived != nullptr) *derived = found->second.derived;
-    return found->second.buffer;
+    auto buffer = found->second.buffer;
+    const auto value = found->second.derived;
+    const bool index = !found->second.indexHighest.empty();
+    if (derived != nullptr) *derived = value;
+    if (index && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache)) NoteIndexSnapshotHit(address, *buffer, use, value);
+    return buffer;
 }
 
 namespace {
@@ -4458,8 +4479,12 @@ std::shared_ptr<Buffer> Recorder::ArmedDrawSnapshot(std::uint64_t address, std::
     if (use == SnapshotUse::Storage && SnapshotDiagEnabled()) SnapshotDiag().exact.fetch_add(1, std::memory_order_relaxed);
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
-    if (derived != nullptr) *derived = found->second.derived;
-    return found->second.buffer;
+    auto buffer = found->second.buffer;
+    const auto value = found->second.derived;
+    const bool index = !found->second.indexHighest.empty();
+    if (derived != nullptr) *derived = value;
+    if (index && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache)) NoteIndexSnapshotHit(address, *buffer, use, value);
+    return buffer;
 }
 
 std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset) {
@@ -4629,6 +4654,54 @@ static void OwnedDrawTraceCount(const char* name, std::uint64_t amount = 1) {
     PerformanceTrace::CountOwnedDraw(name, amount);
 }
 
+bool Recorder::refreshIndexSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, SnapshotUse use) {
+    if (entry.indexHighest.empty()) return false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pages;
+    if (!GuestMemory::ChangedPages(address, bytes, entry.generation, pages)) {
+        AgcDriver::ArchB::Recorder::Count("fix_dic_input_refused_untracked");
+        return false;
+    }
+    constexpr std::size_t blockBytes = 65536;
+    const auto held = entry.buffer->Bytes();
+    std::vector<std::size_t> blocks;
+    std::vector<CompareSpan> spans;
+    std::size_t compared = 0;
+    for (const auto& [begin, end] : pages) {
+        for (auto block = static_cast<std::size_t>(begin - address) / blockBytes; block <= static_cast<std::size_t>(end - address - 1) / blockBytes; ++block) {
+            if (!blocks.empty() && blocks.back() == block) continue;
+            const auto offset = block * blockBytes;
+            const auto length = std::min(blockBytes, bytes - offset);
+            blocks.push_back(block);
+            spans.push_back({held.data() + offset, reinterpret_cast<const void*>(address + offset), length});
+            compared += length;
+        }
+    }
+    AgcDriver::ArchB::Recorder::Count("fix_dic_input_compared_bytes", compared);
+    std::vector<std::uint8_t> equal(spans.size());
+    CompareSpans(spans, equal);
+    const bool changed = std::ranges::find(equal, 0) != equal.end();
+    if (changed && entry.buffer.use_count() != 1) {
+        AgcDriver::ArchB::Recorder::Count("fix_dic_input_refused_shared");
+        return false;
+    }
+    const auto indexSize = use == SnapshotUse::Index16 || use == SnapshotUse::Index16Restart ? 2u : 4u;
+    const bool restart = use == SnapshotUse::Index16Restart || use == SnapshotUse::Index32Restart;
+    for (std::size_t k = 0; k < blocks.size(); ++k) {
+        if (equal[k] != 0) continue;
+        const auto offset = blocks[k] * blockBytes;
+        const auto length = spans[k].bytes;
+        std::memcpy(held.data() + offset, spans[k].second, length);
+        entry.indexHighest[blocks[k]] = HighestDrawIndex(held.subspan(offset, length), indexSize, restart);
+        AgcDriver::ArchB::Recorder::Count("fix_dic_input_uploaded_bytes", length);
+        AgcDriver::ArchB::Recorder::Count("fix_dic_input_scanned_bytes", length);
+    }
+    std::optional<std::uint32_t> highest;
+    for (const auto value : entry.indexHighest) if (value) highest = highest ? std::max(*highest, *value) : value;
+    entry.derived = restart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u);
+    AgcDriver::ArchB::Recorder::Count(changed ? "fix_dic_input_refreshed_changed" : "fix_dic_input_refreshed_equal");
+    return true;
+}
+
 void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, bool ownedInsertion) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
@@ -4652,7 +4725,16 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, {}, generation});
+        DrawSnapshot snapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, {}, generation, {}};
+        const auto indexSize = use == SnapshotUse::Index16 || use == SnapshotUse::Index16Restart ? 2u : use == SnapshotUse::Index32 || use == SnapshotUse::Index32Restart ? 4u : 0u;
+        if (indexSize != 0 && bytes != 0 && !ownedInsertion && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache) && snapshot.buffer->Bytes().size() == bytes) {
+            const bool restart = use == SnapshotUse::Index16Restart || use == SnapshotUse::Index32Restart;
+            const auto held = snapshot.buffer->Bytes();
+            for (std::size_t at = 0; at < bytes; at += 65536) snapshot.indexHighest.push_back(HighestDrawIndex(held.subspan(at, std::min<std::size_t>(65536, bytes - at)), indexSize, restart));
+            AgcDriver::ArchB::Recorder::Count("fix_dic_input_stored");
+            AgcDriver::ArchB::Recorder::Count("fix_dic_input_cold_scanned_bytes", bytes);
+        }
+        drawSnapshots.emplace(key, std::move(snapshot));
     } catch (...) {
         pool.recency.pop_back();
         throw;

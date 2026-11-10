@@ -5,6 +5,7 @@
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/LazyCopyBack.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -6885,7 +6886,8 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
 
 void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied = false) {
     auto context = device.GetContext();
-    constexpr std::size_t bytes = 65536;
+    const bool indexRefreshTest = std::getenv("TEST_DERIVED_INDEX_REFRESH") != nullptr;
+    constexpr std::size_t bytes = 3 * 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
         std::cout << "host imports or write watching unavailable: in-place draw inputs not tested\n";
@@ -6911,7 +6913,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
         }
     } unregister{context, block};
-    if (HostImportFor(context, address, bytes) == nullptr) {
+    if (!indexRefreshTest && HostImportFor(context, address, bytes) == nullptr) {
         std::cout << "host import of the watched block refused: in-place draw inputs not tested\n";
         return;
     }
@@ -6922,6 +6924,113 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
     if (copied) {
         Require(InPlaceDrawInput(context, vertices, 256, 4) == nullptr, "an imported draw input was bound in place where draw inputs are copied");
         Require(!recorder.PendingReadOverlaps(vertices, 256), "a copied draw input's read was noted as an in-place read");
+        if (indexRefreshTest) {
+            AgcDriver::ArchB::Recorder::BindThread("derived index refresh test");
+            AgcDriver::ArchB::Recorder::Boundary(true, 1, AgcDriver::ArchB::Recorder::Clock::now());
+            using Use = Recorder::SnapshotUse;
+            constexpr std::size_t length = 32768;
+            auto* words = static_cast<std::uint32_t*>(block);
+            for (std::size_t i = 0; i < length / 4; ++i) words[i] = static_cast<std::uint32_t>(i);
+            words[0] = 0xffffffffu;
+            const auto take = [&](std::size_t size = 32768, Use use = Use::Index32, std::size_t offset = 0) {
+                auto result = CopyDrawInput(context, &recorder, address + offset, size, use == Use::Index16 || use == Use::Index16Restart ? 2 : 4, use);
+                Require(result.buffer != nullptr && result.generation != 0, "the derived index fixture needs tracked copied indices");
+                Require(std::memcmp(result.buffer->Bytes().data(), reinterpret_cast<const void*>(address + offset), size) == 0, "a derived index snapshot has stale bytes");
+                return result;
+            };
+            const auto first = take();
+            Require(!first.reused, "a new derived index snapshot was reused");
+            KeepDrawInput(&recorder, address, first, Use::Index32, 0xffffffffu);
+            const auto repeat = take();
+            Require(repeat.reused && repeat.buffer == first.buffer && repeat.derived == 0xffffffffu, "a repeated derived index snapshot lost its cached maximum");
+            AgcDriver::GuestMemory::MarkWritten(address + 4096, 4);
+            const auto refreshed = take();
+            const bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache);
+            Require(refreshed.reused == enabled, "a generation change with identical index bytes did not follow the derived index refresh switch");
+            if (enabled) Require(refreshed.buffer == first.buffer && refreshed.derived == 0xffffffffu, "refreshing identical indices lost their buffer or maximum");
+            KeepDrawInput(&recorder, address, refreshed, Use::Index32, 0xffffffffu);
+            Require(!take(length - 4).reused, "a changed index range reused a snapshot of another length");
+            Require(!take(length, Use::Index32, 4).reused, "a changed index address reused another snapshot");
+            Require(!take(length, Use::Index16).reused, "a changed index size reused a 32-bit maximum");
+            Require(!take(length, Use::Index32Restart).reused, "a changed restart setting reused a non-restart maximum");
+            words[0] = 12;
+            const auto changed = take();
+            Require(!changed.reused && std::memcmp(first.buffer->Bytes().data(), words, length) != 0, "a guest index write reused or modified an earlier draw's snapshot");
+            const auto highest = HighestDrawIndex(changed.buffer->Bytes(), 4, false);
+            Require(highest == length / 4 - 1, "a changed index write kept the old maximum");
+            KeepDrawInput(&recorder, address, changed, Use::Index32, *highest);
+            const auto changedRepeat = take();
+            Require(changedRepeat.reused && changedRepeat.derived == highest, "a changed index snapshot did not cache its new maximum");
+            constexpr std::size_t soleLength = 2 * 65536;
+            for (std::size_t i = length / 4; i < (length + soleLength) / 4; ++i) words[i] = 1;
+            words[length / 4] = 500;
+            words[(length + 65536) / 4] = 77;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            {
+                const auto sole = take(soleLength, Use::Index32, length);
+                Require(!sole.reused, "a disjoint index range reused an earlier snapshot");
+                buffer = sole.buffer->Handle();
+                KeepDrawInput(&recorder, address + length, sole, Use::Index32, 500);
+            }
+            words[length / 4] = 12;
+            {
+                const auto lowered = take(soleLength, Use::Index32, length);
+                Require(lowered.reused == enabled, "a changed index snapshot without other readers did not follow the derived index refresh switch");
+                if (enabled) Require(lowered.buffer->Handle() == buffer && lowered.derived == 77, "refreshing changed indices did not keep the maximum of another block");
+                Require(HighestDrawIndex(lowered.buffer->Bytes(), 4, false) == 77, "refreshing indices changed their result");
+                KeepDrawInput(&recorder, address + length, lowered, Use::Index32, 77);
+            }
+            words[(length + 65536) / 4] = 5;
+            const auto loweredAgain = take(soleLength, Use::Index32, length);
+            Require(loweredAgain.reused == enabled, "a second changed index block did not follow the derived index refresh switch");
+            if (enabled) Require(loweredAgain.derived == 12, "refreshing another index block did not lower the maximum");
+            for (const auto use : {Use::Index16, Use::Index16Restart, Use::Index32Restart}) {
+                constexpr std::size_t offset = length + soleLength;
+                const auto indexSize = use == Use::Index32Restart ? 4u : 2u;
+                const bool restart = use != Use::Index16;
+                std::memset(static_cast<std::byte*>(block) + offset, 0xff, length);
+                auto copy = take(length, use, offset);
+                Require(!copy.reused, "another index format reused a different format's snapshot");
+                const auto highest = HighestDrawIndex(copy.buffer->Bytes(), indexSize, restart);
+                const auto derived = restart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u);
+                KeepDrawInput(&recorder, address + offset, copy, use, derived);
+                copy = {};
+                const std::uint16_t value = 9;
+                std::memcpy(static_cast<std::byte*>(block) + offset, &value, sizeof(value));
+                const auto updated = take(length, use, offset);
+                Require(updated.reused == enabled, "an index format did not follow the derived index refresh switch");
+                const auto now = HighestDrawIndex(updated.buffer->Bytes(), indexSize, restart);
+                if (enabled) Require(updated.derived == (restart ? (now ? *now + 1u : 0u) : now.value_or(0u)), "an index format refreshed a stale maximum or restart state");
+            }
+            static thread_local std::uint64_t publishAt = 0;
+            static thread_local bool publish = false;
+            static thread_local std::uint32_t lazyReads = 0, fenceReads = 0;
+            publishAt = address;
+            publish = true;
+            lazyReads = fenceReads = 0;
+            struct ResetReadHooks {
+                ~ResetReadHooks() {
+                    AgcDriver::GuestMemory::SetLazyStoreHook(nullptr);
+                    AgcDriver::GuestMemory::SetDeferredFenceHook(nullptr);
+                }
+            } resetReadHooks;
+            AgcDriver::GuestMemory::SetLazyStoreHook([](std::uint64_t begin, std::size_t size) {
+                ++lazyReads;
+                if (publish && begin <= publishAt && publishAt - begin < size) {
+                    publish = false;
+                    *reinterpret_cast<std::uint32_t*>(publishAt) = 32769;
+                    AgcDriver::GuestMemory::MarkWritten(publishAt, 4);
+                }
+            });
+            AgcDriver::GuestMemory::SetDeferredFenceHook([](std::uint64_t, std::size_t) { ++fenceReads; });
+            AgcDriver::GuestMemory::MarkWritten(address, 4);
+            const auto published = take();
+            Require(!published.reused && !publish && lazyReads != 0 && fenceReads != 0 && HighestDrawIndex(published.buffer->Bytes(), 4, false) == 32769, "an index refresh compared guest bytes before their deferred read hooks ran");
+            auto counters = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters;
+            Require((counters["fix_dic_input_hits"] > 0) == enabled && (counters["fix_dic_input_refreshed_equal"] > 0) == enabled && (counters["fix_dic_input_refreshed_changed"] > 0) == enabled && (counters["fix_dic_input_refused_shared"] > 0) == enabled, "derived index refresh or refusal counters did not follow the switch");
+            if (std::getenv("APS5_ARCHB_FIX_DERIVED_INDEX_CACHE_VERIFY") != nullptr) Require(counters["fix_dic_verified"] > 0 && counters["fix_dic_verify_mismatches"] == 0, "derived index verification did not run or found a mismatch");
+            AgcDriver::ArchB::Recorder::Boundary(false, 2, AgcDriver::ArchB::Recorder::Clock::now());
+        }
         return;
     }
     const auto* import = InPlaceDrawInput(context, vertices, 256, 4);
