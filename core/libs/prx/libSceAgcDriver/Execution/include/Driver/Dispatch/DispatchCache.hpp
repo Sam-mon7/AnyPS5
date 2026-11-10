@@ -1,0 +1,209 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
+
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory/GenTable.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <list>
+#include <map>
+#include <memory>
+#include <set>
+#include <span>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+#include "prx/libc/include/general/AtomicSharedPtr.hpp"
+
+namespace ShaderRecompiler {
+struct IrResourcePlan;
+struct ResourceCapture;
+}
+
+namespace AgcDriver::DriverDetail {
+
+inline bool CaptureRegisteredViewsCurrent(std::span<const ShaderRecompiler::RegisteredImageView> views) {
+    if (views.empty()) return true;
+    std::vector<std::uintptr_t> addresses;
+    addresses.reserve(views.size());
+    for (const auto& view : views) addresses.push_back(static_cast<std::uintptr_t>(view.address));
+    std::vector<std::shared_ptr<const GuestAllocations::Range>> ranges(views.size());
+    GuestAllocations::GuestAllocationsLookupEach_nid_postfix(addresses.data(), addresses.size(), ranges.data());
+    for (std::size_t index = 0; index < views.size(); ++index) {
+        const auto& view = views[index];
+        const auto& range = ranges[index];
+        if (view.hasRange != (range != nullptr)) return false;
+        if (range != nullptr && (range->address != view.rangeAddress || range->bytes != view.rangeBytes || range->allocationAddress != view.allocationAddress || range->allocationBytes != view.allocationBytes || range->backingSerial != view.backingSerial || range->readable != view.readable || range->writable != view.writable || range->gpu != view.gpu)) return false;
+    }
+    return true;
+}
+
+inline constexpr std::size_t MaxDispatchVariants = 8;
+
+using WordBitMasks = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+
+struct TsharpFeedbackMasks {
+    WordBitMasks memory;
+    WordBitMasks userData;
+    std::vector<WordBitMasks> bindings;
+    WordBitMasks pushConstants;
+    bool operator==(const TsharpFeedbackMasks&) const = default;
+};
+
+struct DispatchVariant {
+
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::uint32_t> words;
+    std::vector<SharedWords> shared;
+    std::uint64_t forgetSerial = 0;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
+    std::array<std::uint32_t, 4> meshIndexDescriptor{};
+
+    std::shared_ptr<const ShaderSnapshot> shader;
+
+    AtomicSharedPtr<const Recipe> recipe;
+    std::atomic<RecipeBuildFailure> recipeFailure{RecipeBuildFailure::NotAttempted};
+
+    static constexpr std::uint32_t NoFlatBinding = std::numeric_limits<std::uint32_t>::max();
+    std::vector<std::uint32_t> dataPositions;
+    std::vector<std::uint32_t> dataSlots;
+    std::uint32_t flatBinding = NoFlatBinding;
+    TsharpFeedbackMasks feedback;
+    struct BufferBasePatch {
+        std::uint32_t position, binding, word;
+    };
+    WordBitMasks bufferBaseMasks;
+    std::vector<BufferBasePatch> bufferBasePatches;
+    std::vector<std::uint32_t> userData;
+
+    std::uint32_t pushOffset = 0;
+    std::vector<std::int8_t> runBases;
+    struct RunParent {
+        std::uint32_t run = NoFlatBinding;
+        std::uint32_t word = 0;
+        bool operator==(const RunParent&) const = default;
+    };
+    std::vector<RunParent> runParents;
+    std::vector<std::array<std::uint32_t, 4>> nestedPointerPatches;
+    bool nestedRelocated = false;
+    bool nestedPointerProof = false;
+    std::uint64_t relocatableWords = 0;
+    std::uint64_t userWordsWalked = 0;
+    std::uint64_t valueWords = 0;
+    std::vector<std::array<std::uint32_t, 3>> valueSlots;
+    std::vector<std::array<std::uint32_t, 3>> descriptorPatches;
+    std::uint64_t calleeWords = 0;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> calleeReads;
+    std::shared_ptr<DispatchVariant> donor;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
+    std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> indirectCapture;
+
+    std::shared_ptr<ShaderMemory> memory;
+    std::vector<ShaderRecompiler::MemoryRegion> captured;
+    std::vector<std::pair<std::uint64_t, std::size_t>> spans;
+    std::atomic<std::uint64_t> generation{0};
+    // Write generations: the generation taken before the capture read the guest bytes (rule V6,
+    // Gen::CaptureSince; 0 when the capture read memory a GPU write was announced over), only ever
+    // raised to one taken before an exactly equal byte compare (CompareAndRestamp). While every
+    // watched block is at most it, the guest bytes of `runs` are `words`: the shadow census
+    // (GEN_SHADOW) classifies against it and GEN_DRAW_VALIDATION skips the byte compare on it.
+    mutable std::atomic<std::uint64_t> genSince{0};
+    // The newest ticket in effect when the capture or an exact compare read the bytes (only raised):
+    // checks at that ticket or an older one need no sweep (GEN_DRAW_VALIDATION). Any since paired
+    // with any proven ticket is evidence: both come from readings that found the words.
+    mutable std::atomic<std::uint64_t> genProvenTicket{0};
+};
+
+struct DispatchEntry {
+    std::vector<std::shared_ptr<DispatchVariant>> variants;
+
+    std::uint64_t touched = 0;
+
+    std::list<std::uint64_t>::iterator order;
+};
+
+struct EntryCounters {
+    std::uint64_t lookups = 0, absent = 0, equal = 0, differing = 0, queuedStores = 0, inaccessible = 0, queuedLabel = 0, flushingImage = 0, publishMoved = 0, pendingMoved = 0, forgetMoved = 0, imagesFlushed = 0, runsSynced = 0, forgetSinceInsert = 0, replaced = 0, inserts = 0, unstable = 0, touches = 0;
+
+    std::uint64_t runsValidated = 0, runsInserted = 0, retriesEqual = 0, retriesMoved = 0;
+    double validateUs = 0;
+
+    std::uint64_t differingClassified = 0, differingAddress = 0, differingData = 0, differingWalk = 0, differingMixed = 0, differingRunsChanged = 0, differingMatchedPrior = 0, differingWords = 0;
+    std::array<std::uint64_t, 4> differingWordBuckets{};
+
+    std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
+    std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0;
+
+    std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
+    std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
+    std::array<std::uint64_t, 7> dataInsertReasons{};
+    std::array<std::uint64_t, 4> dataNoLeafReasons{};
+    std::array<std::uint64_t, 4> dataDifferingReasons{};
+    std::map<std::uint64_t, std::array<std::uint64_t, 11>> dataInsertsByProgram;
+    std::map<std::uint64_t, std::string> flatSlotReasonsByProgram;
+    std::map<std::shared_ptr<const ShaderRecompiler::IrResourcePlan>, std::vector<std::uint16_t>> flatSlotReasonsByPlan;
+    std::uint64_t refinedDataInserts = 0, refinedDataPositions = 0;
+    std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, 3>> dataLookupsBySite;
+    std::map<std::uint64_t, std::map<std::tuple<std::size_t, std::uint64_t, std::uint32_t, std::uint32_t>, std::uint64_t>> differingWordRoles;
+    std::set<std::size_t> differingPositions;
+    std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
+    std::map<std::uint64_t, std::uint64_t> differingByProgram;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+struct DataMask {
+    std::span<const std::uint32_t> positions;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> feedback;
+    bool* feedbackHit = nullptr;
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> bufferBases;
+    std::span<const std::uint32_t> storedWords;
+    std::vector<std::uint32_t>* refreshedWords = nullptr;
+};
+
+bool SameCapturedRuns(std::span<const std::pair<std::uint64_t, std::uint64_t>> before, std::span<const std::pair<std::uint64_t, std::uint64_t>> after);
+std::uint32_t WordMask(std::span<const std::pair<std::uint32_t, std::uint32_t>> masks, std::size_t position);
+bool FeedbackWordsEqual(std::span<const std::uint32_t> before, std::span<const std::uint32_t> after, std::span<const std::pair<std::uint32_t, std::uint32_t>> masks, bool* used = nullptr);
+void RecordTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+void RecordUncachedTsharpFeedbackMasks(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+bool FeedbackBindingsEqual(const DispatchVariant& variant, const ShaderRecompiler::RecompileResult& before, const ShaderRecompiler::RecompileResult& after, bool enabled);
+void RecordBufferBasePatches(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
+bool PatchBufferBases(const DispatchVariant& variant, std::span<const std::uint32_t> words, ShaderRecompiler::RecompileResult& result);
+
+enum class EntryOutcome { Equal, EqualData, Differing, QueuedStores, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
+
+// Write-generation shadow for one validated variant (draw or multi-variant dispatch): what Check
+// would say over its runs at its genSince, classified against the validation's decision when that
+// decision came from the byte compare (Equal: unchanged; EqualData, Differing or Inaccessible after
+// the compare: changed); refusals before or around the compare (pending sync, flushes, queued
+// labels, moved serials) are counted as refused. `before` is Gen::CaptureSince read before the
+// validation; an Equal outcome restamps the since to it only when `exact` (VariantValidationExact).
+// Returns the verdict (Clean feeds the queue-0 hit-run histogram).
+GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer consumer, const DispatchVariant& variant, EntryOutcome outcome, std::uint64_t before, bool exact);
+// Whether the calling thread's last validateVariant proved the guest bytes of every run equal to the
+// variant's words exactly (Equal with no live data word, no masked feedback bit, no pending GPU write
+// over a run): only then may a since move.
+bool VariantValidationExact();
+// Raises the variant's since to `since` and its proven ticket to `ticket` (never lowers either).
+void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::uint64_t ticket = 0);
+// Whether a GPU write announced over any region is still pending (a capture over it may hold known
+// or raw values rather than the guest bytes: its since is not evidence).
+bool CapturedOverPendingWrite(std::span<const ShaderRecompiler::MemoryRegion> regions);
+
+bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
+
+}
+
+#endif

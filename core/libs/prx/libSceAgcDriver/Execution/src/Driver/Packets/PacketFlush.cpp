@@ -1,0 +1,167 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <algorithm>
+#include <atomic>
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include <cstdlib>
+
+namespace AgcDriver::DriverDetail {
+
+void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::PacketFlush);
+    static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
+    static const bool ownLock = std::getenv("APS5_LABEL_OWN_LOCK") != nullptr;
+    static const bool batchState = std::getenv("APS5_NO_LABEL_STATE_BATCHING") == nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> statePacketsBatched{0};
+    static std::atomic<std::uint64_t> packetFlushes{0}, deadlineFlushes{0}, capFlushes{0}, boundaryReaps{0}, overdueLocks{0};
+    auto& deferred = deferredLabels();
+    const bool queued = !deferred.labels.empty();
+    const bool queuedTable = queued && QueuedLabelTable();
+    if (queuedTable) noteQueuedLabels(queue);
+    const bool selfLocking = !ownLock && PacketLocksItself(header);
+    bool submit = false, record = false, needsRecord = false, deferredDue = false, pendingDue = false;
+    const auto pending = Graphics::Recorder::PendingLabelSince();
+
+    struct LastReapTryThreadStorage {};
+    auto& lastReapTry = AgcDriver::ThreadScratch<std::chrono::steady_clock::time_point, LastReapTryThreadStorage>();
+    const bool completions = completionsPending();
+    const bool reapDue = completions && (reapEachPacket() || queue == 0);
+
+    const auto now = queued || pending.has_value() || reapDue ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    bool recordAtLock = false;
+    if (queued) {
+        const bool keepQueued = batchState && queuedTable && LabelBatchSubmit() && !NeedsRecordedLabels(header) && header != RenderingWaitPacketHeader;
+        if (!labelPacket && !keepQueued) {
+            record = true;
+
+            needsRecord = !queuedTable && NeedsRecordedLabels(header) && !selfLocking;
+        }
+        if (now - deferred.since >= labelFlushDeadline()) record = deferredDue = true;
+        if (profile && !labelPacket && keepQueued && !deferredDue) statePacketsBatched.fetch_add(1, std::memory_order_relaxed);
+        if (record && !deferredDue && selfLocking && !labelTryEachPacket()) {
+            record = false;
+            recordAtLock = true;
+            // Arch C labels, C_LABEL_AWAITED_EARLY: a queued label another queue is already blocked on (its awaited
+            // slot overlaps the label) is recorded by a try here, before the self-locking packet's unlocked
+            // preparation, instead of at that packet's own lock. The same try flushAwaitedLabels makes when the
+            // waiter blocked first; the labels still go out in order and before the packet's work.
+            if (queue != 0 && ArchB::Switches::Enabled(ArchB::Feature::CLabelAwaitedEarly)) {
+                const auto ownSlot = queue - 0x20 + 1;
+                const auto& labels = deferred.labels;
+                for (std::size_t index = 0; index < awaitedSlots.size() && recordAtLock; ++index) {
+                    if (index == ownSlot) continue;
+                    const auto address = awaitedSlots[index].address.load(std::memory_order_acquire);
+                    if (address == 0) continue;
+                    const auto bytes = awaitedSlots[index].shape.load(std::memory_order_relaxed) >> 32u;
+                    if (bytes != 4 && bytes != 8) continue;
+                    if (std::any_of(labels.begin(), labels.end(), [&](const DeferredLabel& label) { return address >= label.address ? address - label.address < label.size : label.address - address < bytes; })) {
+                        // _VERIFY=N: one candidate in N is left to the packet's lock as before (both paths stay exercised);
+                        // a candidate the try records must leave no label queued (checked after the record).
+                        static const std::uint64_t verifyPeriod = [] {
+                            const char* value = std::getenv("APS5_ARCHB_C_LABEL_AWAITED_EARLY_VERIFY");
+                            return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+                        }();
+                        static std::atomic<std::uint64_t> candidates{0};
+                        if (verifyPeriod != 0 && (candidates.fetch_add(1, std::memory_order_relaxed) + 1) % verifyPeriod == 0) {
+                            ArchB::Recorder::Count("c_label_awaited_early_verified");
+                            break;
+                        }
+                        record = true;
+                        recordAtLock = false;
+                        ArchB::Recorder::Count("c_label_awaited_early");
+                    }
+                }
+            }
+        }
+    }
+    if (pending.has_value()) {
+        if (!labelPacket && packetFlush) submit = true;
+        if (now - *pending >= labelFlushDeadline()) submit = pendingDue = true;
+    }
+    const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
+    const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
+    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
+    if (!submit && !record && !capped && !reap) {
+        if (recordAtLock) ++recordTriesSkipped;
+        return;
+    }
+    if (reap) lastReapTry = now;
+    if (DrawPipeline::Active() && (submit || record || capped || recordAtLock)) {
+        static const bool committerSubmits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
+        if (committerSubmits && !record && !recordAtLock && DrawPipeline::Queue0().Busy()) return;
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Flush);
+    }
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+
+    if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+    else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+
+    bool outright = needsRecord;
+    if (LabelBatchSubmit()) {
+        const auto grace = 4 * labelFlushDeadline();
+        const bool overdue = (deferredDue && now - deferred.since >= grace) || (pendingDue && now - *pending >= grace) || (capped && work >= 2 * batchCap());
+        if (overdue) ++overdueLocks;
+        outright = outright || overdue;
+    } else if (deferredDue || (queue == 0 && (capped || (submit && (!selfLocking || pendingDue))))) {
+        outright = true;
+    }
+    if (outright) {
+        gpuLock.lock();
+    } else if (!gpuLock.try_lock()) {
+        ++triesFailed[record ? TryLabel : submit || capped ? TryFlush : TryReap];
+        if (selfLocking && record) ++packetLockDeferred;
+        else if (selfLocking && submit) ++packetSubmitDeferred;
+        return;
+    }
+    if (record || recordAtLock) {
+        // An early record (C_LABEL_AWAITED_EARLY) on a compute queue makes the compute-sync prewait the packet's own
+        // lock would have made (FIX_COMPUTE_SYNC_UNLOCKED), so its label-time stores wait unlocked as before.
+        const bool early = record && selfLocking && queue != 0 && !deferredDue && ArchB::Switches::Enabled(ArchB::Feature::CLabelAwaitedEarly);
+        const Graphics::Recorder::ComputeSyncScope computeSync(early ? ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) : Graphics::Recorder::ComputeSyncEnabled());
+        Graphics::StorageTexture::PrepareReadbackBeforeLabel(early && Graphics::Recorder::ComputeSyncEnabled());
+    }
+    const auto localDevice = device.Load();
+    if (record || recordAtLock) {
+        recordDeferredLabels(localDevice.get(), queue);
+        if (record && selfLocking && queue != 0 && !deferredDue && !deferredLabels().labels.empty() && ArchB::Switches::Enabled(ArchB::Feature::CLabelAwaitedEarly)) ArchB::Recorder::Count("c_label_awaited_early_verify_mismatches");
+        auto& labelThread = ArchB::LabelCensus::Thread();
+        labelThread.syncNs = 0;
+        labelThread.prewaitSkipped.clear();
+
+        if ((!labelPacket && packetFlush) || deferredDue) submit = true;
+    }
+    if (localDevice == nullptr) return;
+    if (submit || capped) {
+
+        if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
+        localDevice->SubmitRecorded(queue == 0);
+        if (capped) ++capFlushes;
+        else if (!labelPacket && packetFlush) ++packetFlushes;
+        else ++deadlineFlushes;
+    } else if (reap) {
+        localDevice->ReapRecorded();
+        ++boundaryReaps;
+    }
+    static std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    if (!profile) return;
+    const auto reportNow = std::chrono::steady_clock::now();
+    if (reportNow - lastReport < std::chrono::seconds(10)) return;
+    lastReport = reportNow;
+    AgcDriver::ProfilePrint_nid_no_patch("[labels-state] %llu boundaries passed with labels queued (cumulative)\n", static_cast<unsigned long long>(statePacketsBatched.load(std::memory_order_relaxed)));
+    const auto stores = Graphics::Recorder::StoreCounts();
+    const auto failed = [](TrySite site) { return static_cast<unsigned long long>(triesFailed[site].load()); };
+    AgcDriver::ProfilePrint_nid_no_patch("[labels] batch flushes between packets: %llu at the next packet, %llu by deadline, %llu by size cap (%llu well overdue, waited for the mutex); %llu boundary reaps; record tries skipped (self-locking next) %llu; failed tries: label %llu, flush %llu, reap %llu, poll %llu, idle %llu, capture %llu, poll-record %llu; at the packet's own lock: %llu label groups (%.0f ms), %llu submits (%.0f ms incl. queue 0's reaps), left to it by a failed try: %llu groups, %llu submits; after a capture: %llu groups recorded by a try, %llu tries batched into the packet lock, %llu packets redone for a queued label over the capture, %llu for captured memory that changed before recording; %llu suspend points; stores: %llu in %llu runs (%llu joined, %llu replaced, %llu WAW barriers, %llu joins refused; %llu runs recorded at submit, %llu in place before a writer or reader); DCC key stores: %llu queued in %llu runs (%llu before a writer, %llu joined a queued range); queued labels: %llu noted (%llu over a recorded entry), %llu same-queue wait hits, %llu groups recorded from a poll loop, %llu from the flush hook (%llu hook accesses, %llu inside a completion skipped)\n", static_cast<unsigned long long>(packetFlushes.load()), static_cast<unsigned long long>(deadlineFlushes.load()), static_cast<unsigned long long>(capFlushes.load()), static_cast<unsigned long long>(overdueLocks.load()), static_cast<unsigned long long>(boundaryReaps.load()), static_cast<unsigned long long>(recordTriesSkipped.load()), failed(TryLabel), failed(TryFlush), failed(TryReap), failed(TryPoll), failed(TryIdle), failed(TryCapture), failed(TryPollRecord), static_cast<unsigned long long>(packetLockRecords.load()), packetLockRecordUs.load() / 1000.0, static_cast<unsigned long long>(packetLockSubmits.load()), packetLockSubmitUs.load() / 1000.0, static_cast<unsigned long long>(packetLockDeferred.load()), static_cast<unsigned long long>(packetSubmitDeferred.load()), static_cast<unsigned long long>(captureTryRecords.load()), static_cast<unsigned long long>(captureTriesBatched.load()), static_cast<unsigned long long>(captureRetries.load()), static_cast<unsigned long long>(captureChangeRetries.load()), static_cast<unsigned long long>(suspendPoints.load()), static_cast<unsigned long long>(stores.stores), static_cast<unsigned long long>(stores.runs), static_cast<unsigned long long>(stores.joined), static_cast<unsigned long long>(stores.replaced), static_cast<unsigned long long>(stores.wawBarriers), static_cast<unsigned long long>(stores.joinsRefused), static_cast<unsigned long long>(stores.runsAtSubmit), static_cast<unsigned long long>(stores.runsForced), static_cast<unsigned long long>(stores.keyStores), static_cast<unsigned long long>(stores.keyStoreRuns), static_cast<unsigned long long>(stores.keyStoreRunsForWriter), static_cast<unsigned long long>(stores.keyStoresJoined), static_cast<unsigned long long>(stores.queuedNoted), static_cast<unsigned long long>(stores.queuedOverRecorded), static_cast<unsigned long long>(stores.queuedHits), static_cast<unsigned long long>(pollLabelRecords.load()), static_cast<unsigned long long>(hookLabelRecords.load()), static_cast<unsigned long long>(stores.queuedHookRecords), static_cast<unsigned long long>(stores.queuedHookInCompletion));
+}
+
+}

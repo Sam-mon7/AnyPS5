@@ -1,0 +1,620 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include "prx/libc/include/PreciseWait.hpp"
+#include <algorithm>
+#include <tuple>
+#include <vector>
+
+namespace AgcDriver::ArchB::LabelWake {
+
+std::uint64_t SignalCount() {
+    return Signals().load(std::memory_order_relaxed);
+}
+
+}
+
+namespace AgcDriver::DriverDetail {
+
+#ifdef _WIN32
+namespace {
+
+HANDLE PollTimer() {
+    thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return timer;
+}
+
+}
+#endif
+
+// C_LABEL_WAKE: PollSleep's 200 us step, ended early when a label over the awaited dword is recorded (the slot's event).
+void PollSleepOrWake(std::size_t slot) {
+#ifdef _WIN32
+    HANDLE timer = PollTimer();
+    HANDLE event = slot < ArchB::LabelWake::SlotCount ? static_cast<HANDLE>(ArchB::LabelWake::EventOf(slot)) : nullptr;
+    if (timer != nullptr && event != nullptr) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -2000;
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            const HANDLE handles[2] = {timer, event};
+            if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+                CancelWaitableTimer(timer);
+                ArchB::Recorder::Count("c_label_wake_woken");
+            }
+            return;
+        }
+    }
+#endif
+    PollSleep();
+}
+
+void PollSleep() {
+#ifdef _WIN32
+    HANDLE timer = PollTimer();
+    if (timer != nullptr) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -2000;
+        if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+}
+
+bool OwnStoreRejects(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes, std::uint32_t queue) {
+    const auto own = Graphics::Recorder::UnlandedOwnLabel(awaited, bytes, queue);
+    if (own.mask == 0) return false;
+    const std::uint64_t memory = bytes == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+    return !Pm4::WaitComparesValue(packet, (memory & ~own.mask) | own.value);
+}
+
+int Driver::waitTimeoutMs() {
+    static const int value = [] { const char* text = std::getenv("APS5_GPU_WAIT_TIMEOUT_MS"); return text ? std::atoi(text) : 1000; }();
+    return value;
+}
+
+bool Driver::pollReapAll() {
+    static const bool all = std::getenv("APS5_POLL_REAP") != nullptr;
+    return all;
+}
+
+bool Driver::pollTryEach() {
+    static const bool each = std::getenv("APS5_POLL_TRY_EACH") != nullptr;
+    return each;
+}
+
+bool Driver::traceLateLabels() {
+    static const bool trace = std::getenv("APS5_TRACE_LATE_LABELS") != nullptr;
+    return trace;
+}
+
+std::vector<Driver::PendingWait>& Driver::pendingWaits() {
+    struct WaitsTag {};
+    return HostThreadLocal<std::vector<PendingWait>, WaitsTag>();
+}
+
+void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
+    if (packet.size() > std::tuple_size_v<decltype(PendingWait::words)>) return;
+    static const bool allQueues = std::getenv("APS5_LAND_WAITS_ALL_QUEUES") != nullptr;
+    if (!allQueues && queue == 0) return;
+    if (Pm4::WaitSatisfiedUnchecked(packet)) return;
+    auto& waits = pendingWaits();
+    for (const auto& wait : waits) {
+        if (wait.count == packet.size() && std::equal(packet.begin(), packet.end(), wait.words.begin())) return;
+    }
+    PendingWait wait{};
+    std::copy(packet.begin(), packet.end(), wait.words.begin());
+    wait.count = packet.size();
+    wait.received = received;
+    waits.push_back(wait);
+}
+
+void Driver::landPendingWaits(std::uint32_t queue) {
+    auto& waits = pendingWaits();
+    if (waits.empty()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    struct LandStats {
+        std::uint64_t lands = 0, waited = 0, fenceWaits = 0;
+        double waitedMs = 0, gpuMs = 0, maxMs = 0;
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+    LandStats* stats = nullptr;
+    if (profile) {
+        static thread_local LandStats counts;
+        stats = &counts;
+    }
+    const PacketHistory none{};
+    for (const auto& wait : waits) {
+        const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
+        if (profile) ++stats->lands;
+        if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto gpuBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+        waitMemory(packet, queue, none, wait.received, false, true);
+        if (profile) {
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            const auto gpuMs = Graphics::Recorder::ThreadWaitedMs() - gpuBefore;
+            ++stats->waited;
+            if (gpuMs > 0.0) ++stats->fenceWaits;
+            stats->waitedMs += ms;
+            stats->gpuMs += gpuMs;
+            stats->maxMs = std::max(stats->maxMs, ms);
+        }
+    }
+    waits.clear();
+    if (profile && std::chrono::steady_clock::now() - stats->reported > std::chrono::seconds(10)) {
+        AgcDriver::ProfilePrint_nid_no_patch("[landwait] queue 0x%x (10 s): %llu waits landed before a guest read, %llu required memory polling: %.1f ms in total, max %.2f ms\n", queue, static_cast<unsigned long long>(stats->lands), static_cast<unsigned long long>(stats->waited), stats->waitedMs, stats->maxMs);
+        AgcDriver::ProfilePrint_nid_no_patch("[landwait-detail] queue 0x%x (10 s): skipped memory-satisfied %llu; kept with fence/timeline waits %llu, without %llu; measured fence/timeline waits %.1f ms, other landing wall time %.1f ms\n", queue, static_cast<unsigned long long>(stats->lands - stats->waited), static_cast<unsigned long long>(stats->fenceWaits), static_cast<unsigned long long>(stats->waited - stats->fenceWaits), stats->gpuMs, std::max(0.0, stats->waitedMs - stats->gpuMs));
+        *stats = LandStats{};
+    }
+}
+
+void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool epochCovered) {
+    PerformanceTimer recorderTiming("Driver.LabelWait");
+    recorderTiming.RecorderCounter("label_wait_ms");
+    ArchB::Recorder::Count("label_waits");
+
+    auto start = std::chrono::steady_clock::now();
+    auto lastDone = packetsDone.load();
+
+    GuestMemory::TagGpuLockThread(queue);
+    auto& outcomes = waitOutcomes();
+    const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+    const std::size_t awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+    const auto alignMask = awaitedBytes == 8 ? ~7ull : ~3ull;
+    const std::uint64_t awaited = (packet[2] & static_cast<std::uint32_t>(alignMask)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    Timeline::WaitScope timelineWait(packet, awaited, awaitedBytes);
+    // Arch C label census: which thread recorded the awaited label and when, against this wait's start and end.
+    ArchB::LabelCensus::WaitScope labelCensus(awaited, requireMemory);
+    static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
+    if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
+                               *reinterpret_cast<const volatile std::uint32_t*>(awaited));
+    struct WaitTrace {
+        bool enabled; std::uint32_t queue; std::uint64_t address; std::chrono::steady_clock::time_point begin;
+        ~WaitTrace() {
+            if (!enabled) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            if (ms >= 0.5) std::fprintf(stderr, "[gpu] %.1f queue 0x%x wait on 0x%llx done after %.1f ms\n", TraceMs(), queue, static_cast<unsigned long long>(address), ms);
+        }
+    } waitTrace{traceGpu, queue, awaited, std::chrono::steady_clock::now()};
+    bool warned = false;
+
+    // The ticket reason (write generations): a value read from memory (CPU), a label another
+    // queue recorded or stored (GPU label), or a value held at submission.
+    struct EpochPoint {
+        bool bump;
+        GuestMemory::Gen::TicketReason reason = GuestMemory::Gen::TicketReason::WaitCpu;
+        ~EpochPoint() {
+            if (bump) bumpEpoch(&EpochBumps::waits, reason);
+        }
+    } epochPoint{!heldAtSubmit || requireMemory || !epochCovered};
+    // V5 census (APS5_ARCHB_GEN_SHADOW): whether ticket inheritance would admit a wait satisfied by
+    // another queue's label: from the recorder table without reading memory, or from memory when the
+    // label's last writer is that store and no CPU store reached its block since (the late path has
+    // just collected the label's pages; the history path is judged without a sweep, an upper bound).
+    const auto noteInheritable = [&](bool fromTable, std::optional<std::uint64_t> storeGeneration) {
+        if (!GuestMemory::Gen::ShadowActive()) return;
+        const bool admitted = fromTable || (storeGeneration.has_value() && *storeGeneration != 0 && GuestMemory::Gen::Global().Fields(awaited).cpu <= *storeGeneration);
+        GuestMemory::Gen::NoteWaitInheritance(fromTable, admitted);
+    };
+    bool ownStoreUnlanded = false;
+    const auto memorySatisfied = [&] {
+        ownStoreUnlanded = false;
+        if (!Pm4::WaitSatisfiedUnchecked(packet)) return false;
+        if (requireMemory || !OwnStoreRejects(packet, awaited, awaitedBytes, queue)) return true;
+        ownStoreUnlanded = true;
+        return false;
+    };
+    const auto storedByOwnLabel = [&] {
+        std::uint32_t writer = queue;
+        return !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer) && writer == queue;
+    };
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::optional<Graphics::Recorder::WaitProfile> waitProfile;
+    if (profile) waitProfile.emplace(queue, awaited, awaitedBytes);
+    // Stage 4 M1 (APS5_PIPE_IDLE_ATTRIB, queue 0 only): the wait spins first, then sleeps (Blocking).
+    Stage4::WaitScope stage4Wait(Stage4::Wait::Label, true);
+    // Recorded GPU work pending over the label when the wait began (a Polled end then names the GPU).
+    const bool stage4GpuPending = stage4Wait.Active() && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+    const auto stage4Writer = [&](std::uint32_t writer, bool table) {
+        if (!stage4Wait.Active()) return;
+        using W = Stage4::Writer;
+        stage4Wait.SetWriter(writer == queue ? (table ? W::OwnTable : W::OwnStore) : (table ? W::OtherTable : W::OtherStore), writer);
+    };
+    const auto finishProfile = [&](Graphics::Recorder::WaitEnd end) {
+        timelineWait.end = static_cast<std::uint32_t>(end);
+        if (PipeDrainDiag()) ThreadWaitDiag().end = static_cast<int>(end);
+        if (profile) waitProfile->end = end;
+        stage4Wait.SetEnd(static_cast<std::uint8_t>(end));
+        if (end == Graphics::Recorder::WaitEnd::Fence) stage4Wait.SetWriter(Stage4::Writer::Gpu, 0);
+    };
+    static const bool submitLabels = std::getenv("APS5_NO_WAIT_LABEL_SUBMIT") == nullptr;
+    const auto submitWriter = [&](std::uint32_t writer, bool locked = false) {
+        if (!submitLabels || writer == queue) return;
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!locked && !gpuLock.try_lock()) return;
+        if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+            localDevice->SubmitRecorded(false);
+            ++outcomes.shortcutSubmits;
+        }
+    };
+    if (memorySatisfied()) {
+        ++outcomes.atEntry;
+        if (storedByOwnLabel()) epochPoint.bump = false;
+        finishProfile(Graphics::Recorder::WaitEnd::Entry);
+        return;
+    }
+    if (heldAtSubmit) {
+        epochPoint.reason = GuestMemory::Gen::TicketReason::WaitEntry;
+        finishProfile(Graphics::Recorder::WaitEnd::Held);
+        return;
+    }
+    labelCensus.Blocked();
+    std::optional<std::uint64_t> historyGeneration;
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer, &historyGeneration)) {
+        submitWriter(writer);
+        if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
+        stage4Writer(writer, false);
+        if (writer != queue) {
+            notePendingWait(packet, queue, received);
+            epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
+            noteInheritable(false, historyGeneration);
+        } else {
+            epochPoint.bump = false;
+            if (GuestMemory::Gen::Active()) GuestMemory::Gen::NoteTicket(GuestMemory::Gen::TicketReason::WaitOwn);
+        }
+        finishProfile(Graphics::Recorder::WaitEnd::History);
+        return;
+    }
+
+    static const bool labelShortcut = std::getenv("APS5_NO_LABEL_SHORTCUT") == nullptr;
+    const bool labelTable = labelShortcut && !requireMemory;
+    static const bool overlapSubmit = std::getenv("APS5_NO_WAIT_OVERLAP_SUBMIT") == nullptr;
+
+    static const bool waitLock = std::getenv("APS5_WAIT_LOCK") != nullptr;
+
+    std::uint64_t refusedGeneration = 0;
+
+    bool behindCompletion = false;
+    const auto traceLate = [&](const char* outcome, const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal) {
+        static std::atomic<int> shown{0};
+        if (shown.fetch_add(1) >= 200) return;
+        std::fprintf(stderr, "[late] queue 0x%x wait on 0x%llx (function %u ref 0x%x mask 0x%x) received %llu: %s; entry value 0x%llx stamp %llu generation %llu, refusal %d\n", queue, static_cast<unsigned long long>(awaited), packet[1] & 7u, packet[4], packet[5], static_cast<unsigned long long>(received), outcome,
+                     static_cast<unsigned long long>(hit ? hit->value : 0), static_cast<unsigned long long>(hit ? hit->stamp : 0), static_cast<unsigned long long>(hit ? hit->generation : 0), static_cast<int>(refusal));
+    };
+    const auto takeLabel = [&](const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal, bool polling, bool unlockedHit) {
+        behindCompletion = refusal == Graphics::Recorder::LabelRefusal::BehindCompletion;
+        const bool trace = traceLateLabels() && (refusal != Graphics::Recorder::LabelRefusal::None || (hit.has_value() && hit->late));
+        if (stage4Wait.Active()) {
+            using R = Stage4::LabelReason;
+            constexpr R reasons[] = {R::NoEntry, R::TrustOff, R::Queued, R::Overwritten, R::Unclosed, R::BehindCompletion};
+            if (!hit.has_value()) stage4Wait.SetReason(static_cast<std::size_t>(refusal) < sizeof(reasons) / sizeof(reasons[0]) ? reasons[static_cast<std::size_t>(refusal)] : R::NoEntry);
+            else if (!Pm4::WaitComparesValue(packet, hit->value)) stage4Wait.SetReason(R::ValueMismatch);
+        }
+        if (!hit.has_value() || !Pm4::WaitComparesValue(packet, hit->value)) {
+            if (trace) traceLate(hit.has_value() ? "value mismatch" : "refused by the table", hit, refusal);
+            return false;
+        }
+        if (hit->late) {
+            if (hit->generation == refusedGeneration) return false;
+            if (!GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation)) {
+                ++outcomes.lateRefusedCpuStore;
+                stage4Wait.SetReason(Stage4::LabelReason::LateCpuStore);
+                refusedGeneration = hit->generation;
+                if (trace) traceLate("refused, CPU store since the group closed", hit, refusal);
+                return false;
+            }
+            ++outcomes.fromRecorderLate;
+            if (trace) traceLate("trusted", hit, refusal);
+        }
+        ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
+        if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(hit->queue);
+        stage4Writer(hit->queue, true);
+        if (unlockedHit) ++outcomes.fromRecorderUnlocked;
+        if (hit->queue == queue) {
+            ++outcomes.fromRecorderSameQueue;
+            if (!hit->late) {
+                epochPoint.bump = false;
+                if (GuestMemory::Gen::Active()) GuestMemory::Gen::NoteTicket(GuestMemory::Gen::TicketReason::WaitOwn);
+            }
+        } else {
+            notePendingWait(packet, queue, received);
+            epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
+            noteInheritable(!hit->late, hit->late ? std::optional<std::uint64_t>(hit->generation) : std::nullopt);
+        }
+        if (Timeline::Enabled) {
+            for (std::size_t offset = 0; offset < awaitedBytes; offset += 4) Timeline::Emit(Timeline::Kind::WaitSource,
+                awaited + offset, (hit->value >> (offset * 8u)) & 0xffffffffu, Timeline::LabelStamps()[offset / 4], 4, 0, Timeline::LabelQueues()[offset / 4]);
+        }
+        submitWriter(hit->queue, !unlockedHit);
+        finishProfile(Graphics::Recorder::WaitEnd::Recorder);
+        return true;
+    };
+
+    std::uint64_t seenGeneration = Graphics::Recorder::WriteGeneration();
+
+    const bool unlocked = !waitLock && overlapSubmit;
+    if (unlocked) {
+        if (labelTable) {
+            Graphics::Recorder::LabelRefusal refusal{};
+            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, false, true)) return;
+        }
+    }
+    const bool lockedEntry = !unlocked || Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+    if (!lockedEntry) ++outcomes.entriesUnlocked;
+
+    static const bool blockingEntry = std::getenv("APS5_WAIT_LOCK_ENTRY") != nullptr;
+    bool recheck = !lockedEntry;
+    bool entryTryFailed = false;
+    if (lockedEntry) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (blockingEntry || !unlocked) {
+            gpuLock.lock();
+        } else if (!gpuLock.try_lock()) {
+            ++outcomes.entryTriesFailed;
+            recheck = true;
+            entryTryFailed = true;
+        }
+        if (const auto localDevice = gpuLock.owns_lock() ? device.Load() : std::shared_ptr<VulkanDevice>{}) {
+
+            if (labelTable) {
+                Graphics::Recorder::LabelRefusal refusal{};
+                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
+            }
+
+            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
+        }
+    }
+
+    static const bool pollProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& poll = pollStats();
+    const auto pollRefused = [&](Graphics::Recorder::LabelRefusal refusal) {
+        if (pollProfile && refusal != Graphics::Recorder::LabelRefusal::None && static_cast<std::size_t>(refusal) < poll.refusals.size()) ++poll.refusals[static_cast<std::size_t>(refusal)];
+    };
+
+    const bool reapAll = pollReapAll() || !labelShortcut || queue == 0;
+    std::chrono::steady_clock::time_point lastTry{};
+    const auto pollService = [&](bool sleeping) {
+        if (pollProfile) ++poll.ticks;
+        const auto generation = Graphics::Recorder::WriteGeneration();
+        const bool changed = generation != seenGeneration || recheck;
+        const bool labelDue = labelFlushDue();
+        const bool reap = sleeping && (behindCompletion || ownStoreUnlanded || ((reapAll || queue0Dormant.load(std::memory_order_relaxed)) && completionsPending()));
+        if (!changed && !labelDue && !reap) return false;
+
+        if (!changed && !pollTryEach()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastTry < PollTryInterval) return false;
+            lastTry = now;
+        }
+        if (changed && unlocked && labelTable) {
+
+            Graphics::Recorder::LabelRefusal refusal{};
+            if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, true, true)) {
+                if (pollProfile) ++poll.tableHits;
+                return true;
+            }
+            pollRefused(refusal);
+        }
+        if (pollProfile) ++poll.tries;
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (!gpuLock.owns_lock()) {
+            ++triesFailed[TryPoll];
+            if (pollProfile) ++poll.triesFailed;
+            return false;
+        }
+
+        struct TryHold {
+            bool enabled;
+            PollStats& poll;
+            std::chrono::steady_clock::time_point start;
+            ~TryHold() {
+                if (!enabled) return;
+                const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                poll.tryHoldUs += us;
+                poll.longestTryHoldUs = std::max(poll.longestTryHoldUs, us);
+            }
+        } tryHold{pollProfile, poll, pollProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+        const auto localDevice = device.Load();
+        if (localDevice == nullptr) {
+            seenGeneration = generation;
+            recheck = false;
+            return false;
+        }
+        bool submitted = false;
+        if (changed) {
+            seenGeneration = generation;
+            recheck = false;
+            if (labelTable) {
+                Graphics::Recorder::LabelRefusal refusal{};
+                if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, true, false)) {
+                    if (pollProfile) ++poll.tableHits;
+                    return true;
+                }
+                pollRefused(refusal);
+            }
+            if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+                localDevice->SubmitRecorded(false);
+                submitted = true;
+            }
+        }
+        if (labelDue && !submitted && Graphics::Recorder::PendingLabelSince().has_value()) {
+            localDevice->SubmitRecorded(false);
+            submitted = true;
+        }
+        if (submitted) {
+            ++outcomes.pollSubmits;
+            if (pollProfile) ++poll.submits;
+        }
+        if (reap) {
+            const auto withWorkBefore = pollProfile ? Graphics::Recorder::ReapsWithWork() : 0;
+            localDevice->ReapRecorded();
+            if ((profile || Timeline::Enabled || stage4Wait.Active()) && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
+            ++outcomes.pollReaps;
+            if (pollProfile) {
+                ++poll.reaps;
+                ++(behindCompletion ? poll.reapsBehindCompletion : poll.reapsOther);
+                poll.reapsWithWork += Graphics::Recorder::ReapsWithWork() - withWorkBefore;
+            }
+        }
+        return false;
+    };
+
+    if (entryTryFailed && pollService(false)) return;
+
+    noteWaitFields(queue, packet);
+    noteWaitBlocked(queue, awaited, true);
+    struct BlockedWait {
+        Driver& driver;
+        std::uint32_t queue;
+        ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
+    } blocked{*this, queue};
+    static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
+    static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;
+    const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
+    // C_LABEL_WAKE: the slot's dword is published for the wait's whole poll loop (a label recorded during the spin
+    // leaves the event set, and the first sleep returns at once).
+    const bool labelWake = !requireMemory && ArchB::LabelWake::On();
+    const auto wakeSlot = ArchB::LabelWake::SlotOf(queue);
+    struct WakeArm {
+        bool armed;
+        std::size_t slot;
+        ~WakeArm() { if (armed) ArchB::LabelWake::Disarm(slot); }
+    } wakeArm{labelWake && wakeSlot < ArchB::LabelWake::SlotCount, wakeSlot};
+    if (wakeArm.armed) {
+        static_cast<void>(ArchB::LabelWake::EventOf(wakeSlot));
+        ArchB::LabelWake::Arm(wakeSlot, awaited, static_cast<std::uint32_t>(awaitedBytes));
+    }
+    const auto spinStart = std::chrono::steady_clock::now();
+    bool spinning = pauseSpin;
+    std::uint32_t polls = 0;
+    StallWatch stall(queue);
+    std::uint64_t producerToken = 0;
+    auto lastProducerScan = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
+    while (!memorySatisfied()) {
+        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer, &historyGeneration)) {
+            submitWriter(writer);
+            if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
+            stage4Writer(writer, false);
+            if (writer != queue) notePendingWait(packet, queue, received);
+            else epochPoint.bump = false;
+            finishProfile(Graphics::Recorder::WaitEnd::History);
+            return;
+        }
+        ++polls;
+        if (spinning) {
+            PreciseSpinPause();
+            if ((polls & 63u) != 0) continue;
+            if (std::chrono::steady_clock::now() - spinStart > spinLimit) {
+                spinning = false;
+                stage4Wait.Blocking();
+            }
+        } else if (pauseSpin || polls >= 4000) {
+            stage4Wait.Blocking();
+            if (wakeArm.armed) PollSleepOrWake(wakeSlot);
+            else PollSleep();
+        } else {
+            std::this_thread::yield();
+        }
+        CheckFailure();
+        if (pollService(!spinning)) return;
+        if (storeHeldResults && !spinning && (polls & 31u) == 0) {
+            const bool pending = (profile || Timeline::Enabled || stage4Wait.Active()) && Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+            GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+            if (pending && Pm4::WaitSatisfiedUnchecked(packet)) finishProfile(Graphics::Recorder::WaitEnd::Fence);
+        }
+        noteAwaitingTitle(queue, awaited);
+        if (requireMemory && (polls & 15u) == 0) {
+            std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
+            if (settleLock.owns_lock()) {
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    finishProfile(Graphics::Recorder::WaitEnd::Fence);
+                    return;
+                }
+            }
+        }
+        if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
+            lastDone = done;
+            start = std::chrono::steady_clock::now();
+            stall.Progressed();
+        } else if (const auto now = std::chrono::steady_clock::now(); now - lastProducerScan >= std::chrono::milliseconds(100)) {
+            lastProducerScan = now;
+            if (std::uint64_t token = 0; findWaitProducer(awaited, awaitedBytes, token) && token != producerToken) {
+                producerToken = token;
+                start = now;
+                stall.Progressed();
+            }
+        }
+        stall.Check(((packet[0] >> 8u) & 0xffu) == 0x93u ? "WAIT_REG_MEM_64 at" : "WAIT_REG_MEM at", awaited);
+
+        if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
+            warned = true;
+            ++outcomes.timedOut;
+            {
+                static std::mutex reportedMutex;
+                static std::set<std::uint64_t> reported;
+                static std::uint64_t timeouts = 0;
+                const std::lock_guard lock(reportedMutex);
+                if (++timeouts % 20 == 0) std::fprintf(stderr, "[gpu] %llu GPU waits have timed out\n", static_cast<unsigned long long>(timeouts));
+                if (!reported.insert(awaited).second) continue;
+            }
+            const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+            const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
+            const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
+            const std::uint64_t current = awaitedBytes == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+            std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
+                         static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
+            const auto address = awaited;
+            for (const auto& record : writeHistory()) {
+                if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4))
+                    std::fprintf(stderr, "[gpu]   earlier write by queue 0x%x opcode 0x%x at 0x%llx+0x%llx\n", record.queue, record.opcode, static_cast<unsigned long long>(record.target), static_cast<unsigned long long>(record.length));
+            }
+
+            if (const auto reportDevice = device.Load(); reportDevice != nullptr) {
+                Graphics::Recorder::LabelRefusal refusal{};
+                const auto hit = reportDevice->PendingLabel(awaited, awaitedBytes, received, &refusal);
+                const auto since = Graphics::Recorder::PendingLabelSince();
+                const auto age = since.has_value() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - *since).count() : -1.0;
+                std::fprintf(stderr, "[gpu]   recorder: table %s (refusal %u), open batch writes it %d, snapshot write overlaps %d, pending completion labels %llu, write-back completions %llu, pending label age %.1f ms, write generation %llu seen %llu, queue 0 dormant %d, completions pending %d, label due %d\n",
+                             hit.has_value() ? "hit" : "miss", static_cast<unsigned>(refusal), reportDevice->OpenWriteOverlaps(awaited, awaitedBytes) ? 1 : 0, Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes) ? 1 : 0,
+                             static_cast<unsigned long long>(Graphics::Recorder::PendingCompletionLabels()), static_cast<unsigned long long>(Graphics::Recorder::PendingWriteBackCompletions()), age,
+                             static_cast<unsigned long long>(Graphics::Recorder::WriteGeneration()), static_cast<unsigned long long>(seenGeneration), queue0Dormant.load(std::memory_order_relaxed) ? 1 : 0, completionsPending() ? 1 : 0, labelFlushDue() ? 1 : 0);
+            }
+            context.Print(stderr, "[gpu]   preceding packet %s\n");
+        }
+    }
+    ++outcomes.polled;
+    if (storedByOwnLabel()) epochPoint.bump = false;
+    if (timelineWait.end != static_cast<std::uint32_t>(Graphics::Recorder::WaitEnd::Fence)) finishProfile(Graphics::Recorder::WaitEnd::Polled);
+    if (stage4Wait.Active() && timelineWait.end != static_cast<std::uint32_t>(Graphics::Recorder::WaitEnd::Fence)) {
+        // A store in the label history (a queue's packet) satisfies it, else recorded GPU work was
+        // pending over it, else no driver record: a guest thread's store.
+        std::uint32_t writer = queue;
+        if (storedSince(packet, awaited, awaitedBytes, received, queue, &writer, nullptr)) stage4Writer(writer, false);
+        else stage4Wait.SetWriter(stage4GpuPending ? Stage4::Writer::Gpu : Stage4::Writer::Guest, 0);
+    }
+}
+
+}

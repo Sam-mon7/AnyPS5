@@ -1,0 +1,282 @@
+#include "prx/libSceVideoOut/include/Telemetry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+
+#include <chrono>
+#include <charconv>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+#endif
+
+#include "prx/libSceAgcDriver/TraceRevision.hpp"
+
+namespace VideoOutTelemetry {
+
+namespace {
+
+constexpr char ContractLevel[] = "v1-pad";
+
+constexpr auto DropReportInterval = std::chrono::seconds(10);
+constexpr std::size_t DefaultQueueCapacity = 4096;
+
+std::int64_t gateDelayMicros() {
+    using ReadDelay = std::int64_t (*)();
+    static const ReadDelay readDelay = []() -> ReadDelay {
+#ifdef APS5_ARCHB_SWITCHES_TEST
+        return std::getenv("ARCHB_TEST_LEGACY_DRIVER") == nullptr ? &AgcDriverGateDelayMicros_nid_no_patch : nullptr;
+#elif defined(_WIN32)
+        const auto driver = GetModuleHandleW(L"libSceAgcDriver.prx");
+        return driver == nullptr ? nullptr : reinterpret_cast<ReadDelay>(GetProcAddress(driver, "AgcDriverGateDelayMicros_nid_no_patch"));
+#else
+        return reinterpret_cast<ReadDelay>(dlsym(RTLD_DEFAULT, "AgcDriverGateDelayMicros_nid_no_patch"));
+#endif
+    }();
+    if (readDelay != nullptr) return readDelay();
+    static const auto delay = [] {
+        if (const char* path = std::getenv("APS5_ARCHB_CONTROL_FILE"); path != nullptr && *path != '\0') throw std::runtime_error("VideoOut: runtime gate requires the C01b driver");
+        const char* value = std::getenv("APS5_ARCHB_GATE_DELAY_US");
+        if (value == nullptr) return std::int64_t{0};
+        const std::string_view text(value);
+        std::int64_t micros = 0;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), micros);
+        if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || micros < 0 || micros > INT64_MAX / 1000) {
+            std::fprintf(stderr, "[archb] invalid GATE_DELAY_US=%s\n", value);
+            std::exit(EXIT_FAILURE);
+        }
+        return micros;
+    }();
+    return delay;
+}
+
+std::int64_t steadyNanos() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string configuredDirectory() {
+#ifdef _WIN32
+    const wchar_t* configured = _wgetenv(L"APS5_VIDEOOUT_TELEMETRY_DIR");
+    if (configured == nullptr) return {};
+    const auto text = std::filesystem::path(configured).u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+#else
+    const char* configured = std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR");
+    return configured != nullptr ? configured : std::string();
+#endif
+}
+
+std::int64_t processId() {
+#ifdef _WIN32
+    return static_cast<std::int64_t>(::GetCurrentProcessId());
+#else
+    return static_cast<std::int64_t>(::getpid());
+#endif
+}
+
+std::string head(std::int64_t timeNanos, const char* event) {
+    char text[96];
+    std::snprintf(text, sizeof(text), "{\"v\":1,\"t_ns\":%lld,\"ev\":\"%s\"", static_cast<long long>(timeNanos), event);
+    return text;
+}
+
+}
+
+BoundedLineQueue::BoundedLineQueue(std::size_t capacity) : capacity(capacity) {
+}
+
+bool BoundedLineQueue::TryPush(std::string line) {
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return pushLocked(std::move(line));
+}
+
+bool BoundedLineQueue::Push(std::string line) {
+    std::lock_guard lock(mutex);
+    return pushLocked(std::move(line));
+}
+
+bool BoundedLineQueue::pushLocked(std::string line) {
+    if (lines.size() >= capacity) {
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    lines.push_back(std::move(line));
+    return true;
+}
+
+std::deque<std::string> BoundedLineQueue::Drain() {
+    std::lock_guard lock(mutex);
+    return std::exchange(lines, {});
+}
+
+std::uint64_t BoundedLineQueue::Dropped() const {
+    return dropped.load(std::memory_order_relaxed);
+}
+
+Writer::Writer(const std::string& directory, std::size_t capacity, const std::string& commit) : queue(capacity) {
+    const std::string path = directory + "/videoout.jsonl";
+    output.open(std::filesystem::path(reinterpret_cast<const char8_t*>(path.c_str())), std::ios::binary | std::ios::app);
+    if (!output.is_open()) throw std::runtime_error("VideoOut telemetry: cannot open " + path);
+    output.exceptions(std::ios::badbit | std::ios::failbit);
+    const auto steady = steadyNanos();
+    char text[256];
+    std::snprintf(text, sizeof(text), ",\"contract\":\"%s\",\"commit\":\"%s\",\"pid\":%lld,\"prx\":\"libSceVideoOut\"}\n", ContractLevel, commit.c_str(), static_cast<long long>(processId()));
+    queue.Push(head(steady, "contract") + text);
+    thread = std::jthread([this](std::stop_token token) { run(token); });
+}
+
+Writer::~Writer() {
+    thread.request_stop();
+    if (thread.joinable()) thread.join();
+}
+
+bool Writer::emit(std::string line, bool mustKeep) {
+    return mustKeep ? queue.Push(std::move(line)) : queue.TryPush(std::move(line));
+}
+
+void Writer::writeAll(const std::string& text) {
+    output.write(text.data(), static_cast<std::streamsize>(text.size()));
+    output.flush();
+}
+
+void Writer::writeDrops(bool force) {
+    const auto total = queue.Dropped();
+    if (total == 0 || (total == reportedDrops && !force)) return;
+    reportedDrops = total;
+    char text[64];
+    std::snprintf(text, sizeof(text), ",\"dropped\":%llu}\n", static_cast<unsigned long long>(total));
+    writeAll(head(steadyNanos(), "drops") + text);
+}
+
+void Writer::run(std::stop_token token) {
+    try {
+        auto nextDropReport = std::chrono::steady_clock::now() + DropReportInterval;
+        std::mutex sleepMutex;
+        std::condition_variable_any sleepWake;
+        while (true) {
+            {
+                std::unique_lock lock(sleepMutex);
+                sleepWake.wait_for(lock, token, std::chrono::milliseconds(200), [] { return false; });
+            }
+            std::string batch;
+            for (auto& line : queue.Drain()) batch += line;
+            if (!batch.empty()) writeAll(batch);
+            if (std::chrono::steady_clock::now() >= nextDropReport) {
+                nextDropReport += DropReportInterval;
+                writeDrops(false);
+            }
+            if (token.stop_requested()) break;
+        }
+        std::string rest;
+        for (auto& line : queue.Drain()) rest += line;
+        if (!rest.empty()) writeAll(rest);
+        writeDrops(true);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[videoout] telemetry writer stopped: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "[videoout] telemetry writer stopped\n");
+    }
+}
+
+bool Writer::EmitPad(std::uint64_t frame, const PadInputState& state) {
+    char text[192];
+    std::snprintf(text, sizeof(text), ",\"n\":%llu,\"buttons\":%u,\"sticks\":[%u,%u,%u,%u],\"triggers\":[%u,%u]}\n",
+        static_cast<unsigned long long>(frame), state.buttons, state.sticks[0], state.sticks[1], state.sticks[2], state.sticks[3],
+        state.analogButtonsL2, state.analogButtonsR2);
+    return emit(head(steadyNanos(), "pad") + text, true);
+}
+
+void Writer::EmitPresent(std::uint64_t frame, double fps) {
+    EmitPresent(frame, fps, steadyNanos());
+}
+
+void Writer::EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos) {
+    char text[96];
+    std::snprintf(text, sizeof(text), ",\"n\":%llu,\"fps\":%.2f}\n", static_cast<unsigned long long>(frame), fps);
+    emit(head(timeNanos, "present") + text, false);
+}
+
+void Writer::EmitPresent(std::uint64_t frame, double fps, std::int64_t timeNanos, const AgcDriver::PresentCounters& counters) {
+    char text[288];
+    std::snprintf(text, sizeof(text), ",\"n\":%llu,\"fps\":%.2f,\"presented\":%llu,\"attempts\":%llu,\"acquire_dropped\":%llu,\"out_of_date\":%llu}\n",
+        static_cast<unsigned long long>(frame), fps, static_cast<unsigned long long>(counters.presented),
+        static_cast<unsigned long long>(counters.attempts), static_cast<unsigned long long>(counters.acquireDropped),
+        static_cast<unsigned long long>(counters.outOfDate));
+    emit(head(timeNanos, "present") + text, false);
+}
+
+bool GateRunEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_GATE_RUN");
+        if (value == nullptr) return false;
+        if (std::string_view(value) == "0") return false;
+        if (std::string_view(value) == "1") return true;
+        std::fprintf(stderr, "[archb] invalid GATE_RUN=%s\n", value);
+        std::exit(EXIT_FAILURE);
+    }();
+    return enabled;
+}
+
+void ObservePresent(Writer* writer, std::uint64_t frame, double fps, std::int64_t timeNanos) {
+    const bool gate = GateRunEnabled();
+    if (writer != nullptr) {
+        if (gate) {
+            AgcDriver::PresentCounters counters{};
+            AgcDriverPresentCounters_nid_postfix(&counters);
+            writer->EmitPresent(frame, fps, timeNanos, counters);
+        }
+        else if (frame == 1 || frame % 30 == 0) writer->EmitPresent(frame, fps);
+    }
+    if (!gate) return;
+    const auto delay = std::chrono::microseconds(gateDelayMicros());
+    if (delay.count() != 0) std::this_thread::sleep_for(delay);
+}
+
+std::uint64_t Writer::Dropped() const {
+    return queue.Dropped();
+}
+
+bool PadChangeFilter::Changed(const PadInputState& state) const {
+    return state.buttons != last.buttons || state.sticks != last.sticks ||
+        state.analogButtonsL2 != last.analogButtonsL2 || state.analogButtonsR2 != last.analogButtonsR2;
+}
+
+void PadChangeFilter::Commit(const PadInputState& state) {
+    last.buttons = state.buttons;
+    last.sticks = state.sticks;
+    last.analogButtonsL2 = state.analogButtonsL2;
+    last.analogButtonsR2 = state.analogButtonsR2;
+}
+
+bool EmitPadIfChanged(Writer& writer, PadChangeFilter& filter, std::uint64_t frame, const PadInputState& state) {
+    if (!filter.Changed(state)) return false;
+    if (!writer.EmitPad(frame, state)) return false;
+    filter.Commit(state);
+    return true;
+}
+
+std::unique_ptr<Writer> OpenFromEnvironment(const char* directory, const std::string& commit) {
+    if (directory == nullptr || directory[0] == '\0') return nullptr;
+    return std::make_unique<Writer>(directory, DefaultQueueCapacity, commit);
+}
+
+Writer* Instance() {
+    static const std::unique_ptr<Writer> writer = OpenFromEnvironment(configuredDirectory().c_str(), APS5_TRACE_COMMIT);
+    return writer.get();
+}
+
+}

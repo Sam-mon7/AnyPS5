@@ -1,0 +1,68 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words result;
+    Words snapshot;
+    Words target;
+    Words counter;
+    Words reference;
+    Words stats;
+    uint count;
+    uint always;
+} parameters;
+
+uint differingBytes(uint difference) {
+    uint folded = difference | (difference >> 1u);
+    folded |= folded >> 2u;
+    folded |= folded >> 4u;
+    return (folded & 0x01010101u) * 0xffu;
+}
+
+shared uint blockChanged;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    bool validIndex = index < parameters.count;
+    if ((parameters.always & 16u) != 0u) {
+        if (validIndex) {
+            parameters.reference.words[index] = parameters.result.words[index];
+            parameters.reference.words[parameters.count + index] = parameters.snapshot.words[index];
+            parameters.reference.words[2u * parameters.count + index] = parameters.target.words[index];
+        }
+        return;
+    }
+    if ((parameters.always & 32u) != 0u) {
+        if (validIndex && (parameters.result.words[index] != parameters.reference.words[index] || parameters.snapshot.words[index] != parameters.reference.words[parameters.count + index] || parameters.target.words[index] != parameters.reference.words[2u * parameters.count + index])) atomicAdd(parameters.stats.words[3], 1u);
+        return;
+    }
+    uint value = validIndex ? parameters.result.words[index] : 0u;
+    uint before = validIndex ? parameters.snapshot.words[index] : 0u;
+    if ((parameters.always & 4u) != 0u) {
+        if (gl_LocalInvocationIndex == 0u) blockChanged = 0u;
+        barrier();
+        if (validIndex && value != before) atomicOr(blockChanged, 1u);
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && (parameters.always & 8u) != 0u) {
+            atomicAdd(parameters.stats.words[0], 1u);
+            if (blockChanged == 0u) atomicAdd(parameters.stats.words[1], 1u);
+            else atomicAdd(parameters.stats.words[2], min(64u, parameters.count - gl_WorkGroupID.x * 64u));
+        }
+        if (blockChanged == 0u) return;
+    }
+    if (!validIndex) return;
+    uint held = parameters.target.words[index];
+    uint changed = differingBytes(value ^ before);
+    uint kept = differingBytes(held ^ before);
+    uint stored = (parameters.always & 1u) != 0u ? 0xffffffffu : changed & ~kept;
+    uint merged = (held & ~stored) | (value & stored);
+    if (stored != 0u) parameters.target.words[index] = merged;
+    if ((parameters.always & 2u) != 0u) {
+        parameters.result.words[index] = merged;
+        parameters.snapshot.words[index] = merged;
+    }
+    if (uint64_t(parameters.counter) != 0ul && (changed & kept) != 0u) atomicAdd(parameters.counter.words[0], 1u);
+}

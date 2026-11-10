@@ -1,0 +1,405 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "Recompiler.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using Range = std::pair<std::uint64_t, std::uint64_t>;
+using Ranges = std::vector<Range>;
+
+void Require(bool condition, const std::string& what) {
+    if (!condition) throw std::runtime_error("draw write ranges: " + what);
+}
+
+bool Contains(const Ranges& ranges, std::uint64_t begin, std::uint64_t end) {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first <= begin && end <= range.second; });
+}
+
+bool Touches(const Ranges& ranges, std::uint64_t begin, std::uint64_t end) {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < end && begin < range.second; });
+}
+
+std::array<std::uint32_t, 8> ImageWords(std::uint64_t base, std::uint32_t width, std::uint32_t height) {
+    std::array<std::uint32_t, 8> words{};
+    const auto base40 = base >> 8u;
+    words[0] = static_cast<std::uint32_t>(base40);
+    words[1] = static_cast<std::uint32_t>((base40 >> 32u) & 0xffu) | (56u << 20u) | (((width - 1u) & 0x3u) << 30u);
+    words[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    words[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | (9u << 28u);
+    return words;
+}
+
+void ConservativeWrites() {
+    using namespace AgcDriver::DriverDetail;
+    using Role = ShaderRecompiler::DescriptorRole;
+    constexpr std::uint64_t base = 0x100000000ull;
+    ShaderRecompiler::RecompileResult program;
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
+    const auto unknown = [&](const char* what) {
+        bool bounded = true;
+        static_cast<void>(DispatchWriteRanges(program, bounded));
+        Require(!bounded, std::string(what) + " was reported as a bounded dispatch");
+        for (const bool exact : {false, true}) Require(Contains(DrawWriteRanges({}, stages, exact), 0, std::numeric_limits<std::uint64_t>::max()), std::string(what) + " was not conservative for a draw");
+    };
+    program.bdaAbiVersion = 1;
+    unknown("BDA writes");
+    program.bdaAbiVersion = 0;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.count = 1;
+    for (const auto role : {Role::Gds, Role::BdaPagetable}) {
+        binding.role = role;
+        program.bindings = {binding};
+        unknown("an unbounded shader write domain");
+    }
+    binding.role = Role::FaultBuffer;
+    program.bindings = {binding};
+    for (const auto abi : {0u, 1u}) {
+        program.bdaAbiVersion = abi;
+        bool bounded = false;
+        Require(DispatchWriteRanges(program, bounded).empty() && bounded, "a fault-buffer-only shader reported guest dispatch writes");
+        for (const bool exact : {false, true}) Require(DrawWriteRanges({}, stages, exact).empty(), "a fault-buffer-only shader reported guest draw writes");
+    }
+    program.bdaAbiVersion = 0;
+    binding.role = Role::GuestBuffers;
+    program.bindings = {binding};
+    unknown("a truncated written buffer");
+    { auto flags = program.bindings[0].Flags(); flags.bufferWritten = {false}; program.bindings[0].SetFlags(std::move(flags)); }
+    bool bounded = false;
+    Require(DispatchWriteRanges(program, bounded).empty() && bounded, "a read-only buffer was treated as written");
+    { auto flags = program.bindings[0].Flags(); flags.bufferWritten = {true}; program.bindings[0].SetFlags(std::move(flags)); }
+    program.bindings[0].guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 256, 0x71016facu};
+    unknown("an invalid written buffer type");
+    program.bindings[0].guestDescriptor[3] = 0x31016facu;
+    for (const bool otherFlag : {false, true}) {
+        ShaderRecompiler::DescriptorFlags flags;
+        if (otherFlag) flags.bufferRead = {true};
+        program.bindings[0].SetFlags(flags);
+        Require(Contains(DispatchWriteRanges(program, bounded), base, base + 256) && bounded, "absent buffer-written flags omitted a valid buffer");
+        Require(Contains(DrawWriteRanges({}, stages, true), base, base + 256), "absent buffer-written flags omitted a valid draw buffer");
+        for (const bool written : {false, true}) {
+            flags.bufferWritten = {written};
+            program.bindings[0].SetFlags(flags);
+            const auto ranges = DispatchWriteRanges(program, bounded);
+            Require(bounded && (written ? Contains(ranges, base, base + 256) : ranges.empty()), "explicit buffer-written flag was confused with an absent flag");
+            const auto drawRanges = DrawWriteRanges({}, stages, true);
+            Require(written ? Contains(drawRanges, base, base + 256) : drawRanges.empty(), "draw confused explicit buffer-written flags with absent flags");
+        }
+    }
+    const auto words = ImageWords(base, 128, 128);
+    for (const auto role : {Role::GuestImages, Role::ImageTable, Role::ImageStorageTable}) {
+        binding.role = role;
+        binding.kind = role == Role::ImageTable ? ShaderRecompiler::DescriptorKind::SampledImage : ShaderRecompiler::DescriptorKind::StorageImage;
+        binding.guestDescriptor.assign(words.begin(), words.end());
+        { auto flags = binding.Flags(); flags.imageWritten = {true}; binding.SetFlags(std::move(flags)); }
+        program.bindings = {binding};
+        const auto ranges = DispatchWriteRanges(program, bounded);
+        Require(bounded && Contains(ranges, base, base + 128 * 128 * 4), "a written image table entry was omitted");
+        Require(Contains(DrawWriteRanges({}, stages, true), base, base + 128 * 128 * 4), "a draw image table entry was omitted");
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten = {false}; program.bindings[0].SetFlags(std::move(flags)); }
+        Require(DispatchWriteRanges(program, bounded).empty() && bounded, "a read-only image table entry was treated as written");
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten.clear(); program.bindings[0].SetFlags(std::move(flags)); }
+        program.bindings[0].guestDescriptor.pop_back();
+        unknown("a truncated written image");
+    }
+    AgcDriver::Graphics::State state{};
+    state.hasColorTarget = true;
+    state.color.address = base;
+    state.color.extent = {128, 128};
+    state.color.bytes = 65536;
+    state.color.layers = 3;
+    Require(Contains(DrawWriteRanges(state, {}, true), base, base + 3 * state.color.bytes), "a layered target omitted later slices");
+    state.color.layers = 1;
+    state.color.samples = 4;
+    Require(Contains(DrawWriteRanges(state, {}, true), 0, std::numeric_limits<std::uint64_t>::max()), "an unsupported multisampled target was bounded");
+    state.color.samples = 1;
+    state.color.bytes = 0;
+    Require(Contains(DrawWriteRanges(state, {}, true), 0, std::numeric_limits<std::uint64_t>::max()), "an unknown target size was guessed");
+    state.color.bytes = 65536;
+    state.color.extent = {1920, 1080};
+    Require(Contains(DrawWriteRanges(state, {}, true), 0, std::numeric_limits<std::uint64_t>::max()), "a target smaller than its layout was bounded");
+    state.color.extent = {128, 128};
+    state.color.address = std::numeric_limits<std::uint64_t>::max() - 16;
+    for (const bool exact : {false, true}) Require(Contains(DrawWriteRanges(state, {}, exact), 0, std::numeric_limits<std::uint64_t>::max()), "an overflowing target was bounded");
+    state = {};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->address = base;
+    state.depth->extent = {256, 256};
+    state.depth->format = VK_FORMAT_D32_SFLOAT;
+    state.depth->samples = 4;
+    const auto bytes = AgcDriver::Graphics::MultisampledDepthBytes_nid_no_patch(state.depth->extent, 4, 4);
+    Require(Contains(DrawWriteRanges(state, {}, true), base, base + bytes), "multisampled depth omitted samples");
+    state.depth->samples = 1;
+    state.depth->htileAddress = base + 0x40000000;
+    Require(Contains(DrawWriteRanges(state, {}, true), state.depth->htileAddress, state.depth->htileAddress + 4096), "HTILE was omitted");
+}
+
+}
+
+// APS5_ARCHB_PIPE_NARROW_DRAW_WRITES: a draw program on the BDA ABI without BDA writes is bounded by its
+// written bindings (its page table and fault buffer are driver memory); one with BDA writes, a GDS
+// binding, and dispatches stay unbounded. A single-sample, single-slice HTILE depth target is bounded by
+// its planes and HTILE metadata; multisampled or sliced ones stay unbounded.
+void NarrowedWrites() {
+    using namespace AgcDriver::DriverDetail;
+    using Role = ShaderRecompiler::DescriptorRole;
+    constexpr std::uint64_t base = 0x100000000ull;
+    constexpr auto unbounded = std::numeric_limits<std::uint64_t>::max();
+    ShaderRecompiler::RecompileResult program;
+    program.bdaAbiVersion = 1;
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding table, fault, buffer;
+    table.role = Role::BdaPagetable;
+    table.count = 1;
+    fault.role = Role::FaultBuffer;
+    fault.count = 1;
+    buffer.role = Role::GuestBuffers;
+    buffer.count = 1;
+    buffer.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 256, 0x31016facu};
+    { ShaderRecompiler::DescriptorFlags flags; flags.bufferWritten = {true}; buffer.SetFlags(flags); }
+    program.bindings = {table, fault, buffer};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Vertex, &program, 0}}};
+    Require(UnboundedWrites(DrawWriteRanges({}, stages, true)), "a BDA program was bounded without the switch");
+    auto narrowed = DrawWriteRanges({}, stages, true, true);
+    Require(!UnboundedWrites(narrowed) && Contains(narrowed, base, base + 256) && !Touches(narrowed, base + 256, unbounded) && !Touches(narrowed, 0, base), "a BDA program without BDA writes was not bounded by its written buffer");
+    bool bounded = true;
+    static_cast<void>(DispatchWriteRanges(program, bounded));
+    Require(!bounded, "a dispatch with a BDA program was bounded without the switch");
+    program.bdaWrites = true;
+    Require(UnboundedWrites(DrawWriteRanges({}, stages, true, true)), "a BDA program with BDA writes was bounded");
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding gds;
+    gds.role = Role::Gds;
+    gds.count = 1;
+    program.bindings.push_back(gds);
+    Require(UnboundedWrites(DrawWriteRanges({}, stages, true, true)), "a GDS binding was bounded");
+
+    AgcDriver::Graphics::State state{};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->address = base;
+    state.depth->stencilAddress = base + 0x10000000;
+    state.depth->htileAddress = base + 0x40000000;
+    state.depth->extent = {1920, 1080};
+    state.depth->format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    state.depth->samples = 1;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true)), "an HTILE depth target was bounded without the switch");
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, false, true)), "an HTILE depth target was bounded by the estimate");
+    narrowed = DrawWriteRanges(state, {}, true, true);
+    const auto plane = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 4u);
+    const auto htile = AgcDriver::Graphics::HtileMetadataBytes(state.depth->extent);
+    Require(!UnboundedWrites(narrowed) && Contains(narrowed, base, base + plane) && Contains(narrowed, state.depth->stencilAddress, state.depth->stencilAddress + AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 1u)) && Contains(narrowed, state.depth->htileAddress, state.depth->htileAddress + htile), "an HTILE depth target omitted a plane or its metadata");
+    Require(!Touches(narrowed, state.depth->htileAddress + htile, unbounded) && htile >= 32768u, "an HTILE depth target was bounded wider than its metadata");
+    state.depth->samples = 4;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a multisampled HTILE depth target was bounded");
+    state.depth->samples = 1;
+    state.depth->lastSlice = 2;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a sliced HTILE depth target was bounded");
+}
+
+// APS5_ARCHB_PIPE_NARROW_SLICED_DEPTH: a single-sample depth target whose view names slices is bounded by
+// its first slice (decodeDepthPlane moved its plane, stencil and HTILE addresses there; the driver renders
+// and stores that slice only), exactly as a slice-0 view, never wider; multisampled targets, the estimate
+// mode and HTILE without PIPE_NARROW_DRAW_WRITES stay unbounded.
+void SlicedDepthWrites() {
+    using namespace AgcDriver::DriverDetail;
+    constexpr std::uint64_t base = 0x100000000ull;
+    constexpr auto unbounded = std::numeric_limits<std::uint64_t>::max();
+    AgcDriver::Graphics::State state{};
+    state.depth = AgcDriver::Graphics::DepthTarget{};
+    state.depth->address = base;
+    state.depth->stencilAddress = base + 0x10000000;
+    state.depth->extent = {1024, 1024};
+    state.depth->format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    state.depth->samples = 1;
+    state.depth->firstSlice = 3;
+    state.depth->lastSlice = 5;
+    const auto plane = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 4u);
+    const auto stencil = AgcDriver::Graphics::DepthSliceBytes(state.depth->extent, 1u);
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true)), "a sliced depth target was bounded without the switch");
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, false, true, true)), "a sliced depth target was bounded by the estimate");
+    const auto sliced = DrawWriteRanges(state, {}, true, false, true);
+    Require(!UnboundedWrites(sliced) && Contains(sliced, base, base + plane) && Contains(sliced, state.depth->stencilAddress, state.depth->stencilAddress + stencil), "a sliced depth target omitted its first slice's planes");
+    Require(!Touches(sliced, base + plane, state.depth->stencilAddress) && !Touches(sliced, state.depth->stencilAddress + stencil, unbounded) && !Touches(sliced, 0, base), "a sliced depth target was bounded wider than one slice");
+    state.depth->firstSlice = 0;
+    state.depth->lastSlice = 0;
+    Require(DrawWriteRanges(state, {}, true) == sliced, "a sliced depth target's set differs from the slice-0 view's at the same addresses");
+    state.depth->firstSlice = 7;
+    state.depth->lastSlice = 2;
+    Require(DrawWriteRanges(state, {}, true, false, true) == sliced, "a depth view whose last slice is below its first was bounded differently");
+    state.depth->htileAddress = base + 0x40000000;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, false, true)), "a sliced HTILE depth target was bounded without PIPE_NARROW_DRAW_WRITES");
+    const auto htile = AgcDriver::Graphics::HtileMetadataBytes(state.depth->extent);
+    const auto both = DrawWriteRanges(state, {}, true, true, true);
+    Require(!UnboundedWrites(both) && Contains(both, state.depth->htileAddress, state.depth->htileAddress + htile) && !Touches(both, state.depth->htileAddress + htile, unbounded), "a sliced HTILE depth target was not bounded by one slice's HTILE metadata");
+    state.depth->samples = 4;
+    Require(UnboundedWrites(DrawWriteRanges(state, {}, true, true, true)), "a multisampled sliced depth target was bounded");
+}
+
+// APS5_ARCHB_PIPE_NARROW_DISPATCH_WRITES: a dispatch program on the BDA ABI without BDA writes is bounded
+// by its written bindings; one with BDA writes or a GDS binding stays unbounded.
+void NarrowedDispatchWrites() {
+    using namespace AgcDriver::DriverDetail;
+    using Role = ShaderRecompiler::DescriptorRole;
+    constexpr std::uint64_t base = 0x100000000ull;
+    constexpr auto unbounded = std::numeric_limits<std::uint64_t>::max();
+    ShaderRecompiler::RecompileResult program;
+    program.bdaAbiVersion = 1;
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding table, fault, buffer;
+    table.role = Role::BdaPagetable;
+    table.count = 1;
+    fault.role = Role::FaultBuffer;
+    fault.count = 1;
+    buffer.role = Role::GuestBuffers;
+    buffer.count = 1;
+    buffer.guestDescriptor = {static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 256, 0x31016facu};
+    { ShaderRecompiler::DescriptorFlags flags; flags.bufferWritten = {true}; buffer.SetFlags(flags); }
+    program.bindings = {table, fault, buffer};
+    bool bounded = true;
+    static_cast<void>(DispatchWriteRanges(program, bounded));
+    Require(!bounded, "a BDA dispatch was bounded without the switch");
+    const auto narrowed = DispatchWriteRanges(program, bounded, true);
+    Require(bounded && Contains(narrowed, base, base + 256) && !Touches(narrowed, base + 256, unbounded) && !Touches(narrowed, 0, base), "a BDA dispatch without BDA writes was not bounded by its written buffer");
+    program.bdaWrites = true;
+    static_cast<void>(DispatchWriteRanges(program, bounded, true));
+    Require(!bounded, "a BDA dispatch with BDA writes was bounded");
+    program.bdaWrites = false;
+    ShaderRecompiler::DescriptorBinding gds;
+    gds.role = Role::Gds;
+    gds.count = 1;
+    program.bindings.push_back(gds);
+    static_cast<void>(DispatchWriteRanges(program, bounded, true));
+    Require(!bounded, "a BDA dispatch with a GDS binding was bounded");
+}
+
+int main() {
+    try {
+        ConservativeWrites();
+        NarrowedWrites();
+        SlicedDepthWrites();
+        NarrowedDispatchWrites();
+        using AgcDriver::DriverDetail::DrawWriteRanges;
+        constexpr std::uint64_t written = 0x100000000ull;
+        constexpr std::uint64_t readOnly = 0x200000000ull;
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding images;
+        images.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+        images.role = ShaderRecompiler::DescriptorRole::GuestImages;
+        images.count = 2;
+        for (const auto base : {written, readOnly}) {
+            const auto words = ImageWords(base, 256, 128);
+            images.guestDescriptor.insert(images.guestDescriptor.end(), words.begin(), words.end());
+        }
+        { auto flags = images.Flags(); flags.imageWritten = {true, false}; images.SetFlags(std::move(flags)); }
+        program.bindings.push_back(images);
+        const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
+        AgcDriver::Graphics::State state{};
+        const auto resource = AgcDriver::Graphics::DecodeTextureResource(std::span<const std::uint32_t>(images.guestDescriptor).subspan(0, 8));
+        const auto surfaceBytes = AgcDriver::Graphics::DescribeSurface(resource).guestBytes;
+        Require(resource.baseAddress == written && surfaceBytes >= 256u * 128u * 4u, "the test T# does not decode as meant");
+        for (const bool exact : {false, true}) {
+            const auto ranges = DrawWriteRanges(state, stages, exact);
+            Require(Contains(ranges, written, written + surfaceBytes), "a storage image the draw stores to is not a write range");
+            Require(!Touches(ranges, readOnly, readOnly + surfaceBytes), "a storage image the draw only reads is a write range");
+        }
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten.clear(); program.bindings[0].SetFlags(std::move(flags)); }
+        Require(Contains(DrawWriteRanges(state, stages, true), readOnly, readOnly + surfaceBytes), "an image without written flags is not a write range");
+        auto nullImage = ImageWords(0, 256, 128);
+        nullImage[0] = 0;
+        nullImage[1] &= ~0xffu;
+        std::copy(nullImage.begin(), nullImage.end(), program.bindings[0].guestDescriptor.begin() + 8);
+        { auto flags = program.bindings[0].Flags(); flags.imageWritten = {true, true}; program.bindings[0].SetFlags(std::move(flags)); }
+        for (const bool exact : {false, true}) {
+            const auto ranges = DrawWriteRanges(state, stages, exact);
+            Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a null one is not a write range");
+            Require(!Touches(ranges, 0, surfaceBytes), "a null storage image is a write range");
+        }
+        bool bounded = false;
+        const auto dispatchRanges = AgcDriver::DriverDetail::DispatchWriteRanges(program, bounded);
+        Require(bounded, "a dispatch whose written images are a real one and a null one is not bounded");
+        Require(Contains(dispatchRanges, written, written + surfaceBytes), "a written image next to a null one is not a dispatch write range");
+        Require(!Touches(dispatchRanges, 0, surfaceBytes), "a null storage image is a dispatch write range");
+        auto typeZero = ImageWords(0x500000000ull, 256, 128);
+        typeZero[3] &= 0x0fffffffu;
+        auto typeOne = typeZero;
+        typeOne[3] |= 1u << 28u;
+        const std::array<std::uint32_t, 8> reported{0x04efd000u, 0x00040011u, 0x00017a00u, 0x00005204u, 0x0af00000u, 0u, 0x00000612u, 0x00fff000u};
+        for (const auto& [words, base] : {std::pair{typeZero, 0x500000000ull}, std::pair{typeOne, 0x500000000ull}, std::pair{reported, 0x1104efd00000ull}}) {
+            std::copy(words.begin(), words.end(), program.bindings[0].guestDescriptor.begin() + 8);
+            for (const bool exact : {false, true}) {
+                const auto ranges = DrawWriteRanges(state, stages, exact);
+                Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a TYPE 0 or 1 one is not a write range");
+                Require(!Touches(ranges, base, base + surfaceBytes), "a TYPE 0 or 1 storage image is a write range");
+            }
+            bool typedBounded = false;
+            const auto typedRanges = AgcDriver::DriverDetail::DispatchWriteRanges(program, typedBounded);
+            Require(typedBounded && Contains(typedRanges, written, written + surfaceBytes), "a dispatch whose written images are a real one and a TYPE 0 or 1 one lost the real one");
+            Require(!Touches(typedRanges, base, base + surfaceBytes), "a TYPE 0 or 1 storage image is a dispatch write range");
+        }
+        AgcDriver::Graphics::State targets{};
+        targets.hasColorTarget = true;
+        auto& color = targets.color;
+        color.address = 0x300000000ull;
+        color.surfaceAddress = color.address;
+        color.extent = {1920, 1080};
+        color.tileMode = AgcDriver::Graphics::ColorTileMode::RenderTarget;
+        color.elementBytes = 4;
+        const AgcDriver::Graphics::ColorTargetLayout layout(1920, 1080, color.tileMode, 4);
+        color.bytes = layout.Bytes();
+        color.dccAddress = 0x380000000ull;
+        color.cmaskAddress = 0x3c0000000ull;
+        color.cmaskBytes = AgcDriver::Graphics::CmaskBytes(1920, 1080);
+        AgcDriver::Graphics::DepthTarget depth{};
+        depth.address = 0x400000000ull;
+        depth.stencilAddress = 0x480000000ull;
+        depth.extent = {1920, 1080};
+        depth.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        targets.depth = depth;
+        const std::span<const AgcDriver::Graphics::CompiledShader> none;
+        const auto exact = DrawWriteRanges(targets, none, true);
+        const auto estimated = DrawWriteRanges(targets, none, false);
+        std::size_t last = 0;
+        for (std::uint32_t y = 0; y < 1080; y += 7) {
+            for (std::uint32_t x = 0; x < 1920; x += 5) last = std::max(last, layout.Offset(x, y));
+        }
+        last = std::max(last, layout.Offset(1919, 1079));
+        Require(last + 4 <= color.bytes, "the color layout addresses past its bytes");
+        Require(Contains(exact, color.address, color.address + color.bytes), "the exact color range misses the layout");
+        Require(!Touches(exact, color.address + color.bytes, color.address + color.bytes + 1), "the exact color range runs past the layout");
+        Require(Contains(exact, color.dccAddress, color.dccAddress + color.bytes / 256) && !Touches(exact, color.dccAddress + (color.bytes + 255) / 256, color.dccAddress + (color.bytes + 255) / 256 + 1), "the exact DCC range is not one key byte per 256 surface bytes");
+        for (const auto& ranges : {exact, estimated}) {
+            Require(Contains(ranges, color.cmaskAddress, color.cmaskAddress + color.cmaskBytes), "the CMASK of the color target is not a write range");
+        }
+        Require(!Touches(exact, color.cmaskAddress + color.cmaskBytes, color.cmaskAddress + color.cmaskBytes + 1), "the exact CMASK range runs past CmaskBytes");
+        const auto depthBytes = AgcDriver::Graphics::DepthSliceBytes(depth.extent, 4);
+        const auto stencilBytes = AgcDriver::Graphics::DepthSliceBytes(depth.extent, 1);
+        Require(Contains(exact, depth.address, depth.address + depthBytes) && !Touches(exact, depth.address + depthBytes, depth.address + depthBytes + 1), "the exact depth range is not DepthSliceBytes");
+        Require(Contains(exact, depth.stencilAddress, depth.stencilAddress + stencilBytes) && !Touches(exact, depth.stencilAddress + stencilBytes, depth.stencilAddress + stencilBytes + 1), "the exact stencil range is not DepthSliceBytes");
+        for (const auto& [begin, end] : exact) Require(Contains(estimated, begin, end), "an exact range is not inside the estimates");
+        targets.depth.reset();
+        color.dccPipeAligned = true;
+        const auto keyBytes = AgcDriver::Graphics::DccKeyCount(AgcDriver::Graphics::ColorTextureTileMode(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, color.bytes);
+        Require(keyBytes > color.bytes / 256, "the DCC regression does not exercise padded metadata");
+        for (const bool precise : {false, true}) Require(Contains(DrawWriteRanges(targets, none, precise), color.dccAddress, color.dccAddress + keyBytes), "pipe-aligned DCC metadata was truncated");
+        std::printf("draw write ranges: color %zu bytes (estimate %llu), depth %llu, stencil %llu\n", color.bytes, static_cast<unsigned long long>(2 * color.bytes + 65536), static_cast<unsigned long long>(depthBytes), static_cast<unsigned long long>(stencilBytes));
+        std::puts("draw write ranges tests passed");
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

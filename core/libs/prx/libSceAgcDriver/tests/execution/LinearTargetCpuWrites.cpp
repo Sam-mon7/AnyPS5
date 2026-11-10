@@ -1,0 +1,528 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#include "Recompiler.hpp"
+#include "VulkanTestDevice.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
+namespace {
+
+using AgcDriver::Graphics::Require;
+using ShaderRecompiler::ShaderStage;
+
+constexpr std::uint32_t Width = 64;
+constexpr std::uint32_t Height = 16;
+constexpr std::size_t BlockBytes = 65536;
+constexpr std::size_t TargetBytes = std::size_t{Width} * Height * 16u;
+constexpr std::size_t RowBytes = std::size_t{Width} * 16u;
+constexpr std::uint32_t Drawn = Width / 2u;
+constexpr std::uint32_t Rgba32FloatInfo = 0x8738u;
+constexpr std::uint32_t LinearAttrib3 = 0x09000000u;
+constexpr std::uint32_t Float32AbgrExport = 9;
+
+alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
+    0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
+};
+
+constexpr std::array<std::array<float, 4>, 3> Triangle{{
+    {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
+}};
+
+alignas(256) std::array<std::array<std::uint32_t, 16>, 2> Programs{};
+
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
+}
+
+std::span<const std::uint32_t> Program(std::size_t index, bool blue) {
+    auto& code = Programs.at(index);
+    std::size_t at = 0;
+    code[at++] = 0x36000000u | (20u << 17u) | 0xffu;
+    code[at++] = 0x0000ffffu;
+    code[at++] = 0x2c000000u | (21u << 17u) | 0x90u;
+    code[at++] = 0x7e000c00u | (20u << 17u) | (256u + 20u);
+    code[at++] = 0x7e000c00u | (21u << 17u) | (256u + 21u);
+    code[at++] = (blue ? 0x7e0002f2u : 0x7e000280u) | (22u << 17u);
+    code[at++] = 0x7e0002f2u | (23u << 17u);
+    code[at++] = 0xf800180fu;
+    code[at++] = 0x17161514u;
+    code[at++] = 0xbf810000u;
+    return std::span<const std::uint32_t>(code.data(), at);
+}
+
+struct Block {
+    Block(std::size_t bytes, bool stayWatched) : bytes(bytes), arena(AgcDriver::GuestMemory::WriteWatched()) {
+#ifdef _WIN32
+        if (arena) {
+            data = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, BlockBytes));
+            GuestArena::GuestArenaCommit_nid_postfix(data, bytes, PAGE_READWRITE, bytes);
+        } else {
+            data = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
+#else
+        if (arena) {
+            void* raw = mmap(nullptr, bytes + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            Require(raw != MAP_FAILED, "cannot map the color target");
+            const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+            const auto aligned = (begin + BlockBytes - 1) & ~(static_cast<std::uintptr_t>(BlockBytes) - 1);
+            if (aligned != begin) munmap(raw, aligned - begin);
+            if (aligned + bytes != begin + bytes + BlockBytes) munmap(reinterpret_cast<void*>(aligned + bytes), begin + BlockBytes - aligned);
+            data = reinterpret_cast<std::uint8_t*>(aligned);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, bytes);
+        } else {
+            data = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, bytes));
+        }
+#endif
+        Require(data != nullptr, "cannot allocate the color target");
+        Require(!arena || AgcDriver::GuestMemory::Watched(Address(), bytes), "the color target is not write-watched");
+        if (arena && !stayWatched) {
+            AgcDriver::GuestMemory::Unwatch(Address(), bytes);
+            Require(!AgcDriver::GuestMemory::Watched(Address(), bytes), "the color target is still write-watched");
+        }
+        GuestAllocations::Mutation mutation;
+        mutation.Add(data, bytes, true, true, true);
+    }
+    ~Block() {
+        AgcDriver::Graphics::StorageTexture::FlushPending(Address(), bytes, nullptr, "test release");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(data);
+        }
+#ifdef _WIN32
+        if (arena) {
+            GuestArena::GuestArenaReset_nid_postfix(data, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(data, bytes);
+        } else {
+            VirtualFree(data, 0, MEM_RELEASE);
+        }
+#else
+        if (arena) {
+            munmap(data, bytes);
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, bytes);
+        } else {
+            std::free(data);
+        }
+#endif
+    }
+    Block(const Block&) = delete;
+    Block& operator=(const Block&) = delete;
+    std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
+    std::size_t bytes;
+    bool arena;
+    std::uint8_t* data = nullptr;
+};
+
+AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block) {
+    AgcDriver::Registers cx;
+    cx[0x318] = static_cast<std::uint32_t>(block.Address() >> 8u);
+    cx[0x31b] = 0;
+    cx[0x31c] = Rgba32FloatInfo;
+    cx[0x31d] = 0;
+    cx[0x323] = 0;
+    cx[0x324] = 0;
+    cx[0x3b0] = ((Width - 1u) << 14u) | (Height - 1u);
+    cx[0x3b8] = LinearAttrib3;
+    cx[0x390] = static_cast<std::uint32_t>(block.Address() >> 40u);
+    auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
+    color.exportIndex = 0;
+    return color;
+}
+
+void PreparedDraws(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::State state, const AgcDriver::Pm4::DrawParameters& draw, std::span<const AgcDriver::Graphics::CompiledShader> shaders) {
+    const bool enabled = AgcDriver::Graphics::DrawPrelockEnabled();
+    const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    auto& cache = AgcDriver::Graphics::SharedResourceCache();
+    std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
+    unsigned kept = 0xff;
+    for (unsigned step = 0; step != 7; ++step) {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(!AgcDriver::GuestMemory::GpuMutex().HeldByThisThread(), "draw preparation started with the GPU mutex held");
+        auto prepared = device.PrepareDraw(state, draw, shaders, step == 6 ? recipe.get() : nullptr);
+        Require((prepared.device != VK_NULL_HANDLE) == enabled, "draw preparation ignored its switch");
+        if (enabled && profile && context.detiler != nullptr) Require(prepared.ranges != 0, "draw preparation did not collect the target surface");
+        if (enabled && step != 6) Require(!prepared.resourceKey.empty(), "draw preparation did not make the resource key");
+        if (step != 0 && step != 6 && enabled) Require(cache.Find(prepared.resourceKey) != nullptr, "draw preparation regression did not start from a cached template");
+        if (step == 1) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            cache.Clear();
+        }
+        if (step == 2 || step == 6) {
+            kept = step == 2 ? 0x42 : 0x44;
+            const std::vector<std::byte> bytes(TargetBytes, static_cast<std::byte>(kept));
+            AgcDriver::GuestMemory::Write(state.color.address, bytes);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+        }
+        if (step == 3) {
+            kept = 0x43;
+            const std::array<std::uint32_t, 4> pattern{0x43434343u, 0x43434343u, 0x43434343u, 0x43434343u};
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(device.FillBuffer(state.color.address, TargetBytes, pattern), "draw preparation regression could not record its intervening GPU fill");
+            Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(state.color.address, TargetBytes), "the intervening GPU fill has no pending write");
+        }
+        if (step == 4 && enabled) {
+            prepared.device = reinterpret_cast<VkDevice>(std::uintptr_t{1});
+            prepared.resourceKey = {0u};
+        }
+        std::unique_ptr<Block> mapping;
+        if (step == 5) mapping = std::make_unique<Block>(BlockBytes, false);
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(AgcDriver::Graphics::HostImportFor(context, state.color.address, TargetBytes) != nullptr, "draw preparation regression could not refresh its target host import");
+            if (step == 6) {
+                Require(device.DrawFromRecipe(state, draw, shaders, {}, recipe, nullptr, &prepared) == AgcDriver::RecipeOutcome::Recorded, "the prepared draw recipe did not revalidate and record");
+            } else {
+                device.Draw(state, draw, shaders, {}, &recipe, nullptr, 0, &prepared);
+                Require(recipe != nullptr, "the prepared draw did not build a reusable recipe");
+                Require(!enabled || prepared.resourceKey.empty(), "the prepared resource key was not consumed or invalidated");
+                if (enabled && profile) {
+                    Require(prepared.keyUsed == (step != 4), "the draw reused a key from another device or rebuilt a current key");
+                    Require(prepared.keyInvalidated == (step == 4), "draw preparation did not count a discarded device key");
+                    if (step == 1) Require(prepared.cacheChanged, "cache eviction between preparation and recording was not detected");
+                }
+            }
+            if (enabled && profile && (step == 2 || step == 4 || step == 5 || step == 6)) Require(prepared.collectInvalidated, "the draw preparation did not detect an invalidated collection");
+            device.WaitIdle();
+        }
+        std::vector<std::byte> stored(TargetBytes);
+        AgcDriver::GuestMemory::Read(state.color.address, stored);
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto offset = static_cast<std::size_t>(y) * RowBytes + x * 16u;
+                if (x < state.scissor.extent.width) {
+                    std::array<float, 4> actual{};
+                    std::memcpy(actual.data(), stored.data() + offset, sizeof(actual));
+                    const std::array<float, 4> expected{static_cast<float>(x), static_cast<float>(y), 0.0f, 1.0f};
+                    Require(actual == expected, "the prepared draw used stale inputs or lost its GPU pixels at step " + std::to_string(step));
+                } else {
+                    Require(std::all_of(stored.begin() + offset, stored.begin() + offset + 16u, [&](std::byte byte) { return byte == static_cast<std::byte>(kept); }), "the prepared draw lost CPU or GPU target bytes outside its scissor at step " + std::to_string(step));
+                }
+            }
+        }
+    }
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.PrepareDraw(state, draw, shaders).device == VK_NULL_HANDLE, "draw preparation ran inside an existing GPU hold");
+    }
+}
+
+void PreparedTargetDraws(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::State& state, const AgcDriver::Pm4::DrawParameters& draw, std::span<const AgcDriver::Graphics::CompiledShader> shaders, void* vertices) {
+    using namespace AgcDriver;
+    using namespace AgcDriver::Graphics;
+    const auto context = VulkanDeviceTestAccess::ContextOf(device);
+    const auto surface = SurfaceForTarget(state.color);
+    const bool enabled = StorageTexture::DrawTargetPrelockEnabled() && DrawPrelockEnabled();
+    const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::shared_ptr<const DrawRecipe> recipe;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        device.Draw(state, draw, shaders, {}, &recipe);
+        device.WaitIdle();
+    }
+    for (unsigned step = 0; step != 11; ++step) {
+        unsigned kept = 0x45;
+        GuestMemory::Write(state.color.address, std::vector<std::byte>(TargetBytes, static_cast<std::byte>(kept)));
+        GuestMemory::BumpCollectEpoch();
+        std::shared_ptr<StorageTexture> image;
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            image = CachedStorageSurface(context, surface);
+            Require(image->Refresh(), "the target preparation fixture did not establish a clean refresh proof");
+        }
+        auto prepared = device.PrepareDraw(state, draw, shaders, step == 8 ? recipe.get() : nullptr);
+        const bool memo = GuestMemory::ThreadCollectEpoch() != 0;
+        if (enabled && memo) Require(prepared.targets.size() == 1 && prepared.targets[0].ready, "the target preparation fixture did not prove a clean resident target before locking at step " + std::to_string(step));
+        else Require(prepared.targets.empty(), "target proofs ignored the opt-in, preparation or collect-memo switch");
+        if (step == 0) {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            auto* proof = prepared.targets.empty() ? nullptr : &prepared.targets[0];
+            Require(CachedStorageSurface(context, surface, proof) == image, "a clean prepared lookup changed image identity");
+            if (enabled && memo && profile) Require(proof->lookupAccepted && proof->accepted, "the clean target lookup did not use its pre-lock proof");
+        }
+        if (step == 1 || step == 8) {
+            kept = 0x46 + step;
+            std::memset(reinterpret_cast<void*>(state.color.address), kept, TargetBytes);
+            GuestMemory::BumpCollectEpoch();
+        }
+        if (step == 2) {
+            kept = 0x47;
+            const std::array<std::uint32_t, 4> pattern{0x47474747u, 0x47474747u, 0x47474747u, 0x47474747u};
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            Require(device.FillBuffer(state.color.address, TargetBytes, pattern), "the target proof fixture could not record an intervening GPU fill");
+        }
+        std::shared_ptr<StorageTexture> foreign;
+        if (step == 3 || step == 9) {
+            kept = 0x48;
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            auto alias = surface;
+            alias.width /= 2;
+            alias.height *= 2;
+            foreign = CachedStorageSurface(context, alias);
+            Require(foreign != image && foreign->GuestBytes() == image->GuestBytes(), "the target proof fixture has no distinct equal-span foreign image");
+            const std::array<std::uint32_t, 4> pattern{0x48484848u, 0x48484848u, 0x48484848u, 0x48484848u};
+            const char* refusal = nullptr;
+            Require(foreign->FillClear(pattern, StorageTexture::WholeImage, refusal), refusal != nullptr ? refusal : "the foreign image clear failed");
+        }
+        if (step == 9) {
+            prepared = device.PrepareDraw(state, draw, shaders);
+            if (enabled && memo) Require(!prepared.targets[0].ready, "a foreign pending image passed the pre-lock proof");
+        }
+        if (step == 4) {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            ClearCachedTextures(context.device);
+            Require(!StorageImageCached(context, image.get()), "the target proof fixture did not evict its image");
+        }
+        std::unique_ptr<Block> mapping;
+        if (step == 5) mapping = std::make_unique<Block>(BlockBytes, false);
+        if (step == 6) GuestMemory::Unwatch(state.color.address, TargetBytes);
+        if (step == 7) GuestMemory::BumpCollectEpoch();
+        if (step == 10) {
+            auto moved = Triangle;
+            for (auto& vertex : moved) vertex[0] += 4.0f;
+            GuestMemory::Write(reinterpret_cast<std::uintptr_t>(vertices), std::as_bytes(std::span(moved)));
+            GuestMemory::BumpCollectEpoch();
+        }
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            if (step == 8) Require(device.DrawFromRecipe(state, draw, shaders, {}, recipe, nullptr, &prepared) == RecipeOutcome::Recorded, "the stale-target recipe did not refresh and record");
+            else device.Draw(state, draw, shaders, {}, &recipe, nullptr, 0, &prepared);
+            if (enabled && memo && profile && step != 0) Require(!prepared.targets[0].lookupAccepted && !prepared.targets[0].accepted, "a changed target or resource input reused a stale pre-lock proof at step " + std::to_string(step));
+            device.WaitIdle();
+        }
+        std::vector<std::byte> stored(TargetBytes);
+        GuestMemory::Read(state.color.address, stored);
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto offset = static_cast<std::size_t>(y) * RowBytes + x * 16u;
+                if (step != 10 && x < state.scissor.extent.width) {
+                    std::array<float, 4> actual{};
+                    std::memcpy(actual.data(), stored.data() + offset, sizeof(actual));
+                    Require(actual == std::array<float, 4>{static_cast<float>(x), static_cast<float>(y), 0.0f, 1.0f}, "a prepared draw used stale resources at step " + std::to_string(step));
+                } else {
+                    Require(std::all_of(stored.begin() + offset, stored.begin() + offset + 16u, [&](std::byte byte) { return byte == static_cast<std::byte>(kept); }), "a prepared draw used stale target contents or stale vertices at step " + std::to_string(step));
+                }
+            }
+        }
+        if (step == 6) {
+            const std::pair<std::uint64_t, std::uint64_t> range{state.color.address, state.color.address + TargetBytes};
+            GuestMemory::Rewatch(std::span(&range, 1));
+        }
+    }
+    GuestMemory::Write(reinterpret_cast<std::uintptr_t>(vertices), std::as_bytes(std::span(Triangle)));
+}
+
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false, bool targetPrelock = false, Block* vertices = nullptr) {
+    const auto target = device.Target();
+    constexpr std::uint32_t waveSize = 64;
+    std::vector<std::uint32_t> vertexUserData(4, 0u);
+    if (prelock) {
+        Require(vertices != nullptr, "draw preparation has no vertex block");
+        std::memcpy(vertices->data, Triangle.data(), sizeof(Triangle));
+    }
+    const auto vertexBuffer = BufferDescriptor(prelock ? vertices->data : static_cast<const void*>(Triangle.data()), 16u, static_cast<std::uint32_t>(Triangle.size()));
+    std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
+    const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
+    ShaderRecompiler::RecompileRequest vertex{
+        {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(VertexCode.data()), VertexCode, 0, {}},
+        {waveSize, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
+        target,
+        {0, 0, 0, 64}
+    };
+    vertex.useCache = false;
+    const auto vertexResult = ShaderRecompiler::Recompile(vertex);
+    const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
+
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionFixedPoint);
+    pixel.targetOutputMode.at(0) = Float32AbgrExport;
+    pixel.targetExportMapping.fill(0xe4u);
+    const std::vector<std::uint32_t> pixelUserData(8, 0u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
+    ShaderRecompiler::RecompileRequest fragment{
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
+        {waveSize, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
+        target,
+        PixelPushLayout(vertexPush, target)
+    };
+    fragment.useCache = false;
+    const auto pixelResult = ShaderRecompiler::Recompile(fragment);
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
+        {ShaderStage::Vertex, &vertexResult, 0},
+        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
+    }};
+
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.blendEnable = VK_FALSE;
+    blend.colorWriteMask = 0xf;
+    AgcDriver::Graphics::State state{};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, waveSize, waveSize, std::nullopt, std::nullopt};
+    state.colors = {color};
+    state.color = color;
+    state.hasColorTarget = true;
+    state.renderExtent = {Width, Height};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
+    state.negativeOneToOne = false;
+    state.scissor = {{0, 0}, {scissorWidth, Height}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blends = {blend};
+    state.blend = blend;
+    state.blendConstants = {};
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    if (prelock) {
+        if (targetPrelock) PreparedTargetDraws(device, state, draw, shaders, vertices->data);
+        else PreparedDraws(device, state, draw, shaders);
+        return;
+    }
+    device.Draw(state, draw, shaders);
+}
+
+std::array<float, 4> Texel(const std::uint8_t* target, std::uint32_t x, std::uint32_t y) {
+    std::array<float, 4> texel{};
+    std::memcpy(texel.data(), target + static_cast<std::size_t>(y) * RowBytes + static_cast<std::size_t>(x) * 16u, sizeof(texel));
+    return texel;
+}
+
+enum class Outcome { Kept, Lost, Skipped };
+
+Outcome Run(AgcDriver::VulkanDevice& device, bool watched, bool seeded, bool hookRead, bool leaveWatch = false) {
+    const auto name = std::string(seeded ? "seeded" : "unseeded") + ", " + (watched ? "write-watched" : "unwatched") + " memory" + (hookRead ? ", driver read before the store" : "") + (leaveWatch ? ", left the watch while drawn" : "");
+    Block block(watched ? std::size_t{16} * BlockBytes : BlockBytes, watched);
+    std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return Outcome::Skipped;
+    const auto color = DecodeTarget(block);
+    Require(color.tileMode == AgcDriver::Graphics::ColorTileMode::Linear && color.bytes == TargetBytes, "the target is not a linear R32G32B32A32 target");
+    Draw(device, color, Program(0, false), Width);
+    const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr && !recorder->Idle(), "the draw into an imported linear target waited for the GPU instead of being recorded");
+    device.WaitIdle();
+    std::vector<std::uint8_t> stored(TargetBytes);
+    std::memcpy(stored.data(), block.data, TargetBytes);
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            const std::array<float, 4> expected{static_cast<float>(x), static_cast<float>(y), 0.0f, 1.0f};
+            const auto texel = Texel(stored.data(), x, y);
+            Require(texel == expected, name + ": after the first draw, raw guest read: pixel (" + std::to_string(x) + ", " + std::to_string(y) + ") holds (" + std::to_string(texel[0]) + ", " + std::to_string(texel[1]) + ", " + std::to_string(texel[2]) + ", " + std::to_string(texel[3]) + ")");
+        }
+    }
+    if (seeded) {
+        for (std::uint32_t y = 0; y < Height; ++y) std::memset(block.data + y * RowBytes, 0x5a, Drawn * 16u);
+    }
+    Draw(device, color, Program(1, true), Drawn);
+    if (leaveWatch) {
+        AgcDriver::GuestMemory::Unwatch(block.Address(), block.bytes);
+        Require(!AgcDriver::GuestMemory::Watched(block.Address(), TargetBytes), name + ": the drawn target's memory is still write-watched");
+    }
+    for (std::uint32_t y = 0; y < Height; ++y) std::memset(block.data + y * RowBytes + Drawn * 16u, 0x42, RowBytes - Drawn * 16u);
+    const bool watchedAtStore = AgcDriver::GuestMemory::Watched(block.Address(), TargetBytes);
+    if (hookRead) {
+        std::vector<std::uint8_t> row(RowBytes);
+        AgcDriver::GuestMemory::Read(block.Address(), std::as_writable_bytes(std::span(row)), 1);
+        for (std::uint32_t x = 0; x < Drawn; ++x) {
+            const std::array<float, 4> expected{static_cast<float>(x), 0.0f, 1.0f, 1.0f};
+            const auto texel = Texel(row.data(), x, 0);
+            Require(texel == expected, name + ": a driver read of row 0 before the store: pixel (" + std::to_string(x) + ", 0) holds (" + std::to_string(texel[0]) + ", " + std::to_string(texel[1]) + ", " + std::to_string(texel[2]) + ", " + std::to_string(texel[3]) + "), not the second draw's");
+        }
+    }
+    device.WaitIdle();
+    std::size_t wrongGpu = 0;
+    std::size_t wrongCpu = 0;
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Drawn; ++x) {
+            const std::array<float, 4> expected{static_cast<float>(x), static_cast<float>(y), 1.0f, 1.0f};
+            if (Texel(block.data, x, y) != expected) ++wrongGpu;
+        }
+        auto* begin = block.data + y * RowBytes + Drawn * 16u;
+        wrongCpu += static_cast<std::size_t>(std::count_if(begin, block.data + (y + 1u) * RowBytes, [](std::uint8_t byte) { return byte != 0x42u; }));
+    }
+    std::printf("linear target CPU writes, %s (watched at the store: %d): wrong GPU pixels %zu/%u, wrong CPU bytes %zu/%zu\n", name.c_str(), watchedAtStore ? 1 : 0, wrongGpu, Drawn * Height, wrongCpu, (RowBytes - Drawn * 16u) * Height);
+    return wrongGpu == 0 && wrongCpu == 0 ? Outcome::Kept : Outcome::Lost;
+}
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        if (argc == 2 && (std::string_view(argv[1]) == "--draw-prelock" || std::string_view(argv[1]) == "--draw-target-prelock")) {
+            Block block(BlockBytes, true);
+            Block vertices(BlockBytes, false);
+            std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
+            const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+            const bool targetPrelock = std::string_view(argv[1]) == "--draw-target-prelock";
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return VulkanTestSkipped;
+                if (targetPrelock && !AgcDriver::Graphics::WatchedAfterSettle(context, block.Address(), TargetBytes)) return VulkanTestSkipped;
+            }
+            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true, targetPrelock, &vertices);
+            std::puts("draw preparation tests passed");
+            return 0;
+        }
+        bool kept = true;
+        bool ran = false;
+        for (const bool watched : {true, false}) {
+            for (const bool seeded : {false, true}) {
+                for (const bool hookRead : {false, true}) {
+                    const auto outcome = Run(*device, watched, seeded, hookRead);
+                    ran = ran || outcome != Outcome::Skipped;
+                    kept = kept && outcome != Outcome::Lost;
+                }
+            }
+        }
+        for (const bool seeded : {false, true}) {
+            const auto outcome = Run(*device, true, seeded, false, true);
+            ran = ran || outcome != Outcome::Skipped;
+            kept = kept && outcome != Outcome::Lost;
+        }
+        if (!ran) {
+            std::puts("linear target CPU write test skipped: no host import on this device");
+            return VulkanTestSkipped;
+        }
+        Require(kept, "a drawn linear target's store lost the drawn half or the CPU's later stores to the other half");
+        std::puts("linear target CPU write tests passed");
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
