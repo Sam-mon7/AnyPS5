@@ -6578,6 +6578,13 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
+void PrepareDriverRead_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, bytes);
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes);
+    GuardRead(address, bytes);
+    FlushGpuWrites(address, bytes);
+}
+
 namespace {
 
 std::atomic<std::uint64_t> lockedHostWrites{0};
