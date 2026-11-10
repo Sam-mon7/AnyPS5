@@ -221,19 +221,21 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         appendEntryRegions(*variant, regions);
                         ++compared;
                         const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
+                        auto& hit = stageData[i];
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases, GuestMemory::Gen::Consumer::DrawValidate, &hit.words);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases, GuestMemory::Gen::Consumer::DrawValidate, &hit.words);
                         const auto genVerdict = genShadow ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore, VariantValidationExact()) : GuestMemory::Gen::Verdict::Unknown;
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
                         if (genVerdict != GuestMemory::Gen::Verdict::Clean) genAllClean = false;
-                        if (result == EntryOutcome::EqualData) {
-                            auto& hit = stageData[i];
-                            hit.words = variant->words;
+                        if (result == EntryOutcome::EqualData || !hit.words.empty()) {
+                            if (hit.words.empty()) hit.words = variant->words;
                             for (const auto& [position, value] : liveData) hit.words[position] = value;
                             regions.clear();
                             appendEntryRegions(*variant, regions, &hit.words);
+                        }
+                        if (result == EntryOutcome::EqualData) {
                             hit.compiled = patchDataWords(*variant, hit.words, bufferBases);
                             if (hit.compiled == nullptr) { ArchB::Recorder::Count("fix_buffer_base_refused_patch"); hit.words.clear(); continue; }
                             hit.bufferBaseHit = bufferBases && std::any_of(liveData.begin(), liveData.end(), [&](const auto& word) { return WordMask(variant->bufferBaseMasks, word.first) != 0; });
@@ -343,9 +345,16 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.variant->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, feedbackMask, &memoryFeedback);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, feedbackMask, &memoryFeedback);
-                    if (result == EntryOutcome::Equal) candidates.push_back({variant, std::move(regions), userFeedback || memoryFeedback});
+                    std::vector<std::uint32_t> words;
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DrawValidate, &words);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, nullptr, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DrawValidate, &words);
+                    if (result == EntryOutcome::Equal) {
+                        if (!words.empty()) {
+                            regions.clear();
+                            appendEntryRegions(*variant, regions, &words);
+                        }
+                        candidates.push_back({variant, std::move(regions), userFeedback || memoryFeedback, std::move(words)});
+                    }
                 }
             }
         }

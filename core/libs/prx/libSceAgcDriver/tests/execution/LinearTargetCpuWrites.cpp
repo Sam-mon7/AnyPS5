@@ -267,7 +267,7 @@ void PreparedTargetDraws(AgcDriver::VulkanDevice& device, const AgcDriver::Graph
         }
         auto prepared = device.PrepareDraw(state, draw, shaders, step == 8 ? recipe.get() : nullptr);
         const bool memo = GuestMemory::ThreadCollectEpoch() != 0;
-        if (enabled && memo) Require(prepared.targets.size() == 1 && prepared.targets[0].ready, "the target preparation fixture did not prove a clean resident target before locking");
+        if (enabled && memo) Require(prepared.targets.size() == 1 && prepared.targets[0].ready, "the target preparation fixture did not prove a clean resident target before locking at step " + std::to_string(step));
         else Require(prepared.targets.empty(), "target proofs ignored the opt-in, preparation or collect-memo switch");
         if (step == 0) {
             std::lock_guard lock(GuestMemory::GpuMutex());
@@ -347,16 +347,15 @@ void PreparedTargetDraws(AgcDriver::VulkanDevice& device, const AgcDriver::Graph
     GuestMemory::Write(reinterpret_cast<std::uintptr_t>(vertices), std::as_bytes(std::span(Triangle)));
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false, bool targetPrelock = false) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, std::span<const std::uint32_t> pixelCode, std::uint32_t scissorWidth, bool prelock = false, bool targetPrelock = false, Block* vertices = nullptr) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
-    std::unique_ptr<Block> vertexBlock;
     if (prelock) {
-        vertexBlock = std::make_unique<Block>(BlockBytes, false);
-        std::memcpy(vertexBlock->data, Triangle.data(), sizeof(Triangle));
+        Require(vertices != nullptr, "draw preparation has no vertex block");
+        std::memcpy(vertices->data, Triangle.data(), sizeof(Triangle));
     }
-    const auto vertexBuffer = BufferDescriptor(prelock ? vertexBlock->data : static_cast<const void*>(Triangle.data()), 16u, static_cast<std::uint32_t>(Triangle.size()));
+    const auto vertexBuffer = BufferDescriptor(prelock ? vertices->data : static_cast<const void*>(Triangle.data()), 16u, static_cast<std::uint32_t>(Triangle.size()));
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
     ShaderRecompiler::RecompileRequest vertex{
@@ -408,7 +407,7 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
     if (prelock) {
-        if (targetPrelock) PreparedTargetDraws(device, state, draw, shaders, vertexBlock->data);
+        if (targetPrelock) PreparedTargetDraws(device, state, draw, shaders, vertices->data);
         else PreparedDraws(device, state, draw, shaders);
         return;
     }
@@ -486,12 +485,16 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (argc == 2 && (std::string_view(argv[1]) == "--draw-prelock" || std::string_view(argv[1]) == "--draw-target-prelock")) {
             Block block(BlockBytes, true);
+            Block vertices(BlockBytes, false);
             std::fill(block.data, block.data + block.bytes, std::uint8_t{0xff});
             const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
-            if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return VulkanTestSkipped;
             const bool targetPrelock = std::string_view(argv[1]) == "--draw-target-prelock";
-            if (targetPrelock && !AgcDriver::GuestMemory::Watched(block.Address(), TargetBytes)) return VulkanTestSkipped;
-            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true, targetPrelock);
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return VulkanTestSkipped;
+                if (targetPrelock && !AgcDriver::Graphics::WatchedAfterSettle(context, block.Address(), TargetBytes)) return VulkanTestSkipped;
+            }
+            Draw(*device, DecodeTarget(block), Program(0, false), Drawn, true, targetPrelock, &vertices);
             std::puts("draw preparation tests passed");
             return 0;
         }

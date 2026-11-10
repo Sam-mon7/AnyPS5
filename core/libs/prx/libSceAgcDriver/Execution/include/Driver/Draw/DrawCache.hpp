@@ -87,6 +87,7 @@ struct DrawDataCandidate {
     std::shared_ptr<DispatchVariant> variant;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     bool feedbackHit = false;
+    std::vector<std::uint32_t> words;
 };
 
 using DrawDataCandidates = std::vector<std::vector<DrawDataCandidate>>;

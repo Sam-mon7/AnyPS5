@@ -65,10 +65,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     ++compared;
                     const bool genShadow = GuestMemory::Gen::ShadowActive();
                     const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DispatchValidate);
+                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DispatchValidate, &liveWords);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DispatchValidate);
+                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, feedbackMask, &memoryFeedback, false, GuestMemory::Gen::Consumer::DispatchValidate, &liveWords);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
                     }
                     if (genShadow) static_cast<void>(ShadowValidatedVariant(GuestMemory::Gen::Consumer::DispatchValidate, *variants[i], result, genBefore, VariantValidationExact()));
@@ -166,14 +166,16 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 compiledResult = variant->compiled;
                 if (dataHit) {
 
-                    liveWords = variant->words;
+                    if (liveWords.empty()) liveWords = variant->words;
                     for (const auto& [position, value] : liveData) liveWords[position] = value;
-                    regions.clear();
-                    appendEntryRegions(*variant, regions, &liveWords);
                     compiledResult = patchDataWords(*variant, liveWords);
                     ++counters.dataHits;
                     counters.dataWordsRefreshed += liveData.size();
                     ++counters.dataHitsByRank[rank];
+                }
+                if (!liveWords.empty()) {
+                    regions.clear();
+                    appendEntryRegions(*variant, regions, &liveWords);
                 }
                 if (stampValidate()) {
                     captured = variant->captured;

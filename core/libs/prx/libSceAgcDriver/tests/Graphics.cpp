@@ -7108,21 +7108,21 @@ void movedWordUploadTests() {
             return bindings;
         };
         const auto before = ShaderResources::MovedWordTotals();
+        const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
         const std::vector<std::uint32_t> first(4, 0x5a5a0000u), second(4, 0x6b6b0000u);
         auto a = draw(first);
         auto b = draw(first);
-        Require(a->snapshots[0].buffer == b->snapshots[0].buffer && a->snapshots[0].offset == b->snapshots[0].offset, "identical words did not take the held snapshot");
+        Require(a->snapshots[0].buffer == b->snapshots[0].buffer && (a->snapshots[0].offset == b->snapshots[0].offset) == on && b->snapshots[0].offset % alignment == 0, "identical words did not follow the moved-word reuse policy");
         auto c = draw(second);
         Require(c->snapshots[0].buffer != a->snapshots[0].buffer || c->snapshots[0].offset != a->snapshots[0].offset, "new words reused the held snapshot");
         const auto after = ShaderResources::MovedWordTotals();
-        const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
         Require(c->snapshots[0].buffer == a->snapshots[0].buffer && c->snapshots[0].offset != a->snapshots[0].offset && c->snapshots[0].offset % alignment == 0, "two word sets did not share the upload chunk at aligned offsets");
         Require(after.created == before.created, "the upstream upload path created a dedicated word buffer");
         if (on) {
             Require(after.uploaded - before.uploaded == 2 && after.held - before.held == 1 && after.created == before.created, "the moved words did not take the upload path");
             if (verifying) Require(after.verified - before.verified == 1 && after.mismatches == before.mismatches, "verify did not check the held slice");
         } else {
-            Require(after.uploaded == before.uploaded && after.held == before.held, "the no-op switch reported upload counters while off");
+            Require(after.uploaded == before.uploaded && after.held == before.held, "the disabled moved-word cache reported upload counters");
         }
         a.reset();
         b.reset();

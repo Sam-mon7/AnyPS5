@@ -8522,7 +8522,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     if (patch.allocation == index && patch.byte < override->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
             };
-            const auto held = reportUploadWords ? std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && std::ranges::equal(entry.words, override->words); }) : movedWordBuffers.end();
+            const bool cacheWords = reportUploadWords || slotted;
+            const auto held = cacheWords ? std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.uploaded == reportUploadWords && std::ranges::equal(entry.words, override->words); }) : movedWordBuffers.end();
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize wordOffset = 0;
             if (held != movedWordBuffers.end()) {
@@ -8548,8 +8549,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (reportUploadWords) {
                     movedWordCounters().uploaded.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (reportUploadWords) {
-                    MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer, wordOffset, true};
+                if (cacheWords) {
+                    MovedWordBuffer entry{index, {override->words.begin(), override->words.end()}, override->size, buffer, wordOffset, reportUploadWords};
                     if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                     else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
                 }
