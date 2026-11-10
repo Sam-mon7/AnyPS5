@@ -69,15 +69,24 @@ void structureChanges() {
     auto longer = Stream(1, 3);
     longer.push_back(Filler);
     const auto grown = recognizer.Observe(0, longer);
-    Require(grown.match == RegionMatch::New && grown.patchWords == 0 && grown.packets == 5, "a region of another length was compared");
+    Require(grown.match == RegionMatch::Prefix && grown.packets == 5 && grown.prefixPackets == 4 && grown.prefixDraws == 1 && grown.prefixDispatches == 1 && grown.patchWords == 0, "a region with one more trailing packet did not match by its common prefix");
     recognizer.EndFrame();
     auto other = longer;
     other[3] = Type3(0x35u, 2);
+    other[2] = 9u;
     const auto swapped = recognizer.Observe(0, other);
-    Require(swapped.match == RegionMatch::New && swapped.patchWords == 0 && swapped.patchWordsByKind.empty(), "a region with another packet header was matched");
+    Require(swapped.match == RegionMatch::Prefix && swapped.prefixPackets == 1 && swapped.prefixDraws == 0 && swapped.patchWords == 1, "a changed packet header did not end the common prefix there");
     recognizer.EndFrame();
     const auto after = recognizer.Observe(0, other);
     Require(after.match == RegionMatch::Exact, "a region after a structure change did not match its own repeat");
+    recognizer.EndFrame();
+    auto first = other;
+    first[0] = Type3(0x68u, 2);
+    const auto none = recognizer.Observe(0, first);
+    Require(none.match == RegionMatch::New && none.prefixPackets == 0 && none.patchWords == 0 && none.patchWordsByKind.empty(), "a region whose first packet differs was matched");
+    recognizer.EndFrame();
+    const auto shorter = recognizer.Observe(0, std::vector<std::uint32_t>(first.begin(), first.begin() + 6));
+    Require(shorter.match == RegionMatch::Prefix && shorter.prefixPackets == 2 && shorter.packets == 2, "a shorter region did not match as a prefix of the longer one");
 }
 
 void positionsAndQueues() {

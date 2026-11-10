@@ -9,13 +9,16 @@
 
 namespace AgcDriver::DriverDetail::Replay {
 
-enum class RegionMatch : std::uint8_t { New, Structure, Exact };
+enum class RegionMatch : std::uint8_t { New, Structure, Exact, Prefix };
 
 struct RegionReport {
     RegionMatch match = RegionMatch::New;
     std::uint32_t packets = 0;
     std::uint32_t draws = 0;
     std::uint32_t dispatches = 0;
+    std::uint32_t prefixPackets = 0;
+    std::uint32_t prefixDraws = 0;
+    std::uint32_t prefixDispatches = 0;
     std::uint32_t patchWords = 0;
     std::uint32_t alternatingWords = 0;
     bool stablePatches = false;

@@ -551,16 +551,23 @@ void recognizeRegion(std::uint32_t queue, std::span<const std::uint32_t> command
     static auto* const kindNames = new std::map<std::uint32_t, std::string>;
     const std::lock_guard lock(*guard);
     const auto report = recognizer->Observe(queue, commands);
-    static constexpr const char* names[3][4] = {
+    static constexpr const char* names[4][4] = {
         {"replay_rec_regions_new", "replay_rec_draws_new", "replay_rec_dispatches_new", "replay_rec_packets_new"},
         {"replay_rec_regions_structure", "replay_rec_draws_structure", "replay_rec_dispatches_structure", "replay_rec_packets_structure"},
         {"replay_rec_regions_exact", "replay_rec_draws_exact", "replay_rec_dispatches_exact", "replay_rec_packets_exact"},
+        {"replay_rec_regions_prefix", "replay_rec_draws_prefix", "replay_rec_dispatches_prefix", "replay_rec_packets_prefix"},
     };
     const auto& name = names[static_cast<std::size_t>(report.match)];
+    const bool prefix = report.match == Replay::RegionMatch::Prefix;
     ArchB::Recorder::Count(name[0]);
-    ArchB::Recorder::Count(name[1], report.draws);
-    ArchB::Recorder::Count(name[2], report.dispatches);
-    ArchB::Recorder::Count(name[3], report.packets);
+    ArchB::Recorder::Count(name[1], prefix ? report.prefixDraws : report.draws);
+    ArchB::Recorder::Count(name[2], prefix ? report.prefixDispatches : report.dispatches);
+    ArchB::Recorder::Count(name[3], prefix ? report.prefixPackets : report.packets);
+    if (prefix) {
+        ArchB::Recorder::Count("replay_rec_draws_new", report.draws - report.prefixDraws);
+        ArchB::Recorder::Count("replay_rec_dispatches_new", report.dispatches - report.prefixDispatches);
+        ArchB::Recorder::Count("replay_rec_packets_new", report.packets - report.prefixPackets);
+    }
     if (report.patchWords != 0) {
         ArchB::Recorder::Count("replay_rec_patch_words", report.patchWords);
         ArchB::Recorder::Count("replay_rec_patch_words_alternating", report.alternatingWords);
