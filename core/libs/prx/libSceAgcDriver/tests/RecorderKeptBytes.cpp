@@ -519,6 +519,7 @@ void UnlockedWaitMutation(bool retire, bool submitNew) {
     });
     const auto target = recorder.OpenSerial();
     const auto allocated = mock.allocatedCommands;
+    const auto freed = mock.freedCommands;
     mock.duringWait = [&] {
         std::thread producer([&] {
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -527,7 +528,7 @@ void UnlockedWaitMutation(bool retire, bool submitNew) {
             recorder.Keep(std::make_shared<int>(2));
             recorder.NotePendingWrite(0x1000, 4);
             recorder.OnComplete([&] { completions.push_back(2); });
-            if (retire) Expect(mock.allocatedCommands == allocated, "the retired batch's command buffer was not reused during the wait");
+            if (retire) Expect(mock.allocatedCommands == allocated + 1 && mock.freedCommands == freed + 1, "the retired batch's command buffer was not freed and replaced during the wait");
             if (submitNew) {
                 recorder.Submit();
                 recorder.Keep(std::make_shared<int>(3));
