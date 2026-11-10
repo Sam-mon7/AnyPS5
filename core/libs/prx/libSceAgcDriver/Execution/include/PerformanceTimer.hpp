@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
@@ -242,23 +243,23 @@ private:
 
 class PerformanceContext {
 public:
-    explicit PerformanceContext(FrameTiming* frame) : previous(current) {
-        current = frame;
+    explicit PerformanceContext(FrameTiming* frame) : previous(Current()) {
+        HostThreadSlot<FrameTiming*, CurrentSlot>::Set(frame);
     }
 
     PerformanceContext(const PerformanceContext&) = delete;
     PerformanceContext& operator=(const PerformanceContext&) = delete;
 
     ~PerformanceContext() {
-        current = previous;
+        HostThreadSlot<FrameTiming*, CurrentSlot>::Set(previous);
     }
 
     static FrameTiming* Current() {
-        return current;
+        return HostThreadSlot<FrameTiming*, CurrentSlot>::Get();
     }
 
 private:
-    inline static thread_local FrameTiming* current = nullptr;
+    struct CurrentSlot {};
     FrameTiming* previous;
 };
 

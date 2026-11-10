@@ -111,14 +111,14 @@ struct Recorder::Thread {
 };
 
 Recorder::Thread& Recorder::thread() {
-    if (local == nullptr) BindThread("unbound");
-    return *local;
+    if (local() == nullptr) BindThread("unbound");
+    return *local();
 }
 
 void Recorder::BindThread(const char* name) {
-    if (local != nullptr && local->name == name) return;
+    if (local() != nullptr && local()->name == name) return;
     auto bound = std::make_shared<Thread>(name);
-    local = bound.get();
+    local(bound.get());
     std::lock_guard lock(state().mutex);
     state().threads.push_back(std::move(bound));
 }
@@ -143,11 +143,11 @@ void Recorder::Scope::Begin(const char* scope, Clock::time_point now, Phase phas
     active = true;
     name = scope;
     previous = now;
-    parent = currentScope;
-    work = currentWork;
+    parent = currentScope();
+    work = currentWork();
     category = phase != Phase::Inherit ? phase : parent != nullptr && parent->work == work ? parent->category : work != nullptr ? work->phase : Phase::Prepare;
     generation = Recorder::generation.load(std::memory_order_relaxed);
-    currentScope = this;
+    currentScope(this);
 }
 
 void Recorder::Scope::Mark(const char* stage, Clock::time_point now) {
@@ -168,18 +168,18 @@ void Recorder::Scope::End(Clock::time_point now) {
     if (!active) return;
     Mark(nullptr, now);
     if (counter != nullptr && generation == Recorder::generation.load(std::memory_order_relaxed)) Count(counter, milliseconds(elapsed));
-    currentScope = parent;
+    currentScope(parent);
     active = false;
 }
 
 Recorder::Work::Work(Key key, Phase phase, bool call)
-    : previous(currentWork), key(key), phase(phase), call(call), generation(Recorder::generation.load(std::memory_order_relaxed)) {
-    currentWork = this;
+    : previous(currentWork()), key(key), phase(phase), call(call), generation(Recorder::generation.load(std::memory_order_relaxed)) {
+    currentWork(this);
 }
 
 Recorder::Work::~Work() {
     if (Enabled() && generation == Recorder::generation.load(std::memory_order_relaxed)) AddShader(key, call ? 1 : 0, elapsed);
-    currentWork = previous;
+    currentWork(previous);
 }
 
 void Recorder::phase(const char* name, const char* stage, Clock::duration elapsed) {

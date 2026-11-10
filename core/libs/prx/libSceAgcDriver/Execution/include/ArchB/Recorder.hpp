@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_ARCHB_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_ARCHB_RECORDER_HPP
 
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -108,13 +109,19 @@ public:
 
 private:
     struct Thread;
+    struct LocalSlot {};
+    struct ScopeSlot {};
+    struct WorkSlot {};
+    static Thread* local() { return HostThreadSlot<Thread*, LocalSlot>::Get(); }
+    static void local(Thread* value) { HostThreadSlot<Thread*, LocalSlot>::Set(value); }
+    static Scope* currentScope() { return HostThreadSlot<Scope*, ScopeSlot>::Get(); }
+    static void currentScope(Scope* value) { HostThreadSlot<Scope*, ScopeSlot>::Set(value); }
+    static Work* currentWork() { return HostThreadSlot<Work*, WorkSlot>::Get(); }
+    static void currentWork(Work* value) { HostThreadSlot<Work*, WorkSlot>::Set(value); }
     static Thread& thread();
     static void phase(const char* name, const char* stage, Clock::duration elapsed);
     inline static std::atomic<bool> enabled{false};
     inline static std::atomic<std::uint64_t> generation{0};
-    inline static thread_local Thread* local = nullptr;
-    inline static thread_local Scope* currentScope = nullptr;
-    inline static thread_local Work* currentWork = nullptr;
 };
 
 }
