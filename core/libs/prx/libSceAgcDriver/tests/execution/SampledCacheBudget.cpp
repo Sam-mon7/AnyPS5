@@ -757,6 +757,10 @@ bool resourceEpochTests(Context context, bool draw) {
         const auto program = SampledProgram(surface.Address());
         const CompiledShader shader{stage, &program, 0};
         auto resources = create(shader);
+#ifdef _WIN32
+        Require(GuestArena::GuestArenaAllocate_nid_postfix(SurfaceBytes, 65536) != nullptr, "cannot reserve the gap before the audit surface");
+#endif
+        WatchedSurface imported(context);
         Memory::BumpCollectEpoch();
         warm(*resources, shader);
         ClearDepthSurfaces(context.device);
@@ -764,7 +768,12 @@ bool resourceEpochTests(Context context, bool draw) {
         Require(resources->Revalidate(shader, &report) && !report.epochReused, "a changed depth registry reused its old proof");
         warm(*resources, shader);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        Require(resources->Revalidate(shader, &report) && !report.epochReused && report.path == ShaderResources::ProofPath::Full, "epoch reuse postponed the lookup audit");
+        Require(resources->Revalidate(shader, &report) && !report.epochReused && report.path == (enabled ? ShaderResources::ProofPath::Full : ShaderResources::ProofPath::Fast) && report.audited == enabled, "the interval proof did not follow its audit admission rule");
+        if (!enabled) {
+            const auto imports = HostImportSetGeneration();
+            Require(HostImportFor(context, imported.Address(), SurfaceBytes) != nullptr && HostImportSetGeneration() != imports, "the audit fixture did not add a host import");
+            Require(resources->Revalidate(shader, &report) && !report.epochReused && report.path == ShaderResources::ProofPath::Full && report.audited, "a changed import generation postponed the lookup audit");
+        }
         warm(*resources, shader);
         ClearCachedTextures(context.device);
         Require(!resources->Revalidate(shader, &report) && !report.epochReused, "an evicted sampled texture reused its old proof");
@@ -1722,6 +1731,7 @@ void collectRefusalTests(Context context) {
     const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     auto sampled = std::make_shared<ShaderResources>(context, shader);
     Require(sampled->Reusable() && sampled->SampledTextures().size() == 1, "the template over the partial surface is not reusable");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
     ShaderResources::ProofReport report{};
     Require(sampled->Revalidate(shader, &report), "a template over a surface with an uncommitted page did not prove current");
     Require(report.path == ShaderResources::ProofPath::Full, "a template over a surface with an uncommitted page took the fast proof");

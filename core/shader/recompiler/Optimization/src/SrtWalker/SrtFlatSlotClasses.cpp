@@ -19,6 +19,13 @@ std::vector<std::uint8_t> ResourceGuardingConditions(const IrResourcePlan& plan)
             if (successor >= count) return guards;
         }
     }
+    std::vector<std::uint8_t> required(count);
+    for (const auto& source : plan.descriptorSources) {
+        for (const auto block : source.requiredBlocks) {
+            if (block >= count) return guards;
+            required[block] = 1u;
+        }
+    }
     // Post-dominator sets as bit rows. Exit blocks start with themselves, the others with every block.
     const std::size_t words = (count + 63u) / 64u;
     std::vector<std::uint64_t> sets(count * words, ~std::uint64_t {0});
@@ -99,7 +106,7 @@ std::vector<std::uint8_t> ResourceGuardingConditions(const IrResourcePlan& plan)
             if (visit == join || seen[visit] != 0u) continue;
             seen[visit] = 1u;
             const auto& region = blocks[visit];
-            guarding = exits[visit] == 0u || !region.sources.empty() || !region.images.empty() || !region.flatSlots.empty();
+            guarding = exits[visit] == 0u || required[visit] != 0u || !region.sources.empty() || !region.images.empty() || !region.flatSlots.empty();
             pending.insert(pending.end(), region.successors.begin(), region.successors.end());
         }
         guards[index] = guarding ? 1u : 0u;

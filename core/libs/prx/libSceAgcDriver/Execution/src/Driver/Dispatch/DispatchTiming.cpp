@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <numeric>
 #include <string>
@@ -141,8 +142,8 @@ void Driver::reportDispatchShaders() {
 }
 
 PendingDispatchPhases& Driver::pendingDispatchPhases() {
-    static thread_local PendingDispatchPhases pending;
-    return pending;
+    struct PendingStorage {};
+    return HostThreadLocal<PendingDispatchPhases, PendingStorage>();
 }
 
 std::chrono::steady_clock::time_point& Driver::packetStartedAt() {

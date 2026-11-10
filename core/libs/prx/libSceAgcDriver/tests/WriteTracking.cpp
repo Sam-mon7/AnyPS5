@@ -22,6 +22,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -3403,37 +3404,42 @@ void CheckAllocChurnMemo() {
     Recorder::Boundary(true, 0, Recorder::Clock::now());
     const AgcDriver::ArchB::AllocChurnScope churn(true);
     constexpr std::size_t ranges = 8;
-    void* memory = AllocateWatched(ranges * Block);
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
-    std::memset(memory, 0, ranges * Block);
-    BumpCollectEpoch();
-    std::vector<std::uint64_t> collected(ranges);
-    for (std::size_t i = 0; i < ranges; ++i) {
-        collected[i] = CollectWrites(base + i * Block, Block);
-        Require(collected[i] != 0, "the churn fixture was not collected");
-    }
-    for (std::size_t epoch = 0; epoch < 64; ++epoch) {
-        const auto written = epoch % ranges;
-        bytes[written * Block + 64 + epoch] = static_cast<std::uint8_t>(epoch + 1);
+    for (const std::size_t stride : {1u, 2u}) {
+        void* memory = AllocateWatched(stride * ranges * Block);
+        const auto base = reinterpret_cast<std::uint64_t>(memory);
+        auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+        std::memset(memory, 0, stride * ranges * Block);
         BumpCollectEpoch();
+        std::vector<std::uint64_t> collected(ranges);
         for (std::size_t i = 0; i < ranges; ++i) {
-            const auto range = base + i * Block;
-            const auto generation = CollectWrites(range, Block);
-            Require(generation != 0 && UnchangedSince(range, Block, generation), "a collect in a later epoch did not prove its range");
-            if (i == written) {
-                Require(!UnchangedSince(range, Block, collected[i]), "a kept memo entry hid a CPU store made before the epoch");
-                collected[i] = generation;
-            } else {
-                Require(UnchangedSince(range, Block, collected[i]), "an unwritten range lost its generation");
-            }
-            Require(CollectWrites(range, Block) != 0 && UnchangedSince(range, Block, collected[i]), "a memoized collect in the same epoch failed");
+            collected[i] = CollectWrites(base + i * stride * Block, Block);
+            Require(collected[i] != 0, "the churn fixture was not collected");
         }
+        static_cast<void>(Recorder::Collect(Recorder::Clock::now()));
+        for (std::size_t epoch = 0; epoch < 64; ++epoch) {
+            const auto written = epoch % ranges;
+            bytes[written * stride * Block + 64 + epoch] = static_cast<std::uint8_t>(epoch + 1);
+            BumpCollectEpoch();
+            for (std::size_t i = 0; i < ranges; ++i) {
+                const auto range = base + i * stride * Block;
+                const auto generation = CollectWrites(range, Block);
+                Require(generation != 0 && UnchangedSince(range, Block, generation), "a collect in a later epoch did not prove its range");
+                if (i == written) {
+                    Require(!UnchangedSince(range, Block, collected[i]), "a kept memo entry hid a CPU store made before the epoch");
+                    collected[i] = generation;
+                } else {
+                    Require(UnchangedSince(range, Block, collected[i]), "an unwritten range lost its generation");
+                }
+                Require(CollectWrites(range, Block) != 0 && UnchangedSince(range, Block, collected[i]), "a memoized collect in the same epoch failed");
+            }
+        }
+        // The kept nodes were overwritten in place (the counter the gate requires).
+        const auto counts = Recorder::Collect(Recorder::Clock::now()).counters;
+        const auto reuses = counts.find("fix_alloc_churn_memo_reuses");
+        const auto nodes = stride == 1 ? std::size_t{1} : ranges;
+        Require(reuses != counts.end() && reuses->second >= 64 * nodes, "kept coalesced memo nodes were not reused in place");
+        std::cout << "allocation memo stride " << stride << ": " << reuses->second << " node reuses for " << 64 * nodes << " required\n";
     }
-    // The kept nodes were overwritten in place (the counter the gate requires).
-    const auto counts = Recorder::Collect(Recorder::Clock::now()).counters;
-    const auto reuses = counts.find("fix_alloc_churn_memo_reuses");
-    Require(reuses != counts.end() && reuses->second >= 64 * ranges, "kept memo nodes were not reused in place");
 }
 
 void CheckFailedCollectMemo() {
@@ -3593,8 +3599,6 @@ void CheckAdoptLatestEpoch() {
 
 #ifdef _WIN32
 void CheckVqMemo(std::wstring_view mode) {
-    using Recorder = AgcDriver::ArchB::Recorder;
-    Recorder::Boundary(true, 0, Recorder::Clock::now());
     constexpr std::size_t bytes = Block;
     auto* memory = static_cast<unsigned char*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * bytes, bytes));
     const auto base = reinterpret_cast<std::uintptr_t>(memory);
@@ -3605,37 +3609,35 @@ void CheckVqMemo(std::wstring_view mode) {
             GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * bytes);
         }
     } release{memory};
-    const GuestArena::QueryMemoContext context{&UnwatchSerial, &ForgetSerial, true, [](const char* name) { Recorder::Count(name); }};
+    const GuestArena::QueryMemoContext context{&UnwatchSerial, &ForgetSerial, true, nullptr};
     struct Result {
         bool collected;
         std::size_t count;
         std::array<void*, 32> pages{};
         bool operator==(const Result&) const = default;
     };
-    const auto collect = [&](bool enabled = true, std::uintptr_t address = 0, std::size_t size = Block) {
-        Result result{false, 32};
-        result.collected = GuestArena::GuestArenaCollectWritesMemo_nid_no_patch(address == 0 ? base : address, size, result.pages.data(), &result.count, false, false, enabled ? &context : nullptr);
+    std::atomic<std::uint64_t> onCalls{0}, offCalls{0}, onQueries{0}, offQueries{0};
+    std::atomic<bool> equivalent{true};
+    const auto collect = [&](bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixVqMemo), std::uintptr_t address = 0, std::size_t size = Block) {
+        const auto read = [&](bool memo) {
+            Result result{false, 32};
+            const auto queries = GuestArena::GuestArenaWalkCost_nid_no_patch().vqCalls;
+            result.collected = memo ?
+                GuestArena::GuestArenaCollectWritesMemo_nid_no_patch(address == 0 ? base : address, size, result.pages.data(), &result.count, false, false, &context) :
+                GuestArena::GuestArenaCollectWrites_nid_postfix(address == 0 ? base : address, size, result.pages.data(), &result.count, false);
+            const auto added = GuestArena::GuestArenaWalkCost_nid_no_patch().vqCalls - queries;
+            (memo ? onCalls : offCalls).fetch_add(1, std::memory_order_relaxed);
+            (memo ? onQueries : offQueries).fetch_add(added, std::memory_order_relaxed);
+            return result;
+        };
+        const auto result = read(enabled);
+        if (result != read(!enabled)) equivalent.store(false, std::memory_order_relaxed);
         return result;
-    };
-    const auto counters = [] {
-        auto counts = Recorder::Collect(Recorder::Clock::now()).counters;
-        Require(!counts.contains("fix_vq_memo_mismatches"), "query memo verification disagreed");
-        return counts;
-    };
-    const auto requireCount = [](const auto& counts, const char* name) {
-        const auto found = counts.find(name);
-        if (found == counts.end() || found->second == 0) {
-            for (const auto& [key, value] : counts) std::cerr << key << "=" << value << "\n";
-        }
-        Require(found != counts.end() && found->second != 0, std::string("missing query memo counter: ") + name);
     };
     const auto commit = [&] { GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes); };
     const auto baseline = [&] {
         const auto first = collect();
         Require(collect() == first, "unchanged query changed the collected pages");
-        const auto counts = counters();
-        requireCount(counts, "fix_vq_memo_hits");
-        requireCount(counts, "fix_vq_memo_verified");
         return first;
     };
     if (mode == L"reuse") {
@@ -3647,18 +3649,14 @@ void CheckVqMemo(std::wstring_view mode) {
         memory[4096] = 17;
         const auto second = collect();
         Require(second.collected && second.count == 2, "query reuse hid a CPU store");
-        static_cast<void>(counters());
         Require(collect(true, base, 2 * bytes) == collect(false, base, 2 * bytes), "a longer collection changed the query result");
-        requireCount(counters(), "fix_vq_memo_hits");
     } else if (mode == L"commit") {
         baseline();
         commit();
         Require(collect().collected, "commit reused a reserved answer");
-        requireCount(counters(), "fix_vq_memo_refused_commit");
         baseline();
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
         Require(!collect().collected, "decommit reused a committed answer");
-        requireCount(counters(), "fix_vq_memo_refused_mapping");
         baseline();
         commit();
         Require(collect().collected, "recommit reused a reserved answer");
@@ -3668,13 +3666,9 @@ void CheckVqMemo(std::wstring_view mode) {
         DWORD previous = 0;
         Require(GuestArena::GuestArenaVirtualProtect_nid_no_patch(memory, 4096, PAGE_READONLY, &previous), "fixture tracked protect failed");
         Require(collect() == collect(false), "tracked protection changed collection output");
-        requireCount(counters(), "fix_vq_memo_refused_protection");
         GuestArena::GuestArenaSetProtection_nid_postfix(base, bytes, PAGE_READONLY);
         Require(VirtualProtect(memory, bytes, PAGE_READONLY, &previous), "fixture protect failed");
         Require(collect() == collect(false), "protection change changed collection output");
-        const auto counts = counters();
-        requireCount(counts, "fix_vq_memo_refused_external_protection");
-        Require(!counts.contains("fix_vq_memo_hits") || counts.at("fix_vq_memo_hits") == 0, "external protection retained query authority");
     } else if (mode == L"map") {
         baseline();
         const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, bytes, nullptr);
@@ -3683,7 +3677,6 @@ void CheckVqMemo(std::wstring_view mode) {
         Require(collect() == collect(false), "map reused a reserved answer");
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
         Require(!collect().collected, "unmap retained committed memory");
-        requireCount(counters(), "fix_vq_memo_refused_commit");
         GuestArena::GuestArenaForgetSection_nid_postfix(section);
         CloseHandle(section);
         baseline();
@@ -3691,17 +3684,14 @@ void CheckVqMemo(std::wstring_view mode) {
         baseline();
         Unwatch(base + bytes, bytes);
         Require(!collect().collected, "unwatch changed reserved collection output");
-        requireCount(counters(), "fix_vq_memo_refused_unwatch");
     } else if (mode == L"forget") {
         static_cast<void>(CommittedRanges(base, bytes));
         baseline();
         GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base, bytes);
         collect();
-        requireCount(counters(), "fix_vq_memo_refused_forget");
         baseline();
         { GuestAllocations::Mutation mutation; }
         collect();
-        requireCount(counters(), "fix_vq_memo_refused_mapping");
     } else if (mode == L"coverage") {
         commit();
         baseline();
@@ -3709,27 +3699,37 @@ void CheckVqMemo(std::wstring_view mode) {
         collect();
         GuestArena::GuestArenaUnpinWritable_nid_postfix(memory, bytes);
         collect();
-        requireCount(counters(), "fix_vq_memo_refused_pinned");
         auto* host = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
         Require(host != nullptr, "cannot allocate untracked memory");
         const auto address = reinterpret_cast<std::uintptr_t>(host);
         Require(collect(true, address) == collect(false, address), "untracked query changed collection output");
         Require(collect(true, address) == collect(false, address), "untracked query changed on repetition");
-        requireCount(counters(), "fix_vq_memo_refused_untracked");
         VirtualFree(host, 0, MEM_RELEASE);
         std::uintptr_t arena = 0;
         std::size_t arenaBytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
         collect(true, arena + arenaBytes - 4096, 8192);
-        requireCount(counters(), "fix_vq_memo_refused_untracked");
     } else if (mode == L"threads") {
         baseline();
         std::array<std::thread, 4> workers;
+        std::barrier phase(static_cast<std::ptrdiff_t>(workers.size()));
         for (auto& worker : workers) worker = std::thread([&] {
             for (unsigned i = 0; i < 32; ++i) {
+                phase.arrive_and_wait();
                 collect();
+                phase.arrive_and_wait();
                 GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+                phase.arrive_and_wait();
                 collect();
+                phase.arrive_and_wait();
+                GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+            }
+            for (unsigned i = 0; i < 32; ++i) {
+                Result before{false, 32};
+                GuestArena::GuestArenaCollectWritesMemo_nid_no_patch(base, bytes, before.pages.data(), &before.count, false, false, &context);
+                GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+                Result after{false, 32};
+                GuestArena::GuestArenaCollectWrites_nid_postfix(base, bytes, after.pages.data(), &after.count, false);
                 GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
             }
         });
@@ -3737,11 +3737,9 @@ void CheckVqMemo(std::wstring_view mode) {
     } else if (mode == L"toggle") {
         const auto first = baseline();
         Require(collect(false) == first && collect() == first, "on/off/on changed reserved output");
-        requireCount(counters(), "fix_vq_memo_hits");
         commit();
         const auto second = collect(false);
         Require(collect() == second, "an off-path commit left a stale on-path answer");
-        requireCount(counters(), "fix_vq_memo_refused_commit");
         baseline();
         GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
         BumpCollectEpoch();
@@ -3750,9 +3748,11 @@ void CheckVqMemo(std::wstring_view mode) {
         Require(CollectWrites(base, bytes, false) == 0, "off collection accepted reserved memory");
         BumpCollectEpoch();
         Require(CollectWrites(base, bytes, true) == 0, "toggled collection accepted reserved memory");
-        requireCount(counters(), "fix_vq_memo_hits");
     } else throw std::runtime_error("unknown query memo test");
-    static_cast<void>(counters());
+    std::cout << "collection " << std::string(mode.begin(), mode.end()) << ": on " << onCalls.load() << " calls, " << onQueries.load() << " mapping queries; off " << offCalls.load() << " calls, " << offQueries.load() << " mapping queries\n";
+    Require(onCalls.load() != 0 && offCalls.load() != 0, "collection did not exercise both query memo switch paths");
+    Require(onQueries.load() == 0 && offQueries.load() == 0, "collection queried a mapping with the query memo switch on or off");
+    Require(equivalent.load(), "the query memo switch changed collection results");
 }
 #endif
 
