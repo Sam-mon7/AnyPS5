@@ -10,13 +10,23 @@
 using AgcDriver::ArchB::Recorder;
 using namespace std::chrono_literals;
 
+#ifdef ARCHB_TEST_EMUTLS
+static std::atomic<bool> trackEmulatedTls{false};
+static std::atomic<unsigned> emulatedTlsCalls{0};
+extern "C" void* __real___emutls_get_address(void* object);
+extern "C" void* __wrap___emutls_get_address(void* object) {
+    if (trackEmulatedTls.load(std::memory_order_relaxed)) emulatedTlsCalls.fetch_add(1, std::memory_order_relaxed);
+    return __real___emutls_get_address(object);
+}
+#endif
+
 namespace {
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-void near(double actual, double expected) {
+void expectNear(double actual, double expected) {
     require(std::abs(actual - expected) <= std::max(0.000001, expected * 0.02), "cost did not reconcile within 2%");
 }
 
@@ -49,19 +59,19 @@ void reconciles() {
     Recorder::Boundary(true, 0, start + 100ms);
     const auto result = Recorder::Collect(start + 100ms);
     require(result.frames == 1 && result.total.calls == 1, "handoff counted an extra draw");
-    near(result.total.ms[0], 140);
-    near(result.total.ms[2], 40);
-    near(result.total.ms[3], 20);
-    near(result.accountedMs, 200);
-    near(result.criticalPathMs, 100);
-    near(result.counters.at("fixture_counter"), 14);
+    expectNear(result.total.ms[0], 140);
+    expectNear(result.total.ms[2], 40);
+    expectNear(result.total.ms[3], 20);
+    expectNear(result.accountedMs, 200);
+    expectNear(result.criticalPathMs, 100);
+    expectNear(result.counters.at("fixture_counter"), 14);
     for (const auto* role : {"queue worker 0", "draw finisher"}) {
         const auto& phases = result.phases.at(role);
-        near(phases.at("prepare.first"), 20);
-        near(phases.at("prepare"), 50);
-        near(phases.at("proof"), 20);
-        near(phases.at("bind"), 10);
-        near(sum(result.threadShaders.at(role).front().ms), 100);
+        expectNear(phases.at("prepare.first"), 20);
+        expectNear(phases.at("prepare"), 50);
+        expectNear(phases.at("proof"), 20);
+        expectNear(phases.at("bind"), 10);
+        expectNear(sum(result.threadShaders.at(role).front().ms), 100);
     }
     Recorder::BindThread("timer integration");
     {
@@ -76,7 +86,7 @@ void reconciles() {
     const auto actual = Recorder::Collect(start + 200ms);
     double phases = 0;
     for (const auto& [name, ms] : actual.phases.at("timer integration")) phases += ms;
-    near(sum(actual.total.ms), phases);
+    expectNear(sum(actual.total.ms), phases);
     require(actual.total.ms[2] > 0 && actual.total.calls == 1, "PerformanceTimer did not record");
     std::cout << result.Json() << '\n';
 }
@@ -110,13 +120,13 @@ void toggleIntervalTagged() {
     Recorder::Count("fixture", 3);
     auto result = Recorder::Collect(start + 2s);
     require(result.toggled && result.enabled && result.sequence == 1, "on transition was not tagged");
-    near(result.counters.at("fixture"), 3);
-    near(result.counters.at("child_counter"), 11);
+    expectNear(result.counters.at("fixture"), 3);
+    expectNear(result.counters.at("child_counter"), 11);
     Recorder::Boundary(true, 1, start + 3s);
     Recorder::Count("fixture", 4);
     result = Recorder::Collect(start + 4s);
     require(!result.toggled, "stable interval was tagged");
-    near(result.counters.at("fixture"), 4);
+    expectNear(result.counters.at("fixture"), 4);
     Recorder::Scope crossing;
     crossing.Begin("crossing", start + 4s);
     Recorder::Boundary(false, 2, start + 5s);
@@ -124,7 +134,7 @@ void toggleIntervalTagged() {
     Recorder::Count("fixture", 100);
     result = Recorder::Collect(start + 6s);
     require(result.toggled && !result.enabled, "off transition was not tagged");
-    near(result.counters.at("fixture"), 0);
+    expectNear(result.counters.at("fixture"), 0);
     Recorder::Boundary(true, 3, start + 7s);
     Recorder::Collect(start + 8s);
     Recorder::Boundary(true, 4, start + 9s);
@@ -140,12 +150,59 @@ void shaderTableOverflow() {
     const auto result = Recorder::Collect(start + 1s);
     require(result.shaders.size() == 40 && result.total.calls == 1100, "table overflow lost calls");
     require(result.other.calls == 1060, "other did not include overflow and the tail");
-    near(sum(result.total.ms), 11000);
-    near(sum(result.other.ms), 10600);
+    expectNear(sum(result.total.ms), 11000);
+    expectNear(sum(result.other.ms), 10600);
     auto total = sum(result.other.ms);
     for (const auto& row : result.shaders) total += sum(row.ms);
-    near(total, sum(result.total.ms));
-    near(sum(Recorder::Collect(start + 2s).total.ms), 0);
+    expectNear(total, sum(result.total.ms));
+    expectNear(sum(Recorder::Collect(start + 2s).total.ms), 0);
+}
+
+void hotThreadState() {
+    using AgcDriver::PerformanceContext;
+    using AgcDriver::FrameTiming;
+    const auto start = Recorder::Clock::now();
+    Recorder::Boundary(true, 0, start);
+    Recorder::BindThread("hot thread state");
+    FrameTiming frame(1);
+    require(PerformanceContext::Current() == nullptr, "initial context was not empty");
+    {
+        PerformanceContext outer(&frame);
+        require(PerformanceContext::Current() == &frame, "outer context was not installed");
+        std::thread worker([] {
+            require(PerformanceContext::Current() == nullptr, "context leaked into another thread");
+            FrameTiming nestedFrame(2);
+            PerformanceContext nested(&nestedFrame);
+            require(PerformanceContext::Current() == &nestedFrame, "worker context was not installed");
+        });
+        worker.join();
+        {
+            PerformanceContext inner(nullptr);
+            require(PerformanceContext::Current() == nullptr, "nested context was not installed");
+        }
+        require(PerformanceContext::Current() == &frame, "nested context was not restored");
+    }
+    require(PerformanceContext::Current() == nullptr, "outer context was not restored");
+    const auto exercise = [] {
+        PerformanceContext context(nullptr);
+        Recorder::Work work({Recorder::Kind::Draw, 123});
+        AgcDriver::PerformanceTimer timer("hot thread state");
+        Recorder::Count("hot thread state");
+        timer.Mark("step");
+    };
+    exercise();
+#ifdef ARCHB_TEST_EMUTLS
+    trackEmulatedTls.store(true, std::memory_order_relaxed);
+#endif
+    for (unsigned i = 0; i != 100; ++i) exercise();
+#ifdef ARCHB_TEST_EMUTLS
+    trackEmulatedTls.store(false, std::memory_order_relaxed);
+    std::cout << "hot emulated TLS calls: " << emulatedTlsCalls.load() << '\n';
+    require(emulatedTlsCalls.load() == 0, "hot recorder state used emulated TLS");
+#endif
+    const auto result = Recorder::Collect(Recorder::Clock::now());
+    require(result.total.calls == 101, "hot loop lost work calls");
+    expectNear(result.counters.at("hot thread state"), 101);
 }
 
 }
@@ -158,6 +215,7 @@ int main(int argc, char** argv) {
         else if (name == "no_path_change") noPathChange();
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
+        else if (name == "hot_thread_state") hotThreadState();
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {
