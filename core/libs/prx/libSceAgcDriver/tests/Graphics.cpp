@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
@@ -6934,6 +6935,86 @@ void drawSetPoolTests() {
     }
     Require(mock.live == 0, "pooled draw sets leaked Vulkan objects");
     std::cout << "draw set pool tests passed\n";
+}
+
+void drawSetPoolFaultTests() {
+    using AgcDriver::Graphics::BdaResources;
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    const bool pooled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    context.limits.maxStorageBufferRange = 1u << 27;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        auto flags = binding.Flags();
+        flags.bufferWritten = {false, false};
+        binding.SetFlags(std::move(flags));
+        vertex.bindings.push_back(binding);
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto faultBinding = ShaderRecompiler::RuntimeAbi::BindingNumber(ShaderRecompiler::RuntimeAbi::Stage::Main, ShaderRecompiler::RuntimeAbi::Binding::FaultBuffer);
+        const auto fragmentFaultBinding = ShaderRecompiler::RuntimeAbi::BindingNumber(ShaderRecompiler::RuntimeAbi::Stage::Fragment, ShaderRecompiler::RuntimeAbi::Binding::FaultBuffer);
+        vertex.bindings.push_back({ShaderRecompiler::DescriptorKind::StorageBuffer, Role::FaultBuffer, 0, faultBinding, 1, {}, false});
+        fragment.bindings.push_back({ShaderRecompiler::DescriptorKind::StorageBuffer, Role::FaultBuffer, 0, fragmentFaultBinding, 1, {}, false});
+        vertex.bdaAbiVersion = fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        std::array<MockDescriptorWrite, 2> originalFaults{findWrite(faultBinding), findWrite(fragmentFaultBinding)};
+        BdaResources firstRecord(context), secondRecord(context);
+        const auto same = [](const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b) { return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range; };
+        Require(!same(firstRecord.Fault(), secondRecord.Fault()), "simultaneous draw fault records share a descriptor");
+        const std::vector<ShaderResources::MovedBuffer> moved{{0, 0, 16, std::vector<std::uint32_t>(4, 0x12340000u)}};
+        const auto draw = [&](const BdaResources* record, bool reused) {
+            mock.writes.clear();
+            auto result = resources.PrepareDrawBindings(recorder, moved, false, record);
+            Require(result != nullptr && result->allocation.set != VK_NULL_HANDLE, "fault-bearing draw snapshots are missing");
+            for (auto& original : originalFaults) {
+                for (const auto& write : mock.writes) {
+                    if (write.set == original.set && write.binding == original.binding) original = write;
+                }
+                const auto expected = record != nullptr ? record->Fault() : original.buffers.at(0);
+                const auto found = std::find_if(mock.writes.begin(), mock.writes.end(), [&](const auto& write) { return write.binding == original.binding && (write.set == result->allocation.set || write.set == result->fragmentAllocation.set); });
+                Require(found != mock.writes.end() && found->count == 1 && same(found->buffers.at(0), expected), "a draw set did not rewrite its current per-use fault descriptor");
+            }
+            if (reused) {
+                Require(std::none_of(mock.writes.begin(), mock.writes.end(), [](const auto& write) { return write.binding == 4 || (write.binding == 0 && write.arrayElement + write.count > 1); }), "a reused fault-bearing set rewrote an unchanged guest descriptor: " + ShaderResources::DrawSetPoolText() + "; snapshots " + std::to_string(result->snapshots.size()) + "; overridden " + std::to_string(result->overridden.size()));
+            } else {
+                Require(std::any_of(mock.writes.begin(), mock.writes.end(), [](const auto& write) { return write.binding == 0 && write.count == 2; }) && std::any_of(mock.writes.begin(), mock.writes.end(), [](const auto& write) { return write.binding == 4; }), "a fresh fault-bearing set did not write all guest descriptors");
+            }
+            return result;
+        };
+        const auto release = [&](std::shared_ptr<ShaderResources::DrawBindings>& bindings) {
+            std::weak_ptr<ShaderResources::DrawBindings> watched = bindings;
+            bindings.reset();
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            Require(watched.expired(), "completed fault-bearing draw bindings were not released");
+        };
+        auto first = draw(&firstRecord, false);
+        const auto firstSet = first->allocation.set;
+        auto overlapping = draw(&secondRecord, false);
+        Require(overlapping->allocation.set != firstSet, "an overlapping draw reused an in-flight fault-bearing set");
+        release(first);
+        auto reused = draw(&secondRecord, pooled);
+        if (pooled) Require(reused->allocation.set == firstSet, "a completed fault-bearing set was excluded from its template pool");
+        release(reused);
+        auto own = draw(nullptr, pooled);
+        if (pooled) Require(own->allocation.set == firstSet, "the template's fault record did not reuse its completed draw set");
+        own.reset();
+        overlapping.reset();
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+    }
+    Require(mock.live == 0, "fault-bearing pooled draw sets leaked Vulkan objects");
+    std::cout << "fault-bearing draw set pool tests passed\n";
 }
 
 // APS5_ARCHB_PIPE_DRAW_REUSE (Stage 3 B1): on the committer, a pooled set keeps its small snapshots in its own
@@ -14105,6 +14186,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-set-pool") {
             drawSetPoolTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-set-pool-faults") {
+            drawSetPoolFaultTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-key-writer") {

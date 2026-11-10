@@ -8760,7 +8760,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     result.cache = context.descriptorCache;
     // APS5_ARCHB_FIX_DRAW_SET_POOL (sampled per call): a set back from an earlier draw of this object
     // keeps everything but the snapshot elements (see DrawSetPool).
-    const bool pooled = recorder != nullptr && faultDescriptors.empty() && drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
+    const bool pooled = recorder != nullptr && drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
     setTiming.mode = pooled ? 1 : 0;
     DrawSetPool::Entry reused;
     bool slotMatched = false;
@@ -8910,6 +8910,9 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
                 const auto live = held.buffer.lock();
                 if (live == nullptr || live->Handle() != snapshot.buffer->Handle()) counters.mismatches.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+        for (std::size_t index = 0; index < allocations.size(); ++index) {
+            if (allocations[index].role == ShaderRecompiler::DescriptorRole::FaultBuffer) marks[index] = 1;
         }
         writes.clear();
         std::size_t full = 0;
