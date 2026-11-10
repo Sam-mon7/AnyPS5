@@ -5838,7 +5838,7 @@ void Recorder::Sync() {
 bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
     static const bool enabled = std::getenv("APS5_UNLOCKED_LABEL_WAITS") != nullptr;
     auto& mutex = GuestMemory::GpuMutex();
-    if (!enabled || timeline == VK_NULL_HANDLE || mutex.DepthOnThisThread() != 1 || completionDepth != 0) return false;
+    if (!enabled || timeline == VK_NULL_HANDLE || mutex.DepthOnThisThread() != 1 || completionDepth() != 0) return false;
     if (serial == 0) return true;
     if (serial > submissions) Submit();
     if (serial > submissions) throw std::runtime_error("AGC recorder: unlocked wait for an unrecorded batch");
@@ -5886,7 +5886,7 @@ bool Recorder::ComputeSyncEnabled() {
 bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
     auto& mutex = GuestMemory::GpuMutex();
     if (!computeSyncEnabled) return false;
-    if (mutex.DepthOnThisThread() != 1 || completionDepth != 0 || !finishing.empty()) {
+    if (mutex.DepthOnThisThread() != 1 || completionDepth() != 0 || !finishing.empty()) {
         ArchB::Recorder::Count("fix_csync_refused_nested");
         return false;
     }
