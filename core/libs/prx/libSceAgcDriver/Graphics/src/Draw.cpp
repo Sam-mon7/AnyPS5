@@ -6077,6 +6077,10 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(AgcDriver::FaultStage::graphics), args);
     std::uint32_t subdraw = 0;
     recordDrawCommands(context, commands, state, draw, inputs, &indirect, argumentBuffer, argumentOffset, trace, subdraw);
+    if (pipeline->SplitsFaces()) {
+        pipeline->ContinueBackFaces(commands, state);
+        recordDrawCommands(context, commands, state, draw, inputs, &indirect, argumentBuffer, argumentOffset, trace, subdraw);
+    }
     recorder->EndGpuTiming(ownTiming);
     recorder->EndGpuTiming(eachDrawTiming);
     CountIndirectDraw(IndirectDrawPath::Gpu, 0, rewritten);
