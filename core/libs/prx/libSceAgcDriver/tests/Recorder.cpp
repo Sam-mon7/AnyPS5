@@ -4734,6 +4734,252 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+bool blockPublishTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+#ifdef _WIN32
+    using Trace = AgcDriver::ArchB::Recorder;
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) return false;
+    Trace::Boundary(true, 1, Trace::Clock::now());
+    constexpr std::size_t bytes = 4u << 20u;
+    const bool untracked = scenario == "untracked";
+    const bool excluded = scenario == "excluded";
+    const bool held = scenario == "held";
+    const bool between = scenario == "between_value" || scenario == "between_identical" || scenario == "deferred";
+    const bool late = scenario == "after_record" || scenario == "after_execution" || scenario == "identical" || scenario == "hle";
+    const bool fallback = untracked || excluded || held || between || scenario == "unaligned" || scenario == "gpu_writer";
+    const bool reuse = !fallback && scenario != "untouched";
+    void* block = untracked ? VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) : AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "cannot allocate block publication fixture");
+    if (excluded) {
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, bytes, nullptr);
+        Require(section != nullptr, "cannot allocate excluded fixture section");
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+        CloseHandle(section);
+    }
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto element = address + 4096;
+    const std::size_t elementBytes = (1u << 20u) - (scenario == "partial" ? 12u : scenario == "unaligned" ? 1u : 0u);
+    auto* words = reinterpret_cast<volatile std::uint32_t*>(element);
+    void* extra = scenario == "allocation" ? AllocateWatched(65536, 65536) : nullptr;
+    Require(scenario != "allocation" || extra != nullptr, "cannot allocate generation fixture");
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        void* extra;
+        bool untracked;
+        bool held;
+        std::uint64_t element;
+        std::size_t elementBytes;
+        ~Cleanup() {
+            recorder.Sync();
+            if (held) GuestArena::GuestWtFaultRelease_nid_no_patch(element, elementBytes);
+            GuestAllocations::Mutation().Remove(block);
+            if (extra != nullptr) {
+                GuestAllocations::Mutation().Remove(extra);
+                ReleaseWatched(extra, 65536);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+            if (untracked) VirtualFree(block, 0, MEM_RELEASE);
+            else ReleaseWatched(block, bytes);
+        }
+    } cleanup{context, recorder, block, extra, untracked, held, element, elementBytes};
+    Require(HostImportFor(context, address, bytes) != nullptr, "the block publication fixture cannot be imported");
+    if (!untracked) GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    if (scenario == "before") words[128] = 7;
+    AgcDriver::GuestMemory::WtFaultFlip(false);
+    if (!untracked && !excluded) Require(AgcDriver::GuestMemory::FaultUnchangedSince(element, elementBytes, AgcDriver::GuestMemory::FaultClock()), "the block fixture pages were not armed by the frame flip");
+    if (held) GuestArena::GuestWtFaultHold_nid_no_patch(element, elementBytes);
+    if (scenario == "resources" || scenario == "resources_deferred") {
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+        { auto flags = binding.Flags(); flags.bufferWritten = {true}; binding.SetFlags(std::move(flags)); }
+        program.bindings.push_back(binding);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        auto resources = std::make_shared<ShaderResources>(context, compute);
+        Require(resources->HasStagedCopies(), "the resource template did not stage its writable range");
+        if (scenario == "resources_deferred") {
+            const void* owner = resources->MemoryOwner();
+            std::vector<Recorder::RunAccess> accesses;
+            resources->RunAccesses(accesses);
+            recorder.Commands();
+            recorder.DeferDispatchBarrier(0x20, std::span(&owner, 1), accesses);
+            resources->CopyBacksAfterRun(resources);
+        }
+        resources->MarkGpuWrites(recorder);
+        for (int use = 0; use < 4; ++use) {
+            const auto before = GuestBufferMemory::CrossCarry();
+            Require(resources->ProveCurrent(compute), "the staged resource template could not be reused");
+            Require(GuestBufferMemory::CrossCarry().carried == before.carried + 1, "resource/template reuse bypassed block carry admission");
+            resources->MarkGpuWrites(recorder);
+        }
+        words[128] = 7;
+        const auto before = GuestBufferMemory::CrossCarry();
+        Require(resources->Revalidate(compute), "the CPU-written resource template could not be refreshed");
+        Require(GuestBufferMemory::CrossCarry().carried == before.carried && GuestBufferMemory::CrossCarry().copied == before.copied + 1, "resource/template reuse carried a CPU-written block shadow");
+        resources->MarkGpuWrites(recorder);
+        recorder.Keep(resources);
+        recorder.Sync();
+        std::vector<std::byte> expected(bytes);
+        const std::uint32_t value = 7;
+        std::memcpy(expected.data() + 4096 + 512, &value, 4);
+        Require(std::memcmp(block, expected.data(), bytes) == 0, "resource/template reuse changed the eager guest result");
+        const auto counters = Trace::Collect(Trace::Clock::now()).counters;
+        const auto count = [&](const char* key) { const auto it = counters.find(key); return it == counters.end() ? 0.0 : it->second; };
+        Require(count("c_gpu_block_publish_publications") >= 5 && count("c_gpu_block_publish_verified") >= 5 && count("c_gpu_block_publish_blocks_rejected") > 0, "the resource template did not exercise verified block publication");
+        Require(count("c_gpu_block_publish_carry_taken") == 4 && count("c_gpu_block_publish_carry_fault") == 1, "the resource template missed untouched carry or CPU-store refusal");
+        Require(count("c_gpu_block_publish_verify_mismatches") == 0, "resource/template publication differs from full reconciliation");
+        std::cout << "block publication " << scenario << " passed\n";
+        return true;
+    }
+    auto memory = std::make_shared<GuestBufferMemory>(context);
+    memory->AllowDeviceStaging();
+    memory->AddWritable(element, elementBytes, false, true);
+    memory->Upload(false);
+    Require(memory->InPlaceReads().empty(), "block publication fixture did not stage its writable input");
+    std::uint32_t adjustment = 0;
+    auto view = memory->Descriptor(element, elementBytes, adjustment);
+    auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, 4, 1);
+    const auto tailOffset = (elementBytes & ~std::size_t{3}) - 4;
+    if (scenario == "partial" || scenario == "unaligned") context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment + tailOffset, 4, 9);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    const auto finish = [&] {
+        memory->RecordCopyBacks(recorder);
+        memory->NoteStagingWrites(recorder);
+        memory->MarkDirectWrites();
+        memory->NoteStagingCarryTokens(recorder);
+    };
+    if (scenario == "between_value") words[128] = 7;
+    if (scenario == "between_identical") words[128] = 0;
+    if (scenario == "own_address_note") {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{element, element + elementBytes}}};
+        memory->NoteStagingAccesses(recorder, [&] { recorder.NotePendingReads(ranges, Recorder::ReadKind::AddressBased, true); });
+    }
+    if (scenario == "gpu_writer") {
+        const auto* imported = HostImportFor(context, element, elementBytes);
+        Require(imported != nullptr, "the GPU alias has no import");
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, imported->buffer, HostImportOffset(*imported, element + 512), 4, 7);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.NotePendingWrite(element + 512, 4);
+    }
+    if (scenario == "deferred") {
+        const void* owner = memory.get();
+        std::vector<Recorder::RunAccess> accesses;
+        memory->RunAccesses(accesses);
+        recorder.DeferDispatchBarrier(0x20, std::span(&owner, 1), accesses);
+        recorder.AfterRun([memory](Recorder& after) {
+            memory->RecordCopyBacks(after);
+            memory->NoteStagingCarryTokens(after);
+        });
+        memory->NoteStagingWrites(recorder);
+        Require(recorder.RunOpen(), "the publication was not deferred");
+        words[128] = 7;
+        Require(recorder.CloseRunOwing(memory.get()), "the deferred publication was not executed");
+    } else finish();
+    if (scenario == "after_record") words[128] = 7;
+    if (scenario == "hle") {
+        GuestArena::GuestArenaBeginHostWrite_nid_postfix(reinterpret_cast<void*>(element + 512), 4);
+        words[128] = 7;
+        GuestArena::GuestArenaEndHostWrite_nid_postfix(reinterpret_cast<void*>(element + 512), 4);
+    }
+    if (late || scenario == "cross_batch" || scenario == "allocation" || scenario == "alias") recorder.Sync();
+    if (scenario == "after_execution" || scenario == "alias") words[128] = 7;
+    if (scenario == "identical") words[0] = 1;
+    if (late) Require(words[0] == 1 && words[128] == (scenario == "identical" ? 0u : 7u), "eager publication lost a CPU store after recording");
+    if (scenario == "allocation") GuestAllocations::Mutation().Add(extra, 65536, true, true, true);
+    if (scenario == "toggle") {
+        const auto* control = std::getenv("APS5_ARCHB_CONTROL_FILE");
+        Require(control != nullptr, "the block toggle fixture has no control file");
+        std::ofstream(control) << "1 C_GPU_BLOCK_PUBLISH=0\n";
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (AgcDriver::ArchB::Switches::Sequence() != 1 && std::chrono::steady_clock::now() < deadline) { AgcDriver::ArchB::Switches::PollControl(); std::this_thread::yield(); }
+        Require(!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish), "block publication did not turn off");
+    }
+    const auto before = GuestBufferMemory::CrossCarry();
+    if (reuse) {
+        if (scenario == "alias") {
+            auto alias = std::make_shared<GuestBufferMemory>(context);
+            alias->AllowDeviceStaging();
+            alias->AddWritable(element, elementBytes - 256, false, true);
+            alias->Upload(false);
+            recorder.Keep(memory);
+            memory = std::move(alias);
+            view = memory->Descriptor(element, elementBytes - 256, adjustment);
+        } else {
+            memory->RecordStagingCopies(recorder);
+            view = memory->Descriptor(element, elementBytes, adjustment);
+        }
+        const auto after = GuestBufferMemory::CrossCarry();
+        if (late || scenario == "toggle" || scenario == "allocation" || scenario == "alias") {
+            Require(after.carried == before.carried, "an invalid block-published shadow was carried");
+            if (scenario != "alias") Require(after.copied == before.copied + 1, "a refused block carry did not copy in afresh");
+            if (scenario == "allocation") Require(after.registry == before.registry + 1, "allocation mutation did not refuse the carry");
+        } else {
+            Require(after.carried == before.carried + 1, "an untouched block-published shadow was not carried");
+            if (scenario == "cross_batch") Require(after.crossBatch == before.crossBatch + 1, "cross-batch carry was not exercised");
+        }
+    }
+    auto downloaded = std::make_shared<Buffer>(context, 516, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, view.buffer, view.offset + adjustment, downloaded->Handle(), 0, 516);
+    recorder.Keep(downloaded);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    if (reuse) finish();
+    recorder.Sync();
+    std::uint32_t gpuFirst = 0, gpuCpu = 0;
+    std::memcpy(&gpuFirst, downloaded->Bytes().data(), 4);
+    std::memcpy(&gpuCpu, downloaded->Bytes().data() + 512, 4);
+    const std::uint32_t expectedFirst = 1;
+    const std::uint32_t expectedCpu = scenario == "before" || scenario == "between_value" || scenario == "deferred" || (late && scenario != "identical") || scenario == "gpu_writer" || scenario == "alias" ? 7u : 0u;
+    Require(gpuFirst == expectedFirst && gpuCpu == expectedCpu, "the private result differs from eager reconciliation");
+    std::vector<std::byte> expected(bytes);
+    std::memcpy(expected.data() + 4096, &expectedFirst, 4);
+    std::memcpy(expected.data() + 4096 + 512, &expectedCpu, 4);
+    if (scenario == "partial" || scenario == "unaligned") {
+        const std::uint32_t tail = 9;
+        std::memcpy(expected.data() + 4096 + tailOffset, &tail, 4);
+    }
+    Require(std::memcmp(block, expected.data(), bytes) == 0, "publication changed guest bytes outside the eager result");
+    const auto counters = Trace::Collect(Trace::Clock::now()).counters;
+    const auto count = [&](const char* key) { const auto it = counters.find(key); return it == counters.end() ? 0.0 : it->second; };
+    Require(count("c_gpu_block_publish_verify_mismatches") == 0, "block publication differs from full reconciliation");
+    if (fallback) {
+        Require(count("c_gpu_block_publish_fallback") == 1 && count("c_gpu_block_publish_publications") == 0 && count("c_gpu_block_publish_blocks_considered") == 0, "an unavailable input proof did not use full reconciliation");
+        if (between || held) Require(count("c_gpu_block_publish_fallback_cpu") == 1, "a CPU store or hold did not refuse block publication");
+        if (scenario == "gpu_writer") Require(count("c_gpu_block_publish_fallback_gpu") == 1, "an intervening GPU writer did not refuse block publication");
+        if (scenario == "unaligned") Require(count("c_gpu_block_publish_fallback_range") == 1, "an unaligned range did not refuse block publication");
+    } else {
+        Require(count("c_gpu_block_publish_publications") >= 1 && count("c_gpu_block_publish_verified") >= 1, "the block publication path was not taken and verified");
+        Require(count("c_gpu_block_publish_blocks_rejected") > 0 && count("c_gpu_block_publish_target_dwords_read") < count("c_gpu_block_publish_blocks_considered") * 64, "block rejection did not avoid guest target reads");
+        if (scenario == "untouched") Require(count("c_gpu_block_publish_blocks_considered") == elementBytes / 256 && count("c_gpu_block_publish_blocks_rejected") == elementBytes / 256 - 1 && count("c_gpu_block_publish_target_dwords_read") == 64, "the single dirty block did not bound guest target reads");
+        if (late) Require(count("c_gpu_block_publish_carry_fault") == 1, "a CPU store after recording did not refuse the block carry");
+        if (scenario == "toggle") Require(count("c_gpu_block_publish_carry_switch") == 1, "turning off block publication did not refuse its carry");
+        if (reuse && !late && scenario != "toggle" && scenario != "allocation" && scenario != "alias") Require(count("c_gpu_block_publish_carry_taken") == 1 && count("c_gpu_block_publish_publications") == 2, "an untouched carry did not allow the next block publication");
+    }
+    if (scenario == "own_address_note") Require(count("c_gpu_block_publish_fallback_gpu") == 0, "own address-based notes invalidated the input proof");
+    if (scenario == "toggle") std::filesystem::remove(std::getenv("APS5_ARCHB_CONTROL_FILE"));
+    std::cout << "block publication " << scenario << " passed\n";
+    return true;
+#else
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    static_cast<void>(scenario);
+    return false;
+#endif
+}
+
 // APS5_ARCHB_GPU_STAGING_CARRY: a reused build's next use in the same batch skips the copy-in of a
 // staged region whose copy-back stored it whole, unless a write was noted over it since or the batch
 // was submitted; off, every use copies in. _VERIFY compares each carried shadow with the import.
@@ -17664,6 +17910,14 @@ void smallElementDetileTests(Device& device) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    if (argc == 3 && std::string_view(argv[1]) == "--block-publish" && std::string_view(argv[2]) == "toggle") {
+        const auto* scratch = std::getenv("ANYPS5_TEST_SCRATCH");
+        const auto path = (scratch != nullptr ? std::filesystem::path(scratch) : std::filesystem::temp_directory_path()) / ("R3b-control-" + std::to_string(GetCurrentProcessId()) + ".txt");
+        std::filesystem::remove(path);
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", path.string().c_str());
+    }
+#endif
     _ZSt13set_terminatePFvvE_nid_postfix([] {
         std::fflush(nullptr);
         std::cout.flush();
@@ -18073,6 +18327,7 @@ int main(int argc, char** argv) {
             parkedImportUnmapTests(device);
             return 0;
         }
+        if (argc == 3 && std::string_view(argv[1]) == "--block-publish") return blockPublishTests(device, recorder, argv[2]) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--changed-copy-only") {
             changedCopyTests(device, recorder);
             return 0;

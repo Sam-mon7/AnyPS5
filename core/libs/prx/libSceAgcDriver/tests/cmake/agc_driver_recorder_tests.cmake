@@ -464,6 +464,16 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_sparse_run_import_copied COMMAND agc_driver_recorder_tests --sparse-run-copied-only)
     set_tests_properties(agc_sparse_run_import_copied PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        foreach(blockCase IN ITEMS untouched before between_value between_identical after_record after_execution untracked excluded held partial unaligned gpu_writer same_batch cross_batch toggle allocation alias deferred identical hle own_address_note resources resources_deferred)
+            add_test(NAME agc_gpu_block_publish_${blockCase} COMMAND agc_driver_recorder_tests --block-publish ${blockCase})
+            set_tests_properties(agc_gpu_block_publish_${blockCase} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                ENVIRONMENT "APS5_ARCHB_C_GPU_BLOCK_PUBLISH=1;APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_C_WATCH_SPLIT=0;APS5_ARCHB_C_GPU_BLOCK_PUBLISH_VERIFY=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>"
+                FAIL_REGULAR_EXPRESSION "VUID-;was not found but was requested by env var VK_INSTANCE_LAYERS")
+        endforeach()
+        set_property(TEST agc_gpu_block_publish_toggle APPEND PROPERTY ENVIRONMENT "APS5_ARCHB_GATE_RUN=1")
+    endif()
     add_test(NAME agc_changed_copy COMMAND agc_driver_recorder_tests --changed-copy-only)
     set_tests_properties(agc_changed_copy PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
