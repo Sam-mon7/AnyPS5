@@ -364,12 +364,24 @@ void Driver::execute(const Submission& submission) {
                 recorder->EndComputeChain(force);
             }
         }
-        if ((header >> 30u) == 3u && statePacket(opcode) && !(Pm4::Predicated(header) && queue.predication.operation != 0) && !profilePackets && !Timeline::Enabled && !CaptureTrace::Enabled() && !(submission.queue == 0 && DrawFinisher::Busy()) && !(submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) && ArchB::Switches::Enabled(ArchB::Feature::FixStatePacketFast)) {
-            Pm4::Execute(packet, queue);
-            if (submission.queue == 0 && pendingFrameTiming != nullptr) pendingFrameTiming->NotePacket(submission.serial, cursor, opcode, count, {});
-            ++statePacketsFast;
-            cursor += count;
-            continue;
+        if ((header >> 30u) == 3u && (statePacket(opcode) || Pm4::IndirectRegisterOpcode(opcode)) && !(Pm4::Predicated(header) && queue.predication.operation != 0) && !profilePackets && !Timeline::Enabled && !CaptureTrace::Enabled() && !(submission.queue == 0 && DrawFinisher::Busy()) && !(submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) && ArchB::Switches::Enabled(ArchB::Feature::FixStatePacketFast)) {
+            const std::vector<std::uint32_t>* listed = nullptr;
+            if (Pm4::IndirectRegisterOpcode(opcode) && (!pipelined || keepIndirectRegs != nullptr)) {
+                const auto found = submission.registerLists.find(cursor);
+                if (found != submission.registerLists.end() && Pm4::IndirectRegistersValid(found->second)) listed = &found->second;
+            }
+            if (listed != nullptr || statePacket(opcode)) {
+                if (listed == nullptr) {
+                    Pm4::Execute(packet, queue);
+                } else {
+                    if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::CountKeptIndirectRegisters();
+                    Pm4::ExecuteIndirectRegisters(packet, *listed, queue);
+                }
+                if (submission.queue == 0 && pendingFrameTiming != nullptr) pendingFrameTiming->NotePacket(submission.serial, cursor, opcode, count, {});
+                ++statePacketsFast;
+                cursor += count;
+                continue;
+            }
         }
         Timeline::PacketScope timelinePacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.serial, cursor);
         auto nextCursor = cursor + count;
