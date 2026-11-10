@@ -185,10 +185,10 @@ public:
     // batch after the point, and any queued store over the range: whether recorded work since the
     // point may read or write [begin, end) through the import.
     bool AccessedSince(const NotePoint& point, std::uint64_t begin, std::uint64_t end) const;
-    std::uint64_t WatchCarry(std::uint64_t begin, std::uint64_t end);
+    std::uint64_t WatchCarry(std::uint64_t begin, std::uint64_t end, bool input = false);
     bool TakeCarry(std::uint64_t id);
     void DropCarry(std::uint64_t id);
-    std::size_t CarryWatches() const { return carryWatches.size(); }
+    std::size_t CarryWatches() const { std::size_t count = 0; for (const auto& watch : carryWatches) count += !watch.input; return count; }
     static constexpr std::size_t CarryWatchLimit = 512;
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
@@ -422,7 +422,7 @@ public:
     void CountSamples();
     bool CountingSamples() const { return countingSamples; }
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
-    bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0, bool reconcile = false);
+    bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0, bool reconcile = false, bool blockPublish = false);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -1203,6 +1203,7 @@ private:
         std::uint64_t begin;
         std::uint64_t end;
         std::uint64_t id;
+        bool input;
     };
     std::vector<CarryWatch> carryWatches;
     std::uint64_t carryWatchIds = 0;

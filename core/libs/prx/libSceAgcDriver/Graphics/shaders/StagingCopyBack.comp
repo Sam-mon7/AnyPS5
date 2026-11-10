@@ -9,6 +9,8 @@ layout(push_constant) uniform Parameters {
     Words snapshot;
     Words target;
     Words counter;
+    Words reference;
+    Words stats;
     uint count;
     uint always;
 } parameters;
@@ -20,11 +22,38 @@ uint differingBytes(uint difference) {
     return (folded & 0x01010101u) * 0xffu;
 }
 
+shared uint blockChanged;
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
-    if (index >= parameters.count) return;
-    uint value = parameters.result.words[index];
-    uint before = parameters.snapshot.words[index];
+    bool validIndex = index < parameters.count;
+    if ((parameters.always & 16u) != 0u) {
+        if (validIndex) {
+            parameters.reference.words[index] = parameters.result.words[index];
+            parameters.reference.words[parameters.count + index] = parameters.snapshot.words[index];
+            parameters.reference.words[2u * parameters.count + index] = parameters.target.words[index];
+        }
+        return;
+    }
+    if ((parameters.always & 32u) != 0u) {
+        if (validIndex && (parameters.result.words[index] != parameters.reference.words[index] || parameters.snapshot.words[index] != parameters.reference.words[parameters.count + index] || parameters.target.words[index] != parameters.reference.words[2u * parameters.count + index])) atomicAdd(parameters.stats.words[3], 1u);
+        return;
+    }
+    uint value = validIndex ? parameters.result.words[index] : 0u;
+    uint before = validIndex ? parameters.snapshot.words[index] : 0u;
+    if ((parameters.always & 4u) != 0u) {
+        if (gl_LocalInvocationIndex == 0u) blockChanged = 0u;
+        barrier();
+        if (validIndex && value != before) atomicOr(blockChanged, 1u);
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && (parameters.always & 8u) != 0u) {
+            atomicAdd(parameters.stats.words[0], 1u);
+            if (blockChanged == 0u) atomicAdd(parameters.stats.words[1], 1u);
+            else atomicAdd(parameters.stats.words[2], min(64u, parameters.count - gl_WorkGroupID.x * 64u));
+        }
+        if (blockChanged == 0u) return;
+    }
+    if (!validIndex) return;
     uint held = parameters.target.words[index];
     uint changed = differingBytes(value ^ before);
     uint kept = differingBytes(held ^ before);

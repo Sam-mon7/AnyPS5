@@ -6160,6 +6160,13 @@ bool liveCpuProof(std::uint64_t begin, std::uint64_t end, std::uint64_t clock, s
 
 std::atomic<GuestBufferMemory::CarryCpuProof> cpuProof{&liveCpuProof};
 
+bool blockCarryProof(std::uint64_t begin, std::uint64_t end, std::uint64_t clock, std::uint64_t generation) {
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    const char* refused = !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish) ? "c_gpu_block_publish_carry_switch" : clock == 0 || generation == 0 ? "c_gpu_block_publish_carry_untracked" : !GuestMemory::FaultUnchangedSince(begin, bytes, clock) ? "c_gpu_block_publish_carry_fault" : !GuestMemory::UnchangedSince(begin, bytes, generation) ? "c_gpu_block_publish_carry_stamp" : nullptr;
+    AgcDriver::ArchB::Recorder::Count(refused != nullptr ? refused : "c_gpu_block_publish_carry_taken");
+    return refused == nullptr;
+}
+
 struct ShadowPool {
     AgcDriver::Mutex mutex;
     std::map<std::tuple<VkDevice, std::uint64_t, std::uint64_t, VkBufferUsageFlags>, std::weak_ptr<void>> shadows;
@@ -6920,6 +6927,16 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         recorder->DropCarry(std::exchange(carryToken(*region).watch, 0));
         beginCarryUse(*region);
+        region->blockPublished = false;
+        recorder->DropCarry(std::exchange(region->inputWatch, 0));
+        region->inputClock = 0;
+        region->inputAllocations = 0;
+        if (region->deviceLocal && changedCopyBacks(context) && region->buffer->DeviceAddress() != 0 && Recorder::ReadTracking() && WritesOverlap(region->begin, static_cast<std::size_t>(bytes)) && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish)) {
+            static_cast<void>(GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes)));
+            region->inputClock = GuestMemory::FaultClock();
+            region->inputAllocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            region->inputWatch = recorder->WatchCarry(region->begin, region->end, true);
+        }
         std::vector<std::byte> expected;
         const auto address = region->begin;
         const auto batch = static_cast<unsigned long long>(recorder->Submissions() + 1);
@@ -7063,6 +7080,16 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         const bool wholeRegion = region.deviceLocal && region.buffer != nullptr && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
         const bool reconcile = wholeRegion && region.shadowCopy != nullptr && region.copySourceAddress != 0 && region.begin % 4u == 0 && region.end % 4u == 0 && region.copySourceBase % 4u == 0 && (stagingCarry::Enabled() || crossCarry::Enabled());
         bool reconciled = false;
+        const bool blockEnabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish);
+        const bool gpuUntouched = region.inputWatch != 0 && recorder.TakeCarry(std::exchange(region.inputWatch, 0));
+        const bool cpuTracked = region.inputClock != 0;
+        const bool cpuUntouched = cpuTracked && region.inputAllocations == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && GuestMemory::FaultUnchangedSince(region.begin, static_cast<std::size_t>(region.end - region.begin), region.inputClock);
+        const bool blockPublish = blockEnabled && reconcile && gpuUntouched && cpuUntouched;
+        region.blockPublished = false;
+        if (blockEnabled) {
+            ArchB::Recorder::Count(blockPublish ? "c_gpu_block_publish_publications" : "c_gpu_block_publish_fallback");
+            if (!blockPublish) ArchB::Recorder::Count(!reconcile ? "c_gpu_block_publish_fallback_range" : !cpuTracked ? "c_gpu_block_publish_fallback_untracked" : !gpuUntouched ? "c_gpu_block_publish_fallback_gpu" : "c_gpu_block_publish_fallback_cpu");
+        }
         const bool lazyWhole = lazy && region.shadowCopy == nullptr && wholeRegion;
         if (lazy && region.shadowCopy != nullptr) lazyCopyBack::counters().refusedBaseline.fetch_add(1, std::memory_order_relaxed);
         if (lazy && region.buffer != nullptr && !lazyWhole) lazyCopyBack::state().pending.erase(region.buffer->Handle());
@@ -7150,8 +7177,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
                     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
                 }
-                if (alignedFrom < alignedTo && recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), counter != nullptr ? counter->DeviceAddress() : 0, reconcile)) {
+                if (alignedFrom < alignedTo && recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), counter != nullptr ? counter->DeviceAddress() : 0, reconcile, blockPublish)) {
                     reconciled = reconcile;
+                    region.blockPublished = blockPublish;
+                    if (blockEnabled && !blockPublish) ArchB::Recorder::Count("c_gpu_block_publish_fallback_target_dwords_read", static_cast<double>((alignedTo - alignedFrom) / 4u));
                     if (counter != nullptr) {
                         recorder.Keep(counter);
                         recorder.OnComplete([counter, alignedFrom, alignedTo, regionBegin = region.begin, regionEnd = region.end] {
@@ -7520,6 +7549,20 @@ void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& o
     for (const auto& [begin, end] : writes) out.push_back({begin, end, Recorder::RunAccessWritten});
 }
 
+void GuestBufferMemory::NoteStagingAccesses(Recorder& recorder, const std::function<void()>& notes) {
+    std::vector<Region*> guarded;
+    for (auto& region : regions) {
+        if (!region.gpuCopy || !region.deviceLocal || region.copiedBack || region.inputWatch == 0) continue;
+        if (recorder.TakeCarry(std::exchange(region.inputWatch, 0))) guarded.push_back(&region);
+    }
+    notes();
+    for (auto* region : guarded) if (!region->copiedBack) region->inputWatch = recorder.WatchCarry(region->begin, region->end, true);
+}
+
+void GuestBufferMemory::NoteStagingWrites(Recorder& recorder) {
+    NoteStagingAccesses(recorder, [&] { recorder.NotePendingWrites(writes); });
+}
+
 void GuestBufferMemory::MarkStagedWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
@@ -7848,8 +7891,10 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        recorder.DropCarry(std::exchange(region.inputWatch, 0));
         auto& held = carryToken(region);
         const auto watch = std::exchange(held.watch, 0);
+        const bool partial = held.kind == CarryKind::BlockPublished;
         if (cross) {
             auto& c = crossCarry::counters();
             const bool token = watch != 0;
@@ -7863,9 +7908,9 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
                 crossCarry::count(c.noToken, "c_gpu_staging_carry_no_token");
             } else if (!recorder.TakeCarry(watch)) {
                 crossCarry::count(c.noted, "c_gpu_staging_carry_noted");
-            } else if (!sameBatch && held.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+            } else if ((partial || !sameBatch) && held.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
                 crossCarry::count(c.registry, "c_gpu_staging_carry_registry");
-            } else if (!sameBatch && !crossCarry::cpuProof.load(std::memory_order_relaxed)(region.begin, region.end, held.clock, held.generation)) {
+            } else if (partial ? !crossCarry::blockCarryProof(region.begin, region.end, held.clock, held.generation) : !sameBatch && !crossCarry::cpuProof.load(std::memory_order_relaxed)(region.begin, region.end, held.clock, held.generation)) {
                 crossCarry::count(c.cpu, "c_gpu_staging_carry_cpu");
             } else {
                 take = true;
@@ -7879,6 +7924,14 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
                     crossCarry::count(c.crossBytes, "c_gpu_staging_carry_cross_bytes", region.end - region.begin);
                 }
                 beginCarryUse(region);
+                region.blockPublished = false;
+                region.inputClock = 0;
+                region.inputAllocations = 0;
+                if (region.shadowCopy != nullptr && Recorder::ReadTracking() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish)) {
+                    region.inputClock = held.clock;
+                    region.inputAllocations = held.allocations;
+                    region.inputWatch = recorder.WatchCarry(region.begin, region.end, true);
+                }
                 carried.push_back(&region);
                 continue;
             }
@@ -7893,7 +7946,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-back left it: the shadow's bytes. A CPU store into the region after that use was
         // recorded lands before the batch runs, so its copy-back overwrites it either way. Queued
         // label and key stores over the region are recorded first, so they count as noted writes.
-        const bool point = carry && region.copiedBack && region.carrySerial != 0 && region.carryWhole;
+        const bool point = carry && !region.blockPublished && region.copiedBack && region.carrySerial != 0 && region.carryWhole;
         region.copiedBack = false;
         if (carry) {
             if (!point) {
@@ -8010,11 +8063,12 @@ void GuestBufferMemory::NoteStagingCarryTokens(Recorder& recorder) {
             continue;
         }
         static_cast<void>(GuestMemory::CollectWrites(region.begin, size));
+        token.kind = region.blockPublished ? CarryKind::BlockPublished : CarryKind::Reconciled;
         token.watch = recorder.WatchCarry(region.begin, region.end);
         token.serial = recorder.OpenSerial();
-        token.clock = GuestMemory::FaultClock();
+        token.clock = region.blockPublished ? region.inputClock : GuestMemory::FaultClock();
         token.generation = GuestMemory::WriteGeneration();
-        token.allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        token.allocations = region.blockPublished ? region.inputAllocations : GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         crossCarry::count(crossCarry::counters().tokens, "c_gpu_staging_carry_tokens");
     }
 }
