@@ -269,9 +269,13 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
     auto& counters = drawRelocationCounters;
     ++counters.lookups;
     const auto found = drawAliases.find(alias);
-    if (found == drawAliases.end()) return;
+    if (found == drawAliases.end()) {
+        ArchB::Recorder::Count("draw_reloc_alias_unknown");
+        return;
+    }
     const auto cached = drawCache.find(found->second);
     if (cached == drawCache.end()) {
+        ArchB::Recorder::Count("draw_reloc_donor_evicted");
         drawAliases.erase(found);
         return;
     }
@@ -291,8 +295,12 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             if (current != program.userData[index]) moves.push_back({i, index, program.userData[index], current});
         }
     }
-    if (moves.empty()) return;
+    if (moves.empty()) {
+        ArchB::Recorder::Count("draw_reloc_no_moves");
+        return;
+    }
     ++counters.donors;
+    ArchB::Recorder::Count("draw_reloc_donors");
     auto relocated = std::make_shared<DrawEntry>();
     relocated->decode = donor->decode;
     relocated->donor = donor->donor != nullptr ? donor->donor : donor;
@@ -307,6 +315,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             if (variant == nullptr || variant->compiled == nullptr) continue;
             const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || (variant->valueWords >> move.index & 1u) != 0)); });
             if (!allowed) {
+                ArchB::Recorder::Count("draw_reloc_refused");
                 ++counters.refused;
                 continue;
             }

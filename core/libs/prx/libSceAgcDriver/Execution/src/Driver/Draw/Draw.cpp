@@ -673,10 +673,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
         const auto found = drawCache.find(drawKey);
         if (found != drawCache.end()) {
+            ArchB::Recorder::Count("draw_reloc_direct");
             entry = found->second;
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
+            ArchB::Recorder::Count(!drawRelocationEnabled() ? "draw_reloc_absent_off" : relocation != nullptr ? "draw_reloc_absent_shape" : drawRelocations.contains(drawIdentity) ? "draw_reloc_absent_idle" : "draw_reloc_absent_no_shape");
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
@@ -685,6 +687,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
+            else if (relocation != nullptr) ArchB::Recorder::Count("draw_reloc_alias_zero");
+            ArchB::Recorder::Count(entry != nullptr ? "draw_reloc_entry" : "draw_reloc_none");
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
                 ++trial.lookups;
