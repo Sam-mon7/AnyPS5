@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 
 namespace ShaderRecompiler::Detail {
@@ -254,6 +255,7 @@ private:
                 node.clean = current.clean;
                 node.loaded = LoadedFromMemory(*handle);
                 node.source = value;
+                node.parentRead = RawReadSource(plan, handle->Argument(0));
                 if (IrValue* low = handle->Argument(0); low != nullptr) {
                     low = low->Resolve();
                     if (!low->HasImmediate() && low->Opcode() == IrOpcode::GetUserData && low->ArgumentCount() >= 1 && low->Argument(0) != nullptr) {
@@ -380,6 +382,7 @@ struct SrtTape::Frame {
     bool nullRoot = false;
     std::uint32_t addressDepth = 0;
     std::size_t descriptorBytes = 0;
+    std::unordered_map<const IrValue*, std::uint64_t> readAddresses;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -500,7 +503,12 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 frame.nullRoot = true;
                 return false;
             }
-            if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
+            if (frame.runtime.userDataUse != nullptr) {
+                const auto parent = frame.readAddresses.find(node.parentRead);
+                frame.runtime.userDataUse->reads.emplace_back(address, origin);
+                frame.runtime.userDataUse->nested.emplace_back(address, parent != frame.readAddresses.end() ? parent->second : 0);
+                frame.readAddresses[node.source] = address;
+            }
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
                 if (trace->profile) trace->slotReads.emplace_back(node.source, address);
@@ -623,6 +631,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
     const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
+    const auto nestedBefore = use != nullptr ? use->nested.size() : 0;
     const auto refuse = [&] {
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
@@ -634,6 +643,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             use->asBase = baseBefore;
             use->asValue = valueBefore;
             use->reads.resize(useReadsBefore);
+            use->nested.resize(nestedBefore);
         }
         profileWalk(fast, pooled, grew, false, fast ? activityEntries : 0u);
         return false;

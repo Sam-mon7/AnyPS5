@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -131,7 +132,7 @@ std::uint64_t Driver::drawIdentityKey(const QueueState& queue, const ShaderRegis
     return key == 0 ? 1 : key;
 }
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, std::array<std::uint64_t, 5>* components, const DrawRelocation* relocation, std::uint64_t* alias) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape, std::array<std::uint64_t, 5>* components, const DrawRelocation* relocation, std::uint64_t* alias, bool nested) {
     const bool aliased = alias != nullptr && relocation != nullptr && !relocation->words.empty();
     bool readable = true;
     std::uint64_t other = 0x6c62272e07bb0142ull;
@@ -150,7 +151,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         forEachKeyedUserWord(queue, allUserWords, [&](std::uint32_t offset, std::uint32_t value) {
             mixOther(offset);
             const auto word = std::find_if(relocation->words.begin(), relocation->words.end(), [&](const RelocatableUserWord& candidate) { return candidate.reg == offset; });
-            mixOther(word != relocation->words.end() ? relocatedContentKey(*word, value, readable) : value);
+            mixOther(word != relocation->words.end() ? (nested ? nestedContentKey(*word, value, readable, ArchB::Switches::Enabled(ArchB::Feature::FixDrawRelocNested)) : relocatedContentKey(*word, value, readable)) : value);
         });
         mixOther(deviceSerial);
     }

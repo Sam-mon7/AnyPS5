@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -24,6 +26,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <thread>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -235,6 +241,53 @@ void SplitRunsNameTheirSharedWords() {
     std::size_t first = 0;
     for (std::size_t run = 0; run < shared.region && run < variant.runs.size(); ++run) first += static_cast<std::size_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t));
     Require(shared.region < variant.runs.size() && variant.runs[shared.region].first == tableAddress && first == shared.first, "the shared words of a variant whose runs were split for relocation name run " + std::to_string(shared.region) + " of " + std::to_string(variant.runs.size()) + ", not the table's run " + std::to_string(variant.runs.size() - 1u));
+
+    const std::array<std::uint32_t, 4> pointers{0x2000u, 0u, 0x3000u, 0u};
+    const std::array<std::uint32_t, 4> child{0x4000u, 0u, 1u, 2u};
+    const std::array<ShaderRecompiler::MemoryRegion, 4> nestedRegions{{{0x1000u, std::as_bytes(std::span(pointers))}, {0x2010u, std::as_bytes(std::span(child))}, {0x3010u, std::as_bytes(std::span(data))}, {0x4010u, std::as_bytes(std::span(data))}}};
+    ShaderRecompiler::SrtUserDataUse nestedUse;
+    nestedUse.asBase = 1u;
+    for (std::uint64_t offset = 0; offset < 16u; offset += 4u) {
+        nestedUse.reads.emplace_back(0x1000u + offset, 0);
+        nestedUse.reads.emplace_back(0x2010u + offset, -1);
+        nestedUse.reads.emplace_back(0x3010u + offset, -1);
+        nestedUse.reads.emplace_back(0x4010u + offset, -1);
+        nestedUse.nested.emplace_back(0x2010u + offset, 0x1000u);
+        nestedUse.nested.emplace_back(0x3010u + offset, offset < 8u ? 0x1000u : 0x1008u);
+        nestedUse.nested.emplace_back(0x4010u + offset, 0x2010u);
+    }
+    AgcDriver::DriverDetail::DispatchVariant nested;
+    AgcDriver::DriverDetail::Driver::tagVariantRuns(nested, nestedRegions, nestedUse, true, 0);
+    Require(nested.runParents.size() == nested.runs.size() && nested.runBases.size() == nested.runs.size(), "nested relocation: provenance length differs from the run list");
+    Require(nested.runParents[1] == AgcDriver::DriverDetail::DispatchVariant::RunParent{0u, 0u} && nested.runParents[3] == AgcDriver::DriverDetail::DispatchVariant::RunParent{1u, 0u}, "nested relocation: child or grandchild lost its supplying pointer position");
+    Require(nested.runParents[2].run == AgcDriver::DriverDetail::DispatchVariant::NoFlatBinding, "nested relocation: a run read through two pointers acquired a parent");
+
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, 2> descriptors{{{0x123400u, 0x000c0002u, 16u, 0x4a3acu}, {0x567800u, 0x000c0003u, 32u, 0x4a3acu}}};
+    alignas(16) static std::array<std::uint64_t, 2> roots{reinterpret_cast<std::uintptr_t>(descriptors[0].data()), reinterpret_cast<std::uintptr_t>(descriptors[1].data())};
+    const auto root = reinterpret_cast<std::uintptr_t>(&roots[0]);
+    const auto leaf = roots[0];
+    const std::array<ShaderRecompiler::MemoryRegion, 2> aliasRegions{{{root, std::as_bytes(std::span(&roots[0], 1))}, {leaf, std::as_bytes(std::span(descriptors[0]))}}};
+    ShaderRecompiler::SrtUserDataUse aliasUse;
+    aliasUse.asBase = 1u;
+    aliasUse.reads = {{root, 0}, {root + 4u, 0}};
+    for (std::uint64_t offset = 0; offset < 16u; offset += 4u) {
+        aliasUse.reads.emplace_back(leaf + offset, -1);
+        aliasUse.nested.emplace_back(leaf + offset, root);
+    }
+    auto aliasVariant = std::make_shared<AgcDriver::DriverDetail::DispatchVariant>();
+    AgcDriver::DriverDetail::Driver::tagVariantRuns(*aliasVariant, aliasRegions, aliasUse, true, 0);
+    aliasVariant->bufferBaseMasks = {{2u, 0xfffffffcu}, {3u, 0xffffu}};
+    aliasVariant->dataPositions = {4u};
+    AgcDriver::DriverDetail::RelocatableUserWord word{0u, {}};
+    word.nestedVariant = aliasVariant;
+    word.nestedBase = static_cast<std::uint32_t>(root) & ~3u;
+    bool readable = true;
+    const auto originalAlias = AgcDriver::DriverDetail::Driver::nestedContentKey(word, static_cast<std::uint32_t>(root), readable);
+    const auto movedAlias = AgcDriver::DriverDetail::Driver::nestedContentKey(word, static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&roots[1])), readable);
+    Require(readable && originalAlias == movedAlias, "nested census: moving both tables or changing masked descriptor words changed the alias");
+    descriptors[1][3] ^= 1u;
+    const auto materialAlias = AgcDriver::DriverDetail::Driver::nestedContentKey(word, static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&roots[1])), readable);
+    Require(readable && originalAlias != materialAlias, "nested census: different second-level material content shared an alias");
 }
 
 class TiledTarget {
@@ -363,10 +416,173 @@ void MovedForwardedWordReachesStageDataHit(bool libraries) {
     Require(moved.empty(), mode + ": a relocated stage data hit did not draw with the moved user word: " + moved);
 }
 
+void NestedSpeculationRefusesProtectionChanges() {
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    auto* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    Require(block != nullptr, "nested speculation: cannot allocate guest pages");
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+#else
+    auto* block = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(block != MAP_FAILED, "nested speculation: cannot map pages");
+#endif
+    std::array<std::uint32_t, 4> content{1, 2, 3, 4};
+    std::memcpy(block, content.data(), sizeof(content));
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    std::uint64_t pointer = address;
+    const auto root = reinterpret_cast<std::uintptr_t>(&pointer);
+    auto variant = std::make_shared<AgcDriver::DriverDetail::DispatchVariant>();
+    variant->runs = {{root, root + 8}, {address, address + sizeof(content)}};
+    variant->runBases = {0, -1};
+    variant->runParents = {{}, {0, 0}};
+    variant->words.resize(6);
+    std::memcpy(variant->words.data(), &pointer, sizeof(pointer));
+    std::memcpy(variant->words.data() + 2, content.data(), sizeof(content));
+    AgcDriver::DriverDetail::RelocatableUserWord word{0, {}};
+    word.nestedVariant = variant;
+    word.nestedBase = static_cast<std::uint32_t>(root) & ~3u;
+    bool readable = true;
+    static_cast<void>(AgcDriver::DriverDetail::Driver::nestedContentKey(word, static_cast<std::uint32_t>(root), readable));
+    Require(readable, "nested speculation: the mapped child was refused");
+    Require(AgcDriver::GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content))) == AgcDriver::GuestMemory::Compare::Equal, "nested speculation: cannot prime the mapped-page cache");
+#ifdef _WIN32
+    DWORD previous = 0;
+    Require(VirtualProtect(block, bytes, PAGE_NOACCESS, &previous) != 0, "nested speculation: cannot protect pages outside guest invalidation");
+    const bool cachedReadable = AgcDriver::GuestMemory::Accessible(block, sizeof(content));
+#else
+    Require(mprotect(block, bytes, PROT_NONE) == 0, "nested speculation: cannot protect pages");
+    const bool cachedReadable = true;
+#endif
+    const auto copied = AgcDriver::GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content)), true);
+    readable = true;
+    static_cast<void>(AgcDriver::DriverDetail::Driver::nestedContentKey(word, static_cast<std::uint32_t>(root), readable));
+#ifdef _WIN32
+    DWORD ignored = 0;
+    const bool restored = VirtualProtect(block, bytes, previous, &ignored) != 0;
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+#else
+    const bool restored = munmap(block, bytes) == 0;
+#endif
+    Require(restored && cachedReadable, "nested speculation: the stale cached-permission case was not exercised or restored");
+    Require(copied == AgcDriver::GuestMemory::Compare::Unmapped && !readable, "nested speculation: a protected child was read through stale cached page permissions");
+}
+
+void NestedRelocationPath(const std::filesystem::path& control) {
+    using D = AgcDriver::DriverDetail::Driver;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    using R = AgcDriver::ArchB::Recorder;
+    alignas(256) static constexpr std::array<std::uint32_t, 16> code{
+        0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu,
+        0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u,
+        0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+    alignas(8) static Header header{};
+    alignas(256) static std::array<std::array<float, 64>, 12> data{};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, 12> descriptors{};
+    alignas(16) static std::array<std::array<std::uint64_t, 2>, 12> roots{};
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code.data(), sizeof(code), 1);
+    for (std::size_t index = 0; index < roots.size(); ++index) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data[index].data());
+        const bool second = index == 8 || index == 9 || index == 11;
+        data[index][0] = second ? 1.0f : 0.25f;
+        descriptors[index] = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), second ? 32u : 64u, 0x30016facu};
+        roots[index][0] = reinterpret_cast<std::uintptr_t>(descriptors[index].data());
+    }
+    unsigned sequence = 0;
+    const auto enable = [&](bool enabled) {
+        std::ofstream(control, std::ios::trunc) << ++sequence << " RECORDER=1 FIX_DRAW_RELOC_NESTED=" << enabled << " FIX_BUFFER_BASE_REFRESH=1\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        S::PollControl();
+        Require(S::Enabled(F::FixDrawRelocNested) == enabled, "nested relocation: runtime switch did not apply");
+        R::Boundary(true, sequence, R::Clock::now());
+    };
+    const auto draw = [&](std::size_t index) {
+        ColorMemory.fill(std::byte{0x40});
+        auto commands = DrawFrom({roots[index].data()}, TriangleVertexCode.data(), code.data());
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "nested relocation: submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+        return D::Get().DrawCacheCounters();
+    };
+    const auto requirePixels = [&](std::uint8_t red) {
+        std::size_t written = 0;
+        for (std::size_t offset = 0; offset < ColorMemory.size(); offset += 4) {
+            if (ColorMemory[offset + 1] == std::byte{0x40}) continue;
+            Require(ColorMemory[offset] == static_cast<std::byte>(red) && ColorMemory[offset + 1] == std::byte{0} && ColorMemory[offset + 2] == std::byte{0} && ColorMemory[offset + 3] == static_cast<std::byte>(red), "nested relocation: the rendered buffer value was stale");
+            ++written;
+        }
+        Require(written != 0, "nested relocation: the draw wrote no pixels");
+    };
+    enable(true);
+    const auto before = D::Get().DrawCacheCounters();
+    for (std::size_t index = 0; index < 6; ++index) draw(index);
+    for (std::size_t index = 0; index < 6; ++index) data[index][0] = 0.0f;
+    const auto taught = D::Get().DrawCacheCounters();
+    const auto relocated = draw(6);
+    Require(relocated.hits == taught.hits + 1 && relocated.hits > before.hits, "nested relocation: moving both tables did not hit the draw cache");
+    requirePixels(64);
+    const auto image = ColorMemory;
+    const auto counts = R::Collect(R::Clock::now()).counters;
+    const auto hits = counts.find("fix_draw_reloc_nested_hits");
+    Require(hits != counts.end() && hits->second > 0, "nested relocation: no nested-relocated hit was exercised");
+    if (std::getenv("APS5_ARCHB_FIX_DRAW_RELOC_NESTED_VERIFY") != nullptr) {
+        const auto checked = counts.find("fix_draw_reloc_nested_verified");
+        const auto mismatches = counts.find("fix_draw_reloc_nested_verify_mismatches");
+        Require(checked != counts.end() && checked->second == hits->second && (mismatches == counts.end() || mismatches->second == 0), "nested relocation: full capture disagreed with the relocated hit");
+    }
+    enable(false);
+    const auto fresh = draw(7);
+    Require(fresh.hits == relocated.hits, "nested relocation: the disabled switch accepted a nested relocation");
+    requirePixels(64);
+    Require(image == ColorMemory, "nested relocation: the relocated image differs from the full-capture image with the switch off");
+    enable(true);
+    const auto changed = draw(8);
+    Require(changed.hits == fresh.hits, "nested relocation: an unmasked child descriptor word change hit the old material");
+    draw(8);
+    draw(8);
+    const auto materialBefore = D::Get().DrawCacheCounters();
+    const auto second = draw(9);
+    Require(second.hits == materialBefore.hits + 1, "nested relocation: the second material did not retain its own alias");
+    requirePixels(255);
+    const auto first = draw(10);
+    Require(first.hits == second.hits + 1, "nested relocation: the first material lost its alias to the second material");
+    requirePixels(64);
+    Require(image == ColorMemory, "nested relocation: materials shared a cross hit");
+    const auto again = draw(11);
+    Require(again.hits == first.hits + 1, "nested relocation: alternating materials did not retain two aliases");
+    requirePixels(255);
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--nested-copy") {
+            NestedSpeculationRefusesProtectionChanges();
+            return 0;
+        }
+        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels")) {
+            struct Control {
+                std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-nested-relocation-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+                ~Control() { std::filesystem::remove(path); }
+            } control;
+#ifdef _WIN32
+            _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+            _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+#else
+            setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+            setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+#endif
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            NestedRelocationPath(control.path);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";
+            return 0;
+        }
         const bool evicted = argc == 2 && std::string(argv[1]) == "--evicted";
         const bool kept = argc == 2 && std::string(argv[1]) == "--kept";
         if (!evicted && !kept) SplitRunsNameTheirSharedWords();

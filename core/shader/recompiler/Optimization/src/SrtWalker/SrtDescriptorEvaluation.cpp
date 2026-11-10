@@ -254,6 +254,7 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
     const auto useReadsBefore = use != nullptr ? use->reads.size() : 0;
+    const auto nestedBefore = use != nullptr ? use->nested.size() : 0;
     const auto runWithRetry = [&](auto evaluateFn) {
         for (std::uint32_t attempt = 0; attempt < 3u; ++attempt) {
             if (attempt != 0u) {
@@ -266,6 +267,7 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
                     use->asBase = baseBefore;
                     use->asValue = valueBefore;
                     use->reads.resize(useReadsBefore);
+                    use->nested.resize(nestedBefore);
                 }
             }
             const SrtForceSyncScope forceSync(runtime, attempt == 2u);
@@ -305,7 +307,13 @@ bool sameUserDataUse(const SrtUserDataUse& tape, const SrtUserDataUse& interpret
         std::sort(reads->begin(), reads->end());
         reads->erase(std::unique(reads->begin(), reads->end()), reads->end());
     }
-    return tapeReads == interpretedReads;
+    auto tapeNested = tape.nested;
+    auto interpretedNested = interpreted.nested;
+    for (auto* reads : {&tapeNested, &interpretedNested}) {
+        std::sort(reads->begin(), reads->end());
+        reads->erase(std::unique(reads->begin(), reads->end()), reads->end());
+    }
+    return tapeReads == interpretedReads && tapeNested == interpretedNested;
 }
 
 void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, std::size_t slotsBefore, const SrtUserDataUse* useBefore) {

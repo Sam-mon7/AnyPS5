@@ -112,6 +112,8 @@ public:
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {});
     static void tagUserValueWords(DispatchVariant& variant, const DrawProgram& program);
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
+    static std::uint64_t nestedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable, bool requireProof = false);
+    static void tagNestedPointerPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture);
     static void applyShaderDataPatches(DispatchVariant& variant);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     static void reportSkip(const char* kind, const std::string& what);
@@ -216,13 +218,15 @@ private:
     void maybeReportDrawCache(bool profile);
     void reportDrawCache(DrawEntryCounters& counters, bool profile);
     std::string profileDrawCacheLines(const DrawEntryCounters& counters);
-    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, std::array<std::uint64_t, 5>* components = nullptr, const DrawRelocation* relocation = nullptr, std::uint64_t* alias = nullptr);
+    static std::uint64_t drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, std::uint64_t* shape = nullptr, std::array<std::uint64_t, 5>* components = nullptr, const DrawRelocation* relocation = nullptr, std::uint64_t* alias = nullptr, bool nested = false);
     void traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss);
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
     static void patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value);
     void learnPendingRelocation();
-    void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
+    void censusNestedDraw(const QueueState& queue, std::uint64_t alias);
+    static const char* moveNestedRuns(DispatchVariant& copy);
+    void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches, bool nested = false);
     void reportDrawRelocation();
     // APS5_ARCHB_FIX_DISPATCH_RELOCATION: the draw relocation alias for dispatches. A dispatch-cache
     // insert tags its variant's runs by the user word each is read through (tagVariantRuns), learns
@@ -495,6 +499,8 @@ private:
     std::list<std::uint64_t> drawOrder;
     std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> drawRelocations;
     std::unordered_map<std::uint64_t, std::uint64_t> drawAliases;
+    std::unordered_map<std::uint64_t, std::uint64_t> nestedDrawAliases;
+    std::unordered_map<std::uint64_t, std::uint64_t> nestedCensusAliases;
     DrawRelocationPending drawRelocationPending;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;

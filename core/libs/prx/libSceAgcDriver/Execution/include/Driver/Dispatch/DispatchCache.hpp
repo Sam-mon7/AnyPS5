@@ -88,6 +88,15 @@ struct DispatchVariant {
 
     std::uint32_t pushOffset = 0;
     std::vector<std::int8_t> runBases;
+    struct RunParent {
+        std::uint32_t run = NoFlatBinding;
+        std::uint32_t word = 0;
+        bool operator==(const RunParent&) const = default;
+    };
+    std::vector<RunParent> runParents;
+    std::vector<std::array<std::uint32_t, 4>> nestedPointerPatches;
+    bool nestedRelocated = false;
+    bool nestedPointerProof = false;
     std::uint64_t relocatableWords = 0;
     std::uint64_t userWordsWalked = 0;
     std::uint64_t valueWords = 0;

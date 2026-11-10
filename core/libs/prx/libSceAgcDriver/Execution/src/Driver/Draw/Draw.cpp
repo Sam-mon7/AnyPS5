@@ -156,6 +156,7 @@ struct DrawTail {
     bool imageTableSnapshotReuse = false;
     bool imageTableBitScanKeys = false;
     bool bufferBases = false;
+    bool nestedRelocation = false;
     bool allocChurn = false;
     bool partialSnapshot = false;
     bool hostSlabAlloc = false;
@@ -481,6 +482,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     tail.imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     tail.bufferBases = ArchB::Switches::Enabled(ArchB::Feature::FixBufferBaseRefresh);
+    tail.nestedRelocation = ArchB::Switches::Enabled(ArchB::Feature::FixDrawRelocNested);
     // APS5_ARCHB_FIX_ALLOC_CHURN, once per draw: this thread's allocation sites follow it for the rest
     // of the draw, and the finisher and pipelined commits take the same value from the tail.
     tail.allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
@@ -636,6 +638,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<DrawUserPatch> userPatches;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool nestedRelocation = tail.nestedRelocation;
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
@@ -646,9 +649,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
-                if (trial.idle != 0) --trial.idle;
+                if (trial.idle != 0 && !nestedRelocation) --trial.idle;
                 else relocation = known->second;
-                aliasFirst = relocation != nullptr && trial.productive;
+                aliasFirst = relocation != nullptr && trial.productive && !nestedRelocation;
             }
         }
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
@@ -678,17 +681,31 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             decode = entry->decode;
         } else {
             ++drawEntryCounters.absent;
+            static const bool nestedCensus = std::getenv("APS5_DRAW_RELOC_NESTED_CENSUS") != nullptr;
+            std::uint64_t censusAlias = 0;
+            if (nestedCensus) {
+                const auto known = drawRelocations.find(drawIdentity);
+                if (known != drawRelocations.end()) {
+                    drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, known->second.get(), &censusAlias, true);
+                    censusAlias = packetKey(censusAlias);
+                    if (censusAlias == 0) ArchB::Recorder::Count("draw_nested_census_alias_unreadable");
+                }
+            }
             ArchB::Recorder::Count(!drawRelocationEnabled() ? "draw_reloc_absent_off" : relocation != nullptr ? "draw_reloc_absent_shape" : drawRelocations.contains(drawIdentity) ? "draw_reloc_absent_idle" : "draw_reloc_absent_no_shape");
             if (relocation != nullptr && !aliasFirst) {
                 cacheLock.unlock();
-                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
+                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, nestedRelocation);
                 drawAlias = packetKey(drawAlias);
                 cacheLock.lock();
             }
-            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
-            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
+            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity, censusAlias, nestedRelocation};
+            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches, nestedRelocation);
             else if (relocation != nullptr) ArchB::Recorder::Count("draw_reloc_alias_zero");
             ArchB::Recorder::Count(entry != nullptr ? "draw_reloc_entry" : "draw_reloc_none");
+            if (nestedCensus && drawRelocations.contains(drawIdentity)) {
+                if (entry == nullptr) censusNestedDraw(queue, censusAlias);
+                else ArchB::Recorder::Count("draw_nested_census_existing_entry");
+            }
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
                 ++trial.lookups;
@@ -877,7 +894,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     auto& shaderMemory = tail.shaderMemory;
-    shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask || tail.bufferBases);
+    shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask || tail.bufferBases || tail.nestedRelocation);
     shaderMemory->SetImageTableSnapshotReuse(tail.imageTableSnapshotReuse);
     shaderMemory->SetImageTableBitScanKeys(tail.imageTableBitScanKeys);
     auto& results = tail.results;
@@ -1018,7 +1035,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
             ++drawRelocationTrials[drawIdentity].hits;
-            if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
+            auto& aliases = tail.nestedRelocation ? nestedDrawAliases : drawAliases;
+            if (const auto alias = aliases.find(drawAlias); alias != aliases.end()) {
                 const auto donor = drawCache.find(alias->second);
                 if (donor != drawCache.end() && drawCacheHits - donor->second->touched > drawCacheEntries() / 8) {
                     drawOrder.splice(drawOrder.begin(), drawOrder, donor->second->order);
@@ -1345,6 +1363,49 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     if (partialFeedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
+    if (verifyHit && std::any_of(matched.begin(), matched.end(), [](const auto& variant) { return variant != nullptr && variant->nestedRelocated; })) {
+        const auto flattened = [](const auto& runs, const auto& words) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> values;
+            std::size_t position = 0;
+            for (const auto& [begin, end] : runs) for (auto address = begin; address < end && position < words.size(); address += sizeof(std::uint32_t)) values.emplace_back(address, words[position++]);
+            std::sort(values.begin(), values.end());
+            return values;
+        };
+        for (std::size_t i = 0; i < matched.size(); ++i) {
+            if (matched[i] == nullptr) continue;
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+            std::vector<std::uint32_t> words;
+            freshRuns(i, runs, words);
+            const auto& kept = *matched[i];
+            const auto& hit = stageData[i];
+            const auto& expected = hit.compiled != nullptr ? *hit.compiled : *kept.compiled;
+            const auto& expectedWords = hit.compiled != nullptr ? hit.words : kept.words;
+            const bool feedback = tail.feedbackMask && hit.feedbackHit;
+            auto expectedValues = flattened(kept.runs, expectedWords);
+            auto freshValues = flattened(runs, words);
+            std::map<std::uint64_t, std::uint32_t> masks;
+            if (feedback) {
+                std::size_t position = 0;
+                for (const auto& [begin, end] : kept.runs) for (auto address = begin; address < end; address += sizeof(std::uint32_t), ++position) {
+                    const auto mask = WordMask(kept.feedback.memory, position);
+                    const auto [found, inserted] = masks.emplace(address, mask);
+                    if (!inserted) found->second &= mask;
+                }
+            }
+            bool sameMemory = expectedWords.size() == words.size() && expectedValues.size() == freshValues.size();
+            for (std::size_t word = 0; sameMemory && word < expectedValues.size(); ++word) {
+                const auto& [address, value] = expectedValues[word];
+                const auto mask = feedback ? masks.at(address) : 0u;
+                sameMemory = address == freshValues[word].first && ((value ^ freshValues[word].second) & ~mask) == 0;
+            }
+            const bool same = stageCaptures[i].compiled != nullptr && sameMemory && FeedbackBindingsEqual(kept, expected, *stageCaptures[i].compiled, feedback);
+            if (!same) {
+                ArchB::Recorder::Count("fix_draw_reloc_nested_verify_mismatches");
+                static std::atomic<unsigned> reports {0};
+                if (reports.fetch_add(1) < 12) std::fprintf(stderr, "[draw-nested] verify: stage %zu differs in %s\n", i, sameMemory ? "patched bindings" : "captured addresses or words");
+            }
+        }
+    }
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
