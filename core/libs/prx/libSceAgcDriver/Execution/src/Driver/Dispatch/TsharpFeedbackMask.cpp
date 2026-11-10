@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -333,8 +334,8 @@ MaskPlan BuildPlan(const std::shared_ptr<const ShaderRecompiler::IrResourcePlan>
 }
 
 const MaskPlan& CachedPlan(const std::shared_ptr<const ShaderRecompiler::IrResourcePlan>& plan) {
-    thread_local std::unordered_map<const ShaderRecompiler::IrResourcePlan*, MaskPlan>* cacheSlot = nullptr;
-    auto& cache = ShaderRecompiler::ThreadOwned(cacheSlot);
+    struct CacheSlotStorage {};
+    auto& cache = AgcDriver::ThreadScratch<std::unordered_map<const ShaderRecompiler::IrResourcePlan*, MaskPlan>, CacheSlotStorage>();
     const auto found = cache.find(plan.get());
     if (found != cache.end() && found->second.owner.lock() == plan) {
         ArchB::Recorder::Count("fix_tsharp_build_plan_hits");
@@ -371,8 +372,8 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
         ArchB::Recorder::Count("fix_tsharp_build_skipped");
         return proof.outcome;
     }
-    thread_local std::vector<std::pair<const ShaderRecompiler::IrValue*, std::uint64_t>>* traceSlot = nullptr;
-    auto& trace = ShaderRecompiler::ThreadOwned(traceSlot);
+    struct TraceSlotStorage {};
+    auto& trace = AgcDriver::ThreadScratch<std::vector<std::pair<const ShaderRecompiler::IrValue*, std::uint64_t>>, TraceSlotStorage>();
     trace.clear();
     for (const auto& [raw, address] : capture.readTrace.slotReads) {
         const auto source = std::lower_bound(proof.traceSources.begin(), proof.traceSources.end(), raw, [](const auto& entry, const auto* key) { return std::less<const ShaderRecompiler::IrValue*>{}(entry.first, key); });

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -63,7 +64,10 @@ namespace AgcDriver::Graphics {
 namespace {
 
 Recorder* activeRecorder = nullptr;
-thread_local bool computeSyncEnabled = false;
+bool& computeSyncEnabledThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 std::atomic<std::uint64_t> computeHostEpoch{0};
 std::atomic<std::uint64_t> computeChains{0}, computeChainDispatches{0}, computeChainBarriers{0}, computeChainHazards{0}, computeChainBoundaries{0}, computeChainRejected{0};
 std::array<std::atomic<std::uint64_t>, 3> computeChainAvoided{};
@@ -163,14 +167,21 @@ std::uint64_t syncCounts[5] = {};
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
 double syncWaitedMs[5] = {};
-thread_local int announcedSource = 4;
+int& announcedSourceThreadState() {
+    struct State { int value = 4; };
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State, Slot>().value;
+}
 // The call site CountSync named for that sync (nullptr: none; the sync's own return address is
 // taken then), and the fence-wait table per (source, site) it feeds (APS5_PROFILE_DRAW, under the
 // GpuMutex like finish()): which caller's syncs wait, when the source alone does not say (source
 // 0 is every WaitIdle and drain). `activeSyncSite` is the entry of the sync in progress on this
 // thread (an index: a nested sync from a completion replaces and restores it), so finish() charges
 // each batch's wait to it.
-thread_local const void* announcedSite = nullptr;
+const void*& announcedSiteThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<const void*, Slot>();
+}
 struct SyncSiteWaits {
     int source;
     const void* site;
@@ -181,7 +192,11 @@ struct SyncSiteWaits {
 std::vector<SyncSiteWaits> syncSites;
 constexpr std::size_t NoSyncSite = static_cast<std::size_t>(-1);
 constexpr std::size_t SyncSiteLimit = 160;
-thread_local std::size_t activeSyncSite = NoSyncSite;
+std::size_t& activeSyncSiteThreadState() {
+    struct State { std::size_t value = NoSyncSite; };
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State, Slot>().value;
+}
 
 bool FenceCensusOn() {
     static const bool on = [] {
@@ -202,8 +217,8 @@ struct FenceThread {
 };
 
 FenceThread& fenceThread() {
-    static thread_local FenceThread* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct SlotStorage {};
+    return AgcDriver::ThreadScratch<FenceThread, SlotStorage>();
 }
 
 struct FenceCensusKey {
@@ -279,7 +294,7 @@ void ReportFenceCensus(FenceCensusState& census, std::uint64_t presents) {
 // counting the sync under (source, site). Beyond the table's limit every further site shares the
 // last entry (a nullptr site), so the table stays small.
 std::size_t BeginSyncSite(int source, const void* site) {
-    const auto previous = activeSyncSite;
+    const auto previous = activeSyncSiteThreadState();
     if (!SyncSitesProfiled()) return previous;
     auto it = std::find_if(syncSites.begin(), syncSites.end(), [&](const SyncSiteWaits& entry) { return entry.source == source && entry.site == site; });
     if (it == syncSites.end()) {
@@ -291,20 +306,20 @@ std::size_t BeginSyncSite(int source, const void* site) {
         }
     }
     ++it->syncs;
-    activeSyncSite = static_cast<std::size_t>(it - syncSites.begin());
+    activeSyncSiteThreadState() = static_cast<std::size_t>(it - syncSites.begin());
     return previous;
 }
 
 void CountSiteWait(double ms) {
-    if (activeSyncSite == NoSyncSite || activeSyncSite >= syncSites.size()) return;
-    auto& entry = syncSites[activeSyncSite];
+    if (activeSyncSiteThreadState() == NoSyncSite || activeSyncSiteThreadState() >= syncSites.size()) return;
+    auto& entry = syncSites[activeSyncSiteThreadState()];
     ++entry.batches;
     entry.waitedMs += ms;
 }
 
 void CountComputeSyncWait(int source, bool signaled) {
     static_cast<void>(source);
-    if (computeSyncEnabled && !signaled) ArchB::Recorder::Count(GuestMemory::GpuMutex().DepthOnThisThread() > 1 ? "fix_csync_refused_nested" : "fix_csync_refused_mutable_caller");
+    if (computeSyncEnabledThreadState() && !signaled) ArchB::Recorder::Count(GuestMemory::GpuMutex().DepthOnThisThread() > 1 ? "fix_csync_refused_nested" : "fix_csync_refused_mutable_caller");
 }
 
 // The sites by wait, longest first, as "source@+offset syncs/batches/wait" (offsets symbolize with
@@ -446,7 +461,10 @@ int completionDepth() {
     return HostThreadSlot<int, CompletionDepthSlot>::Get();
 }
 // This thread's hook syncs that waited for an unsignaled target (Recorder::ThreadHookWaits).
-thread_local std::uint64_t hookRealWaits = 0;
+std::uint64_t& hookRealWaitsThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
 
 }
 
@@ -851,7 +869,10 @@ std::atomic<void (*)()> queuedLabelRecorder{nullptr};
 struct LabelGroupDwordsTag {};
 auto& LabelGroupDwords() { return HostThreadLocal<std::vector<std::pair<std::uint64_t, std::uint64_t>>, LabelGroupDwordsTag>(); }
 // Late-rule counters (Recorder::LateCounts), per thread: lookups run on the waiting worker.
-thread_local Recorder::LateStatistics lateCounts{};
+Recorder::LateStatistics& lateCountsThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<Recorder::LateStatistics, Slot>();
+}
 
 // APS5_LABEL_TRUST_LATE=1 trusts entries with stamp <= afterStamp under the late rule; off by
 // default until the frame-rate collapse it produced at the video stage (lt_on: 119 -> 25 presents
@@ -1868,7 +1889,7 @@ bool Recorder::LateTrust() {
 }
 
 Recorder::LateStatistics Recorder::LateCounts() {
-    return lateCounts;
+    return lateCountsThreadState();
 }
 
 void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
@@ -1939,7 +1960,7 @@ Recorder::StoreStatistics Recorder::StoreCounts() {
 }
 
 std::uint64_t Recorder::ThreadHookWaits() {
-    return hookRealWaits;
+    return hookRealWaitsThreadState();
 }
 
 namespace {
@@ -1949,7 +1970,10 @@ struct DispatchOrder {
     bool unordered = false;
 };
 
-thread_local DispatchOrder nextDispatchOrder;
+DispatchOrder& nextDispatchOrderThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<DispatchOrder, Slot>();
+}
 std::atomic<std::uint64_t> overlapDeferred{0}, overlapJoined{0}, overlapFlushed{0};
 
 }
@@ -1960,15 +1984,15 @@ bool Recorder::DispatchOverlapEnabled() {
 }
 
 void Recorder::SetDispatchOrder(std::uint32_t queueKey, bool unordered) {
-    nextDispatchOrder = {queueKey, unordered};
+    nextDispatchOrderThreadState() = {queueKey, unordered};
 }
 
 std::uint32_t Recorder::PeekUnorderedDispatch() {
-    return nextDispatchOrder.unordered ? nextDispatchOrder.queueKey : 0u;
+    return nextDispatchOrderThreadState().unordered ? nextDispatchOrderThreadState().queueKey : 0u;
 }
 
 std::uint32_t Recorder::TakeDispatchOrder(bool& unordered) {
-    const auto order = std::exchange(nextDispatchOrder, DispatchOrder{});
+    const auto order = std::exchange(nextDispatchOrderThreadState(), DispatchOrder{});
     unordered = order.unordered;
     return order.queueKey;
 }
@@ -2075,12 +2099,12 @@ bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t addre
 void Recorder::CountSync(int source, const void* site) {
     if (source < 0 || source >= 5) return;
     ++syncCounts[source];
-    announcedSource = source;
-    announcedSite = site;
+    announcedSourceThreadState() = source;
+    announcedSiteThreadState() = site;
 }
 
 void Recorder::AnnounceSyncSite(const void* site) {
-    announcedSite = site;
+    announcedSiteThreadState() = site;
 }
 
 bool Recorder::FenceCensus() {
@@ -2146,8 +2170,13 @@ struct LazyFenceThread {
 };
 
 LazyFenceThread& lazyFenceThread() {
-    static thread_local LazyFenceThread* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct Slot {};
+    auto* state = HostThreadSlot<LazyFenceThread*, Slot>::Get();
+    if (state == nullptr) {
+        ShaderRecompiler::ThreadOwned(state);
+        HostThreadSlot<LazyFenceThread*, Slot>::Set(state);
+    }
+    return *state;
 }
 
 std::uint32_t LazyFenceVerifyEvery() {
@@ -2662,7 +2691,7 @@ void Recorder::ensureOpen() {
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
         }
         if (Timeline::Enabled) open->timelineId = Timeline::Emit(Timeline::Kind::BatchOpen);
-        TraceBatchTag = open->traceId;
+        TraceBatchTag(open->traceId);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);
@@ -4072,8 +4101,8 @@ void Recorder::BoundKeptBytes() {
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     struct Site {
         std::size_t previous;
-        ~Site() { activeSyncSite = previous; }
-    } site{activeSyncSite};
+        ~Site() { activeSyncSiteThreadState() = previous; }
+    } site{activeSyncSiteThreadState()};
     if (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) BeginSyncSite(4, __builtin_return_address(0));
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
@@ -5412,7 +5441,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
     const auto tag = GuestMemory::GpuLockThreadTag();
     const auto refuse = [&](LabelRefusal reason, std::uint64_t LateStatistics::*counter, const LabelEntry& entry) {
         if (refusal != nullptr) *refusal = entry.behindCompletion ? LabelRefusal::BehindCompletion : reason;
-        if (counter != nullptr) ++(lateCounts.*counter);
+        if (counter != nullptr) ++(lateCountsThreadState().*counter);
         return std::nullopt;
     };
     for (std::size_t offset = 0; offset < bytes; offset += 4) {
@@ -5433,7 +5462,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
         if (entry == nullptr) return std::nullopt;
         if (entry->stamp <= afterStamp) {
             // The late rule (see NoteLabel): counted in both modes, so a control run shows the population.
-            if (!candidate) ++lateCounts.candidates;
+            if (!candidate) ++lateCountsThreadState().candidates;
             candidate = true;
             if (!LateTrustEnabled()) return refuse(LabelRefusal::TrustOff, nullptr, *entry);
             if (entry->batch == nullptr) return refuse(LabelRefusal::Queued, &LateStatistics::queued, *entry);
@@ -5443,8 +5472,8 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             hit.generation = std::min(hit.generation, entry->generation);
         }
         if (Timeline::Enabled) {
-            Timeline::LabelStamps[offset / 4] = entry->stamp;
-            Timeline::LabelQueues[offset / 4] = entry->queue;
+            Timeline::LabelStamps()[offset / 4] = entry->stamp;
+            Timeline::LabelQueues()[offset / 4] = entry->queue;
         }
         hit.value |= static_cast<std::uint64_t>(entry->value) << (offset * 8u);
         if (offset == 0) {
@@ -5739,7 +5768,7 @@ struct UnlockedWaiter {
 // included), so the next sync on the thread is not attributed to this one's site.
 struct RestoreSyncSite {
     std::size_t site;
-    ~RestoreSyncSite() { activeSyncSite = site; }
+    ~RestoreSyncSite() { activeSyncSiteThreadState() = site; }
 };
 
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
@@ -5808,31 +5837,31 @@ void Recorder::FinishUpTo(std::uint64_t serial) {
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
     // up in the site table by its own address).
     ++syncCounts[0];
-    announcedSource = 4;
-    const void* site = std::exchange(announcedSite, nullptr);
-    const auto previousSite = inFlight.empty() || inFlight.front()->serial > serial ? activeSyncSite : BeginSyncSite(0, site != nullptr ? site : __builtin_return_address(0));
+    announcedSourceThreadState() = 4;
+    const void* site = std::exchange(announcedSiteThreadState(), nullptr);
+    const auto previousSite = inFlight.empty() || inFlight.front()->serial > serial ? activeSyncSiteThreadState() : BeginSyncSite(0, site != nullptr ? site : __builtin_return_address(0));
     while (!inFlight.empty() && inFlight.front()->serial <= serial) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), true, 0);
     }
-    activeSyncSite = previousSite;
+    activeSyncSiteThreadState() = previousSite;
 }
 
 void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
-    const auto source = std::exchange(announcedSource, 4);
-    const void* site = std::exchange(announcedSite, nullptr);
+    const auto source = std::exchange(announcedSourceThreadState(), 4);
+    const void* site = std::exchange(announcedSiteThreadState(), nullptr);
     Submit();
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
-    const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
+    const auto previousSite = inFlight.empty() ? activeSyncSiteThreadState() : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
     while (!inFlight.empty()) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), true, source);
     }
-    activeSyncSite = previousSite;
+    activeSyncSiteThreadState() = previousSite;
 }
 
 bool Recorder::FinishUpToUnlocked(std::uint64_t serial) {
@@ -5873,19 +5902,19 @@ void Recorder::FlushDeferredReleases() {
     ReleaseDeferredKeeps();
 }
 
-Recorder::ComputeSyncScope::ComputeSyncScope(bool enabled) : previous(std::exchange(computeSyncEnabled, enabled)) {}
+Recorder::ComputeSyncScope::ComputeSyncScope(bool enabled) : previous(std::exchange(computeSyncEnabledThreadState(), enabled)) {}
 
 Recorder::ComputeSyncScope::~ComputeSyncScope() {
-    computeSyncEnabled = previous;
+    computeSyncEnabledThreadState() = previous;
 }
 
 bool Recorder::ComputeSyncEnabled() {
-    return computeSyncEnabled;
+    return computeSyncEnabledThreadState();
 }
 
 bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
     auto& mutex = GuestMemory::GpuMutex();
-    if (!computeSyncEnabled) return false;
+    if (!computeSyncEnabledThreadState()) return false;
     if (mutex.DepthOnThisThread() != 1 || completionDepth() != 0 || !finishing.empty()) {
         ArchB::Recorder::Count("fix_csync_refused_nested");
         return false;
@@ -5972,8 +6001,8 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         // later batch's own ordering against this write-back is its recorder's business at record
         // time (FillBuffer and DispatchIndirect consult copiedWriters; a later copied writer's
         // write-back runs after this one in finish order; a label behind completions lands after).
-        announcedSource = 4;
-        announcedSite = nullptr;
+        announcedSourceThreadState() = 4;
+        announcedSiteThreadState() = nullptr;
         ++holdCounters.completionSyncsSkipped;
         return;
     }
@@ -5987,22 +6016,22 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
     } completionWait{completionWaitStart};
     if (waitUnlocked) {
         // The hook's wait without the mutex: its own acquisition is the outermost on this thread.
-        const auto source = announcedSource;
-        const void* site = announcedSite != nullptr ? announcedSite : __builtin_return_address(0);
+        const auto source = announcedSourceThreadState();
+        const void* site = announcedSiteThreadState() != nullptr ? announcedSiteThreadState() : __builtin_return_address(0);
         if (syncThroughUnlocked(address, end, source, site)) return;
         // A completion-store wait (kill switch above) is already counted as 'waited'.
         if (completionDepth() == 0) ++holdCounters.hookLockedWaits;
     }
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
         // The announced site (or this call's caller) names the sync, not this function.
-        if (announcedSite == nullptr) announcedSite = __builtin_return_address(0);
+        if (announcedSiteThreadState() == nullptr) announcedSiteThreadState() = __builtin_return_address(0);
         // The open batch's work has not run; without one the newest in flight is the target.
-        if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaits;
+        if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaitsThreadState();
         Sync();
         return;
     }
-    const auto source = std::exchange(announcedSource, 4);
-    const void* site = std::exchange(announcedSite, nullptr);
+    const auto source = std::exchange(announcedSourceThreadState(), 4);
+    const void* site = std::exchange(announcedSiteThreadState(), nullptr);
     std::uint64_t targetSerial = 0;
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
         if (overlaps(**it, address, end)) {
@@ -6011,7 +6040,7 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         }
     }
     if (targetSerial == 0) return;
-    if (unsignaled(targetSerial)) ++hookRealWaits;
+    if (unsignaled(targetSerial)) ++hookRealWaitsThreadState();
     targetedSyncs.fetch_add(1, std::memory_order_relaxed);
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0))};
     // Batches are in flight in serial order. A completion's own guest access can sync re-entrantly
@@ -6102,10 +6131,10 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             }
         }
     }
-    announcedSource = 4;
-    announcedSite = nullptr;
+    announcedSourceThreadState() = 4;
+    announcedSiteThreadState() = nullptr;
     if (targetSerial == 0) return true;
-    if (unsignaled(targetSerial)) ++hookRealWaits;
+    if (unsignaled(targetSerial)) ++hookRealWaitsThreadState();
     // Everything the wait needs is copied out: the recorder may be torn down while the mutex is
     // released (its destructor completes every batch and waits for the semaphore to be left, see
     // WaitTimeline), after which `this` must not be touched. The id re-check below relies on the
@@ -6280,7 +6309,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         } censusWait{waitStart};
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
-        const bool signaledAtStart = !(profile || computeSyncEnabled) || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const bool signaledAtStart = !(profile || computeSyncEnabledThreadState()) || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
         CountComputeSyncWait(source, signaledAtStart);
         struct Report {
             bool enabled;
@@ -6334,9 +6363,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } censusSite{FenceCensusOn(), true, {}, {}};
         if (censusSite.on) {
-            const bool active = activeSyncSite != NoSyncSite && activeSyncSite < syncSites.size();
+            const bool active = activeSyncSiteThreadState() != NoSyncSite && activeSyncSiteThreadState() < syncSites.size();
             const auto packet = GuestMemory::CurrentPacket();
-            censusSite.key = FenceCensusKey{GuestMemory::IsCommitterThread() ? CommitterRole : GuestMemory::GpuLockThreadTag(), active ? syncSites[activeSyncSite].source : -1, active ? syncSites[activeSyncSite].site : nullptr, static_cast<std::uint8_t>(GuestMemory::CurrentReadSite()), packet.opcode, static_cast<std::uint8_t>(fenceThread().reason), completionDepth() != 0, GuestMemory::GpuMutex().DepthOnThisThread() > 1, batch->serial == submissions};
+            censusSite.key = FenceCensusKey{GuestMemory::IsCommitterThread() ? CommitterRole : GuestMemory::GpuLockThreadTag(), active ? syncSites[activeSyncSiteThreadState()].source : -1, active ? syncSites[activeSyncSiteThreadState()].site : nullptr, static_cast<std::uint8_t>(GuestMemory::CurrentReadSite()), packet.opcode, static_cast<std::uint8_t>(fenceThread().reason), completionDepth() != 0, GuestMemory::GpuMutex().DepthOnThisThread() > 1, batch->serial == submissions};
             censusSite.signaled = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
             censusSite.start = std::chrono::steady_clock::now();
         }

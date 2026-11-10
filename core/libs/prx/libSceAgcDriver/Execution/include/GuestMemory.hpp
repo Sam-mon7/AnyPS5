@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory/GenTable.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <atomic>
@@ -382,9 +383,11 @@ void SetGpuUnlockHook(void (*hook)());
 enum class HoldMark : std::uint32_t { ItemTop = 1, ItemTaken, CommitBegin, CommitEnd, ItemDone, PrelockBegin, PrelockEnd, LockBegin, UnlockHookEnd };
 void EnableHoldMarks();
 void HoldMarkSlow(HoldMark mark);
-inline thread_local bool holdMarksOn = false;
+struct HoldMarksSlot {};
+inline bool HoldMarksOn() { return HostThreadSlot<bool, HoldMarksSlot>::Get(); }
+inline void HoldMarksOn(bool value) { HostThreadSlot<bool, HoldMarksSlot>::Set(value); }
 inline void HoldLogMark(HoldMark mark) {
-    if (holdMarksOn) HoldMarkSlow(mark);
+    if (HoldMarksOn()) HoldMarkSlow(mark);
 }
 // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY (runtime, sampled per acquisition): `queued` says whether
 // the queue-0 committer has work queued or in progress. While it does, a queue worker other than

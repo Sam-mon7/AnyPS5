@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
@@ -14,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -195,7 +197,11 @@ bool resolveVerify() {
     return enabled;
 }
 
-thread_local std::size_t resolverIndex = ResolverSlots;
+std::size_t& resolverIndexThreadState() {
+    struct State { std::size_t value = ResolverSlots; };
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State, Slot>().value;
+}
 
 // Applied items' writes kept for the conflict check (a resolve older than the oldest kept counts as
 // conflicting).
@@ -209,8 +215,8 @@ void runResolveSlot(DrawPipeline::ResolveSlot& slot) {
     auto& counters = resolveCounters();
     counters.items.fetch_add(1, std::memory_order_relaxed);
     counters.resolveNs.fetch_add(slot.ns, std::memory_order_relaxed);
-    counters.threadNs[resolverIndex].fetch_add(slot.ns, std::memory_order_relaxed);
-    counters.threadItems[resolverIndex].fetch_add(1, std::memory_order_relaxed);
+    counters.threadNs[resolverIndexThreadState()].fetch_add(slot.ns, std::memory_order_relaxed);
+    counters.threadItems[resolverIndexThreadState()].fetch_add(1, std::memory_order_relaxed);
 }
 
 template<typename TItem>
@@ -222,8 +228,12 @@ struct ClearOnExit {
 }
 
 namespace {
-thread_local bool finisherThread = false;
-thread_local bool finisherProducer = false;
+struct FinisherThreadSlot {};
+struct FinisherProducerSlot {};
+bool finisherThread() { return HostThreadSlot<bool, FinisherThreadSlot>::Get(); }
+void finisherThread(bool value) { HostThreadSlot<bool, FinisherThreadSlot>::Set(value); }
+bool finisherProducer() { return HostThreadSlot<bool, FinisherProducerSlot>::Get(); }
+void finisherProducer(bool value) { HostThreadSlot<bool, FinisherProducerSlot>::Set(value); }
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -256,7 +266,7 @@ bool DrawFinisher::Overlap() {
 }
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -268,7 +278,7 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
-    if (!Busy() || !finisherProducer) return LabelLookup::NotHeld;
+    if (!Busy() || !finisherProducer()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
@@ -284,7 +294,7 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 }
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -298,7 +308,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 }
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
 }
@@ -344,7 +354,7 @@ std::string DrawFinisher::DrainText() {
 }
 
 bool DrawFinisher::OnFinisherThread() {
-    return finisherThread;
+    return finisherThread();
 }
 
 void DrawFinisher::Enqueue(Job job) {
@@ -352,7 +362,7 @@ void DrawFinisher::Enqueue(Job job) {
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
-    finisherProducer = true;
+    finisherProducer(true);
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -371,7 +381,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!running) {
         running = true;
         thread = std::thread([this] {
-            finisherThread = true;
+            finisherThread(true);
             run();
         });
     }
@@ -473,8 +483,8 @@ std::size_t DrawPipeline::Capacity() {
 }
 
 bool& DrawPipeline::DispatchItems() {
-    static thread_local bool items = false;
-    return items;
+    struct ItemsStorage {};
+    return AgcDriver::ThreadScratch<bool, ItemsStorage>();
 }
 
 void DrawPipeline::RegisterCounters() {
@@ -614,8 +624,8 @@ std::size_t DrawPipeline::QueuedItems() {
 }
 
 bool& DrawPipeline::Active() {
-    static thread_local bool active = false;
-    return active;
+    struct ActiveStorage {};
+    return AgcDriver::ThreadScratch<bool, ActiveStorage>();
 }
 
 std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
@@ -663,7 +673,8 @@ void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
     // Write generations: the committer checks at the ticket the issuing thread held when it enqueued
     // the commit (carried explicitly, rule V1/V3), not at a fresh one of its own.
     if (ticket != 0 && GuestMemory::Gen::Active()) GuestMemory::Gen::Follow(ticket);
-    static thread_local std::uint64_t followed = 0;
+    struct FollowedThreadStorage {};
+    auto& followed = AgcDriver::ThreadScratch<std::uint64_t, FollowedThreadStorage>();
     if (followed == token) return;
     followed = token;
     pipeCounters().followBumps.fetch_add(1, std::memory_order_relaxed);
@@ -672,8 +683,9 @@ void DrawPipeline::FollowEpoch(std::uint64_t token, std::uint64_t ticket) {
 }
 
 void DrawPipeline::FollowResolveEpoch(std::uint64_t token) {
-    if (resolverIndex == ResolverSlots) return;
-    static thread_local std::uint64_t followed = 0;
+    if (resolverIndexThreadState() == ResolverSlots) return;
+    struct FollowedThreadStorage {};
+    auto& followed = AgcDriver::ThreadScratch<std::uint64_t, FollowedThreadStorage>();
     if (followed == token) return;
     followed = token;
     GuestMemory::BumpCollectEpoch();
@@ -707,7 +719,7 @@ void DrawPipeline::startResolvers() {
     resolvers.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
         resolvers.emplace_back([this, i] {
-            resolverIndex = i;
+            resolverIndexThreadState() = i;
             PerformanceTrace::BindThread("draw resolver");
             GuestMemory::MarkResolverThread();
             runResolver();
@@ -846,10 +858,14 @@ void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> wr
 
 void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
     constexpr std::size_t RecentSlots = 4096;
-    thread_local std::array<std::uint64_t, RecentSlots> recent{};
-    thread_local std::uint64_t previous = 0;
-    thread_local std::array<std::uint64_t, RecentSlots> recentShapes{};
-    thread_local std::uint64_t previousShape = 0;
+    struct RecentThreadStorage {};
+    auto& recent = AgcDriver::ThreadScratch<std::array<std::uint64_t, RecentSlots>, RecentThreadStorage>();
+    struct PreviousThreadStorage {};
+    auto& previous = AgcDriver::ThreadScratch<std::uint64_t, PreviousThreadStorage>();
+    struct RecentShapesThreadStorage {};
+    auto& recentShapes = AgcDriver::ThreadScratch<std::array<std::uint64_t, RecentSlots>, RecentShapesThreadStorage>();
+    struct PreviousShapeThreadStorage {};
+    auto& previousShape = AgcDriver::ThreadScratch<std::uint64_t, PreviousShapeThreadStorage>();
     const auto shapeSlot = static_cast<std::size_t>((shape ^ (shape >> 29u)) % RecentSlots);
     const auto slot = static_cast<std::size_t>((key ^ (key >> 29u)) % RecentSlots);
     drawKeys.fetch_add(1, std::memory_order_relaxed);
@@ -1378,7 +1394,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap());
+    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer() && DrawFinisher::Busy() && DrawFinisher::Overlap());
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

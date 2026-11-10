@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
@@ -5596,8 +5597,8 @@ struct LastDispatchPhases {
 };
 
 LastDispatchPhases& lastDispatchPhases() {
-    static thread_local LastDispatchPhases last;
-    return last;
+    struct LastStorage {};
+    return AgcDriver::ThreadScratch<LastDispatchPhases, LastStorage>();
 }
 
 struct LastDispatchProof {
@@ -5606,8 +5607,8 @@ struct LastDispatchProof {
 };
 
 LastDispatchProof& lastDispatchProof() {
-    static thread_local LastDispatchProof last;
-    return last;
+    struct LastStorage {};
+    return AgcDriver::ThreadScratch<LastDispatchProof, LastStorage>();
 }
 
 struct DispatchTimer {

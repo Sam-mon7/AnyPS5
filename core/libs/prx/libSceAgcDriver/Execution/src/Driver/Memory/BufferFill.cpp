@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -447,8 +448,8 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
         ++cpuFills;
 
         localDevice->WaitIdle();
-        static thread_local std::vector<std::byte>* blockSlot = nullptr;
-        auto& block = ShaderRecompiler::ThreadOwned(blockSlot);
+        struct BlockSlotStorage {};
+        auto& block = AgcDriver::ThreadScratch<std::vector<std::byte>, BlockSlotStorage>();
         const auto chunk = std::min<std::size_t>(bytes, 1u << 20u);
         block.resize(chunk);
         for (std::size_t at = 0; at < chunk; at += 16) std::memcpy(block.data() + at, pattern.data(), 16);

@@ -209,8 +209,12 @@ std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 // Stage 4.2: the committer's tracker-mutex acquisitions that waited and the time waited (resolver
 // walks hold the same mutex).
-thread_local std::atomic<std::uint64_t>* trackerTimedWaits = nullptr;
-thread_local std::atomic<std::uint64_t>* trackerTimedWaitNs = nullptr;
+struct TrackerTimedWaitsSlot {};
+struct TrackerTimedWaitNsSlot {};
+std::atomic<std::uint64_t>* trackerTimedWaits() { return HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitsSlot>::Get(); }
+void trackerTimedWaits(std::atomic<std::uint64_t>* value) { HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitsSlot>::Set(value); }
+std::atomic<std::uint64_t>* trackerTimedWaitNs() { return HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitNsSlot>::Get(); }
+void trackerTimedWaitNs(std::atomic<std::uint64_t>* value) { HostThreadSlot<std::atomic<std::uint64_t>*, TrackerTimedWaitNsSlot>::Set(value); }
 std::atomic<std::uint64_t> committerTrackerWaits{0};
 std::atomic<std::uint64_t> committerTrackerWaitNs{0};
 std::atomic<std::uint64_t> resolverTrackerWaits{0};
@@ -408,14 +412,16 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 }
 
 void CountReadCaller(const void* returnAddress) {
-    thread_local std::uint32_t sampled = 0;
+    struct SampledThreadStorage {};
+    auto& sampled = AgcDriver::ThreadScratch<std::uint32_t, SampledThreadStorage>();
     // Sampled at the same rate as the callers, in step with them (CountCaller advances the counter).
     if ((sampled + 1) % 256 == 0) readSiteSamples[static_cast<std::size_t>(CurrentReadSite())].fetch_add(256, std::memory_order_relaxed);
     CountCaller(Profile().callers, sampled, 256, returnAddress);
 }
 
 void CountWriteCaller(const void* returnAddress) {
-    thread_local std::uint32_t sampled = 0;
+    struct SampledThreadStorage {};
+    auto& sampled = AgcDriver::ThreadScratch<std::uint32_t, SampledThreadStorage>();
     CountCaller(Profile().writeCallers, sampled, 16, returnAddress);
 }
 
@@ -1171,7 +1177,8 @@ bool pageStateRecorded(std::uintptr_t address, std::size_t bytes) {
 bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
     constexpr std::size_t limit = 4096;
     if (bytes > limit || HostMapping::QueryFd() >= 0 || pageStateRecorded(address, bytes)) return false;
-    thread_local std::array<std::byte, limit> scratch;
+    struct ScratchThreadStorage {};
+    auto& scratch = AgcDriver::ThreadScratch<std::array<std::byte, limit>, ScratchThreadStorage>();
     iovec local{scratch.data(), bytes};
     iovec remote{reinterpret_cast<void*>(address), bytes};
     static const pid_t self = getpid();
@@ -1411,7 +1418,10 @@ struct Counters {
 bool dirtyArmOn() {
     return active.load(std::memory_order_relaxed) && ArchB::Switches::Enabled(ArchB::Feature::WtFaultDirtyArm);
 }
-thread_local bool flipDirtyWalk = false;
+bool& flipDirtyWalkThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 Counters& counters() {
     static auto* made = [] {
         auto* c = new Counters();
@@ -2081,11 +2091,13 @@ public:
                 lock = std::unique_lock<AgcDriver::Mutex>(tracker.mutex, std::adopt_lock);
                 return;
             }
-            if (trackerTimedWaits != nullptr && !lock.try_lock()) {
-                const auto start = std::chrono::steady_clock::now();
+            auto* waits = trackerTimedWaits();
+            if (waits != nullptr && !lock.try_lock()) {
+                const bool cheap = ArchB::CheapClock::Active();
+                const auto start = ArchB::CheapClock::Now(cheap);
                 lock.lock();
-                trackerTimedWaits->fetch_add(1, std::memory_order_relaxed);
-                trackerTimedWaitNs->fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+                waits->fetch_add(1, std::memory_order_relaxed);
+                trackerTimedWaitNs()->fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ArchB::CheapClock::Now(cheap) - start).count()), std::memory_order_relaxed);
                 return;
             }
             if (!lock.owns_lock()) lock.lock();
@@ -2281,8 +2293,8 @@ void shadowRanges(const WriteTracker& tracker, std::span<const ShadowRange> rang
 }
 
 std::vector<ShadowRange>& shadowScratch() {
-    thread_local std::vector<ShadowRange>* scratch = nullptr;
-    return ShaderRecompiler::ThreadOwned(scratch);
+    struct ScratchStorage {};
+    return AgcDriver::ThreadScratch<std::vector<ShadowRange>, ScratchStorage>();
 }
 
 #ifdef _WIN32
@@ -2576,7 +2588,9 @@ enum Outcome : int { OutcomeHit = 0, OutcomeClean = 1, OutcomeChanged = 2, Outco
 constexpr const char* OutcomeNames[6] = {"hit", "clean", "changed", "failed", "skip", "other"};
 
 class Scope;
-thread_local Scope* active = nullptr;
+struct ActiveScopeSlot {};
+Scope* activeScope() { return HostThreadSlot<Scope*, ActiveScopeSlot>::Get(); }
+void activeScope(Scope* value) { HostThreadSlot<Scope*, ActiveScopeSlot>::Set(value); }
 
 std::uint32_t threadTag() {
     return IsCommitterThread() ? 0xc0c0c0c0u : GpuLockThreadTag();
@@ -2585,9 +2599,9 @@ std::uint32_t threadTag() {
 class Scope {
 public:
     Scope(const char* entry, const std::source_location* site = nullptr) {
-        if (!enabled() || active != nullptr) return;
+        if (!enabled() || activeScope() != nullptr) return;
         on = true;
-        active = this;
+        activeScope(this);
         key = {threadTag(), entry, site != nullptr ? site->file_name() : "", site != nullptr ? site->line() : 0u, site != nullptr ? site->function_name() : ""};
 #ifdef _WIN32
         before = GuestArena::GuestArenaWriteWatchCensus_nid_no_patch();
@@ -2596,7 +2610,7 @@ public:
     }
     ~Scope() {
         if (!on) return;
-        active = nullptr;
+        activeScope(nullptr);
         row.calls = 1;
         row.ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
         const auto kind = static_cast<std::size_t>(result < 0 ? OutcomeOther : result);
@@ -2638,11 +2652,11 @@ private:
 };
 
 void note(int outcome) {
-    if (active != nullptr) active->set(outcome);
+    if (activeScope() != nullptr) activeScope()->set(outcome);
 }
 
 void noteIfUnset(int outcome) {
-    if (active != nullptr && active->result < 0) active->set(outcome);
+    if (activeScope() != nullptr && activeScope()->result < 0) activeScope()->set(outcome);
 }
 
 bool answer(bool unchanged) {
@@ -2672,8 +2686,8 @@ EpochWalks* currentWalks() {
 // clearing walks of the same collect epoch (exact range, fully covered by their union, or
 // overlapping it), the evidence a collect memo of the epoch could reuse.
 void noteWalk(std::uint64_t first, std::uint64_t stop) {
-    if (active == nullptr || stop <= first) return;
-    auto& row = active->row;
+    if (activeScope() == nullptr || stop <= first) return;
+    auto& row = activeScope()->row;
     ++row.walks;
     const auto pages = (stop - first) / WritePageBytes;
     row.walkPages += pages;
@@ -2700,7 +2714,7 @@ void noteWalk(std::uint64_t first, std::uint64_t stop) {
 
 // A completed clearing walk (all pages, stamped as CPU or driver stores).
 void noteWalked(std::uint64_t first, std::uint64_t stop) {
-    if (active == nullptr || stop <= first) return;
+    if (activeScope() == nullptr || stop <= first) return;
     auto* current = currentWalks();
     if (current == nullptr) return;
     auto& walks = *current;
@@ -2709,8 +2723,8 @@ void noteWalked(std::uint64_t first, std::uint64_t stop) {
     if (stop - first <= WriteBlockBytes) {
         const auto wideFirst = first & ~std::uint64_t{WriteBlockBytes - 1};
         const auto wideStop = (stop + WriteBlockBytes - 1) & ~std::uint64_t{WriteBlockBytes - 1};
-        ++active->row.widenCalls;
-        active->row.widenPages += (wideStop - wideFirst - (stop - first)) / WritePageBytes;
+        ++activeScope()->row.widenCalls;
+        activeScope()->row.widenPages += (wideStop - wideFirst - (stop - first)) / WritePageBytes;
         insertRange(walks.widened, wideFirst, wideStop);
     } else insertRange(walks.widened, first, stop);
     auto begin = first;
@@ -2727,17 +2741,17 @@ void noteWalked(std::uint64_t first, std::uint64_t stop) {
 
 // A contended tracker lock acquisition inside a census scope: the time spent waiting.
 bool timeLock(AgcDriver::Mutex& mutex) {
-    if (active == nullptr) return false;
+    if (activeScope() == nullptr) return false;
     if (mutex.try_lock()) return true;
     const auto start = std::chrono::steady_clock::now();
     mutex.lock();
-    ++active->row.lockWaits;
-    active->row.lockNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    ++activeScope()->row.lockWaits;
+    activeScope()->row.lockNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     return true;
 }
 
 std::uint64_t pageStart() {
-    if (!enabled() || active != nullptr) return 0;
+    if (!enabled() || activeScope() != nullptr) return 0;
     return static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
 }
 
@@ -2792,8 +2806,14 @@ void noteDriverStoreGen(std::uint64_t begin, std::uint64_t end, std::uint64_t ge
 }
 
 namespace stampTrace {
-thread_local const void* walkCaller = nullptr;
-thread_local int walkTag = 0;
+const void*& walkCallerThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<const void*, Slot>();
+}
+int& walkTagThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<int, Slot>();
+}
 std::pair<std::uint64_t, std::uint64_t> range() {
     static const auto parsed = [] {
         const char* text = std::getenv("APS5_WT_TRACE_RANGE");
@@ -2809,8 +2829,8 @@ std::pair<std::uint64_t, std::uint64_t> range() {
 void note(const char* what, std::uint64_t begin, std::uint64_t end, std::uint64_t generation, int kind) {
     const auto [first, stop] = range();
     if (stop <= first || end <= first || begin >= stop) return;
-    std::fprintf(stderr, "[wt-trace] %s 0x%llx..0x%llx gen %llu kind %d tag %d caller +0x%llx thread %lu\n", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(generation), kind, walkTag,
-                 walkCaller != nullptr ? ModuleOffset(walkCaller) : 0ull,
+    std::fprintf(stderr, "[wt-trace] %s 0x%llx..0x%llx gen %llu kind %d tag %d caller +0x%llx thread %lu\n", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(generation), kind, walkTagThreadState(),
+                 walkCallerThreadState() != nullptr ? ModuleOffset(walkCallerThreadState()) : 0ull,
 #ifdef _WIN32
                  static_cast<unsigned long>(GetCurrentThreadId()));
 #else
@@ -2837,7 +2857,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     }
     // APS5_ARCHB_WT_FAULT: a page found stored stays open across the next flip (hot pages count as
     // changed and do not fault every frame).
-    if (tracker.faultMode && !wtFault::flipDirtyWalk) GuestArena::GuestWtFaultNoteStored_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+    if (tracker.faultMode && !wtFault::flipDirtyWalkThreadState()) GuestArena::GuestWtFaultNoteStored_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
     if (runs.window != nullptr) runs.windowRuns.emplace_back(begin, end);
     else {
         const auto generation = tracker.generation.load(std::memory_order_relaxed);
@@ -2880,7 +2900,10 @@ void stampWindowRuns(StampRuns& runs) {
 
 // APS5_ARCHB_FIX_STABLE_FAILED_COLLECTS: the unreported and compared pages noteRefusedWalk met on
 // this thread (a failed walk that met none has no side effect and may be remembered).
-thread_local std::uint64_t refusedWalkPages = 0;
+std::uint64_t& refusedWalkPagesThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
 
 #ifdef _WIN32
 std::atomic<FreshCollectHook> freshCollectHook{nullptr};
@@ -2942,13 +2965,13 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
     };
     StampRuns runs{tracker, StampKind::Cpu};
     pagesOf(&GuestArena::GuestArenaTakeUnreportedPages_nid_no_patch, [&](std::uintptr_t page) {
-        ++refusedWalkPages;
+        ++refusedWalkPagesThreadState();
         stampWrittenRun(&runs, page, page + WritePageBytes);
     });
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     const bool gen = Gen::Active();
     pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) {
-        ++refusedWalkPages;
+        ++refusedWalkPagesThreadState();
         // Compared-when-shared pages: the block reads Unknown(compared) until a walk tracks it again,
         // and its refusal is a per-block table field (lock-free answers), stored before the map's.
         if (gen) {
@@ -2980,11 +3003,11 @@ bool faultSync(StampRuns& runs, std::uint64_t first, std::uint64_t stop, std::ui
         c.consumerFallback.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    const auto savedTag = stampTrace::walkTag;
-    stampTrace::walkTag = 3;
+    const auto savedTag = stampTrace::walkTagThreadState();
+    stampTrace::walkTagThreadState() = 3;
     struct TagRestore {
         int saved;
-        ~TagRestore() { stampTrace::walkTag = saved; }
+        ~TagRestore() { stampTrace::walkTagThreadState() = saved; }
     } tagRestore{savedTag};
     for (std::size_t i = 0; i < openCount; ++i) {
         if (!collectWindowsWrites(runs, open[2 * i], open[2 * i + 1], false)) {
@@ -3115,11 +3138,11 @@ void record(std::uint64_t first, std::uint64_t stop, std::uint64_t clock, std::u
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool memoVirtualQuery = false, std::uint64_t* stamped = nullptr, bool osWalk = false) {
     struct CallerScope {
-        const void* saved = stampTrace::walkCaller;
+        const void* saved = stampTrace::walkCallerThreadState();
         explicit CallerScope(const void* caller) {
-            if (saved == nullptr) stampTrace::walkCaller = caller;
+            if (saved == nullptr) stampTrace::walkCallerThreadState() = caller;
         }
-        ~CallerScope() { stampTrace::walkCaller = saved; }
+        ~CallerScope() { stampTrace::walkCallerThreadState() = saved; }
     } callerScope{__builtin_return_address(0)};
 #ifdef _WIN32
     const bool skipCandidate = tracker.faultMode && !armedOnly && kind == StampKind::Cpu && !osWalk && window == nullptr && !Gen::Active() && !wtFault::verifyOn() && wtFault::consumersOn() && syncSkip::active();
@@ -3262,12 +3285,16 @@ CollectHitCache& collectHitCache() {
     return *cache;
 }
 
-// The queue-0 committer's collect counters (see GuestMemory.hpp).
-thread_local bool committerThread = false;
+struct CommitterThreadSlot {};
+bool committerThread() { return HostThreadSlot<bool, CommitterThreadSlot>::Get(); }
+void committerThread(bool value) { HostThreadSlot<bool, CommitterThreadSlot>::Set(value); }
 // Stage 4.2 (APS5_ARCHB_PIPE_RESOLVE_POOL): a draw resolver thread. Its walks (made after the item's
 // ordering point, like queue 0's) go into the collect-share table, which the committer then reads
 // even with PIPE_COLLECT_SHARE off; APS5_PIPE_RESOLVE_SHARE=0 leaves both out.
-thread_local bool resolverThread = false;
+bool& resolverThreadThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 
 bool resolveShareActive() {
     static const bool enabled = [] {
@@ -3284,13 +3311,26 @@ bool resolveShareActive() {
 // walk under newer unwatch or mapping serials starts a new generation, retiring every older entry
 // (the clocks of older generations are kept in the top 16 bits' place, never compared).
 namespace collectShare {
-thread_local bool producer = false;
+bool& producerThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 constexpr std::uint64_t Unknown = std::numeric_limits<std::uint64_t>::max();
 // The committer's requirement: the ordering point of the item it commits (Unknown: nothing shared),
 // raised by its own ordering points (floor).
-thread_local std::uint64_t required = Unknown;
-thread_local std::uint64_t floor = 0;
-thread_local std::uint64_t memoHits = 0;
+std::uint64_t& requiredThreadState() {
+    struct State { std::uint64_t value = Unknown; };
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State, Slot>().value;
+}
+std::uint64_t& floorThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
+std::uint64_t& memoHitsThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
 
 bool active() {
     return ArchB::Switches::Enabled(ArchB::Feature::PipeCollectShare);
@@ -3358,9 +3398,9 @@ void record(const WriteTracker& tracker, std::uint64_t first, std::uint64_t stop
 // stops at the first uncovered page unless every page is to be counted.
 std::uint64_t covered(std::uint64_t first, std::uint64_t stop, std::uint64_t unwatched, std::uint64_t mapping, bool countAll) {
     auto& shared = table();
-    if (required == Unknown || required > Table::ClockMask || !shared.serialsKnown || unwatched != shared.unwatched || mapping != shared.mapping || first < shared.base) return 0;
+    if (requiredThreadState() == Unknown || requiredThreadState() > Table::ClockMask || !shared.serialsKnown || unwatched != shared.unwatched || mapping != shared.mapping || first < shared.base) return 0;
     // Same generation and a clock at or above the requirement: one compare against a packed bound.
-    const auto low = shared.generation << Table::GenerationShift | required;
+    const auto low = shared.generation << Table::GenerationShift | requiredThreadState();
     const auto high = shared.generation << Table::GenerationShift | Table::ClockMask;
     std::uint64_t pages = 0;
     for (auto page = (first - shared.base) / WritePageBytes, last = (stop - shared.base) / WritePageBytes; page < last; ++page) {
@@ -3551,7 +3591,8 @@ struct State {
 };
 
 State& state() {
-    thread_local State* slot = nullptr;
+    struct SlotThreadStorage {};
+    auto& slot = AgcDriver::ThreadScratch<State*, SlotThreadStorage>();
     if (slot == nullptr) slot = new State();
     return *slot;
 }
@@ -3827,8 +3868,8 @@ StableFailedCollectCounters& counters() {
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized, bool memoVirtualQuery, const std::source_location& site) {
     const census::Scope censusScope(memoized ? "collect" : "collect_uncached", &site);
     const Stage4::TrackerScope stage4Scope(false, address, bytes);
-    const aheadCensus::Scope aheadScope(committerThread && memoized && aheadCensus::enabled());
-    committerCensus::Call committerCall(committerThread && committerCensus::enabled(), site, memoized);
+    const aheadCensus::Scope aheadScope(committerThread() && memoized && aheadCensus::enabled());
+    committerCensus::Call committerCall(committerThread() && committerCensus::enabled(), site, memoized);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
@@ -3843,7 +3884,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     if (committerCall.on) committerCall.range(first, stop, epoch);
-    if (committerThread && useMemo) CommitterCollects().collects.fetch_add(1, std::memory_order_relaxed);
+    if (committerThread() && useMemo) CommitterCollects().collects.fetch_add(1, std::memory_order_relaxed);
     // Write generations: an uncached collect sweeps at a private fresh ticket (rule V4); a memoized
     // one is modeled under the shadow: what EnsureSwept would sweep at the thread's ticket, judged
     // before this call's own walk can cover anything.
@@ -3866,7 +3907,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (!bookkeeping::verify()) {
                 bookkeeping::count(bookkeeping::Hits);
                 if (MemoryProfiled()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                if (committerThread) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
+                if (committerThread()) CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
                 committerCall.hit(committerCensus::OutcomeHitCache);
                 census::note(census::OutcomeHit);
                 return tracker.stable.load(std::memory_order_acquire);
@@ -3879,11 +3920,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (cached != nullptr) *cached = {first, stop, epoch, unwatched, mapping};
         if (verifyHit) bookkeeping::count(bookkeeping::Verified);
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-        if (committerThread) {
+        if (committerThread()) {
             CommitterCollects().hits.fetch_add(1, std::memory_order_relaxed);
             // APS5_ARCHB_PIPE_COLLECT_SHARE_VERIFY: every 32nd own-memo hit is walked anyway, the
             // baseline rate of writes landing inside an epoch for the covered-walk mismatches.
-            if (collectShare::verify() && collectShare::active() && (++collectShare::memoHits & 31u) == 0) {
+            if (collectShare::verify() && collectShare::active() && (++collectShare::memoHitsThreadState() & 31u) == 0) {
                 const auto lock = lockTracker(tracker);
                 std::uint64_t stamped = 0;
                 if (walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, memoVirtualQuery, &stamped)) {
@@ -3964,7 +4005,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             stableVerify = true;
         }
     }
-    const auto refusedBefore = refusedWalkPages;
+    const auto refusedBefore = refusedWalkPagesThreadState();
     const auto fail = [&]() -> std::uint64_t {
         census::note(census::OutcomeFailed);
         if (memoFailures) {
@@ -3974,7 +4015,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
         if (stableFailures && stableSerials.settled()) {
             auto& counts = stableFailed::counters();
-            if (refusedWalkPages != refusedBefore) {
+            if (refusedWalkPagesThreadState() != refusedBefore) {
                 // Compared or unreported pages: their walk has effects, never remembered.
                 counts.refused.fetch_add(1, std::memory_order_relaxed);
                 if (stableVerify) counts.mismatches.fetch_add(1, std::memory_order_relaxed);
@@ -4049,8 +4090,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     };
     // APS5_ARCHB_PIPE_COLLECT_SHARE: the committer skips a walk queue 0 already made for this epoch;
     // queue 0 records its walks. Not with the write-generation table (its sweep model follows walks).
-    const bool shareCommitter = committerThread && useMemo && !Gen::Active() && (collectShare::active() || resolveShareActive());
-    const bool shareProducer = !committerThread && !Gen::Active() && ((collectShare::producer && collectShare::active()) || (resolverThread && resolveShareActive()));
+    const bool shareCommitter = committerThread() && useMemo && !Gen::Active() && (collectShare::active() || resolveShareActive());
+    const bool shareProducer = !committerThread() && !Gen::Active() && ((collectShare::producerThreadState() && collectShare::active()) || (resolverThreadThreadState() && resolveShareActive()));
     bool shareCovered = false;
 #ifdef _WIN32
     if (shareCommitter) {
@@ -4072,7 +4113,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         } else counters.sharePartialPages.fetch_add(coveredPages, std::memory_order_relaxed);
     }
 #endif
-    if (committerThread && useMemo) {
+    if (committerThread() && useMemo) {
         CommitterCollects().walks.fetch_add(1, std::memory_order_relaxed);
         CommitterCollects().walkPages.fetch_add((stop - first) / page, std::memory_order_relaxed);
     }
@@ -4207,11 +4248,11 @@ void BumpCollectEpoch(Gen::TicketReason reason) {
     // APS5_ARCHB_PIPE_COLLECT_SHARE: a committer's own ordering point (an unlocked wait) also bounds
     // the queue-0 walks that may stand in for its own; following a commit's token resets the
     // requirement until FollowCollectShare names the token's point.
-    if (committerThread) {
-        if (reason == Gen::TicketReason::Committer) collectShare::required = collectShare::Unknown;
+    if (committerThread()) {
+        if (reason == Gen::TicketReason::Committer) collectShare::requiredThreadState() = collectShare::Unknown;
         else {
-            collectShare::floor = std::max(collectShare::floor, epoch);
-            if (collectShare::required != collectShare::Unknown) collectShare::required = std::max(collectShare::required, epoch);
+            collectShare::floorThreadState() = std::max(collectShare::floorThreadState(), epoch);
+            if (collectShare::requiredThreadState() != collectShare::Unknown) collectShare::requiredThreadState() = std::max(collectShare::requiredThreadState(), epoch);
         }
     }
     // Rule V1: a ticket at every ordering point, after the observation (the same points as the
@@ -4229,16 +4270,16 @@ CommitterCollectCounters& CommitterCollects() {
 }
 
 void MarkCommitterThread() {
-    committerThread = true;
-    trackerTimedWaits = &committerTrackerWaits;
-    trackerTimedWaitNs = &committerTrackerWaitNs;
+    committerThread(true);
+    trackerTimedWaits(&committerTrackerWaits);
+    trackerTimedWaitNs(&committerTrackerWaitNs);
     MarkDriverThread();
 }
 
 void MarkResolverThread() {
-    resolverThread = true;
-    trackerTimedWaits = &resolverTrackerWaits;
-    trackerTimedWaitNs = &resolverTrackerWaitNs;
+    resolverThreadThreadState() = true;
+    trackerTimedWaits(&resolverTrackerWaits);
+    trackerTimedWaitNs(&resolverTrackerWaitNs);
     MarkDriverThread();
 }
 
@@ -4376,25 +4417,25 @@ void WtFaultFlip(bool presenter) {
     if (walkArmed && armed != 0) {
         const auto walkStart = std::chrono::steady_clock::now();
         auto& tracker = Tracker();
-        stampTrace::walkTag = 1;
+        stampTrace::walkTagThreadState() = 1;
         for (std::size_t i = 0; i < armed && i < ArmedRuns; ++i) {
             const auto lock = lockTracker(tracker);
             walkWrites(tracker, runs[2 * i], runs[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
         }
-        stampTrace::walkTag = 0;
+        stampTrace::walkTagThreadState() = 0;
         wc.armedWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
     if (dirtyCount != 0) {
         const auto walkStart = std::chrono::steady_clock::now();
         auto& tracker = Tracker();
-        wtFault::flipDirtyWalk = true;
-        stampTrace::walkTag = 2;
+        wtFault::flipDirtyWalkThreadState() = true;
+        stampTrace::walkTagThreadState() = 2;
         for (std::size_t i = 0; i < dirtyCount; ++i) {
             const auto lock = lockTracker(tracker);
             walkWrites(tracker, dirtyRuns[2 * i], dirtyRuns[2 * i + 1], StampKind::Cpu, false, nullptr, false, nullptr, true);
         }
-        wtFault::flipDirtyWalk = false;
-        stampTrace::walkTag = 0;
+        wtFault::flipDirtyWalkThreadState() = false;
+        stampTrace::walkTagThreadState() = 0;
         wc.dirtyWalks.fetch_add(dirtyCount, std::memory_order_relaxed);
         wc.dirtyWalkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count()), std::memory_order_relaxed);
     }
@@ -4465,16 +4506,16 @@ WtFaultStatus WtFault() {
 }
 
 bool IsCommitterThread() {
-    return committerThread;
+    return committerThread();
 }
 
 void SetCollectShareProducer(bool producer) {
-    collectShare::producer = producer;
+    collectShare::producerThreadState() = producer;
 }
 
 void FollowCollectShare(std::uint64_t clock) {
-    if (!committerThread) return;
-    collectShare::required = clock == 0 ? collectShare::Unknown : std::max(clock, collectShare::floor);
+    if (!committerThread()) return;
+    collectShare::requiredThreadState() = clock == 0 ? collectShare::Unknown : std::max(clock, collectShare::floorThreadState());
 }
 
 bool CollectAheadCensus() {
@@ -4490,7 +4531,7 @@ bool CommitterCollectCensus() {
 }
 
 void BeginCommitterCensusItem(std::uint8_t kind) {
-    if (!committerThread || !committerCensus::enabled()) return;
+    if (!committerThread() || !committerCensus::enabled()) return;
     auto& census = committerCensus::state();
     ++census.itemSerial;
     census.itemKind = kind;
@@ -4512,11 +4553,11 @@ CollectAheadCensusCounters& CollectAheadCensusCounts() {
 }
 
 void SetCommitterPrelock(bool prelock) {
-    if (!committerThread) return;
+    if (!committerThread()) return;
     aheadCensus::prelock = prelock;
     if (prelock && !aheadCensus::item.prepared) {
         aheadCensus::item.prepared = true;
-        aheadCensus::item.required = collectShare::required == collectShare::Unknown ? collectShare::Unknown : std::max(collectShare::required, collectShare::floor);
+        aheadCensus::item.required = collectShare::requiredThreadState() == collectShare::Unknown ? collectShare::Unknown : std::max(collectShare::requiredThreadState(), collectShare::floorThreadState());
     }
 }
 
@@ -4537,9 +4578,9 @@ std::uint64_t UnwatchSerial() {
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
-    if (committerThread) {
-        collectShare::floor = std::max(collectShare::floor, latest);
-        if (collectShare::required != collectShare::Unknown) collectShare::required = std::max(collectShare::required, latest);
+    if (committerThread()) {
+        collectShare::floorThreadState() = std::max(collectShare::floorThreadState(), latest);
+        if (collectShare::requiredThreadState() != collectShare::Unknown) collectShare::requiredThreadState() = std::max(collectShare::requiredThreadState(), latest);
     }
     if (Gen::Active()) Gen::AdoptLatest();
 }
@@ -4633,7 +4674,10 @@ void ReportWriteCensus(std::uint64_t pass, std::uint64_t frames) {
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 std::atomic<std::uint64_t> resourceProofSerial{1};
-thread_local bool proofThread = false;
+bool& proofThreadThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 }
 
 std::uint64_t ProofSerial() {
@@ -4658,7 +4702,7 @@ void BreakProofs() {
 }
 
 void MarkProofThread() {
-    proofThread = true;
+    proofThreadThreadState() = true;
 }
 
 std::uint64_t CollectEpoch() {
@@ -4669,7 +4713,11 @@ namespace {
 
 std::atomic<void (*)(std::uint64_t, std::size_t)> unwatchHook{nullptr};
 
-thread_local bool unwatchWritesProven = true;
+bool& unwatchWritesProvenThreadState() {
+    struct State { bool value = true; };
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State, Slot>().value;
+}
 std::atomic<int> importWalkFailureForTest{0};
 std::atomic<std::uint64_t> importWalkFailureSpanForTest{0};
 
@@ -4693,8 +4741,8 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 
 void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
     struct Unproven {
-        Unproven() { unwatchWritesProven = false; }
-        ~Unproven() { unwatchWritesProven = true; }
+        Unproven() { unwatchWritesProvenThreadState() = false; }
+        ~Unproven() { unwatchWritesProvenThreadState() = true; }
         Unproven(const Unproven&) = delete;
         Unproven& operator=(const Unproven&) = delete;
     } unproven;
@@ -4714,7 +4762,10 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 #endif
 }
 
-thread_local bool ownHostWrite = false;
+bool& ownHostWriteThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 std::atomic<std::uint64_t> hostWritesInFlight{0};
 std::atomic<bool> hostWritesStopped{false};
 
@@ -4728,8 +4779,8 @@ public:
 
 class OwnHostWrite {
 public:
-    OwnHostWrite() : outer(std::exchange(ownHostWrite, true)) {}
-    ~OwnHostWrite() { ownHostWrite = outer; }
+    OwnHostWrite() : outer(std::exchange(ownHostWriteThreadState(), true)) {}
+    ~OwnHostWrite() { ownHostWriteThreadState() = outer; }
     OwnHostWrite(const OwnHostWrite&) = delete;
     OwnHostWrite& operator=(const OwnHostWrite&) = delete;
 
@@ -4744,7 +4795,7 @@ void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
 }
 
 bool UnwatchWritesProven() {
-    return unwatchWritesProven;
+    return unwatchWritesProvenThreadState();
 }
 
 void SetImportWalkFailureForTest(int walk, std::uint64_t span) {
@@ -5591,7 +5642,10 @@ UnstampedAliasCounters& UnstampedAlias() {
 #ifdef _WIN32
 namespace {
 
-thread_local ThreadCollectMemo threadHintMemo;
+ThreadCollectMemo& threadHintMemoThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<ThreadCollectMemo, Slot>();
+}
 
 bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
     census::noteWalk(first, stop);
@@ -5632,7 +5686,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::sourc
     if (!tracker.watched || !tracker.hinted(first, stop)) return 0;
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
+    const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemoThreadState().entries.begin(), threadHintMemoThreadState().entries.end(), [&](const WriteTracker::Memo& entry) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
@@ -5640,7 +5694,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, std::sourc
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
-        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched, mapping};
+        if (collectMemoEnabled()) threadHintMemoThreadState().entries[threadHintMemoThreadState().next++ % threadHintMemoThreadState().entries.size()] = {first, stop, epoch, unwatched, mapping};
     }
     return tracker.newestHint(first, stop);
 #else
@@ -5909,6 +5963,7 @@ struct GpuLockStats {
     std::uint64_t labelsInHold = 0;
     std::size_t holdSite = 0;
     std::chrono::steady_clock::time_point holdStart;
+    bool holdCheap = false;
     std::uint64_t heldNs = 0;
     // This thread's column of the holder matrix (-1 until its first hold), and what its contended
     // acquisitions waited behind: holds by (holder, site) that ended during the waits.
@@ -5924,8 +5979,13 @@ struct GpuLockStats {
 };
 
 GpuLockStats& LockStats() {
-    thread_local GpuLockStats stats;
-    return stats;
+    struct Slot {};
+    auto* stats = HostThreadSlot<GpuLockStats*, Slot>::Get();
+    if (stats == nullptr) {
+        ShaderRecompiler::ThreadOwned(stats);
+        HostThreadSlot<GpuLockStats*, Slot>::Set(stats);
+    }
+    return *stats;
 }
 
 bool GpuLockProfiled() {
@@ -5944,12 +6004,13 @@ void BeginHold(std::size_t site) {
     auto& stats = LockStats();
     stats.holdSite = site;
     stats.labelsInHold = 0;
-    stats.holdStart = std::chrono::steady_clock::now();
+    stats.holdCheap = ArchB::CheapClock::Active();
+    stats.holdStart = ArchB::CheapClock::Now(stats.holdCheap);
 }
 
 void EndHold() {
     auto& stats = LockStats();
-    const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
+    const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(ArchB::CheapClock::Now(stats.holdCheap) - stats.holdStart).count();
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     stats.heldNs += static_cast<std::uint64_t>(heldNs);
     ++stats.siteHolds[stats.holdSite];
@@ -6071,7 +6132,8 @@ private:
     }
 
     Ring& local() {
-        thread_local Ring* ring = nullptr;
+        struct RingThreadStorage {};
+        auto& ring = AgcDriver::ThreadScratch<Ring*, RingThreadStorage>();
         if (ring == nullptr) {
             auto owned = std::make_unique<Ring>();
             owned->thread = static_cast<std::uint32_t>(GetCurrentThreadId());
@@ -6121,8 +6183,15 @@ thread_local std::uint64_t holdLogBegin = 0;
 #endif
 
 std::atomic<std::uint64_t> gpuHoldSerial{0};
-thread_local std::chrono::steady_clock::time_point recorderHoldStart{};
-thread_local std::uint64_t recorderHoldGeneration = 0;
+struct RecorderHoldStartSlot {};
+struct RecorderHoldGenerationSlot {};
+struct RecorderHoldCheapSlot {};
+std::uint64_t recorderHoldStart() { return HostThreadSlot<std::uint64_t, RecorderHoldStartSlot>::Get(); }
+void recorderHoldStart(std::uint64_t value) { HostThreadSlot<std::uint64_t, RecorderHoldStartSlot>::Set(value); }
+std::uint64_t recorderHoldGeneration() { return HostThreadSlot<std::uint64_t, RecorderHoldGenerationSlot>::Get(); }
+void recorderHoldGeneration(std::uint64_t value) { HostThreadSlot<std::uint64_t, RecorderHoldGenerationSlot>::Set(value); }
+bool recorderHoldCheap() { return HostThreadSlot<bool, RecorderHoldCheapSlot>::Get(); }
+void recorderHoldCheap(bool value) { HostThreadSlot<bool, RecorderHoldCheapSlot>::Set(value); }
 
 // APS5_ARCHB_PIPE_COMMITTER_MUTEX_PRIORITY (GuestMemory.hpp, SetGpuLockPriorityHook).
 std::atomic<bool (*)()> gpuLockPriorityHook{nullptr};
@@ -6200,13 +6269,17 @@ void GpuMutexType::acquired() {
 #ifdef _WIN32
         if (HoldLog::Instance() != nullptr) holdLogBegin = HoldLog::Now();
 #endif
-        recorderHoldGeneration = ArchB::Recorder::Generation();
-        recorderHoldStart = ArchB::Recorder::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite);
+        if (ArchB::Recorder::Enabled()) {
+            recorderHoldGeneration(ArchB::Recorder::Generation());
+            const bool cheap = ArchB::CheapClock::Active();
+            recorderHoldCheap(cheap);
+            recorderHoldStart(static_cast<std::uint64_t>(ArchB::CheapClock::Now(cheap).time_since_epoch().count()));
+        } else recorderHoldStart(0);
+        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockAcquired, 0, 0, 0, 0, 0, Timeline::LockSite());
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         const bool skipInvalidation = ArchB::Switches::Enabled(ArchB::Feature::UbNoLockInvalidation);
         bool skipped = false;
-        if (!proofThread) {
+        if (!proofThreadThreadState()) {
             if (skipInvalidation) skipped = true;
             else proofSerial.fetch_add(1, std::memory_order_acq_rel);
         }
@@ -6227,8 +6300,8 @@ bool GpuMutexType::try_lock() {
     const bool timelineOuter = Timeline::Enabled && !HeldByThisThread();
     if (timelineOuter) {
         const auto site = LockStats().nextSite;
-        Timeline::LockSite = static_cast<std::uint32_t>(site == GpuLockSite::Other ? GpuLockSite::Try : site) + 1;
-        Timeline::Emit(Timeline::Kind::LockBegin, 1, 0, 0, 0, 0, Timeline::LockSite);
+        Timeline::LockSite() = static_cast<std::uint32_t>(site == GpuLockSite::Other ? GpuLockSite::Try : site) + 1;
+        Timeline::Emit(Timeline::Kind::LockBegin, 1, 0, 0, 0, 0, Timeline::LockSite());
     }
     struct TimelineTry {
         bool outer;
@@ -6268,7 +6341,7 @@ void SetGpuUnlockHook(void (*hook)()) {
 
 void EnableHoldMarks() {
 #ifdef _WIN32
-    holdMarksOn = HoldLog::Instance() != nullptr;
+    HoldMarksOn(HoldLog::Instance() != nullptr);
 #endif
 }
 
@@ -6294,14 +6367,15 @@ std::uint64_t ThreadGpuHeldNs() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
-        if (recorderHoldStart != std::chrono::steady_clock::time_point{} && recorderHoldGeneration == ArchB::Recorder::Generation()) {
-            ArchB::Recorder::Count("gpu_mutex_hold_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - recorderHoldStart).count());
-            recorderHoldStart = {};
+        if (const auto start = recorderHoldStart(); start != 0 && recorderHoldGeneration() == ArchB::Recorder::Generation()) {
+            const auto now = static_cast<std::uint64_t>(ArchB::CheapClock::Now(recorderHoldCheap()).time_since_epoch().count());
+            ArchB::Recorder::Count("gpu_mutex_hold_ms", static_cast<double>(now - start) / 1e6);
+            recorderHoldStart(0);
         }
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
-        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
+        if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite());
 #ifdef _WIN32
         if (auto* log = HoldLog::Instance(); log != nullptr && holdLogBegin != 0) {
             log->Push(LockStats().tag, holdLogBegin, HoldLog::Now());
@@ -6335,14 +6409,14 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
-    if (holdMarksOn && !HeldByThisThread()) HoldMarkSlow(HoldMark::LockBegin);
+    if (HoldMarksOn() && !HeldByThisThread()) HoldMarkSlow(HoldMark::LockBegin);
     // Before the wait timer: time given to the committer is counted apart (pipe_mutex_priority_*).
     DeferToCommitter(*this);
     PerformanceTimer recorderTiming("GpuMutex.wait");
     recorderTiming.RecorderCounter("gpu_mutex_wait_ms");
     if (Timeline::Enabled && !HeldByThisThread()) {
-        Timeline::LockSite = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
-        Timeline::Emit(Timeline::Kind::LockBegin, 0, 0, 0, 0, 0, Timeline::LockSite);
+        Timeline::LockSite() = static_cast<std::uint32_t>(LockStats().nextSite) + 1;
+        Timeline::Emit(Timeline::Kind::LockBegin, 0, 0, 0, 0, 0, Timeline::LockSite());
     }
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
@@ -6653,7 +6727,7 @@ std::string HostWriteReport() {
 }
 
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
-    if (ownHostWrite || bytes == 0) return;
+    if (ownHostWriteThreadState() || bytes == 0) return;
     if (GpuMutex().HeldByThisThread()) noteLockedHostWrite(address, bytes);
     const HostWriteInFlight inFlight;
     if (hostWritesStopped.load(std::memory_order_seq_cst)) return;

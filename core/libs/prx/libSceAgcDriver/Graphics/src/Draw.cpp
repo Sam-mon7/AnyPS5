@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -830,8 +831,9 @@ enum RecipeBuild : std::size_t { RecipeNotRequested, RecipeDisabled, RecipeUncac
 constexpr std::array<const char*, RecipeBuildCount> RecipeBuildNames{"not requested/shape", "disabled", "uncacheable", "waited", "indirect", "not reusable", "moved disabled", "multisampled", "sample order", "built"};
 
 int& archcLastRecipeBuild() {
-    thread_local int last = -1;
-    return last;
+    struct State { int value = -1; };
+    struct LastStorage {};
+    return AgcDriver::ThreadScratch<State, LastStorage>().value;
 }
 
 bool DrawMovedRecipes() {
@@ -1360,8 +1362,8 @@ std::map<std::vector<std::uint64_t>, std::string>& validationFailures() {
 }
 
 std::vector<std::uint64_t>& validationKeyScratch() {
-    thread_local std::vector<std::uint64_t>* keySlot = nullptr;
-    auto& key = ShaderRecompiler::ThreadOwned(keySlot);
+    struct KeySlotStorage {};
+    auto& key = AgcDriver::ThreadScratch<std::vector<std::uint64_t>, KeySlotStorage>();
     key.clear();
     return key;
 }
@@ -1374,8 +1376,10 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
     static std::map<std::vector<std::uint64_t>, std::uint32_t> memo;
     struct LastKeyStorage {};
     auto& lastKey = HostThreadLocal<std::vector<std::uint64_t>, LastKeyStorage>();
-    thread_local std::uint32_t lastOutputs = 0;
-    thread_local bool lastValid = false;
+    struct LastOutputsThreadStorage {};
+    auto& lastOutputs = AgcDriver::ThreadScratch<std::uint32_t, LastOutputsThreadStorage>();
+    struct LastValidThreadStorage {};
+    auto& lastValid = AgcDriver::ThreadScratch<bool, LastValidThreadStorage>();
     const bool trims = keyed && CommitTrims();
     if (trims && lastValid && key == lastKey) {
         memoized = true;
@@ -1748,8 +1752,8 @@ struct ThreadState {
 };
 
 ThreadState& state() {
-    thread_local ThreadState* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct SlotStorage {};
+    return AgcDriver::ThreadScratch<ThreadState, SlotStorage>();
 }
 
 std::uint64_t now() {
@@ -1813,7 +1817,8 @@ struct DrawTimer {
             std::array<std::uint64_t, PhaseCount> phases{};
             std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
         };
-        static thread_local Totals totals;
+        struct TotalsThreadStorage {};
+        auto& totals = AgcDriver::ThreadScratch<Totals, TotalsThreadStorage>();
         const auto held = GuestMemory::ThreadGpuHeldNs();
         ++totals.scopes;
         totals.held += held - heldStart;
@@ -1839,8 +1844,8 @@ struct LastDrawPhases {
 };
 
 LastDrawPhases& lastDrawPhases() {
-    static thread_local LastDrawPhases last;
-    return last;
+    struct LastStorage {};
+    return AgcDriver::ThreadScratch<LastDrawPhases, LastStorage>();
 }
 
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
@@ -2154,7 +2159,8 @@ struct DerivedIndexCache {
 constexpr std::size_t DerivedIndexCacheBytes = 256ull << 20u;
 
 DerivedIndexCache& derivedIndexCache(VkDevice device) {
-    thread_local DerivedIndexCache* cache = nullptr;
+    struct CacheThreadStorage {};
+    auto& cache = AgcDriver::ThreadScratch<DerivedIndexCache*, CacheThreadStorage>();
     if (cache == nullptr) cache = new DerivedIndexCache();
     if (cache->device != device) {
         if (!cache->entries.empty()) {
@@ -3067,8 +3073,8 @@ bool censusActive() {
 }
 
 std::array<std::uint64_t, 8>& prelockNs() {
-    thread_local std::array<std::uint64_t, 8> made{};
-    return made;
+    struct MadeStorage {};
+    return AgcDriver::ThreadScratch<std::array<std::uint64_t, 8>, MadeStorage>();
 }
 
 class CensusProbe {
@@ -3229,7 +3235,8 @@ bool fastVerify() {
 bool verifyHitNow() {
     const auto period = verifyPeriod();
     if (period == 0) return false;
-    thread_local std::uint64_t hits = 0;
+    struct HitsThreadStorage {};
+    auto& hits = AgcDriver::ThreadScratch<std::uint64_t, HitsThreadStorage>();
     return ++hits % period == 0;
 }
 
@@ -3448,24 +3455,30 @@ Counters& counters() {
     static auto* made = new Counters();
     return *made;
 }
-thread_local bool active = false;
-thread_local std::chrono::steady_clock::time_point lap;
+bool& activeThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
+std::chrono::steady_clock::time_point& lapThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::chrono::steady_clock::time_point, Slot>();
+}
 void start() {
-    active = Recorder::SnapshotDiagEnabled() && GuestMemory::IsCommitterThread();
-    if (active) lap = std::chrono::steady_clock::now();
+    activeThreadState() = Recorder::SnapshotDiagEnabled() && GuestMemory::IsCommitterThread();
+    if (activeThreadState()) lapThreadState() = std::chrono::steady_clock::now();
 }
 void restart() {
-    if (active) lap = std::chrono::steady_clock::now();
+    if (activeThreadState()) lapThreadState() = std::chrono::steady_clock::now();
 }
 void mark(Step step) {
-    if (!active) return;
+    if (!activeThreadState()) return;
     const auto now = std::chrono::steady_clock::now();
-    counters().ns[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count()), std::memory_order_relaxed);
-    lap = now;
+    counters().ns[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lapThreadState()).count()), std::memory_order_relaxed);
+    lapThreadState() = now;
 }
 void finish(bool hit) {
-    if (!active) return;
-    active = false;
+    if (!activeThreadState()) return;
+    activeThreadState() = false;
     counters().draws.fetch_add(1, std::memory_order_relaxed);
     if (hit) counters().hits.fetch_add(1, std::memory_order_relaxed);
 }
@@ -3496,8 +3509,8 @@ bool verify() {
 }
 std::shared_ptr<ShaderResources> find(const ResourceCache::Key& key) {
     if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawLookupMemo) || !GuestMemory::IsCommitterThread()) return SharedResourceCache().Find(key);
-    thread_local ResourceCacheMemo* memoSlot = nullptr;
-    return ShaderRecompiler::ThreadOwned(memoSlot).Find(SharedResourceCache(), key, verify(), counters());
+    struct MemoSlotStorage {};
+    return AgcDriver::ThreadScratch<ResourceCacheMemo, MemoSlotStorage>().Find(SharedResourceCache(), key, verify(), counters());
 }
 }
 
@@ -3569,7 +3582,7 @@ bool drawStagingEnabled() {
 
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer, DrawPreparation* preparation) {
     ResolvedResources resolved;
-    lookupDiag::active = false;
+    lookupDiag::activeThreadState() = false;
     auto lookupLap = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto lookupPhase = [&](LookupPhase phase) {
         if (!timer.profile) return;
@@ -4235,7 +4248,8 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     // APS5_ARCHB_FIX_ALLOC_CHURN: the in-place reads in a per-thread scratch that keeps its capacity;
     // off, a vector of this call (as the by-value InPlaceReads made).
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+    struct ReadsSlotThreadStorage {};
+    auto& readsSlot = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>*, ReadsSlotThreadStorage>();
     auto& inPlaceReads = AgcDriver::ArchB::AllocChurnActive() ? ShaderRecompiler::ThreadOwned(readsSlot) : ownedReads;
     resources.InPlaceReads(inPlaceReads);
     for (const auto& [begin, end] : inPlaceReads) {
@@ -4351,7 +4365,10 @@ struct Current {
     std::uint64_t structure = 0;
     std::array<std::uint64_t, StructCensus::ReuseStages> ns{};
 };
-thread_local Current current;
+Current& currentThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<Current, Slot>();
+}
 
 std::uint64_t nowNs() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -4360,38 +4377,38 @@ std::uint64_t nowNs() {
 void begin(bool recipe) {
     static const bool enabled = StructCensus::ReuseCensusEnabled();
     if (!enabled || !GuestMemory::IsCommitterThread()) {
-        current.active = false;
+        currentThreadState().active = false;
         return;
     }
-    current = {};
-    current.active = true;
-    current.recipe = recipe;
-    current.start = current.last = nowNs();
+    currentThreadState() = {};
+    currentThreadState().active = true;
+    currentThreadState().recipe = recipe;
+    currentThreadState().start = currentThreadState().last = nowNs();
 }
 
 void mark(StructCensus::ReuseStage stage) {
-    if (!current.active) return;
+    if (!currentThreadState().active) return;
     const auto now = nowNs();
-    current.ns[stage] += now - current.last;
-    current.last = now;
+    currentThreadState().ns[stage] += now - currentThreadState().last;
+    currentThreadState().last = now;
 }
 
 // The structure level of the draw's census commit; its hashing time is left out of the stages.
 void structure(const State& state, const Pm4::DrawParameters& draw, const RecordedDraw& record, std::uint64_t passKey, const ShaderResources::DrawBindings* bindings, bool continued) {
-    if (!current.active) return;
+    if (!currentThreadState().active) return;
     mark(StructCensus::ReuseRecord);
-    current.structure = StructCensus::Tracker::LevelHashes(drawCensusCommit(state, draw, record, passKey, bindings, continued, false))[StructCensus::LevelStructure];
-    current.last = nowNs();
+    currentThreadState().structure = StructCensus::Tracker::LevelHashes(drawCensusCommit(state, draw, record, passKey, bindings, continued, false))[StructCensus::LevelStructure];
+    currentThreadState().last = nowNs();
 }
 
 void finish() {
-    if (!current.active) return;
-    current.active = false;
-    StructCensus::NoteReuseDraw(current.structure, current.recipe, current.ns, current.last - current.start, GuestMemory::CensusFlips());
+    if (!currentThreadState().active) return;
+    currentThreadState().active = false;
+    StructCensus::NoteReuseDraw(currentThreadState().structure, currentThreadState().recipe, currentThreadState().ns, currentThreadState().last - currentThreadState().start, GuestMemory::CensusFlips());
 }
 
 void markPhase(std::size_t drawPhase) {
-    if (!current.active) return;
+    if (!currentThreadState().active) return;
     using namespace StructCensus;
     switch (drawPhase) {
         case PhaseReadTarget: mark(ReuseTargets); break;
@@ -4468,8 +4485,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool captured = state.stages.mesh && state.tessellationCapture != nullptr;
     const bool addressBased = resources.HoldsLease();
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
-    auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
+    struct PassReadsSlotStorage {};
+    auto& passReads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, PassReadsSlotStorage>();
     passReads.clear();
     if (!addressBased) resources.DeviceReads(passReads);
     const auto deviceReads = passReads.size();
@@ -4506,7 +4523,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownWrites = ((addressBased || resources.UsesAddressTable()) && !readOnlyBda) || resources.HasCopiedWrites();
     GuestRangeList passWrites = resources.GpuWrites();
     GuestRangeList passWriteOnly{};
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* hazardWritesSlot = nullptr;
+    struct HazardWritesSlotThreadStorage {};
+    auto& hazardWritesSlot = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>*, HazardWritesSlotThreadStorage>();
     if (const auto& writeOnly = resources.WriteOnlyRanges(); !writeOnly.empty() && !unknownMemory && WriteOnlyPasses()) {
         const auto listed = [&](const std::pair<std::uint64_t, std::uint64_t>& range, bool aligned) {
             return std::any_of(writeOnly.begin(), writeOnly.end(), [&](const auto& only) {
@@ -4569,7 +4587,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (!continued && Recorder::BarrierValidate()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: a per-thread scratch (NoteAccess reads it before returning).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        struct ReadsSlotThreadStorage {};
+        auto& readsSlot = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>*, ReadsSlotThreadStorage>();
         auto& reads = AgcDriver::ArchB::AllocChurnActive() ? ShaderRecompiler::ThreadOwned(readsSlot) : ownedReads;
         resources.InPlaceReads(reads);
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -5183,8 +5202,9 @@ bool sameMoved(std::span<const ShaderResources::MovedBuffer> a, std::span<const 
 }
 
 int& lastOutcome() {
-    thread_local int made = -1;
-    return made;
+    struct State { int value = -1; };
+    struct MadeStorage {};
+    return AgcDriver::ThreadScratch<State, MadeStorage>().value;
 }
 
 bool active() {
@@ -5208,7 +5228,8 @@ std::uint64_t verifyPeriod() {
 bool verifyNow() {
     const auto period = verifyPeriod();
     if (period == 0) return false;
-    thread_local std::uint64_t checks = 0;
+    struct ChecksThreadStorage {};
+    auto& checks = AgcDriver::ThreadScratch<std::uint64_t, ChecksThreadStorage>();
     return ++checks % period == 0;
 }
 
@@ -5336,8 +5357,8 @@ struct Table {
 };
 
 Table& table() {
-    thread_local Table* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct SlotStorage {};
+    return AgcDriver::ThreadScratch<Table, SlotStorage>();
 }
 
 std::uint64_t mix(std::uint64_t hash, std::uint64_t value) {
@@ -5408,8 +5429,8 @@ struct Seen {
 };
 
 void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
-    thread_local std::unordered_map<std::uint64_t, Seen>* byShapeSlot = nullptr;
-    auto& byShape = ShaderRecompiler::ThreadOwned(byShapeSlot);
+    struct ByShapeSlotStorage {};
+    auto& byShape = AgcDriver::ThreadScratch<std::unordered_map<std::uint64_t, Seen>, ByShapeSlotStorage>();
     std::uint64_t shape = 0x5348u;
     for (const auto& shader : shaders) shape = mix(shape, (static_cast<std::uint64_t>(shader.stage) << 32u) | shader.pushConstantOffset);
     shape = mix(shape, shaders.empty() || shaders.front().program == nullptr ? 0 : shaders.front().program->variantId);
@@ -5434,8 +5455,8 @@ void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& d
         std::unordered_set<std::uint64_t> arguments;
         std::unordered_set<std::uint64_t> draws;
     };
-    thread_local SeenSets* setsSlot = nullptr;
-    auto& sets = ShaderRecompiler::ThreadOwned(setsSlot);
+    struct SetsSlotStorage {};
+    auto& sets = AgcDriver::ThreadScratch<SeenSets, SetsSlotStorage>();
     auto& states = sets.states;
     auto& programs = sets.programs;
     auto& arguments = sets.arguments;
@@ -5457,7 +5478,8 @@ void classifyMiss(const DrawSlotIdentity& identity, const Pm4::DrawParameters& d
 
 bool sightedBefore(std::uint64_t key) {
     constexpr std::size_t Sightings = 16384;
-    thread_local std::array<std::uint64_t, Sightings> seen{};
+    struct SeenThreadStorage {};
+    auto& seen = AgcDriver::ThreadScratch<std::array<std::uint64_t, Sightings>, SeenThreadStorage>();
     auto& entry = seen[static_cast<std::size_t>((key ^ (key >> 29u)) % Sightings)];
     if (entry == key) return true;
     entry = key;
@@ -5489,8 +5511,8 @@ void patchCensus(VkDevice device, const DrawSlotIdentity& identity, const Pm4::D
     struct Seen {
         std::array<std::uint64_t, 16384> keys{};
     };
-    thread_local Seen* seenSlot = nullptr;
-    auto& seen = ShaderRecompiler::ThreadOwned(seenSlot);
+    struct SeenSlotStorage {};
+    auto& seen = AgcDriver::ThreadScratch<Seen, SeenSlotStorage>();
     const auto key = keyOf(device, identity, draw, shaders, true);
     auto& entry = seen.keys[static_cast<std::size_t>((key ^ (key >> 29u)) % seen.keys.size())];
     if (entry == key) made.wordlessSeen.fetch_add(1, std::memory_order_relaxed);
@@ -5729,8 +5751,8 @@ struct ReplayScratch {
 };
 
 ReplayScratch& scratch() {
-    thread_local ReplayScratch* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct SlotStorage {};
+    return AgcDriver::ThreadScratch<ReplayScratch, SlotStorage>();
 }
 
 DrawOutcome& replayOutcome() {
@@ -6702,7 +6724,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     if (recorded && Recorder::BarrierValidate()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: a per-thread scratch (NoteAccess reads it before returning).
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ownedReads;
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+        struct ReadsSlotThreadStorage {};
+        auto& readsSlot = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>*, ReadsSlotThreadStorage>();
         auto& reads = AgcDriver::ArchB::AllocChurnActive() ? ShaderRecompiler::ThreadOwned(readsSlot) : ownedReads;
         resources->InPlaceReads(reads);
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());

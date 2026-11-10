@@ -74,8 +74,9 @@ using SpirvInstructions::Result;
 using SpirvInstructions::VisitIdOperands;
 
 Instruction Make(spv::Op op, std::initializer_list<std::uint32_t> operands) {
-    Instruction result{(static_cast<std::uint32_t>(operands.size() + 1u) << 16u) | op};
-    result.insert(result.end(), operands);
+    Instruction result(operands.size() + 1u);
+    result[0] = (static_cast<std::uint32_t>(result.size()) << 16u) | op;
+    std::copy(operands.begin(), operands.end(), result.begin() + 1u);
     return result;
 }
 

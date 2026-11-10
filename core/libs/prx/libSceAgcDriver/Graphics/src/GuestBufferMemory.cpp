@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -182,8 +183,14 @@ void SetHeapMirrorBudget(std::uint64_t bytes) {
 
 namespace {
 struct RefreshBlock;
-static thread_local GuestBufferMemory* buildingBufferMemory = nullptr;
-static thread_local std::vector<RefreshBlock>* buildingBlocks = nullptr;
+GuestBufferMemory*& buildingBufferMemoryThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<GuestBufferMemory*, Slot>();
+}
+std::vector<RefreshBlock>*& buildingBlocksThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::vector<RefreshBlock>*, Slot>();
+}
 
 std::atomic<std::uint64_t> importSetGeneration{1};
 
@@ -313,23 +320,26 @@ struct ImportSettle {
 
 const bool importsLockOrderChecked = MapImportGate::LockOrderChecked();
 
-thread_local std::uint32_t importsHeld = 0;
+std::uint32_t& importsHeldThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint32_t, Slot>();
+}
 
 class ImportsMutex {
 public:
     void lock() noexcept {
         mutex.lock();
-        if (importsLockOrderChecked) ++importsHeld;
+        if (importsLockOrderChecked) ++importsHeldThreadState();
     }
 
     bool try_lock() noexcept {
         if (!mutex.try_lock()) return false;
-        if (importsLockOrderChecked) ++importsHeld;
+        if (importsLockOrderChecked) ++importsHeldThreadState();
         return true;
     }
 
     void unlock() noexcept {
-        if (importsLockOrderChecked) --importsHeld;
+        if (importsLockOrderChecked) --importsHeldThreadState();
         mutex.unlock();
     }
 
@@ -2709,7 +2719,8 @@ struct AddressBuildTiming {
 };
 
 AddressBuildTiming& ThreadAddressTiming() {
-    thread_local AddressBuildTiming timing;
+    struct TimingThreadStorage {};
+    auto& timing = AgcDriver::ThreadScratch<AddressBuildTiming, TimingThreadStorage>();
     return timing;
 }
 
@@ -3150,8 +3161,8 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
 void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::Mirror);
     constexpr std::uint64_t block = 65536;
-    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
-    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    struct ChangedSlotStorage {};
+    auto& changed = AgcDriver::ThreadScratch<std::vector<std::uint8_t>, ChangedSlotStorage>();
     Mirrors().heapChecks += mirrors.size();
     for (auto* const pointer : mirrors) {
         auto& mirror = *pointer;
@@ -3255,8 +3266,8 @@ void forgetCommitChanges(ImageMirror& mirror, const Pieces& pieces) {
 
 void appendSparseBlocks(ImageMirror& mirror, Pieces pieces, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
     constexpr std::uint64_t block = 65536;
-    thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
-    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    struct ChangedSlotStorage {};
+    auto& changed = AgcDriver::ThreadScratch<std::vector<std::uint8_t>, ChangedSlotStorage>();
     forgetCommitChanges(mirror, pieces);
     ++Mirrors().heapChecks;
     changed.assign(mirror.generations.size(), 0);
@@ -3583,14 +3594,14 @@ void sweepMirrors(std::uint64_t neededBytes, std::uint64_t protectAddress) {
     }
     if (neededBytes != 0 && state.heapBytes + neededBytes > heapMirrorBudget()) {
         std::unordered_set<const ImageMirror*> queued;
-        if (buildingBlocks != nullptr) {
-            for (const auto& block : *buildingBlocks) queued.insert(block.mirror);
+        if (buildingBlocksThreadState() != nullptr) {
+            for (const auto& block : *buildingBlocksThreadState()) queued.insert(block.mirror);
         }
         while (state.heapBytes + neededBytes > heapMirrorBudget()) {
             auto victim = state.entries.end();
             for (auto it = state.entries.begin(); it != state.entries.end(); ++it) {
                 if (!it->second->heap || it->first == protectAddress || queued.count(it->second.get()) != 0) continue;
-                const bool buildingHolds = buildingBufferMemory != nullptr && buildingBufferMemory->HoldsMirror(it->second);
+                const bool buildingHolds = buildingBufferMemoryThreadState() != nullptr && buildingBufferMemoryThreadState()->HoldsMirror(it->second);
                 const auto allowedCount = (buildingHolds && !it->second->writable) ? 2 : 1;
                 if (it->second.use_count() == allowedCount) {
                     if (victim == state.entries.end()) {
@@ -3605,10 +3616,10 @@ void sweepMirrors(std::uint64_t neededBytes, std::uint64_t protectAddress) {
                 }
             }
             if (victim == state.entries.end()) break;
-            if (buildingBufferMemory != nullptr) {
-                buildingBufferMemory->RecordEvicted(victim->first);
-                if (buildingBufferMemory->HoldsMirror(victim->second)) {
-                    buildingBufferMemory->EvictMirror(victim->second);
+            if (buildingBufferMemoryThreadState() != nullptr) {
+                buildingBufferMemoryThreadState()->RecordEvicted(victim->first);
+                if (buildingBufferMemoryThreadState()->HoldsMirror(victim->second)) {
+                    buildingBufferMemoryThreadState()->EvictMirror(victim->second);
                 }
             }
             unlistMirror(state, *victim->second);
@@ -4540,13 +4551,13 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 }
 
 void RequireGpuLockBeforeImports(const char* where) {
-    if (!importsLockOrderChecked || importsHeld == 0 || GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (!importsLockOrderChecked || importsHeldThreadState() == 0 || GuestMemory::GpuMutex().HeldByThisThread()) return;
     std::fprintf(stderr, "[lock] ASSERT: %s takes GuestMemory::GpuMutex while this thread holds the host imports mutex without it\n", where);
     std::abort();
 }
 
 bool ImportsHeldByThisThread() {
-    return importsHeld != 0;
+    return importsHeldThreadState() != 0;
 }
 
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -4819,10 +4830,10 @@ void GuestBufferMemory::RecordEvicted(std::uint64_t address) {
 
 void GuestBufferMemory::AcquireRegistered() {
     struct BuildingScope {
-        explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
+        explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemoryThreadState() = self; }
         ~BuildingScope() {
-            buildingBufferMemory = nullptr;
-            buildingBlocks = nullptr;
+            buildingBufferMemoryThreadState() = nullptr;
+            buildingBlocksThreadState() = nullptr;
         }
     };
     const BuildingScope buildingScope(this);
@@ -4841,7 +4852,7 @@ void GuestBufferMemory::AcquireRegistered() {
     // APS5_NO_SORTED_SNAPSHOT_LOOKUP=1: AddSnapshot scans the regions as before instead of searching.
     static const bool sortedLookup = std::getenv("APS5_NO_SORTED_SNAPSHOT_LOOKUP") == nullptr;
     std::vector<RefreshBlock> blocks;
-    buildingBlocks = &blocks;
+    buildingBlocksThreadState() = &blocks;
     std::vector<ImageMirror*> heaps;
     bool mirrored = false;
     bool served = false;

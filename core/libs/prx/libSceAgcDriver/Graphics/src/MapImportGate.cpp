@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -42,8 +43,14 @@ struct PublisherState {
     Stripes held;
 };
 
-thread_local PublisherState publisher;
-thread_local std::uint32_t leafLocksHeld = 0;
+PublisherState& publisherThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<PublisherState, Slot>();
+}
+std::uint32_t& leafLocksHeldThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint32_t, Slot>();
+}
 
 std::uint32_t Lowest(const Stripes& stripes) {
     for (std::uint32_t index = 0; index < StripeCount; ++index) {
@@ -109,42 +116,42 @@ bool LockOrderChecked() {
 }
 
 void NoteLeafLock() noexcept {
-    if (LockOrderChecked()) ++leafLocksHeld;
+    if (LockOrderChecked()) ++leafLocksHeldThreadState();
 }
 
 void NoteLeafUnlock() noexcept {
-    if (LockOrderChecked()) --leafLocksHeld;
+    if (LockOrderChecked()) --leafLocksHeldThreadState();
 }
 
 void RequireNoLeafLockHeld(const char* where) {
     if (!LockOrderChecked()) return;
-    if (leafLocksHeld == 0 && !ImportsHeldByThisThread()) return;
-    std::fprintf(stderr, "[lock] ASSERT: %s waits for the map-time import gate while this thread holds %s\n", where, leafLocksHeld != 0 ? "the live or pending storage image mutex" : "the host imports mutex");
+    if (leafLocksHeldThreadState() == 0 && !ImportsHeldByThisThread()) return;
+    std::fprintf(stderr, "[lock] ASSERT: %s waits for the map-time import gate while this thread holds %s\n", where, leafLocksHeldThreadState() != 0 ? "the live or pending storage image mutex" : "the host imports mutex");
     std::abort();
 }
 
 PublishHold::PublishHold(std::uint64_t address, std::uint64_t bytes) {
     if (bytes == 0) return;
     const auto wanted = StripesOf(address, address + bytes);
-    if (publisher.depth != 0) {
-        if (!publisher.fast) {
-            const auto missing = wanted & ~publisher.held;
+    if (publisherThreadState().depth != 0) {
+        if (!publisherThreadState().fast) {
+            const auto missing = wanted & ~publisherThreadState().held;
             if (missing.any()) {
-                Require(Lowest(missing) > Highest(publisher.held), "a nested storage image publication needs a map-time import gate stripe below one its thread already holds");
+                Require(Lowest(missing) > Highest(publisherThreadState().held), "a nested storage image publication needs a map-time import gate stripe below one its thread already holds");
                 RequireNoLeafLockHeld("a storage image publication");
                 LockShared(missing);
-                publisher.held |= missing;
+                publisherThreadState().held |= missing;
                 added = missing;
             }
         }
-        ++publisher.depth;
+        ++publisherThreadState().depth;
         return;
     }
     RequireNoLeafLockHeld("a storage image publication");
-    publisher.depth = 1;
+    publisherThreadState().depth = 1;
     fastPublishers.fetch_add(1, std::memory_order_seq_cst);
     if (activeImports.load(std::memory_order_seq_cst) == 0) {
-        publisher.fast = true;
+        publisherThreadState().fast = true;
         mode = Mode::Fast;
         fastPublications.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -153,10 +160,10 @@ PublishHold::PublishHold(std::uint64_t address, std::uint64_t bytes) {
     try {
         LockShared(wanted);
     } catch (...) {
-        publisher.depth = 0;
+        publisherThreadState().depth = 0;
         throw;
     }
-    publisher.held = wanted;
+    publisherThreadState().held = wanted;
     added = wanted;
     mode = Mode::Striped;
     stripedPublications.fetch_add(1, std::memory_order_relaxed);
@@ -165,27 +172,27 @@ PublishHold::PublishHold(std::uint64_t address, std::uint64_t bytes) {
 PublishHold::~PublishHold() {
     switch (mode) {
     case Mode::Fast:
-        publisher.fast = false;
-        publisher.depth = 0;
+        publisherThreadState().fast = false;
+        publisherThreadState().depth = 0;
         fastPublishers.fetch_sub(1, std::memory_order_release);
         return;
     case Mode::Striped:
         UnlockShared(added);
-        publisher.held.reset();
-        publisher.depth = 0;
+        publisherThreadState().held.reset();
+        publisherThreadState().depth = 0;
         return;
     case Mode::Nested:
-        if (publisher.depth == 0) return;
-        --publisher.depth;
+        if (publisherThreadState().depth == 0) return;
+        --publisherThreadState().depth;
         if (added.none()) return;
         UnlockShared(added);
-        publisher.held &= ~added;
+        publisherThreadState().held &= ~added;
         return;
     }
 }
 
 ImportHold::ImportHold(const Stripes& stripes) : held(stripes) {
-    Require(publisher.depth == 0, "a map-time import without the GPU lock runs inside a storage image publication of its own thread");
+    Require(publisherThreadState().depth == 0, "a map-time import without the GPU lock runs inside a storage image publication of its own thread");
     activeImports.fetch_add(1, std::memory_order_seq_cst);
     if (fastPublishers.load(std::memory_order_seq_cst) != 0) {
         drainWaits.fetch_add(1, std::memory_order_relaxed);

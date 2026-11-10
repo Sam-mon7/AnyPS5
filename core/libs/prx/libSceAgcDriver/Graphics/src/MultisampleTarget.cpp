@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include <shared_mutex>
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1037,12 +1038,14 @@ std::mutex& targetsMutex() {
     return mutex;
 }
 
-thread_local bool targetsMutexHeld = false;
+struct TargetsMutexSlot {};
+bool targetsMutexHeld() { return HostThreadSlot<bool, TargetsMutexSlot>::Get(); }
+void targetsMutexHeld(bool value) { HostThreadSlot<bool, TargetsMutexSlot>::Set(value); }
 
 struct TargetsLock {
     std::lock_guard<std::mutex> lock{targetsMutex()};
-    TargetsLock() { targetsMutexHeld = true; }
-    ~TargetsLock() { targetsMutexHeld = false; }
+    TargetsLock() { targetsMutexHeld(true); }
+    ~TargetsLock() { targetsMutexHeld(false); }
 };
 
 std::vector<std::shared_ptr<MultisampleTarget>>& targets() {
@@ -1722,7 +1725,7 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
 }
 
 bool HoldsMultisampleTargetsLock() {
-    return targetsMutexHeld;
+    return targetsMutexHeld();
 }
 
 std::uint64_t MultisampleTargetRangeGeneration() {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
@@ -513,7 +514,10 @@ bool anyUnit(const std::vector<bool>& units) {
     return std::find(units.begin(), units.end(), true) != units.end();
 }
 
-thread_local DepthPlaneOverwrite* currentOverwrite = nullptr;
+DepthPlaneOverwrite*& currentOverwriteThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<DepthPlaneOverwrite*, Slot>();
+}
 
 std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clear) {
     auto& counters = depthClearCounters();
@@ -1141,7 +1145,7 @@ public:
     }
 
     DepthPlaneOverwrite* PlaneOverwritten(std::span<const std::uint32_t> words) const {
-        auto* overwrite = currentOverwrite;
+        auto* overwrite = currentOverwriteThreadState();
         if (overwrite == nullptr || words.size() < overwrite->image.size() || !std::equal(overwrite->image.begin(), overwrite->image.end(), words.begin())) return nullptr;
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         auto& declined = depthClearCounters().declined;
@@ -1157,7 +1161,7 @@ public:
     }
 
     bool StoreOverwrite(const StorageTexture& mirror) {
-        auto* overwrite = currentOverwrite;
+        auto* overwrite = currentOverwriteThreadState();
         if (overwrite == nullptr || !OverwritesWholePlane(*overwrite)) return false;
         const auto& described = mirror.Descriptor();
         const auto& view = overwrite->view;
@@ -3733,7 +3737,8 @@ void PrepareColorTargetDepth(VkDevice device, std::uint64_t address, std::size_t
         RetireDepthSurfaces(device, address, bytes);
         return;
     }
-    thread_local std::array<ColorTargetDepthMemo, 16> memos{};
+    struct MemoSlot {};
+    auto& memos = AgcDriver::ThreadScratch<std::array<ColorTargetDepthMemo, 16>, MemoSlot>();
     auto& memo = memos[static_cast<std::size_t>((address >> 16) ^ (address >> 24) ^ bytes) % memos.size()];
     const auto planes = stalePlanesSerial.load(std::memory_order_acquire);
     const auto created = surfacesSerial.load(std::memory_order_acquire);
@@ -3867,15 +3872,15 @@ DepthPlaneClear::DepthPlaneClear(const StorageImageClear& clear) {
     const auto decoded = decodeOverwrite(clear);
     if (decoded) {
         value = *decoded;
-        previous = currentOverwrite;
-        currentOverwrite = &value;
+        previous = currentOverwriteThreadState();
+        currentOverwriteThreadState() = &value;
         installed = true;
         ++depthClearCounters().taken;
     }
 }
 
 DepthPlaneClear::~DepthPlaneClear() {
-    if (installed) currentOverwrite = previous;
+    if (installed) currentOverwriteThreadState() = previous;
 }
 
 DepthClearStatistics DepthClearCounts() {
@@ -4042,7 +4047,10 @@ VkDeviceSize DepthPlaneCopyBytes() {
 
 namespace {
 
-thread_local bool depthCopySourceActive = false;
+bool& depthCopySourceActiveThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 
 }
 
@@ -4077,7 +4085,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         Require(base.samples > 1u, "multisample reader overlaps a single-sample depth attachment");
         auto* recorder = RecorderFor(context);
         Require(recorder != nullptr, "a native multisampled depth target is sampled only by recorded draws and dispatches");
-        if (depthCopySourceActive) {
+        if (depthCopySourceActiveThreadState()) {
             found->CheckResource(resource);
             found->ApplyFastClear();
         } else {
@@ -4088,7 +4096,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         }
         RecordMemoryBarrier(context, recorder->Commands(), VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
         Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
-        return found->Sampled(words, resource, components, found == drawnDepth, multisampleViewType, depthCopySourceActive);
+        return found->Sampled(words, resource, components, found == drawnDepth, multisampleViewType, depthCopySourceActiveThreadState());
     }
     const bool exact = resource.width == base.extent.width && resource.height == base.extent.height;
     const bool cropped = !exact && base.gcn && !stencil && found->hostFormat == base.format && (resource.gcnPitch == 0 || resource.gcnPitch == base.extent.width) && resource.width <= base.extent.width && resource.height <= base.extent.height && resource.baseArray == 0 && resource.lastLevel == 0 && resource.dimension == TextureDimension::k2D;
@@ -4148,7 +4156,7 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
     std::lock_guard lock(surfacesMutex());
     auto* found = planeSurface(context.device, address);
     if (found == nullptr || !found->Holds(texture)) return false;
-    if (!depthCopySourceActive) found->CheckCurrent();
+    if (!depthCopySourceActiveThreadState()) found->CheckCurrent();
     found->CheckResource(resource);
     return true;
 }
@@ -4399,12 +4407,12 @@ std::shared_ptr<StorageTexture> DepthSurfaceStorage(const Context& context, std:
     return layeredDepthStorage(context, surface, resource, mip);
 }
 
-DepthCopySourceScope::DepthCopySourceScope(bool active) : previous(depthCopySourceActive) {
-    depthCopySourceActive = active;
+DepthCopySourceScope::DepthCopySourceScope(bool active) : previous(depthCopySourceActiveThreadState()) {
+    depthCopySourceActiveThreadState() = active;
 }
 
 DepthCopySourceScope::~DepthCopySourceScope() {
-    depthCopySourceActive = previous;
+    depthCopySourceActiveThreadState() = previous;
 }
 
 std::array<std::uint32_t, 8> DepthCopySourceWords(const DepthTarget& target) {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -17,7 +18,10 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-thread_local std::uint64_t imageMemoryReleasedBytes = 0;
+std::uint64_t& imageMemoryReleasedBytesThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
 
 class MemoryAllocationError : public std::runtime_error {
 public:
@@ -198,7 +202,7 @@ VkDeviceMemory BufferPool::TakeImageMemory(const VkMemoryAllocateInfo& allocatio
 
 void BufferPool::PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept {
     if (memory == VK_NULL_HANDLE) return;
-    imageMemoryReleasedBytes += bytes;
+    imageMemoryReleasedBytesThreadState() += bytes;
     if (!imagePooled(bytes, memoryType)) {
         MemoryAccounting::Free(freeMemory, device, memory);
         return;
@@ -868,7 +872,7 @@ void BufferPool::releaseImageAllocation(const ImageAllocation& allocation) noexc
     if (!allocation.slab) {
         if (allocation.dedicated) {
             MemoryAccounting::Free(freeMemory, device, allocation.memory);
-            imageMemoryReleasedBytes += allocation.bytes;
+            imageMemoryReleasedBytesThreadState() += allocation.bytes;
         }
         else PutImageMemory(allocation.memory, allocation.bytes, allocation.memoryType);
         return;
@@ -888,7 +892,7 @@ void BufferPool::releaseImageAllocation(const ImageAllocation& allocation) noexc
         block.hint = std::min(block.hint, first);
         MemoryAccounting::RetainPart(device, block.memory, static_cast<VkDeviceSize>(units) * imageUnitBytes, true);
         if (--block.allocations != 0) return;
-        imageMemoryReleasedBytes += imageBlockBytes;
+        imageMemoryReleasedBytesThreadState() += imageBlockBytes;
         if (retainedImageSlabBytes.load(std::memory_order_relaxed) == 0 && imageBudget >= imageBlockBytes && imageBytes <= imageBudget - imageBlockBytes && !heapOverBudget()) {
             block.retained = true;
             retainedImageSlabBytes.store(imageBlockBytes, std::memory_order_relaxed);
@@ -931,7 +935,7 @@ ImageAllocation AllocateImageMemory(const Context& context, VkImage image, const
 }
 
 std::uint64_t ImageMemoryReleasedBytes() noexcept {
-    return imageMemoryReleasedBytes;
+    return imageMemoryReleasedBytesThreadState();
 }
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {
@@ -950,7 +954,7 @@ void ReleaseImageMemory(const Context& context, VkDeviceMemory memory, VkDeviceS
         return;
     }
     MemoryAccounting::Free(context, memory);
-    imageMemoryReleasedBytes += bytes;
+    imageMemoryReleasedBytesThreadState() += bytes;
 }
 
 }

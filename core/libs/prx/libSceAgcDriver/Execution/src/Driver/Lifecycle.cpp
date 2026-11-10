@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -404,8 +405,8 @@ void Driver::checkStopping() const {
 }
 
 bool& Driver::onWorkerThread() {
-    static thread_local bool worker = false;
-    return worker;
+    struct WorkerStorage {};
+    return AgcDriver::ThreadScratch<bool, WorkerStorage>();
 }
 
 }

@@ -299,9 +299,9 @@ void BatchIds() {
     Check(json.find("{\"name\":\"Driver.Packet.dispatch\",\"ph\":\"X\",\"ts\":10.000,\"pid\":7,\"tid\":1,\"dur\":30.000,\"args\":{\"batch\":42}}") != std::string::npos, "a slice's batch id was not written");
     std::atomic<std::uint64_t> count{1};
     TraceThread thread("queue worker 0x0", count, 4);
-    AgcDriver::TraceBatchTag = 9;
+    AgcDriver::TraceBatchTag(9);
     thread.Add("Driver.Packet", nullptr, origin, origin + microseconds(30));
-    AgcDriver::TraceBatchTag = 0;
+    AgcDriver::TraceBatchTag(0);
     thread.Add("Driver.Packet", nullptr, origin + milliseconds(1), origin + milliseconds(1) + microseconds(30));
     const auto snapshot = thread.Collect();
     Check(snapshot.slices.size() == 2 && snapshot.slices[0].batch == 9 && snapshot.slices[1].batch == 0, "a slice did not take its thread's batch id");

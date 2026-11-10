@@ -76,9 +76,9 @@ int main() {
             Check(DeferredOrigins().empty());
             {
                 auto context = origins.At(0);
-                Check(Packet == 42 && Opcode == 0x37);
+                Check(Packet() == 42 && Opcode() == 0x37);
             }
-            Check(Packet == 0 && Opcode == 0);
+            Check(Packet() == 0 && Opcode() == 0);
             DeferredOrigins().push_back({43, 0x49});
         }
         Check(DeferredOrigins().size() == 1 && DeferredOrigins()[0].packet == 43);
@@ -105,6 +105,6 @@ int main() {
         }
         Check(found);
     } else {
-        Check(Emit(Kind::Flip) == 0 && Local == nullptr);
+        Check(Emit(Kind::Flip) == 0 && State().local == nullptr);
     }
 }

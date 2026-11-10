@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTWORKMARK_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTWORKMARK_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <array>
 #include <cstddef>
 
@@ -12,8 +13,8 @@ struct Marks {
 };
 
 inline Marks& Local() {
-    thread_local Marks marks;
-    return marks;
+    struct MarksStorage {};
+    return AgcDriver::ThreadScratch<Marks, MarksStorage>();
 }
 
 inline void Note(const void* commands) {

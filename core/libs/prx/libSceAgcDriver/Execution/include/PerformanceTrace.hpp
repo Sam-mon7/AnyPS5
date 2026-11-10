@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETRACE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETRACE_HPP
 
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -176,7 +177,9 @@ private:
     Clock::duration begun{};
 };
 
-inline thread_local std::uint64_t TraceBatchTag = 0;
+struct TraceBatchSlot {};
+inline std::uint64_t TraceBatchTag() { return HostThreadSlot<std::uint64_t, TraceBatchSlot>::Get(); }
+inline void TraceBatchTag(std::uint64_t value) { HostThreadSlot<std::uint64_t, TraceBatchSlot>::Set(value); }
 
 class TraceThread {
 public:
@@ -242,7 +245,7 @@ public:
             folded = {};
         }
         if (length < MinimumSlice) folded += length;
-        else append({scope, stage, begin, length, TraceBatchTag});
+        else append({scope, stage, begin, length, TraceBatchTag()});
     }
 
     void Count(const char* scope, std::uint64_t amount = 1) {

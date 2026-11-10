@@ -101,6 +101,8 @@ enum class Feature : std::uint8_t {
     CLabelAwaitedEarly,
     CLabelWake,
     FixDerivedIndexCache,
+    FixHostSlabAlloc,
+    FixCheapTimers,
     Count
 };
 

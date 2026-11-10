@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -26,8 +27,8 @@ DeferredLabels& deferredLabels() {
 }
 
 std::vector<std::uint32_t>& deferredLabelOpcodes() {
-    static thread_local std::vector<std::uint32_t>* opcodes = nullptr;
-    return ShaderRecompiler::ThreadOwned(opcodes);
+    struct OpcodesStorage {};
+    return AgcDriver::ThreadScratch<std::vector<std::uint32_t>, OpcodesStorage>();
 }
 
 bool DeferLabels() {
@@ -47,8 +48,8 @@ bool LabelBatchSubmit() {
 }
 
 std::size_t& queuedLabelsNoted() {
-    static thread_local std::size_t noted = 0;
-    return noted;
+    struct NotedStorage {};
+    return AgcDriver::ThreadScratch<std::size_t, NotedStorage>();
 }
 
 bool NeedsRecordedLabels(std::uint32_t header) {
@@ -145,8 +146,8 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto* opcodes = profile ? &deferredLabelOpcodes() : nullptr;
-    static thread_local std::vector<DeferredLabel>* recording = nullptr;
-    auto& labels = ShaderRecompiler::ThreadOwned(recording);
+    struct RecordingStorage {};
+    auto& labels = AgcDriver::ThreadScratch<std::vector<DeferredLabel>, RecordingStorage>();
     labels.clear();
     labels.swap(deferred.labels);
     Timeline::DeferredScope timelineOrigins;
@@ -321,8 +322,8 @@ namespace {
 std::atomic<void (*)()> captureCheckHook{nullptr};
 
 bool& recapturing() {
-    static thread_local bool active = false;
-    return active;
+    struct ActiveStorage {};
+    return AgcDriver::ThreadScratch<bool, ActiveStorage>();
 }
 
 }

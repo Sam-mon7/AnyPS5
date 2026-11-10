@@ -355,6 +355,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Switches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ArchB/CheapClock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp

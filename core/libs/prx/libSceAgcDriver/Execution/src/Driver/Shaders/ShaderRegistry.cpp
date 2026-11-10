@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -527,7 +528,7 @@ struct ShaderPreparationTransaction::State {
         std::size_t baseAbis = 0;
     };
     static std::mutex writers;
-    static thread_local State* active;
+    static State*& active();
     std::unique_lock<std::mutex> lock{writers, std::defer_lock};
     std::map<PreparedShaders*, Change> changes;
     bool failed = false;
@@ -538,19 +539,22 @@ struct ShaderPreparationTransaction::State {
 };
 
 std::mutex ShaderPreparationTransaction::State::writers;
-thread_local ShaderPreparationTransaction::State* ShaderPreparationTransaction::State::active = nullptr;
+ShaderPreparationTransaction::State*& ShaderPreparationTransaction::State::active() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State*, Slot>();
+}
 
 ShaderPreparationTransaction::ShaderPreparationTransaction() {
-    if (State::active == nullptr) {
+    if (State::active() == nullptr) {
         state = std::make_unique<State>();
-        State::active = state.get();
+        State::active() = state.get();
     }
-    root = State::active;
+    root = State::active();
 }
 
 ShaderPreparationTransaction::~ShaderPreparationTransaction() {
     if (!committed) root->failed = true;
-    if (state != nullptr) State::active = nullptr;
+    if (state != nullptr) State::active() = nullptr;
 }
 
 PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& snapshot) {

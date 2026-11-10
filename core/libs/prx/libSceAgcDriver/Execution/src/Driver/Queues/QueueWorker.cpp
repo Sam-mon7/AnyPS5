@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
@@ -62,8 +63,8 @@ void Driver::markCompleted(std::uint64_t serial) {
 }
 
 bool& Driver::completionDeferred() {
-    static thread_local bool deferred = false;
-    return deferred;
+    struct DeferredStorage {};
+    return AgcDriver::ThreadScratch<bool, DeferredStorage>();
 }
 
 void Driver::deferCompletion(const Submission& submission) {
@@ -132,13 +133,13 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
 }
 
 const std::atomic<std::uint64_t>*& Driver::workerQueued() {
-    static thread_local const std::atomic<std::uint64_t>* queued = nullptr;
-    return queued;
+    struct QueuedStorage {};
+    return AgcDriver::ThreadScratch<const std::atomic<std::uint64_t>*, QueuedStorage>();
 }
 
 std::atomic<std::uint64_t>*& Driver::workerPacket() {
-    static thread_local std::atomic<std::uint64_t>* packet = nullptr;
-    return packet;
+    struct PacketStorage {};
+    return AgcDriver::ThreadScratch<std::atomic<std::uint64_t>*, PacketStorage>();
 }
 
 void Driver::reapCompletionLabels() {
