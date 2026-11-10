@@ -2608,7 +2608,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (zeroIndices != nullptr) {
             highest = 0u;
         } else if (import != nullptr) {
-            highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            const bool unused = !skipRestart && draw.firstVertex == 0 && !state.stages.mesh && shaders.front().program->vertexAttributes.empty() && context.limits.maxDrawIndexedIndexValue >= (draw.indexSize == 2 ? 0xffffu : 0xffffffffu) && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDerivedIndexCache);
+            if (unused) {
+                highest = 0u;
+                AgcDriver::ArchB::Recorder::Count("fix_dic_highest_unused");
+            } else {
+                highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
+            }
         } else if (!copy.reused) {
             highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));

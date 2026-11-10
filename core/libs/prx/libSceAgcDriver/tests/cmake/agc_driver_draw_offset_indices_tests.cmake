@@ -15,6 +15,20 @@ if(BUILD_TESTING)
                         "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
             endif()
         endforeach()
+        foreach(runtimeFetchScan IN ITEMS skipped kept)
+            set(runtimeFetchTest agc_driver_runtime_fetch_in_place_${runtimeFetchScan}_${runtimeFetchIndex})
+            add_test(NAME ${runtimeFetchTest} COMMAND agc_driver_draw_offset_indices_tests runtime-fetch ${runtimeFetchIndex} in-place)
+            set_tests_properties(${runtimeFetchTest} PROPERTIES
+                    ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_INPUTS_IN_PLACE=1;APS5_ARCHB_FIX_DERIVED_INDEX_CACHE=0" TIMEOUT 45 SKIP_RETURN_CODE 77
+                    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+            if(runtimeFetchScan STREQUAL "skipped")
+                set_property(TEST ${runtimeFetchTest} PROPERTY ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_INPUTS_IN_PLACE=1;APS5_ARCHB_FIX_DERIVED_INDEX_CACHE=1;TEST_EXPECT_HIGHEST_UNUSED=1")
+            endif()
+            if(WIN32)
+                set_tests_properties(${runtimeFetchTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endif()
+        endforeach()
     endforeach()
 endif()
 

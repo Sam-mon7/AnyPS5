@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "Recompiler.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
@@ -604,18 +606,50 @@ std::string Analysis(Fixture& fixture) {
     return failures;
 }
 
-std::string RuntimeFetch(Fixture& fixture, std::uint32_t index, bool compactRestart) {
+std::uint32_t* ImportableIndices(Fixture& fixture) {
+#ifdef _WIN32
+    constexpr std::size_t bytes = 65536;
+    if (fixture.device->graphicsContext().hostImportAlignment == 0) return nullptr;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    return static_cast<std::uint32_t*>(block);
+#else
+    static_cast<void>(fixture);
+    return nullptr;
+#endif
+}
+
+std::string RuntimeFetch(Fixture& fixture, std::uint32_t index, bool compactRestart, bool inPlace = false) {
     const auto userData = fixture.UserData(0, 0);
     const auto vertex = fixture.Vertex(RuntimeFetchCode, userData, true);
     Require(vertex.vertexAttributes.empty(), "runtime fetch must not become fixed vertex attributes");
     VertexSlots.fill(0);
     InstanceSlots.fill(0);
-    alignas(256) static std::array<std::uint32_t, 5> indices{};
-    indices = {0xffffffffu, index, index, index, 0xffffffffu};
+    alignas(256) static std::array<std::uint32_t, 5> copied{};
+    auto* indices = inPlace ? ImportableIndices(fixture) : copied.data();
+    if (indices == nullptr) {
+        std::cout << "host imports unavailable: in-place runtime fetch not tested\n";
+        std::exit(77);
+    }
+    const std::array<std::uint32_t, 5> values{0xffffffffu, index, index, index, 0xffffffffu};
+    std::copy(values.begin(), values.end(), indices);
     const auto first = compactRestart ? 0u : 1u;
     const auto count = compactRestart ? 5u : 3u;
-    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(indices.data() + first), count, 4, 1, 0, true, 0, 0};
-    fixture.Draw(vertex, draw, compactRestart);
+    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(indices + first), count, 4, 1, 0, true, 0, 0};
+    if (inPlace) {
+        using Recorder = AgcDriver::ArchB::Recorder;
+        const bool skips = std::getenv("TEST_EXPECT_HIGHEST_UNUSED") != nullptr;
+        Recorder::BindThread("runtime fetch");
+        Recorder::Boundary(true, 1, Recorder::Clock::now());
+        fixture.Draw(vertex, draw, compactRestart);
+        const auto counters = Recorder::Collect(Recorder::Clock::now()).counters;
+        const auto found = counters.find("fix_dic_highest_unused");
+        const auto skipped = found != counters.end() ? found->second : 0.0;
+        Require(skipped == (skips ? 1.0 : 0.0), "the in-place indexed draw " + std::string(skips ? "scanned indices nothing reads" : "skipped its index scan with the switch off") + " (" + std::to_string(skipped) + ")");
+    } else {
+        fixture.Draw(vertex, draw, compactRestart);
+    }
     std::cout << "runtime fetch, index " << index << ", compact restart " << compactRestart
               << ", attributes " << vertex.vertexAttributes.size() << ": atomic readback "
               << Output[0] << ' ' << Output[1] << ' ' << Output[2] << ' ' << Output[3] << '\n';
@@ -1078,13 +1112,14 @@ int main(int argc, char** argv) {
         else if (mode == "--indirect-push-patch") failures = IndirectPushPatches(fixture, false);
         else if (mode == "--indirect-buffer-base") failures = IndirectPushPatches(fixture, true);
         else {
-            Require(argc == 3 || argc == 4, "expected runtime-fetch INDEX [compact-restart]");
+            Require(argc == 3 || argc == 4, "expected runtime-fetch INDEX [compact-restart|in-place]");
             Require(std::string(argv[1]) == "runtime-fetch", "unknown case");
             const auto index = std::stoul(argv[2]);
             Require(index < VertexSlots.size(), "index exceeds the runtime input buffer");
-            const bool compactRestart = argc == 4;
+            const bool inPlace = argc == 4 && std::string(argv[3]) == "in-place";
+            const bool compactRestart = argc == 4 && !inPlace;
             if (compactRestart) Require(std::string(argv[3]) == "compact-restart", "unknown index path");
-            failures = RuntimeFetch(fixture, static_cast<std::uint32_t>(index), compactRestart);
+            failures = RuntimeFetch(fixture, static_cast<std::uint32_t>(index), compactRestart, inPlace);
         }
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
