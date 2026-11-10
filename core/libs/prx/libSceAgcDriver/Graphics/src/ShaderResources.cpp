@@ -9126,6 +9126,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.AfterRun([inRun](Recorder& after) {
             const ArchC::LazyCensus::UseScope deferredCensusScope;
             inRun->guestMemory.RecordCopyBacks(after);
+            inRun->guestMemory.NoteStagingCarryPoints(after);
+            inRun->guestMemory.NoteStagingCarryTokens(after);
         });
         guestMemory.MarkStagedWrites();
     } else {
