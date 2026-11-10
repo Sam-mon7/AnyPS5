@@ -69,6 +69,7 @@ struct Options {
     std::vector<Dump> dumps;
     std::filesystem::path frames;
     bool pace = true;
+    bool changedWrites = false;
     bool strict = false;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
@@ -351,6 +352,8 @@ struct Replay {
     std::atomic<std::uint64_t> failedRegistrations{0};
     std::atomic<std::uint64_t> submits{0};
     std::atomic<std::uint64_t> deltaBytes{0};
+    std::atomic<std::uint64_t> deltaChangedBytes{0};
+    std::atomic<std::uint64_t> deltaWrites{0};
     std::atomic<std::int64_t> paceWaitedNs{0};
     std::atomic<bool> stalled{false};
     std::atomic<std::uint64_t> stalledAt{0};
@@ -531,8 +534,30 @@ struct Replay {
                 controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
                 std::memcpy(bytes.data() + at, target + at, sizeof(value));
             }
-            std::memcpy(target, bytes.data(), bytes.size());
+            constexpr std::size_t cell = 64;
+            std::size_t changed = 0;
+            std::size_t runs = 0;
+            for (std::size_t at = 0; at < bytes.size();) {
+                const auto step = std::min(bytes.size() - at, cell - static_cast<std::size_t>((chunk->address + at) % cell));
+                if (std::memcmp(target + at, bytes.data() + at, step) == 0) {
+                    at += step;
+                    continue;
+                }
+                auto end = at + step;
+                while (end < bytes.size()) {
+                    const auto next = std::min(bytes.size() - end, cell);
+                    if (std::memcmp(target + end, bytes.data() + end, next) == 0) break;
+                    end += next;
+                }
+                if (options.changedWrites) std::memcpy(target + at, bytes.data() + at, end - at);
+                changed += end - at;
+                ++runs;
+                at = end;
+            }
+            if (!options.changedWrites) std::memcpy(target, bytes.data(), bytes.size());
             deltaBytes += chunk->bytes;
+            deltaChangedBytes += changed;
+            deltaWrites += options.changedWrites ? runs : 1;
         }
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
     }
@@ -779,6 +804,7 @@ int usage() {
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
+                         "  --changed-writes    writes only the 64-byte cells of a memory delta that differ from memory\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
@@ -1456,10 +1482,10 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"delta_changed_mib\":%.1f,\"delta_writes\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
-                static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()),
+                static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<double>(replay.deltaChangedBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.deltaWrites.load()), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
@@ -1540,6 +1566,7 @@ int main(int argc, char** argv) {
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument = argv[index];
             if (argument == "--no-pace") options.pace = false;
+            else if (argument == "--changed-writes") options.changedWrites = true;
             else if (argument == "--no-release") options.release = false;
             else if (argument == "--no-synthesize") options.synthesize = false;
             else if (argument == "--parked-drain-ms" && index + 1 < argc) {
