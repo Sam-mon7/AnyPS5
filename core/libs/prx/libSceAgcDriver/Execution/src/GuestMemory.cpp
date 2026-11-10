@@ -5997,6 +5997,11 @@ struct HoldLogRecord {
     std::uint64_t begin, end;
 };
 
+struct FlushAttribution {
+    std::uint64_t caller = 0, address = 0, bytes = 0;
+};
+thread_local FlushAttribution flushAttribution;
+
 class HoldLog {
 public:
     static HoldLog* Instance() {
@@ -6014,26 +6019,32 @@ public:
         return static_cast<std::uint64_t>(now.QuadPart);
     }
 
-    void Push(std::uint32_t tag, std::uint64_t begin, std::uint64_t end) {
+    bool Attribution() const { return attribution; }
+
+    void Push(std::uint32_t tag, std::uint64_t begin, std::uint64_t end, std::size_t site = 0, std::uint64_t caller = 0) {
         auto& ring = local();
-        const auto next = ring.written.load(std::memory_order_relaxed);
-        if (next - ring.consumed.load(std::memory_order_acquire) == Ring::Capacity) {
-            ring.lost.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        ring.records[next % Ring::Capacity] = {ring.thread, tag, begin, end};
-        ring.written.store(next + 1, std::memory_order_release);
+        append(ring, {ring.thread, attribution ? encoded(site, false) : tag, begin, end});
+        if (attribution) append(ring, {0xfffffff9u, ring.thread, begin, caller});
+    }
+
+    void Wait(std::size_t site, std::uint64_t begin, std::uint64_t end, const void* initialOwner) {
+        auto& ring = local();
+        append(ring, {ring.thread, encoded(site, true), begin, end});
+        append(ring, {0xfffffffbu, ring.thread, begin, reinterpret_cast<std::uint64_t>(initialOwner)});
+    }
+
+    void LockedWait(double ms) {
+        if (!attribution || ms < 0.05) return;
+        auto& ring = local();
+        const auto end = Now();
+        append(ring, {0xfffffff6u, ring.thread, end, static_cast<std::uint64_t>(ms * 1e6)});
+        append(ring, {0xfffffff5u, ring.thread, end, flushAttribution.caller});
+        append(ring, {0xfffffff4u, ring.thread, flushAttribution.address, flushAttribution.bytes});
     }
 
     void Mark(std::uint32_t mark) {
         auto& ring = local();
-        const auto next = ring.written.load(std::memory_order_relaxed);
-        if (next - ring.consumed.load(std::memory_order_acquire) == Ring::Capacity) {
-            ring.lost.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        ring.records[next % Ring::Capacity] = {0xffffffffu, mark, Now(), ring.thread};
-        ring.written.store(next + 1, std::memory_order_release);
+        append(ring, {0xffffffffu, mark, Now(), ring.thread});
     }
 
 private:
@@ -6046,6 +6057,22 @@ private:
         std::atomic<std::uint64_t> lost{0};
     };
 
+    static void append(Ring& ring, HoldLogRecord record) {
+        const auto next = ring.written.load(std::memory_order_relaxed);
+        if (next - ring.consumed.load(std::memory_order_acquire) == Ring::Capacity) {
+            ring.lost.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        ring.records[next % Ring::Capacity] = record;
+        ring.written.store(next + 1, std::memory_order_release);
+    }
+
+    static std::uint32_t encoded(std::size_t site, bool wait) {
+        const auto& stats = LockStats();
+        const auto role = stats.tag != 0xffffffffu ? stats.tag & 0xffffu : IsCommitterThread() ? 0xfffdu : stats.holderColumn == PresenterColumn ? 0xfffeu : 0xffffu;
+        return role | (static_cast<std::uint32_t>(site) << 16u) | (wait ? 0x80000000u : 0u);
+    }
+
     using RegisterFn = ULONG(WINAPI*)(const GUID*, void*, void*, std::uint64_t*);
     using WriteFn = ULONG(WINAPI*)(std::uint64_t, const void*, ULONG, void*);
     struct Descriptor {
@@ -6055,12 +6082,20 @@ private:
         std::uint64_t keyword;
     };
 
-    explicit HoldLog(const char* path) : file(std::fopen(path, "wb")) {
+    explicit HoldLog(const char* path) : file(std::fopen(path, "wb")), attribution(std::getenv("APS5_MUTEX_ATTRIBUTION") != nullptr && GpuHoldProfiled()) {
         if (file == nullptr) throw std::runtime_error("cannot open APS5_HOLD_LOG output");
         LARGE_INTEGER frequency;
         QueryPerformanceFrequency(&frequency);
-        const HoldLogRecord header{0xffffffffu, 0, static_cast<std::uint64_t>(frequency.QuadPart), 0};
+        const HoldLogRecord header{0xffffffffu, 0, static_cast<std::uint64_t>(frequency.QuadPart), attribution ? 1u : 0u};
         std::fwrite(&header, sizeof(header), 1, file);
+        if (attribution) {
+            const HoldLogRecord clock{0xfffffffau, 0, Now(), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())};
+            std::fwrite(&clock, sizeof(clock), 1, file);
+            HMODULE module = nullptr;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&GpuMutex), &module) == 0) throw std::runtime_error("cannot locate mutex attribution module");
+            const HoldLogRecord image{0xfffffff8u, 0, reinterpret_cast<std::uint64_t>(module), 0};
+            std::fwrite(&image, sizeof(image), 1, file);
+        }
         if (auto* advapi = LoadLibraryA("advapi32.dll"); advapi != nullptr) {
             const auto registerProvider = reinterpret_cast<RegisterFn>(reinterpret_cast<void*>(GetProcAddress(advapi, "EventRegister")));
             write = reinterpret_cast<WriteFn>(reinterpret_cast<void*>(GetProcAddress(advapi, "EventWrite")));
@@ -6075,6 +6110,7 @@ private:
         if (ring == nullptr) {
             auto owned = std::make_unique<Ring>();
             owned->thread = static_cast<std::uint32_t>(GetCurrentThreadId());
+            if (attribution) append(*owned, {0xfffffffcu, owned->thread, reinterpret_cast<std::uint64_t>(CurrentThreadToken()), encoded(0, false)});
             ring = owned.get();
             std::lock_guard lock(mutex);
             rings.push_back(std::move(owned));
@@ -6112,12 +6148,14 @@ private:
     }
 
     std::FILE* file;
+    bool attribution;
     WriteFn write = nullptr;
     std::uint64_t handle = 0;
     std::mutex mutex;
     std::vector<std::unique_ptr<Ring>> rings;
 };
 thread_local std::uint64_t holdLogBegin = 0;
+thread_local std::uint64_t holdLogCaller = 0;
 #endif
 
 std::atomic<std::uint64_t> gpuHoldSerial{0};
@@ -6252,6 +6290,9 @@ bool GpuMutexType::try_lock() {
     }
     acquired();
     if (depth == 1) {
+#ifdef _WIN32
+        if (auto* log = HoldLog::Instance(); log != nullptr && log->Attribution()) holdLogCaller = reinterpret_cast<std::uint64_t>(__builtin_return_address(0));
+#endif
         stats.holdSite = static_cast<std::size_t>(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged);
         if (GpuHoldProfiled()) BeginHold(stats.holdSite);
     }
@@ -6304,7 +6345,7 @@ void GpuMutexType::unlock() {
         if (Timeline::Enabled) Timeline::Emit(Timeline::Kind::LockRelease, 0, 0, 0, 0, 0, Timeline::LockSite);
 #ifdef _WIN32
         if (auto* log = HoldLog::Instance(); log != nullptr && holdLogBegin != 0) {
-            log->Push(LockStats().tag, holdLogBegin, HoldLog::Now());
+            log->Push(LockStats().tag, holdLogBegin, HoldLog::Now(), LockStats().holdSite, holdLogCaller);
             holdLogBegin = 0;
         }
 #endif
@@ -6370,11 +6411,20 @@ void GpuMutexType::lock() {
         const bool holders = GpuHoldProfiled();
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
+#ifdef _WIN32
+        auto* attribution = HoldLog::Instance();
+        const auto waitBegin = attribution != nullptr && attribution->Attribution() ? HoldLog::Now() : 0;
+        const auto* initialOwner = waitBegin != 0 ? owner.load(std::memory_order_acquire) : nullptr;
+#endif
         const auto start = std::chrono::steady_clock::now();
         lockSpinningTracked(mutex);
         acquired();
         if (depth == 1) stats.holdSite = site;
         const auto now = std::chrono::steady_clock::now();
+#ifdef _WIN32
+        if (waitBegin != 0) attribution->Wait(site, waitBegin, HoldLog::Now(), initialOwner);
+        if (depth == 1 && attribution != nullptr && attribution->Attribution()) holdLogCaller = reinterpret_cast<std::uint64_t>(__builtin_return_address(0));
+#endif
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
         if (holders) {
             HolderMatrixValues after{};
@@ -6465,6 +6515,11 @@ void GpuMutexType::lock() {
     }
     acquired();
     if (depth == 1) stats.holdSite = site;
+#ifdef _WIN32
+    if (depth == 1) {
+        if (auto* log = HoldLog::Instance(); log != nullptr && log->Attribution()) holdLogCaller = reinterpret_cast<std::uint64_t>(__builtin_return_address(0));
+    }
+#endif
     if (depth == 1 && GpuHoldProfiled()) BeginHold(site);
 }
 
@@ -6484,6 +6539,9 @@ void MarkPresenterThread() {
 
 void NoteLockedGpuWait(double ms) {
     if (!GpuLockProfiled() || GpuMutex().DepthOnThisThread() == 0) return;
+#ifdef _WIN32
+    if (auto* log = HoldLog::Instance(); log != nullptr) log->LockedWait(ms);
+#endif
     auto& stats = LockStats();
     ++stats.lockedGpuWaits;
     stats.lockedGpuWaitMs += ms;
@@ -6575,7 +6633,20 @@ void GuardRead(std::uint64_t address, std::size_t bytes) {
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
-    if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
+    if (const auto hook = flushHook.load(std::memory_order_acquire)) {
+#ifdef _WIN32
+        if (auto* log = HoldLog::Instance(); log != nullptr && log->Attribution()) {
+            struct Restore {
+                FlushAttribution before;
+                ~Restore() { flushAttribution = before; }
+            } restore{flushAttribution};
+            flushAttribution = {reinterpret_cast<std::uint64_t>(__builtin_return_address(0)), address, bytes};
+            hook(address, bytes);
+            return;
+        }
+#endif
+        hook(address, bytes);
+    }
 }
 
 void PrepareDriverRead_nid_no_patch(std::uint64_t address, std::size_t bytes) {
