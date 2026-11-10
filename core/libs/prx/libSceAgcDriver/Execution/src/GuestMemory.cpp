@@ -6433,7 +6433,7 @@ void GpuMutexType::lock() {
             std::snprintf(text, sizeof(text), " %s %llu/%.1f %llu/%.1f", GpuLockSiteNames[i], static_cast<unsigned long long>(stats.siteLockedGpuWaits[i]), stats.siteLockedGpuWaitMs[i], static_cast<unsigned long long>(stats.siteUnlockedGpuWaits[i]), stats.siteUnlockedGpuWaitMs[i]);
             holds += text;
         }
-        if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", IsCommitterThread() ? "draw committer" : stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         if (GpuHoldProfiled()) {
             for (std::size_t i = 0; i < GpuLockSiteCount; ++i) {
