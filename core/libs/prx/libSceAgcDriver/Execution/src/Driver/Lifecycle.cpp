@@ -45,6 +45,7 @@ namespace {
 constexpr std::uintptr_t InlineImportStackBytes = 256 * 1024;
 
 std::atomic<std::uint64_t> gpuMapImportThreads{0};
+std::atomic<const char*> shutdownStage{"driver initialization"};
 
 void PrintFailure(std::exception_ptr error) {
     try {
@@ -170,11 +171,15 @@ void Driver::Shutdown() {
 
 void Driver::stop() {
     require(!onWorkerThread(), "worker cannot stop itself");
+    shutdownStage.store("shutdown mutex");
     std::lock_guard shutdownLock(shutdownMutex);
     if (stopped) return;
+    shutdownStage.store("host write hooks");
     GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
     if (!GuestMemory::StopHostWrites(1000)) std::fprintf(stderr, "[driver] a host write was still inside the driver's hook 1 s into the shutdown; stopping without waiting for it\n");
+    shutdownStage.store("libc shutdown request");
     LibcRequestShutdown_nid_postfix();
+    shutdownStage.store("discarding queued submissions");
     {
         std::lock_guard lock(mutex);
         stopping = true;
@@ -186,31 +191,47 @@ void Driver::stop() {
         }
     }
     changed.notify_all();
+    shutdownStage.store("queue workers");
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    shutdownStage.store("draw finisher");
     try {
         DrawFinisher::Get().Drain();
     } catch (...) {
     }
+    shutdownStage.store("draw pipeline");
     DrawPipeline::Queue0().Stop();
     DrawPipeline::Queue0().ReleaseRetired();
     DrawFinisher::Get().ReleaseRan();
+    shutdownStage.store("worker sampler");
     StopWorkerSampler();
+    shutdownStage.store("shader preparation workers");
     CloseRegistrationPreparation();
+    shutdownStage.store("pipeline library worker");
     Graphics::StopPipelineLibraryWorker();
+    shutdownStage.store("GPU memory mutex");
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    shutdownStage.store("Vulkan device teardown");
     Graphics::ReportHostImports();
     device.Reset();
     replacedDevices.clear();
+    shutdownStage.store("pipeline journal");
     Graphics::FlushPipelineJournal();
+    shutdownStage.store("guest buffer workers");
     Graphics::ShutdownGuestBufferWorkers();
+    shutdownStage.store("compare helpers");
     Graphics::StopCompareHelpers();
+    shutdownStage.store("shader disk cache");
     ShaderRecompiler::ShaderDiskCache::Shutdown();
+    shutdownStage.store("trace output");
     PerformanceTrace::StopOutput();
+    shutdownStage.store("async log");
     FlushAsyncLogAtEnd_nid_no_patch();
+    shutdownStage.store("profile output");
     StopProfileOutput_nid_no_patch();
     stopped = true;
+    shutdownStage.store("complete");
 }
 
 Driver::Driver() {
@@ -404,4 +425,8 @@ std::unique_lock<std::mutex> HoldAsyncLog() {
 extern "C" void* AgcDriverStaticTable_nid_postfix() {
     static_cast<void>(AgcDriver::DriverDetail::Driver::Get());
     return reinterpret_cast<void*>(AgcDriver::DriverDetail::FsTableAddress);
+}
+
+extern "C" const char* AgcDriverShutdownStage_nid_postfix() {
+    return AgcDriver::DriverDetail::shutdownStage.load();
 }

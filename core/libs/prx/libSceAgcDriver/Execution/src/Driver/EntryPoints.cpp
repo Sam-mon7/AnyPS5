@@ -120,6 +120,10 @@ extern "C" void AgcDriverShutdown_nid_postfix() {
     AgcDriver::Shutdown();
 }
 
+extern "C" bool AgcDriverIdleOrParked_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().WaitIdleOrParkedFor(std::chrono::milliseconds(0));
+}
+
 extern "C" void AgcDriverRequestScreenshot_nid_postfix() {
     AgcDriver::Screenshot::Request();
 }

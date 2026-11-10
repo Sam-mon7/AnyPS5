@@ -43,6 +43,8 @@ extern "C" void AgcDriverRaiseWorkerThreadPriority_nid_postfix(const char* role)
 extern "C" void AgcDriverLockVulkanLoader_nid_postfix();
 extern "C" void AgcDriverUnlockVulkanLoader_nid_postfix();
 extern "C" void AgcDriverShutdown_nid_postfix();
+extern "C" const char* AgcDriverShutdownStage_nid_postfix();
+extern "C" bool AgcDriverIdleOrParked_nid_postfix();
 extern "C" void AgcDriverRequestScreenshot_nid_postfix();
 extern "C" void AgcDriverTracePresent_nid_postfix(std::uint32_t width, std::uint32_t height);
 extern "C" void AgcDriverSuspendPoint_nid_postfix();
