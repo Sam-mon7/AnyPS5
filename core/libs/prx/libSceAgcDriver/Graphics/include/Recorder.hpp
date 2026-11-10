@@ -854,6 +854,7 @@ public:
 
 private:
     inline static std::atomic<std::uint64_t> recordingSequence{0};
+    friend struct RecorderTestAccess;
     struct Batch;
     struct WideLabel {
         std::uint64_t end;

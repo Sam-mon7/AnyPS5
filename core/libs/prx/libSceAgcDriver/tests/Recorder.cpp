@@ -108,6 +108,31 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::Graphics {
+
+struct RecorderTestAccess {
+    static VkCommandBuffer Split(Recorder& recorder, const Context& context) {
+        const auto prefix = recorder.Commands();
+        Require(!recorder.CountingSamples(), "a test command split cannot inherit an active query");
+        VkCommandBuffer next = VK_NULL_HANDLE;
+        const VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, context.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &next), "test split command buffer");
+        const VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+        try {
+            Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(next, &begin), "test split begin");
+            Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(prefix), "test split end");
+        } catch (...) {
+            context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &next);
+            throw;
+        }
+        recorder.open->commands = next;
+        recorder.open->coveredAccess = 0;
+        return prefix;
+    }
+};
+
+}
+
 namespace {
 
 struct TestConfigurationError : std::runtime_error {
@@ -641,6 +666,17 @@ public:
                 copyIndirect.pNext = address.pNext;
                 address.pNext = &copyIndirect;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (std::getenv("ANYPS5_TEST_TIMELINE") != nullptr && hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timeline = timelineFeatures.timelineSemaphore == VK_TRUE;
+                if (timeline) {
+                    extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                    timelineFeatures.pNext = address.pNext;
+                    address.pNext = &timelineFeatures;
+                }
+            }
             VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilityFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
             if (hasExtension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &portabilityFeatures};
@@ -693,6 +729,7 @@ public:
     bool NullDescriptors() const { return nullDescriptors; }
     const Context& GetContext() const { return context; }
     bool Graphics() const { return graphics; }
+    bool Timeline() const { return timeline; }
     bool Timestamps() const {
         std::uint32_t count = 0;
         const auto queues = function<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
@@ -751,6 +788,7 @@ private:
     bool graphics = false;
     std::mutex settleMutex;
     bool nullDescriptors = false;
+    bool timeline = false;
     bool memoryBudget = false;
 };
 
@@ -4781,6 +4819,143 @@ bool stagingCarryTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+bool lazyCopyBackCpuStoreTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+#ifdef _WIN32
+    if (device.GetContext().hostImportAlignment == 0 || !LazyCopyBack::Active()) return false;
+    const bool oldValue = scenario == "old-value";
+    const bool window = scenario == "window";
+    if (window && !device.Timeline()) return false;
+    Require(oldValue || window, "unknown lazy copy-back CPU store scenario");
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 4u << 20u;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    Require(block != nullptr, "cannot allocate the lazy copy-back CPU store block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto element = address + 4096;
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(element);
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    Require(HostImportFor(context, address, bytes) != nullptr, "the CPU store block cannot be imported");
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, elementBytes, false, false);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "the CPU store region was not staged");
+        recorder.Sync();
+        const auto finish = [&] {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        memory.RecordStagingCopies(recorder);
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, elementBytes, adjustment);
+        auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, sizeof(std::uint32_t), 1u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        finish();
+        const auto before = LazyCopyBack::Totals();
+        if (oldValue) {
+            Require(*word == 0, "the old value changed before submission");
+            *word = 0;
+        }
+        if (window) {
+            struct Gate {
+                const Context& context;
+                Recorder& recorder;
+                std::array<VkSemaphore, 2> handles{};
+                VkCommandBuffer prefix = VK_NULL_HANDLE;
+                bool submitted = false;
+                void SubmitPrefix() {
+                    if (prefix == VK_NULL_HANDLE || submitted) return;
+                    const std::uint64_t value = 1;
+                    VkTimelineSemaphoreSubmitInfoKHR timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+                    timeline.signalSemaphoreValueCount = 1;
+                    timeline.pSignalSemaphoreValues = &value;
+                    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+                    submit.commandBufferCount = 1;
+                    submit.pCommandBuffers = &prefix;
+                    submit.signalSemaphoreCount = 1;
+                    submit.pSignalSemaphores = &handles[0];
+                    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, VK_NULL_HANDLE), "test prefix submit");
+                    submitted = true;
+                }
+                ~Gate() {
+                    try {
+                        SubmitPrefix();
+                        if (handles[1] != VK_NULL_HANDLE) {
+                            std::uint64_t value = 0;
+                            Check(context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, handles[1], &value), "test gate counter");
+                            if (value == 0) {
+                                const VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, handles[1], 1};
+                                Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "test gate release");
+                            }
+                        }
+                        recorder.Sync();
+                    } catch (...) {
+                    }
+                    if (prefix != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &prefix);
+                    for (const auto semaphore : handles) if (semaphore != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+                }
+            } gate{context, recorder};
+            const VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR, nullptr, VK_SEMAPHORE_TYPE_TIMELINE_KHR, 0};
+            const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+            for (auto& semaphore : gate.handles) Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &semaphore), "lazy evidence semaphore");
+            gate.prefix = RecorderTestAccess::Split(recorder, context);
+            const auto decision = LazyCopyBack::Totals();
+            memory.RecordStagingCopies(recorder);
+            finish();
+            const bool refused = LazyCopyBack::Totals().refusedBaseline == decision.refusedBaseline + 1;
+            recorder.HoldNextSubmit(gate.handles[1], 1);
+            const auto wait = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+            const auto signal = context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR");
+            gate.SubmitPrefix();
+            VkResult workerStatus = VK_NOT_READY;
+            std::jthread writer([&] {
+                const std::uint64_t value = 1;
+                const VkSemaphoreWaitInfoKHR info{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR, nullptr, 0, 1, &gate.handles[0], &value};
+                auto status = wait(context.device, &info, 5000000000ull);
+                if (status == VK_SUCCESS) {
+                    if (*word != 1) status = VK_ERROR_UNKNOWN;
+                    *word = 0;
+                }
+                const VkSemaphoreSignalInfoKHR resume{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, gate.handles[1], 1};
+                const auto resumed = signal(context.device, &resume);
+                workerStatus = status == VK_SUCCESS ? resumed : status;
+            });
+            recorder.Sync();
+            writer.join();
+            Require(refused, "the baseline refusal did not cover the future CPU-write window");
+            Require(workerStatus == VK_SUCCESS && *word == 0, "a CPU store after the cancellation decision did not retain the eager result");
+        } else {
+            memory.RecordStagingCopies(recorder);
+            finish();
+            recorder.Sync();
+            Require(*word == 1, "a refused cancellation did not publish the eager GPU result");
+        }
+        const auto after = LazyCopyBack::Totals();
+        Require(after.cancelled == before.cancelled, "a changed-baseline copy-back was canceled");
+        Require(after.refusedBaseline == before.refusedBaseline + 1, "the old-value CPU store baseline refusal was not counted");
+        Require(after.mismatches == before.mismatches, "the old-value CPU store produced a verification mismatch");
+        std::cout << "lazy copy-back " << scenario << ": baseline refused, eager result retained\n";
+    }
+    GuestAllocations::Mutation().Remove(block);
+    HostImportFor(context, address, bytes);
+    Require(VirtualFree(block, 0, MEM_RELEASE) != 0, "cannot release the CPU store block");
+    return true;
+#else
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    static_cast<void>(scenario);
+    return false;
+#endif
+}
+
 bool crossCarryTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -4811,6 +4986,17 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t elementBytes = 1u << 20u;
     static bool cpuUnchanged = false;
     GuestBufferMemory::SetCarryCpuProof([](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { return cpuUnchanged; });
+    const auto readShadow = [&](GuestBufferMemory& memory, std::uint64_t begin) {
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(begin, elementBytes, adjustment);
+        auto readback = std::make_shared<Buffer>(context, elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), 0, elementBytes);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Keep(readback);
+        return readback;
+    };
     {
         GuestBufferMemory memory(context);
         memory.AllowDeviceStaging();
@@ -4871,13 +5057,25 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
         memory.RecordStagingCopies(recorder);
         expect(3, 2, "cross carry: a shadow was carried over a CPU store");
         finishUse();
+        const auto shadow = LazyCopyBack::Active() ? readShadow(memory, element) : nullptr;
         recorder.Sync();
         now = GuestBufferMemory::CrossCarry();
         if (on && verify) Require(now.verified - start.verified == now.carried - start.carried && now.mismatches == start.mismatches, "cross carry: a carried shadow differed from the import");
         if (AgcDriver::Graphics::LazyCopyBack::Active()) {
             const auto lazy = AgcDriver::Graphics::LazyCopyBack::Totals();
-            Require(lazy.cancelled - lazyStart.cancelled + lazy.verified - lazyStart.verified >= 1, "lazy copy-back: the copy-back before a same-batch carry was neither cancelled nor verified");
+            if (std::getenv("APS5_NO_CHANGED_COPY_BACK") == nullptr && context.bufferDeviceAddress) {
+                Require(lazy.cancelled == lazyStart.cancelled && lazy.verified == lazyStart.verified, "lazy copy-back: a baseline copy-back was cancelled or sampled for cancellation");
+                Require(lazy.refusedBaseline > lazyStart.refusedBaseline, "lazy copy-back: the baseline refusal was not counted");
+            } else {
+                Require(lazy.cancelled - lazyStart.cancelled + lazy.verified - lazyStart.verified >= 1, "lazy copy-back: the copy-back before a same-batch carry was neither cancelled nor verified");
+            }
             Require(lazy.mismatches == lazyStart.mismatches, "lazy copy-back: after the surviving copy-back the import differed from the shadow");
+            const auto gpu = shadow->Bytes();
+            const auto* guest = reinterpret_cast<const std::uint8_t*>(element);
+            for (std::size_t index = 0; index < elementBytes; ++index) {
+                const auto expected = index == 100 ? 0x77u : 0x5au;
+                Require(guest[index] == expected && std::to_integer<unsigned>(gpu[index]) == expected, "lazy copy-back: the guest or GPU shadow differs from the eager result");
+            }
             std::cout << "lazy copy-back: " << lazy.indirect - lazyStart.indirect << " indirect, " << lazy.cancelled - lazyStart.cancelled << " cancelled, " << lazy.accessed - lazyStart.accessed << " refused (accessed), " << lazy.verified - lazyStart.verified << " verified\n";
         }
         Require(on || recorder.CarryWatches() == 0, "cross carry: a watch was registered with the switch off");
@@ -4912,6 +5110,54 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
     GuestBufferMemory::SetCarryCpuProof(nullptr);
     const auto* guest = static_cast<const std::uint8_t*>(block);
     for (std::size_t at = 0; at < bytes; ++at) Require(guest[at] == (at == 4096 + 100 ? 0x77 : 0x5a), "cross carry: the guest bytes differ after the uses");
+
+    if (LazyCopyBack::Active()) {
+        const auto baselineFree = address + (2u << 20u) + 4096;
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(baselineFree, elementBytes, false, false);
+        memory.UploadPrepare(false);
+        const auto refused = StagingShadowsRefused();
+        {
+            struct Full {
+                Full() { SetDeviceLocalFullForTests(true); }
+                ~Full() { SetDeviceLocalFullForTests(false); }
+            } full;
+            memory.UploadFinish(false);
+        }
+        Require(memory.HasStagedCopies() && memory.InPlaceReads().empty(), "lazy copy-back: baseline allocation refusal discarded the staged shadow");
+        Require(StagingShadowsRefused() > refused, "lazy copy-back: the baseline allocation was not refused");
+        const auto lazyStart = LazyCopyBack::Totals();
+        const auto use = [&](std::uint32_t value) {
+            std::uint32_t adjustment = 0;
+            const auto view = memory.Descriptor(baselineFree, elementBytes, adjustment);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment, sizeof(value), value);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        use(0x11111111u);
+        memory.RecordStagingCopies(recorder);
+        use(0x22222222u);
+        const auto shadow = readShadow(memory, baselineFree);
+        recorder.Sync();
+        const auto lazy = LazyCopyBack::Totals();
+        Require(lazy.cancelled - lazyStart.cancelled + lazy.verified - lazyStart.verified >= 1, "lazy copy-back: the copy-back before a same-batch carry was neither cancelled nor verified");
+        Require(lazy.mismatches == lazyStart.mismatches, "lazy copy-back: after the surviving copy-back the import differed from the shadow");
+        Require(lazy.refusedBaseline == lazyStart.refusedBaseline && lazy.indirect >= lazyStart.indirect + 2, "lazy copy-back: the baseline-free region did not use indirect whole copies");
+        const auto gpu = shadow->Bytes();
+        const auto* stored = reinterpret_cast<const std::uint8_t*>(baselineFree);
+        for (std::size_t index = 0; index < elementBytes; ++index) {
+            const auto expected = index < sizeof(std::uint32_t) ? 0x22u : 0x5au;
+            Require(stored[index] == expected && std::to_integer<unsigned>(gpu[index]) == expected, "lazy copy-back: the baseline-free guest or GPU shadow differs from the eager result");
+        }
+        std::cout << "lazy baseline-free: " << lazy.cancelled - lazyStart.cancelled << " cancelled, " << lazy.verified - lazyStart.verified << " verified\n";
+    }
 
     {
         GuestBufferMemory first(context);
@@ -17604,6 +17850,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--c-staging-carry-only") {
             if (!crossCarryTests(device, recorder)) return 77;
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--lazy-copyback-cpu-store-only") {
+            if (!lazyCopyBackCpuStoreTests(device, recorder, argv[2])) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {

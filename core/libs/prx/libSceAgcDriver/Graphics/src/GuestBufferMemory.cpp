@@ -6017,6 +6017,7 @@ std::atomic<PFN_vkCmdCopyMemoryIndirectKHR> indirectCopy{nullptr};
 
 struct Counters {
     std::atomic<std::uint64_t> indirect{0}, cancelled{0}, cancelledBytes{0}, accessed{0}, uncovered{0}, otherBatch{0}, fallback{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> refusedBaseline{0};
     Counters() {
         const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter(name, counter); };
         add("c_lazy_copyback_indirect", indirect);
@@ -6028,6 +6029,7 @@ struct Counters {
         add("c_lazy_copyback_fallback", fallback);
         add("c_lazy_copyback_verified", verified);
         add("c_lazy_copyback_verify_mismatches", mismatches);
+        add("c_lazy_copyback_refused_baseline", refusedBaseline);
     }
 };
 
@@ -7051,6 +7053,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         const bool reconcile = wholeRegion && region.shadowCopy != nullptr && region.copySourceAddress != 0 && region.begin % 4u == 0 && region.end % 4u == 0 && region.copySourceBase % 4u == 0 && (stagingCarry::Enabled() || crossCarry::Enabled());
         bool reconciled = false;
         const bool lazyWhole = lazy && region.shadowCopy == nullptr && wholeRegion;
+        if (lazy && region.shadowCopy != nullptr) lazyCopyBack::counters().refusedBaseline.fetch_add(1, std::memory_order_relaxed);
         if (lazy && region.buffer != nullptr && !lazyWhole) lazyCopyBack::state().pending.erase(region.buffer->Handle());
         if (lazyWhole) {
             auto& s = lazyCopyBack::state();
@@ -8154,7 +8157,7 @@ bool Active() {
 
 Counts Totals() {
     const auto& c = lazyCopyBack::counters();
-    return {c.indirect.load(), c.cancelled.load(), c.cancelledBytes.load(), c.accessed.load(), c.verified.load(), c.mismatches.load()};
+    return {c.indirect.load(), c.cancelled.load(), c.cancelledBytes.load(), c.accessed.load(), c.verified.load(), c.mismatches.load(), c.refusedBaseline.load()};
 }
 
 }
