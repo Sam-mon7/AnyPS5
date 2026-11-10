@@ -5,7 +5,7 @@ if(BUILD_TESTING)
     set_target_properties(agc_driver_frame_replay_state_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_frame_replay_state_tests)
     add_dependencies(agc_driver_frame_replay_state_tests agc_frame_replay)
-    foreach(mode IN ITEMS submits shader_output profile_draws)
+    foreach(mode IN ITEMS submits shader_output profile_draws exit_before_first exit_inside_first exit_after_first exit_inside_second exit_after_second exit_memory_second exit_memory_header exit_memory_boundary exit_snapshot_first exit_eop_first exit_indirect_first exit_loop_before_first exit_parked exit_shutdown exit_exception exit_profile exit_recorded_only exit_synthesize exit_delayed_release exit_watchdog)
         add_test(NAME agc_driver_frame_replay_${mode} COMMAND ${CMAKE_COMMAND}
                 "-DTOOL=$<TARGET_FILE:agc_frame_replay>" "-DWRITER=$<TARGET_FILE:agc_driver_frame_replay_state_tests>"
                 "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-${mode}" "-DMODE=${mode}"
@@ -16,7 +16,7 @@ if(BUILD_TESTING)
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-    set(agcFrameReplayModes order tokens blocking reservations reservation_failure environment)
+    set(agcFrameReplayModes order tokens blocking reservations reservation_failure environment shutdown_parked busy_drain)
     if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         list(APPEND agcFrameReplayModes zero shader shader_host shader_prologue_code shader_prologue_header shader_prologue_readonly unwatched once pending_result partly_covered late_clear store_between_walks gpu_write_before_delta calls_v1 store_window store_window_unwritten store_window_stopped)
     endif()

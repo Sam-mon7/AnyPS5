@@ -75,6 +75,7 @@ struct Options {
     std::chrono::milliseconds releaseAfter{3};
     std::chrono::milliseconds drainTimeout{10000};
     std::chrono::milliseconds busyDrainTimeout{600000};
+    std::chrono::milliseconds parkedDrainTimeout{30000};
     bool release = true;
     bool synthesize = true;
     std::size_t repeat = 1;
@@ -358,6 +359,7 @@ struct Replay {
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::uint64_t> keptReservations{0};
     std::atomic<std::size_t> sequenced{0};
+    std::atomic<std::uint64_t> releaseAttempts{0};
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     std::size_t pass = 0;
@@ -645,24 +647,29 @@ struct Replay {
         std::condition_variable turn;
         std::size_t started = 0;
         std::exception_ptr failure;
-        std::atomic<bool> finished{false};
         sequenced.store(0);
+        releaseAttempts.store(0);
         stalled.store(false);
-        std::thread breaker([&] {
+        std::jthread breaker([&](std::stop_token stop) {
             if (!options.release) return;
-            auto lastCompleted = progress().second;
-            auto lastProgress = Clock::now();
-            while (!finished.load()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                const auto completed = progress().second;
-                if (completed != lastCompleted) {
-                    lastCompleted = completed;
+            try {
+                auto lastCompleted = progress().second;
+                auto lastProgress = Clock::now();
+                while (!stop.stop_requested()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    const auto completed = progress().second;
+                    if (completed != lastCompleted) {
+                        lastCompleted = completed;
+                        lastProgress = Clock::now();
+                        continue;
+                    }
+                    if (Clock::now() - lastProgress < options.releaseAfter) continue;
+                    releaseAwaited(calls, sequenced.load());
+                    ++releaseAttempts;
                     lastProgress = Clock::now();
-                    continue;
                 }
-                if (Clock::now() - lastProgress < options.releaseAfter) continue;
-                releaseAwaited(calls, sequenced.load());
-                lastProgress = Clock::now();
+            } catch (...) {
+                frames.Failed(std::current_exception());
             }
         });
         std::vector<std::thread> workers;
@@ -695,20 +702,31 @@ struct Replay {
         }
         for (auto& worker : workers) worker.join();
         if (failure == nullptr) drain();
-        finished.store(true);
+        breaker.request_stop();
         breaker.join();
         if (failure != nullptr) std::rethrow_exception(failure);
+        if (const auto error = frames.Failure()) std::rethrow_exception(error);
     }
 
     void drain() {
         auto lastCompleted = progress().second;
         auto lastProgress = Clock::now();
         auto lastReport = lastProgress;
+        std::optional<Clock::time_point> parkedSince;
+        auto parkedAttempt = releaseAttempts.load();
+        auto lastReleased = earlyReleases.load();
         while (true) {
+            if (const auto error = frames.Failure()) std::rethrow_exception(error);
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
             if (unfinished == 0) return;
             const auto now = Clock::now();
+            const auto released = earlyReleases.load();
+            if (completed != lastCompleted || released != lastReleased || !AgcDriverIdleOrParked_nid_postfix()) {
+                parkedSince.reset();
+                parkedAttempt = releaseAttempts.load();
+            } else if (!parkedSince && (!options.release || releaseAttempts.load() != parkedAttempt)) parkedSince = now;
+            lastReleased = released;
             if (completed != lastCompleted) {
                 lastCompleted = completed;
                 lastProgress = now;
@@ -717,7 +735,7 @@ struct Replay {
                 std::fprintf(stderr, "[frame-replay] draining: %llu submissions pending for %.0f s (serials %llu/%llu), blocked on%s\n", static_cast<unsigned long long>(unfinished),
                              std::chrono::duration<double>(now - lastProgress).count(), static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
             }
-            if (now - lastProgress >= options.busyDrainTimeout) {
+            if (now - lastProgress >= options.busyDrainTimeout || (parkedSince && now - *parkedSince >= options.parkedDrainTimeout)) {
                 std::fprintf(stderr, "[frame-replay] %llu submissions did not complete after the last captured call (serials %llu/%llu), blocked on%s\n", static_cast<unsigned long long>(unfinished),
                              static_cast<unsigned long long>(completed), static_cast<unsigned long long>(accepted), describeBlocked().c_str());
                 return;
@@ -764,6 +782,7 @@ int usage() {
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
+                         "  --parked-drain-ms   milliseconds with every pending queue parked and no remaining release (30000)\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
@@ -873,15 +892,15 @@ int relaunchAttempt() {
     return attempt;
 }
 
-void relaunchIfHostRegionBlocks(const FrameCaptureReader& reader) {
+std::optional<int> relaunchIfHostRegionBlocks(const FrameCaptureReader& reader) {
     const int attempt = relaunchAttempt() + 1;
     const auto& chunks = reader.Chunks();
     const auto blocked = std::find_if(chunks.begin(), chunks.end(), [](const FrameMemoryChunk& chunk) {
         return chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host && (chunk.access & FrameRangeAccess::Gpu) != 0 &&
                GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(chunk.address), static_cast<std::size_t>(chunk.bytes));
     });
-    if (blocked == chunks.end()) return;
-    if (attempt > RelaunchAttempts) return;
+    if (blocked == chunks.end()) return std::nullopt;
+    if (attempt > RelaunchAttempts) return std::nullopt;
     std::fprintf(stderr, "[frame-replay] a host region sits in the captured GPU range 0x%llx+0x%llx; relaunching (%d of %d)\n", static_cast<unsigned long long>(blocked->address),
                  static_cast<unsigned long long>(blocked->bytes), attempt, RelaunchAttempts);
     std::fflush(stdout);
@@ -896,7 +915,8 @@ void relaunchIfHostRegionBlocks(const FrameCaptureReader& reader) {
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD code = 2;
     GetExitCodeProcess(process.hProcess, &code);
-    std::_Exit(static_cast<int>(code));
+    CloseHandle(process.hProcess);
+    return static_cast<int>(code);
 }
 #endif
 std::uint64_t contentHash(const std::byte* bytes, std::size_t size) {
@@ -1243,15 +1263,105 @@ double percentile(std::vector<double> values, double fraction) {
     return values[std::min(values.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(values.size())))];
 }
 
+bool submissionFlips(CapturedMemory& memory, std::uint64_t address, std::uint64_t size, std::map<std::uint32_t, std::uint32_t>& tokens, std::size_t& budget, bool& rewind, bool& readable, std::size_t depth = 0) {
+    if (size > budget || depth >= 64) {
+        readable = false;
+        return false;
+    }
+    budget -= static_cast<std::size_t>(size);
+    const auto bytes = memory.Read(address, size * sizeof(std::uint32_t));
+    if (!bytes) {
+        readable = false;
+        return false;
+    }
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(size));
+    if (!bytes->empty()) std::memcpy(words.data(), bytes->data(), bytes->size());
+    bool flips = false;
+    for (std::size_t at = 0; at < words.size();) {
+        const auto header = words[at];
+        const auto count = AgcDriver::Pm4::PacketWords(header);
+        if (count > words.size() - at || (!AgcDriver::Pm4::FillerPacket(header) && header >> 30u != 3u)) {
+            readable = false;
+            return flips;
+        }
+        const auto* packet = words.data() + at;
+        const auto opcode = (header >> 8u) & 0xffu;
+        if (header == AgcDriver::FlipPacketHeader) flips = true;
+        else if (header >> 30u == 3u && opcode == 0x49u && count == 8 && ((packet[2] >> 24u) & 7u) == 2u) {
+            if (tokens.erase(packet[7]) != 0) flips = true;
+        } else if (header >> 30u == 3u && opcode == 0x3fu) {
+            if (count != 4 && count != 14) {
+                readable = false;
+                return flips;
+            }
+            const auto target = count == 14 ? 8 : 1;
+            const auto location = static_cast<std::uint64_t>(packet[target] & ~3u) | (static_cast<std::uint64_t>(packet[target + 1] & 0xffffu) << 32u);
+            flips = submissionFlips(memory, location, packet[target + 2] & 0xfffffu, tokens, budget, rewind, readable, depth + 1) || flips;
+            if (!readable || rewind || (count == 4 && (packet[3] & (1u << 20u)) != 0)) return flips;
+        } else if (header >> 30u == 3u && opcode == 0x59u) {
+            rewind = true;
+            return flips;
+        }
+        at += count;
+    }
+    return flips;
+}
+
+std::size_t keepWholeFrames(FrameCaptureReader& reader) {
+    CapturedMemory memory(reader);
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+    }
+    bool recording = false;
+    std::size_t frames = 0;
+    std::size_t end = 0;
+    std::map<std::uint32_t, std::uint32_t> tokens;
+    const auto& calls = reader.Calls();
+    for (std::size_t index = 0; index < calls.size() && reader.IncompleteMemoryGroup() != 0; ++index) {
+        const auto& call = calls[index];
+        bool boundary = false;
+        if (call.kind == FrameCallKind::FrameStart) recording = true;
+        else if (call.kind == FrameCallKind::Memory) {
+            if (const auto incomplete = reader.IncompleteMemoryGroup(); incomplete && call.values.at(0) >= *incomplete) break;
+            const auto group = groups.find(call.values.at(0));
+            if (group == groups.end()) break;
+            memory.Apply(group->second);
+        } else if (call.kind == FrameCallKind::ReserveEopFlip) tokens[static_cast<std::uint32_t>(call.values.at(4))] = static_cast<std::uint32_t>(call.values.at(0));
+        else if (call.kind == FrameCallKind::UnregisterVideoOutput) std::erase_if(tokens, [&](const auto& entry) { return entry.second == call.values.at(0); });
+        else if (recording && call.kind == FrameCallKind::Flip) boundary = true;
+        else if (recording && call.kind == FrameCallKind::Submit) {
+            std::size_t budget = std::size_t{1} << 26u;
+            bool rewind = false;
+            bool readable = true;
+            boundary = submissionFlips(memory, call.address, call.size, tokens, budget, rewind, readable);
+            if (!readable) break;
+        }
+        if (boundary) {
+            ++frames;
+            end = index + 1;
+        }
+    }
+    reader.KeepCalls(end, frames);
+    return frames;
+}
+
 int run(const Options& options) {
     std::optional<DrawProfileWriter> drawProfile;
     if (!options.profileDraws.empty()) drawProfile.emplace(options.profileDraws);
     const auto loadStart = Clock::now();
-    const FrameCaptureReader reader(options.directory);
+    FrameCaptureReader reader(options.directory);
+    const auto totalCalls = reader.Calls().size();
+    const auto wholeFrames = reader.Truncated() ? keepWholeFrames(reader) : 0;
+    if (reader.Truncated() && wholeFrames == 0) {
+        std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying 0 whole frames; dropped %zu trailing calls\n", totalCalls);
+        std::fprintf(stderr, "[frame-replay] the truncated capture contains no whole frame\n");
+        return 3;
+    }
 #ifdef _WIN32
-    relaunchIfHostRegionBlocks(reader);
+    if (const auto code = relaunchIfHostRegionBlocks(reader)) return *code;
 #endif
-    if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
+    if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying %zu whole frames; dropped %zu trailing calls\n", wholeFrames, totalCalls - reader.Calls().size());
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
@@ -1312,7 +1422,7 @@ int run(const Options& options) {
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
         AgcDriverRecorderReplayEnd_nid_no_patch(pass, measured.frames);
-        if (drawProfile) {
+        if (drawProfile && replay.unfinished == 0) {
             AgcDriverWaitIdle_nid_postfix();
             drawProfile->Write(pass);
         }
@@ -1377,54 +1487,102 @@ void configureEnvironment(const Options& options) {
 #endif
 }
 
+[[noreturn]] void exitProcess(int code) {
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+    std::_Exit(code);
+}
+
+int shutdownDriver(int code, std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool stopped = false;
+    std::thread watchdog([&] {
+        std::unique_lock lock(mutex);
+        if (changed.wait_for(lock, timeout, [&] { return stopped; })) return;
+        char message[256];
+        const auto length = std::snprintf(message, sizeof(message), "[frame-replay] driver shutdown did not finish within %lld ms; blocked on %s\n", static_cast<long long>(timeout.count()), AgcDriverShutdownStage_nid_postfix());
+#ifdef _WIN32
+        DWORD written = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), message, static_cast<DWORD>(std::clamp(length, 0, static_cast<int>(sizeof(message) - 1))), &written, nullptr);
+#else
+        std::fputs(message, stderr);
+        std::fflush(stderr);
+#endif
+        exitProcess(code == 0 ? 2 : code);
+    });
+    int result = code;
+    try {
+        AgcDriverShutdown_nid_postfix();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+        if (result == 0) result = 2;
+    } catch (...) {
+        std::fprintf(stderr, "agc_frame_replay: non-standard exception during shutdown\n");
+        if (result == 0) result = 2;
+    }
+    {
+        std::lock_guard lock(mutex);
+        stopped = true;
+    }
+    changed.notify_one();
+    watchdog.join();
+    return result;
+}
+
 }
 
 int main(int argc, char** argv) {
     Options options;
-    for (int index = 1; index < argc; ++index) {
-        const std::string_view argument = argv[index];
-        if (argument == "--no-pace") options.pace = false;
-        else if (argument == "--no-release") options.release = false;
-        else if (argument == "--no-synthesize") options.synthesize = false;
-        else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
-        else if (argument == "--strict") options.strict = true;
-        else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
-        else if (argument == "--shaders") options.shaders = true;
-        else if (argument == "--shader-code" && index + 1 < argc) {
-            options.shaders = true;
-            options.shaderCode = argv[++index];
-        }
-        else if (argument == "--submits" && index + 1 < argc) {
-            const std::string_view value = argv[++index];
-            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.submits);
-            if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
-        } else if (argument == "--trace-serials") options.traceSerials = true;
-        else if (argument == "--cold-pipelines") options.coldPipelines = true;
-        else if (argument == "--profile-draws" && index + 1 < argc) options.profileDraws = argv[++index];
-        else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
-        else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
-        else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
-        else return usage();
-    }
-    if (options.directory.empty()) return usage();
-    configureEnvironment(options);
     int code = 2;
-    const bool listing = options.shaders || options.submits != 0;
     try {
+        for (int index = 1; index < argc; ++index) {
+            const std::string_view argument = argv[index];
+            if (argument == "--no-pace") options.pace = false;
+            else if (argument == "--no-release") options.release = false;
+            else if (argument == "--no-synthesize") options.synthesize = false;
+            else if (argument == "--parked-drain-ms" && index + 1 < argc) {
+                const std::string_view value = argv[++index];
+                std::uint64_t milliseconds = 0;
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), milliseconds);
+                if (error != std::errc{} || end != value.data() + value.size() || milliseconds > static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max()).count())) return usage();
+                options.parkedDrainTimeout = std::chrono::milliseconds(milliseconds);
+            }
+            else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
+            else if (argument == "--strict") options.strict = true;
+            else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
+            else if (argument == "--shaders") options.shaders = true;
+            else if (argument == "--shader-code" && index + 1 < argc) {
+                options.shaders = true;
+                options.shaderCode = argv[++index];
+            }
+            else if (argument == "--submits" && index + 1 < argc) {
+                const std::string_view value = argv[++index];
+                const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.submits);
+                if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
+            } else if (argument == "--trace-serials") options.traceSerials = true;
+            else if (argument == "--cold-pipelines") options.coldPipelines = true;
+            else if (argument == "--profile-draws" && index + 1 < argc) options.profileDraws = argv[++index];
+            else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
+            else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
+            else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;
+            else return usage();
+        }
+        if (options.directory.empty()) return usage();
+        configureEnvironment(options);
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "agc_frame_replay: non-standard exception\n");
     }
+    const bool listing = options.shaders || options.submits != 0;
     if (!listing) {
-        try {
-            AgcDriverShutdown_nid_postfix();
-        } catch (const std::exception& error) {
-            std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
-            if (code == 0) code = 2;
-        }
+        code = shutdownDriver(code);
         if (code == 0) return 0;
     }
     std::fflush(stdout);
     std::fflush(stderr);
-    std::_Exit(code);
+    exitProcess(code);
 }

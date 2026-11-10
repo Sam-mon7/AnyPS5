@@ -1095,16 +1095,208 @@ void testStoreWindowStopped(const std::filesystem::path& directory) {
 
 }
 
+void testParkedShutdown() {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* label = reinterpret_cast<std::uint32_t*>(bytes + 4096);
+    const auto location = address(label);
+    std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(location), static_cast<std::uint32_t>(location >> 32u), 1, 0xffffffffu, 4};
+    Packet packet{wait.data(), static_cast<std::uint32_t>(wait.size()), 0, {}};
+    sceAgcDriverSubmitDcb(&packet);
+    Packet pending{};
+    sceAgcDriverSubmitDcb(&pending);
+    const auto deadline = Clock::now() + std::chrono::seconds(5);
+    std::array<AgcDriver::AwaitedWait, 64> waits{};
+    while (AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size()) == 0 && Clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size()) != 0, "the shutdown test did not park on memory");
+    const auto [accepted, completed] = progress();
+    check(accepted - completed == 2, "the shutdown test has no accepted unfinished submissions");
+    AgcDriverShutdown_nid_postfix();
+    check(*label == 0, "shutdown released the guest wait instead of abandoning it");
+    check(std::string_view(AgcDriverShutdownStage_nid_postfix()) == "complete", "shutdown did not finish");
+}
+
+class ShutdownBlockedFlip final : public AgcDriver::IFlipRequest {
+public:
+    ~ShutdownBlockedFlip() override {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::unique_lock lock(mutex);
+        changed.wait(lock, [] { return false; });
+    }
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override {}
+    void Fail(std::exception_ptr) noexcept override {}
+};
+
+class ShutdownBlockedOutput final : public AgcDriver::IVideoOutput {
+public:
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<ShutdownBlockedFlip>(); }
+    void Fail(std::exception_ptr) noexcept override {}
+};
+
+void testShutdownWatchdog() {
+    AgcDriverRegisterVideoOutput_nid_postfix(7, std::make_shared<ShutdownBlockedOutput>());
+    AgcDriverReserveEopFlipAt_nid_postfix({7, -1, 1, 0}, AgcDriver::EopFlipTokenBase);
+    shutdownDriver(3, std::chrono::milliseconds(50));
+    throw std::runtime_error("the watchdog returned from a blocked shutdown");
+}
+
+class BusyFlip final : public AgcDriver::IFlipRequest {
+public:
+    explicit BusyFlip(Frames& frames) : frames(frames) {}
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        frames.MarkReady();
+    }
+    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+private:
+    Frames& frames;
+};
+
+class BusyOutput final : public AgcDriver::IVideoOutput {
+public:
+    explicit BusyOutput(Frames& frames) : frames(frames) {}
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<BusyFlip>(frames); }
+    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+private:
+    Frames& frames;
+};
+
+void testBusyDrain(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    const auto label = address(bytes);
+    std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1, 0xffffffffu, 4};
+    FrameCaptureWriter writer(directory);
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.releaseAfter = std::chrono::milliseconds(50);
+    options.parkedDrainTimeout = std::chrono::milliseconds(10);
+    Replay replay{options, reader};
+    AgcDriverRegisterVideoOutput_nid_postfix(7, std::make_shared<BusyOutput>(replay.frames));
+    FrameCall call;
+    call.kind = FrameCallKind::Flip;
+    call.values = {7, static_cast<std::uint64_t>(-1), 1, 0};
+    FrameCall submit;
+    submit.kind = FrameCallKind::Submit;
+    submit.address = address(wait.data());
+    submit.size = wait.size();
+    const std::array calls{call, submit};
+    replay.runWindow(calls);
+    check(replay.unfinished == 0 && replay.frames.Times().size() == 1, "a busy worker was treated as a parked queue");
+}
+
+void writeExitCapture(const std::filesystem::path& directory, std::string_view mode) {
+    const auto size = 3 * FrameCaptureWriter::BlockBytes;
+    auto* bytes = allocate(size);
+    auto* words = reinterpret_cast<std::uint32_t*>(bytes);
+    const auto label = address(bytes + 8192);
+    const auto result = address(bytes + 4100);
+    std::vector<std::uint32_t> first{0xc0033700u, 0x500u, static_cast<std::uint32_t>(result), static_cast<std::uint32_t>(result >> 32u), 0x12345678u,
+        AgcDriver::FlipPacketHeader, 7, 0xffffffffu, 1, 0, 0};
+    if (mode == "eop_first") {
+        first.resize(5);
+        first.insert(first.end(), {0xc0064900u, 0x06200504u, 0x42010000u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1u, 0u, AgcDriver::EopFlipTokenBase});
+    }
+    if (mode == "parked" || mode == "exception") {
+        const auto source = address(bytes + FrameCaptureWriter::BlockBytes);
+        const auto target = address(bytes + 2 * FrameCaptureWriter::BlockBytes);
+        std::fill_n(bytes + FrameCaptureWriter::BlockBytes, FrameCaptureWriter::BlockBytes, std::byte{0x5a});
+        first.insert(first.begin(), {0xc0055000u, 0x60000000u, static_cast<std::uint32_t>(source), static_cast<std::uint32_t>(source >> 32u), static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32u), FrameCaptureWriter::BlockBytes});
+    }
+    std::copy(first.begin(), first.end(), words);
+    if (mode == "indirect_first" || mode == "loop_before_first") {
+        std::copy(first.begin(), first.end(), words + 128);
+        const auto target = address(mode == "indirect_first" ? words + 128 : words);
+        first = {0xc0023f00u, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32u), mode == "indirect_first" ? static_cast<std::uint32_t>(first.size()) : 4u};
+        std::copy(first.begin(), first.end(), words);
+    }
+    const std::array<std::uint32_t, 7> wait{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1, 0xffffffffu, 4};
+    std::copy(wait.begin(), wait.end(), words + 64);
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(address(bytes), size, FrameRangeKind::Watched, ReadWrite,
+        FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
+    writer.WriteSnapshot(address(bytes), std::span(bytes, size));
+    std::uint64_t ordinal = 0;
+    const auto call = [&](FrameCallKind kind, std::uint64_t location = 0, std::uint64_t size = 0, std::vector<std::uint64_t> values = {}) {
+        FrameCall entry;
+        entry.kind = kind;
+        entry.ordinal = ++ordinal;
+        entry.thread = 1;
+        entry.address = location;
+        entry.size = size;
+        entry.values = std::move(values);
+        writer.WriteCall(entry);
+    };
+    call(FrameCallKind::RegisterVideoOutput, 0, 0, {7});
+    if (mode == "eop_first") call(FrameCallKind::ReserveEopFlip, 0, 0, {7, static_cast<std::uint64_t>(-1), 1, 0, AgcDriver::EopFlipTokenBase});
+    call(FrameCallKind::FrameStart);
+    call(FrameCallKind::Submit, address(words), first.size());
+    if (mode == "parked" || mode == "exception") {
+        call(FrameCallKind::Submit, address(words + 64), wait.size());
+        call(FrameCallKind::Submit);
+        if (mode == "exception") call(FrameCallKind::ReserveEopFlip, 0, 0, {7, static_cast<std::uint64_t>(-1), 1, 0, 0});
+    } else {
+        const std::uint32_t poison = 0xdeadbeefu;
+        writer.WriteDelta(1, 0, result, std::as_bytes(std::span(&poison, 1)));
+        call(FrameCallKind::Memory, 0, 0, {1});
+        call(FrameCallKind::Submit);
+        call(FrameCallKind::Flip, 0, 0, {7, static_cast<std::uint64_t>(-1), 1, 0});
+        writer.WriteDelta(2, 0, result, std::as_bytes(std::span(&poison, 1)));
+        call(FrameCallKind::Memory, 0, 0, {2});
+        call(FrameCallKind::Submit, address(words + 64), wait.size());
+    }
+    call(FrameCallKind::End);
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    std::ofstream metadata(directory / "test-address.txt");
+    metadata << result;
+    if (mode == "parked" || mode == "exception") return;
+    const auto path = directory / FrameCaptureWriter::CallsName;
+    std::ifstream input(path, std::ios::binary);
+    std::vector<std::uint64_t> ends{FrameCaptureWriter::CallsMagic.size()};
+    while (true) {
+        input.seekg(static_cast<std::streamoff>(ends.back() + 4));
+        std::uint32_t length = 0;
+        if (!input.read(reinterpret_cast<char*>(&length), sizeof(length))) break;
+        ends.push_back(ends.back() + 8 + length);
+    }
+    input.close();
+    if (mode == "before_first") std::filesystem::resize_file(path, ends[2]);
+    else if (mode == "inside_first") std::filesystem::resize_file(path, ends[2] + 12);
+    else if (mode == "after_first" || mode == "indirect_first" || mode == "loop_before_first") std::filesystem::resize_file(path, ends[3]);
+    else if (mode == "eop_first") std::filesystem::resize_file(path, ends[4]);
+    else if (mode == "inside_second") std::filesystem::resize_file(path, ends[4] + 12);
+    else if (mode == "after_second") std::filesystem::resize_file(path, ends[6] + 12);
+    else if (mode == "memory_second" || mode == "memory_header" || mode == "memory_boundary" || mode == "snapshot_first") {
+        const FrameCaptureReader reader(directory);
+        const auto kind = mode == "snapshot_first" ? FrameMemoryKind::Snapshot : FrameMemoryKind::Delta;
+        const auto delta = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& chunk) { return chunk.kind == kind; });
+        check(delta != reader.Chunks().end(), "missing synthetic delta");
+        const auto cut = mode == "memory_header" ? delta->offset - 64 + 24 : mode == "memory_boundary" ? delta->offset - 64 : delta->offset + delta->compressedBytes - 1;
+        std::filesystem::resize_file(directory / FrameCaptureWriter::MemoryName, cut);
+    } else throw std::runtime_error("unknown truncation mode");
+    std::filesystem::remove(directory / FrameCaptureWriter::HeaderName);
+}
+
 int main(int argc, char** argv) {
     try {
         check(argc == 3, "expected a test name and capture directory");
         const std::string mode = argv[1];
         const std::filesystem::path directory = argv[2];
+        if (mode == "shutdown_watchdog") testShutdownWatchdog();
+        if (mode.starts_with("exit_capture_")) {
+            writeExitCapture(directory, std::string_view(mode).substr(13));
+            return 0;
+        }
         if (mode == "inspect_capture") {
             writeInspectionCapture(directory);
             return 0;
         }
-        if (mode == "order") testMemoryOrder(directory);
+        if (mode == "shutdown_parked") testParkedShutdown();
+        else if (mode == "busy_drain") testBusyDrain(directory);
+        else if (mode == "order") testMemoryOrder(directory);
         else if (mode == "zero") testReusedMemory(directory);
         else if (mode.starts_with("shader_prologue_")) testShaderCode(directory, true, mode);
         else if (mode == "shared_page") testSharedPage(directory);

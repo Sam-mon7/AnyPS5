@@ -6,6 +6,7 @@
 #include <cstring>
 #include <future>
 #include <iterator>
+#include <set>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -398,6 +399,23 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
     while (offset < size) {
         if (size - offset < ChunkHeaderBytes) {
             truncated = true;
+            incompleteMemoryGroup = 0;
+            if (size - offset >= sizeof(std::uint32_t)) {
+                std::uint32_t kind = 0;
+                memory.seekg(static_cast<std::streamoff>(offset));
+                memory.read(reinterpret_cast<char*>(&kind), sizeof(kind));
+                if (kind == static_cast<std::uint32_t>(FrameMemoryKind::Delta)) {
+                    std::uint64_t group = 1;
+                    for (const auto& chunk : chunks) {
+                        if (chunk.kind == FrameMemoryKind::Delta) group = std::max(group, chunk.group);
+                    }
+                    if (size - offset >= 24) {
+                        memory.seekg(static_cast<std::streamoff>(offset + 16));
+                        memory.read(reinterpret_cast<char*>(&group), sizeof(group));
+                    }
+                    incompleteMemoryGroup = group;
+                } else if (kind == static_cast<std::uint32_t>(FrameMemoryKind::Reference)) incompleteMemoryGroup.reset();
+            }
             break;
         }
         std::array<std::byte, ChunkHeaderBytes> raw{};
@@ -422,6 +440,8 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
         chunk.offset = offset + ChunkHeaderBytes;
         if (size - chunk.offset < chunk.compressedBytes) {
             truncated = true;
+            if (chunk.kind == FrameMemoryKind::Snapshot) incompleteMemoryGroup = 0;
+            else if (chunk.kind == FrameMemoryKind::Delta) incompleteMemoryGroup = chunk.group;
             break;
         }
         chunks.push_back(chunk);
@@ -455,6 +475,22 @@ std::uint32_t FrameCaptureReader::Version() const {
 
 bool FrameCaptureReader::Truncated() const {
     return truncated;
+}
+
+std::optional<std::uint64_t> FrameCaptureReader::IncompleteMemoryGroup() const {
+    return incompleteMemoryGroup;
+}
+
+void FrameCaptureReader::KeepCalls(std::size_t count, std::size_t frames) {
+    requireCapture(count <= calls.size(), "replay limit exceeds the captured calls");
+    calls.resize(count);
+    std::set<std::uint64_t> groups;
+    for (const auto& call : calls) {
+        if (call.kind == FrameCallKind::Memory) groups.insert(call.values.at(0));
+    }
+    std::erase_if(chunks, [&](const FrameMemoryChunk& chunk) {
+        return (chunk.kind == FrameMemoryKind::Delta && !groups.contains(chunk.group)) || (chunk.kind == FrameMemoryKind::Reference && chunk.group >= frames);
+    });
 }
 
 void FrameCaptureReader::Read(const FrameMemoryChunk& chunk, std::span<std::byte> destination) const {

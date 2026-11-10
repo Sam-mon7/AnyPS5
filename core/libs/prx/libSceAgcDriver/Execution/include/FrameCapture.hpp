@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -122,6 +123,8 @@ public:
     const std::string& Header() const;
     std::uint32_t Version() const;
     bool Truncated() const;
+    std::optional<std::uint64_t> IncompleteMemoryGroup() const;
+    void KeepCalls(std::size_t count, std::size_t frames);
     void Read(const FrameMemoryChunk& chunk, std::span<std::byte> destination) const;
     std::vector<std::byte> Read(const FrameMemoryChunk& chunk) const;
 
@@ -132,6 +135,7 @@ private:
     std::string header;
     std::uint32_t version = 2;
     bool truncated = false;
+    std::optional<std::uint64_t> incompleteMemoryGroup;
 };
 
 std::string_view FrameCallName(FrameCallKind kind);

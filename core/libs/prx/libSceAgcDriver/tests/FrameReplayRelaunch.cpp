@@ -31,7 +31,7 @@ int child(const std::filesystem::path& directory, int exitCode) {
     writer.WriteRange(address, 4096, FrameRangeKind::Watched, 3, AgcDriver::FrameRangeAccess::Readable | AgcDriver::FrameRangeAccess::Gpu);
     writer.Finish("{}");
     const FrameCaptureReader reader(capture);
-    relaunchIfHostRegionBlocks(reader);
+    if (const auto code = relaunchIfHostRegionBlocks(reader)) return *code;
     append(directory / "log.txt", "continued");
     return exitCode;
 }
