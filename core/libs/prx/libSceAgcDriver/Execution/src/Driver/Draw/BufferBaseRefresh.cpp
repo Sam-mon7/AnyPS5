@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PointerSet.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include <map>
 #include <set>
 
@@ -40,11 +42,23 @@ void RecordBufferBasePatches(DispatchVariant& variant, const ShaderRecompiler::R
             return;
         }
     }
+    struct SeenTag {};
+    struct ForbiddenTag {};
+    struct AddressesTag {};
+    struct ReadersTag {};
+    auto& seen = AgcDriver::ThreadScratch<std::vector<const ShaderRecompiler::IrValue*>, SeenTag>();
+    auto& forbidden = AgcDriver::ThreadScratch<PointerSet, ForbiddenTag>();
+    auto& addresses = AgcDriver::ThreadScratch<std::vector<std::pair<const ShaderRecompiler::IrValue*, std::uint64_t>>, AddressesTag>();
+    auto& readers = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, const ShaderRecompiler::IrValue*>>, ReadersTag>();
+    forbidden.clear();
+    addresses.clear();
+    readers.clear();
     const auto sourceValue = [&](const ShaderRecompiler::IrValue* value) {
-        std::set<const ShaderRecompiler::IrValue*> seen;
+        seen.clear();
         while (value != nullptr) {
             value = value->Resolve();
-            if (!seen.insert(value).second) return static_cast<const ShaderRecompiler::IrValue*>(nullptr);
+            if (std::find(seen.begin(), seen.end(), value) != seen.end()) return static_cast<const ShaderRecompiler::IrValue*>(nullptr);
+            seen.push_back(value);
             if (value->Opcode() == ShaderRecompiler::IrOpcode::ReadConst && value->ArgumentCount() == 2 && value->Argument(0) != nullptr && value->Argument(0)->Resolve()->Opcode() == ShaderRecompiler::IrOpcode::GetSrtResource) {
                 const auto* slot = value->Argument(1)->Resolve();
                 if (!slot->HasImmediate() || slot->Type() != ShaderRecompiler::IrType::U32 || slot->ImmediateU32() >= plan.srtReads.size()) return static_cast<const ShaderRecompiler::IrValue*>(nullptr);
@@ -56,10 +70,9 @@ void RecordBufferBasePatches(DispatchVariant& variant, const ShaderRecompiler::R
     };
     struct Candidate { const ShaderRecompiler::IrValue* value; std::uint32_t resource, word; };
     std::vector<Candidate> candidates;
-    std::set<const ShaderRecompiler::IrValue*> forbidden;
     const auto mark = [&](auto&& self, const ShaderRecompiler::IrValue* value) -> void {
         value = sourceValue(value);
-        if (value == nullptr || !forbidden.insert(value).second) return;
+        if (value == nullptr || !forbidden.insert(value)) return;
         for (const auto* argument : value->Arguments()) self(self, argument);
     };
     for (std::uint32_t s = 0; s < plan.descriptorSources.size(); ++s) {
@@ -87,20 +100,29 @@ void RecordBufferBasePatches(DispatchVariant& variant, const ShaderRecompiler::R
         const auto* value = sourceValue(read.value);
         if (value != nullptr) for (const auto* argument : value->Arguments()) mark(mark, argument);
     }
-    std::map<const ShaderRecompiler::IrValue*, std::set<std::uint64_t>> addresses;
-    std::map<std::uint64_t, std::set<const ShaderRecompiler::IrValue*>> readers;
     for (const auto& [raw, address] : capture.readTrace.slotReads) {
         const auto* value = sourceValue(raw);
-        addresses[value].insert(address);
-        readers[address].insert(value);
+        addresses.emplace_back(value, address);
+        readers.emplace_back(address, value);
     }
+    std::sort(addresses.begin(), addresses.end());
+    addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+    std::sort(readers.begin(), readers.end());
+    readers.erase(std::unique(readers.begin(), readers.end()), readers.end());
+    const auto capturedBy = [&](const ShaderRecompiler::IrValue* value) {
+        return std::equal_range(addresses.begin(), addresses.end(), std::make_pair(value, std::uint64_t{0}), [](const auto& left, const auto& right) { return std::less<const ShaderRecompiler::IrValue*>{}(left.first, right.first); });
+    };
+    const auto readersOf = [&](std::uint64_t address) {
+        const auto range = std::equal_range(readers.begin(), readers.end(), std::make_pair(address, static_cast<const ShaderRecompiler::IrValue*>(nullptr)), [](const auto& left, const auto& right) { return left.first < right.first; });
+        return static_cast<std::size_t>(range.second - range.first);
+    };
     for (const auto& candidate : candidates) {
         if (forbidden.contains(candidate.value)) { ArchB::Recorder::Count("fix_buffer_base_refused_dependency"); continue; }
         if (std::count_if(candidates.begin(), candidates.end(), [&](const auto& other) { return other.value == candidate.value; }) != 1) { ArchB::Recorder::Count("fix_buffer_base_refused_alias"); continue; }
-        const auto found = addresses.find(candidate.value);
-        if (found == addresses.end() || found->second.size() != 1) { ArchB::Recorder::Count("fix_buffer_base_refused_unmapped"); continue; }
-        const auto address = *found->second.begin();
-        if (address % 4 != 0 || readers[address].size() != 1) { ArchB::Recorder::Count("fix_buffer_base_refused_alias"); continue; }
+        const auto found = capturedBy(candidate.value);
+        if (found.second - found.first != 1) { ArchB::Recorder::Count("fix_buffer_base_refused_unmapped"); continue; }
+        const auto address = found.first->second;
+        if (address % 4 != 0 || readersOf(address) != 1) { ArchB::Recorder::Count("fix_buffer_base_refused_alias"); continue; }
         std::size_t offset = 0, position = variant.words.size(), matches = 0;
         for (const auto& [begin, end] : variant.runs) {
             if (begin <= address && address < end && end - address >= 4 && (address - begin) % 4 == 0) { position = offset + (address - begin) / 4; ++matches; }
