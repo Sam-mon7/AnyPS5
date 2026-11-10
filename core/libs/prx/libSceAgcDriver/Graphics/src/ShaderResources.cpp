@@ -936,7 +936,7 @@ PendingLookup pendingLookupSource(const Context& context, const GuestTextureReso
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, bool layerRows = false) {
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, bool layerRows = false, bool snapshotWait = true) {
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::TextureLookup);
     Require(!layerRows || (requested.dimension == TextureDimension::k1DArray && !depthCompare), "only a sampled 1D array is laid out as rows of a 2D image");
     const auto resource = layerRows ? requested : ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
@@ -972,13 +972,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (depthBitsWidth == 32u && resource.format != float32) {
         auto bits = resource;
         bits.format = float32;
-        return cachedTexture(context, words, bits, components, guestBytes, depthCompare, VK_IMAGE_VIEW_TYPE_2D, layerRows);
+        return cachedTexture(context, words, bits, components, guestBytes, depthCompare, VK_IMAGE_VIEW_TYPE_2D, layerRows, snapshotWait);
     }
     constexpr auto unorm16 = static_cast<std::uint32_t>(ShaderRecompiler::IrBufferFormat::Format16UNorm);
     if (depthBitsWidth == 16u && resource.format != unorm16) {
         auto normalized = resource;
         normalized.format = unorm16;
-        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare, VK_IMAGE_VIEW_TYPE_2D, layerRows);
+        return cachedTexture(context, words, normalized, components, guestBytes, depthCompare, VK_IMAGE_VIEW_TYPE_2D, layerRows, snapshotWait);
     }
     const auto viewedWindow = [&] {
         const auto window = ViewedArrayWindow(resource, false);
@@ -991,7 +991,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         static std::atomic<std::uint64_t> windows{0};
         const auto count = windows.fetch_add(1) + 1;
         if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] sampled array view 0x%llx (%ux%u format %u, dimension %d, slices %u..%u) served from its viewed slices at 0x%llx; %llu such views\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.baseArray, resource.depthOrLastArray, static_cast<unsigned long long>(window.baseAddress), static_cast<unsigned long long>(count));
-        return cachedTexture(context, words, window, components, 0, depthCompare, VK_IMAGE_VIEW_TYPE_2D, layerRows);
+        return cachedTexture(context, words, window, components, 0, depthCompare, VK_IMAGE_VIEW_TYPE_2D, layerRows, snapshotWait);
     }
     if (guestBytes == 0) guestBytes = SurfaceGuestBytes(resource);
     if (guestBytes >= (1ull << 30u)) {
@@ -1034,6 +1034,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto bytes = static_cast<std::size_t>(guestBytes);
     if (profile) StorageTexture::ProfilePendingAccess(resource, guestBytes, StorageTexture::PendingAccess::Read);
     static_cast<void>(FlushDepthPlanes(address, bytes));
+    if (snapshotWait && ArchB::PartialSnapshotActive() && Recorder::ComputeSyncEnabled() && ArchB::Switches::Enabled(ArchB::Feature::FixComputeSnapshotWait) && sampledCacheHeld == 0 && storageCacheHeld == 0 && !ImportsHeldByThisThread() && (depthCompare || !SampledFromStorageEligible(context, resource, guestBytes)) && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            const auto target = recorder->PendingWriterSerial(address, bytes);
+            if (target != 0) {
+                ArchB::Recorder::Count("fix_compute_snapshot_prewait_candidates");
+                ArchB::Recorder::Count(depthCompare ? "fix_compute_snapshot_prewait_depth" : "fix_compute_snapshot_prewait_no_import");
+                if (recorder->FinishComputeSyncUnlocked(target)) {
+                    ArchB::Recorder::Count("fix_compute_snapshot_prewait_waits");
+                    return cachedTexture(context, words, requested, components, guestBytes, depthCompare, multisampleViewType, layerRows, false);
+                }
+            }
+        }
+    }
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
@@ -1345,8 +1358,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     const char* value = std::getenv("APS5_ARCHB_FIX_PARTIAL_SNAPSHOT_VERIFY");
                     return value != nullptr && std::string_view(value) == "1";
                 }();
+                static const bool verifyPrewait = [] {
+                    const char* value = std::getenv("APS5_ARCHB_FIX_COMPUTE_SNAPSHOT_WAIT_VERIFY");
+                    return value != nullptr && std::string_view(value) == "1";
+                }();
                 static std::atomic<std::uint64_t> verifySamples{0};
-                if (verify && (verifySamples.fetch_add(1, std::memory_order_relaxed) & 63u) == 0u) {
+                if ((verify || (verifyPrewait && ArchB::Switches::Enabled(ArchB::Feature::FixComputeSnapshotWait))) && (verifySamples.fetch_add(1, std::memory_order_relaxed) & 63u) == 0u) {
                     std::vector<std::byte> full(bytes);
                     ReadTextureSurface(resource, DccKeys::Uncompressed, full);
                     const auto reference = createTexture(*context.detiler, resource, components, full, depthCompare, layerRows);

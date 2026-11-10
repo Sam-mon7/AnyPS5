@@ -445,7 +445,8 @@ std::atomic<std::uint64_t>& SampledMemoryCounter() {
 bool PartialSnapshotVerifyEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ARCHB_FIX_PARTIAL_SNAPSHOT_VERIFY");
-        return value != nullptr && std::string_view(value) == "1";
+        const char* prewait = std::getenv("APS5_ARCHB_FIX_COMPUTE_SNAPSHOT_WAIT_VERIFY");
+        return (value != nullptr && std::string_view(value) == "1") || (prewait != nullptr && std::string_view(prewait) == "1");
     }();
     return enabled;
 }

@@ -49,6 +49,7 @@ constexpr Feature PipeCopyKernelItemsPrerequisites[] = {Feature::PipeQ0Committer
 constexpr Feature PipeDrawReusePrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeDrawLookupMemoPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature WtFaultPrerequisites[] = {Feature::WtFault};
+constexpr Feature ComputeSnapshotWaitPrerequisites[] = {Feature::FixComputeSyncUnlocked, Feature::FixPartialSnapshot};
 constexpr Feature PipeResolveSplitPrerequisites[] = {Feature::PipeQ0Committer};
 constexpr Feature PipeResolvePoolPrerequisites[] = {Feature::PipeQ0Committer, Feature::PipeResolveSplit};
 constexpr Feature PrelockStampSkipPrerequisites[] = {Feature::WtFault, Feature::PipeResolveProofs};
@@ -207,6 +208,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // label over the awaited dword sets (the 200 us poll sleep ends early; what satisfies the wait is unchanged).
     {Feature::CLabelWake, "C_LABEL_WAKE", false, true, {}},
     {Feature::FixDerivedIndexCache, "FIX_DERIVED_INDEX_CACHE", false, true, {}},
+    {Feature::FixComputeSnapshotWait, "FIX_COMPUTE_SNAPSHOT_WAIT", false, true, ComputeSnapshotWaitPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
