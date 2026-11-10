@@ -29,6 +29,7 @@ struct Counts {
     std::uint64_t accessed = 0;
     std::uint64_t verified = 0;
     std::uint64_t mismatches = 0;
+    std::uint64_t refusedBaseline = 0;
 };
 Counts Totals();
 

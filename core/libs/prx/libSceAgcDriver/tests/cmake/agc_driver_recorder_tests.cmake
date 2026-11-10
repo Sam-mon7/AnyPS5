@@ -335,6 +335,15 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archc_lazy_copyback PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_LAZY_COPYBACK=1")
     set_tests_properties(agc_archc_lazy_copyback_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_LAZY_COPYBACK=1;APS5_ARCHB_C_LAZY_COPYBACK_VERIFY=1")
     if(WIN32)
+        add_test(NAME agc_archc_lazy_copyback_cpu_old_value COMMAND agc_driver_recorder_tests --lazy-copyback-cpu-store-only old-value)
+        add_test(NAME agc_archc_lazy_copyback_cpu_window COMMAND agc_driver_recorder_tests --lazy-copyback-cpu-store-only window)
+        set_tests_properties(agc_archc_lazy_copyback_cpu_old_value agc_archc_lazy_copyback_cpu_window PROPERTIES
+                SKIP_RETURN_CODE 77 TIMEOUT 30
+                ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_LAZY_COPYBACK=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_property(TEST agc_archc_lazy_copyback_cpu_window APPEND PROPERTY ENVIRONMENT "ANYPS5_TEST_TIMELINE=1")
+    endif()
+    if(WIN32)
         set_tests_properties(agc_archc_lazy_copyback agc_archc_lazy_copyback_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_archb_c_gpu_staging_carry_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_GPU_STAGING_CARRY_VERIFY=1")
