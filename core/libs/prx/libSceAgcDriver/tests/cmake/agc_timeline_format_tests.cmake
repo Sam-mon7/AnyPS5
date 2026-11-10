@@ -1,5 +1,5 @@
 if(BUILD_TESTING)
-    add_test_executable(agc_timeline_format_tests tests/Timeline.cpp)
+    add_test_executable(agc_timeline_format_tests tests/Timeline.cpp Execution/src/ArchB/CheapClock.cpp)
     target_include_directories(agc_timeline_format_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_timeline_format_tests PRIVATE libc)
     configure_windows_unwind(agc_timeline_format_tests)

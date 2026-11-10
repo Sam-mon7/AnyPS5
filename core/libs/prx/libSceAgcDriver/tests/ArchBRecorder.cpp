@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
 #include "ArchBRecorderHandoff.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryAccessScope.hpp"
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -205,6 +207,116 @@ void hotThreadState() {
     expectNear(result.counters.at("hot thread state"), 101);
 }
 
+void memoryAccessThreadState() {
+    using AgcDriver::GuestMemory::MemoryAccessScope;
+    std::size_t outerCalls = 0, innerCalls = 0, workerCalls = 0;
+    const auto resolve = +[](void* context, std::uint64_t address, std::size_t bytes, bool writable) {
+        ++*static_cast<std::size_t*>(context);
+        MemoryAccessScope::Resolve(address, bytes, writable);
+    };
+    MemoryAccessScope::Resolve(1, 1, false);
+    {
+        const MemoryAccessScope outer(&outerCalls, resolve);
+        MemoryAccessScope::Resolve(1, 1, false);
+        {
+            const MemoryAccessScope inner(&innerCalls, resolve);
+            MemoryAccessScope::Resolve(1, 1, true);
+        }
+        std::thread worker([&] {
+            MemoryAccessScope::Resolve(1, 1, false);
+            const MemoryAccessScope own(&workerCalls, resolve);
+            MemoryAccessScope::Resolve(1, 1, false);
+        });
+        worker.join();
+        require(outerCalls == 1 && innerCalls == 1 && workerCalls == 1, "memory resolver state leaked across scopes or threads");
+        MemoryAccessScope::Resolve(1, 1, false);
+#ifdef ARCHB_TEST_EMUTLS
+        emulatedTlsCalls.store(0, std::memory_order_relaxed);
+        trackEmulatedTls.store(true, std::memory_order_relaxed);
+#endif
+        for (unsigned i = 0; i != 100; ++i) MemoryAccessScope::Resolve(1, 1, false);
+#ifdef ARCHB_TEST_EMUTLS
+        trackEmulatedTls.store(false, std::memory_order_relaxed);
+        std::cout << "memory resolver emulated TLS calls: " << emulatedTlsCalls.load() << '\n';
+        require(emulatedTlsCalls.load() == 0, "memory resolver used emulated TLS");
+#endif
+    }
+    MemoryAccessScope::Resolve(1, 1, false);
+    require(outerCalls == 102 && innerCalls == 1 && workerCalls == 1, "memory resolver was not restored or recursively re-entered");
+}
+
+void cheapClock() {
+    const auto first = AgcDriver::ArchB::CheapClock::Now(true);
+    auto previous = first;
+    for (int i = 0; i < 10000; ++i) {
+        const auto current = AgcDriver::ArchB::CheapClock::Now(true);
+        require(current >= previous, "cheap clock moved backwards");
+        previous = current;
+    }
+#ifdef _WIN32
+    LARGE_INTEGER frequency, qpcBegin, qpcEnd;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&qpcBegin);
+    const auto cheapBegin = AgcDriver::ArchB::CheapClock::Now(true);
+    Sleep(100);
+    const auto cheapEnd = AgcDriver::ArchB::CheapClock::Now(true);
+    QueryPerformanceCounter(&qpcEnd);
+    const auto qpcNs = static_cast<double>(qpcEnd.QuadPart - qpcBegin.QuadPart) * 1e9 / static_cast<double>(frequency.QuadPart);
+    const auto cheapNs = std::chrono::duration<double, std::nano>(cheapEnd - cheapBegin).count();
+    const auto& calibration = AgcDriver::ArchB::CheapClock::GetCalibration();
+    std::cout << "cheap_clock rdtsc=" << calibration.rdtsc << " frequency=" << calibration.frequency << " qpc_ns=" << qpcNs << " cheap_ns=" << cheapNs << '\n';
+    require(std::abs(cheapNs - qpcNs) / qpcNs <= 0.01, "cheap clock differs from QPC by more than 1%");
+#endif
+}
+
+void cheapTimerFlip() {
+    const auto start = Recorder::Clock::now();
+    Recorder::Boundary(true, 100, start);
+    Recorder::BindThread("cheap timer flip");
+    {
+        AgcDriver::ArchB::CheapClock::Scope selected(true);
+        AgcDriver::PerformanceTimer timer("crossing cheap timer");
+        {
+            AgcDriver::ArchB::CheapClock::Scope flipped(false);
+            std::this_thread::sleep_for(2ms);
+            timer.Finish();
+        }
+    }
+    const auto result = Recorder::Collect(Recorder::Clock::now());
+    require(result.counters.at("fix_cheap_timers_scopes") != 0, "cheap timer scope was not counted");
+    require(result.phases.at("cheap timer flip").at("crossing cheap timer") > 0, "timer spanning a switch flip was lost");
+}
+
+double timerBench(bool cheap) {
+    constexpr std::size_t iterations = 100000;
+    AgcDriver::ArchB::CheapClock::Scope selected(cheap);
+    static_cast<void>(AgcDriver::ArchB::CheapClock::Now(cheap));
+    const auto begin = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < iterations; ++i) {
+        AgcDriver::PerformanceTimer timer("timer benchmark");
+    }
+    return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - begin).count() / iterations;
+}
+
+double countBench(bool cheap) {
+    constexpr std::size_t iterations = 1000000;
+    AgcDriver::ArchB::CheapClock::Scope selected(cheap);
+    const auto begin = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < iterations; ++i) Recorder::Count("count benchmark");
+    return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - begin).count() / iterations;
+}
+
+void cheapBenchmark() {
+    Recorder::Boundary(true, 101, Recorder::Clock::now());
+    Recorder::BindThread("cheap benchmark");
+    const auto timerOff = timerBench(false);
+    const auto timerOn = timerBench(true);
+    const auto countOff = countBench(false);
+    const auto countOn = countBench(true);
+    std::cout << "performance_timer off_ns=" << timerOff << " on_ns=" << timerOn << '\n';
+    std::cout << "recorder_count off_ns=" << countOff << " on_ns=" << countOn << '\n';
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -216,6 +328,10 @@ int main(int argc, char** argv) {
         else if (name == "toggle_interval_tagged") toggleIntervalTagged();
         else if (name == "shader_table_overflow") shaderTableOverflow();
         else if (name == "hot_thread_state") hotThreadState();
+        else if (name == "memory_access_thread_state") memoryAccessThreadState();
+        else if (name == "cheap_clock") cheapClock();
+        else if (name == "cheap_timer_flip") cheapTimerFlip();
+        else if (name == "cheap_benchmark") cheapBenchmark();
         else throw std::runtime_error("unknown test case");
         return 0;
     } catch (const std::exception& error) {

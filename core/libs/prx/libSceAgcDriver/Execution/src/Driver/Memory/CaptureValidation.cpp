@@ -2,6 +2,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <cstdlib>
 #include <cstring>
 
@@ -16,8 +17,10 @@ bool Driver::captureStable(std::span<const ShaderRecompiler::MemoryRegion> captu
     double waited = 0;
     PendingView pending;
     pending.Load();
-    thread_local std::vector<std::byte>* knownSlot = nullptr;
+    struct KnownSlot {};
+    auto* knownSlot = HostThreadSlot<std::vector<std::byte>*, KnownSlot>::Get();
     auto& known = ShaderRecompiler::ThreadOwned(knownSlot);
+    HostThreadSlot<std::vector<std::byte>*, KnownSlot>::Set(&known);
     for (const auto& region : captured) {
         if (!stable) break;
         known.resize(region.bytes.size());
@@ -62,11 +65,15 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
     using Policy = ShaderMemory::PendingWrite;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
-    thread_local std::vector<std::size_t>* pendingSlot = nullptr;
+    struct PendingSlot {};
+    auto* pendingSlot = HostThreadSlot<std::vector<std::size_t>*, PendingSlot>::Get();
     auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+    HostThreadSlot<std::vector<std::size_t>*, PendingSlot>::Set(&pending);
     pending.clear();
-    thread_local std::vector<VouchedRegions>* skippedSlot = nullptr;
+    struct SkippedSlot {};
+    auto* skippedSlot = HostThreadSlot<std::vector<VouchedRegions>*, SkippedSlot>::Get();
     auto& skipped = ShaderRecompiler::ThreadOwned(skippedSlot);
+    HostThreadSlot<std::vector<VouchedRegions>*, SkippedSlot>::Set(&skipped);
     skipped.clear();
     for (const auto& range : vouched) {
         if (range.begin < range.end && range.end <= captured.size() && (skipped.empty() || skipped.back().end <= range.begin) && !view.Overlaps(range.low, static_cast<std::size_t>(range.high - range.low))) skipped.push_back(range);
@@ -81,8 +88,10 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
     }
 
     const auto compareMasked = [&](const ShaderRecompiler::MemoryRegion& region, std::size_t first) {
-        thread_local std::vector<std::byte>* liveSlot = nullptr;
+        struct LiveSlot {};
+        auto* liveSlot = HostThreadSlot<std::vector<std::byte>*, LiveSlot>::Get();
         auto& live = ShaderRecompiler::ThreadOwned(liveSlot);
+        HostThreadSlot<std::vector<std::byte>*, LiveSlot>::Set(&live);
         live.resize(region.bytes.size());
         const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
         if (copied != GuestMemory::Compare::Equal) return copied;
@@ -112,12 +121,18 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
     };
 
     static constexpr std::size_t NoKnownValue = std::numeric_limits<std::size_t>::max();
-    thread_local std::vector<Policy>* policiesSlot = nullptr;
-    thread_local std::vector<std::size_t>* knownOffsetsSlot = nullptr;
-    thread_local std::vector<std::byte>* knownBytesSlot = nullptr;
+    struct PoliciesSlot {};
+    struct KnownOffsetsSlot {};
+    struct KnownBytesSlot {};
+    auto* policiesSlot = HostThreadSlot<std::vector<Policy>*, PoliciesSlot>::Get();
+    auto* knownOffsetsSlot = HostThreadSlot<std::vector<std::size_t>*, KnownOffsetsSlot>::Get();
+    auto* knownBytesSlot = HostThreadSlot<std::vector<std::byte>*, KnownBytesSlot>::Get();
     auto& policies = ShaderRecompiler::ThreadOwned(policiesSlot);
     auto& knownOffsets = ShaderRecompiler::ThreadOwned(knownOffsetsSlot);
     auto& knownBytes = ShaderRecompiler::ThreadOwned(knownBytesSlot);
+    HostThreadSlot<std::vector<Policy>*, PoliciesSlot>::Set(&policies);
+    HostThreadSlot<std::vector<std::size_t>*, KnownOffsetsSlot>::Set(&knownOffsets);
+    HostThreadSlot<std::vector<std::byte>*, KnownBytesSlot>::Set(&knownBytes);
     policies.assign(pending.size(), Policy::None);
     knownOffsets.assign(pending.size(), NoKnownValue);
     knownBytes.clear();

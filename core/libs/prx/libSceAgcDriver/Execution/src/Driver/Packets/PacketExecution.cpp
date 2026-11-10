@@ -145,8 +145,8 @@ bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode)
 }
 
 bool& drawnSinceSeal() {
-    static thread_local bool drawn = false;
-    return drawn;
+    struct DrawnStorage {};
+    return AgcDriver::ThreadScratch<bool, DrawnStorage>();
 }
 
 }
@@ -300,8 +300,8 @@ void Driver::execute(const Submission& submission) {
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
-    thread_local PacketProfile* packetProfileSlot = nullptr;
-    auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
+    struct PacketProfileSlotStorage {};
+    auto& packetProfile = AgcDriver::ThreadScratch<PacketProfile, PacketProfileSlotStorage>();
     ++packetProfile.submissions;
     auto& packetCounters = PacketCounters::ThisThread();
 

@@ -1,8 +1,11 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -359,8 +362,8 @@ void ReportDispatchItems(bool profile) {
 void NoteMissingRecipe(std::uint32_t queue, bool indirect, RecipeBuildFailure failure) {
     constexpr std::array<const char*, static_cast<std::size_t>(RecipeBuildFailure::Count)> names{"not attempted", "built", "disabled", "uncacheable", "overlay", "address table", "lease", "copied writes", "not reusable", "completion", "objects", "key"};
     using Counts = std::map<std::pair<std::uint32_t, bool>, std::array<std::uint64_t, names.size()>>;
-    thread_local Counts* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    struct CountsSlotStorage {};
+    auto& counts = AgcDriver::ThreadScratch<Counts, CountsSlotStorage>();
     static thread_local auto reportedAt = std::chrono::steady_clock::now();
     ++counts[{queue, indirect}][static_cast<std::size_t>(failure)];
     const auto now = std::chrono::steady_clock::now();
@@ -399,6 +402,10 @@ bool Driver::pipelineDispatch() {
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const bool hostSlabAlloc = ArchB::Switches::Enabled(ArchB::Feature::FixHostSlabAlloc);
+    const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
+    const bool cheapTimers = ArchB::Switches::Enabled(ArchB::Feature::FixCheapTimers);
+    const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
     const bool imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     const bool imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     const bool computeSync = ArchB::Switches::Enabled(ArchB::Feature::FixComputeSyncUnlocked) && submission.queue != 0;
@@ -991,7 +998,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+            const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
+            const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
             const ArchB::AllocChurnScope allocChurnScope(allocChurn);
             const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
@@ -31,7 +32,8 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     bool submit = false, record = false, needsRecord = false, deferredDue = false, pendingDue = false;
     const auto pending = Graphics::Recorder::PendingLabelSince();
 
-    thread_local std::chrono::steady_clock::time_point lastReapTry{};
+    struct LastReapTryThreadStorage {};
+    auto& lastReapTry = AgcDriver::ThreadScratch<std::chrono::steady_clock::time_point, LastReapTryThreadStorage>();
     const bool completions = completionsPending();
     const bool reapDue = completions && (reapEachPacket() || queue == 0);
 

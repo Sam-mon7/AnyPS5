@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_ARCHB_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_ARCHB_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include <array>
 #include <atomic>
@@ -11,6 +12,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+extern "C" void AgcDriverRecorderCount_nid_no_patch(const char* name, double value);
 
 namespace AgcDriver::ArchB {
 
@@ -72,13 +75,19 @@ public:
     };
     class Timer {
     public:
-        explicit Timer(const char* name) { if (Enabled()) scope.Begin(name, Clock::now()); }
-        ~Timer() { if (scope.Active()) scope.End(Clock::now()); }
+        explicit Timer(const char* name) : cheap(CheapClock::Active()) {
+            if (Enabled()) {
+                if (cheap) AgcDriverRecorderCount_nid_no_patch("fix_cheap_timers_scopes", 1);
+                scope.Begin(name, CheapClock::Now(cheap));
+            }
+        }
+        ~Timer() { if (scope.Active()) scope.End(CheapClock::Now(cheap)); }
         Timer(const Timer&) = delete;
         Timer& operator=(const Timer&) = delete;
-        void Mark(const char* stage) { if (scope.Active()) scope.Mark(stage, Clock::now()); }
+        void Mark(const char* stage) { if (scope.Active()) scope.Mark(stage, CheapClock::Now(cheap)); }
     private:
         Scope scope;
+        bool cheap;
     };
     class Work {
     public:

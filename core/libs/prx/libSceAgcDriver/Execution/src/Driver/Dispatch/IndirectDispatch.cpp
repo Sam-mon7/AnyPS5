@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -56,8 +57,8 @@ int Driver::indirectArgumentsPath(std::span<const std::uint32_t> packet, std::ui
 }
 
 Driver::IndirectSource& Driver::indirectSource() {
-    static thread_local IndirectSource source;
-    return source;
+    struct SourceStorage {};
+    return AgcDriver::ThreadScratch<IndirectSource, SourceStorage>();
 }
 
 std::string Driver::describeIndirectSource() {

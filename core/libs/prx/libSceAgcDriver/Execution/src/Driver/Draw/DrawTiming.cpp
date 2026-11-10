@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
@@ -11,8 +12,8 @@
 namespace AgcDriver::DriverDetail {
 
 PendingDrawPhases& Driver::pendingDrawPhases() {
-    static thread_local PendingDrawPhases pending;
-    return pending;
+    struct PendingStorage {};
+    return AgcDriver::ThreadScratch<PendingDrawPhases, PendingStorage>();
 }
 
 bool DrawShaderProfileEnabled() {

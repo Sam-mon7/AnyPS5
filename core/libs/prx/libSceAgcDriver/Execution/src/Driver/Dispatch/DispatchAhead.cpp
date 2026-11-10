@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -15,28 +16,28 @@
 namespace AgcDriver::DriverDetail {
 
 std::map<std::size_t, Driver::ResolvedDispatch>& Driver::resolvedAhead() {
-    static thread_local std::map<std::size_t, ResolvedDispatch>* resolved = nullptr;
-    return ShaderRecompiler::ThreadOwned(resolved);
+    struct ResolvedStorage {};
+    return AgcDriver::ThreadScratch<std::map<std::size_t, ResolvedDispatch>, ResolvedStorage>();
 }
 
 Driver::GroupCaptureStats& Driver::groupCaptureStats() {
-    static thread_local GroupCaptureStats stats;
-    return stats;
+    struct StatsStorage {};
+    return AgcDriver::ThreadScratch<GroupCaptureStats, StatsStorage>();
 }
 
 std::size_t& Driver::currentPacketOffset() {
-    static thread_local std::size_t offset = 0;
-    return offset;
+    struct OffsetStorage {};
+    return AgcDriver::ThreadScratch<std::size_t, OffsetStorage>();
 }
 
 bool& Driver::resolvingAhead() {
-    static thread_local bool resolving = false;
-    return resolving;
+    struct ResolvingStorage {};
+    return AgcDriver::ThreadScratch<bool, ResolvingStorage>();
 }
 
 bool& Driver::gateOpened() {
-    static thread_local bool opened = false;
-    return opened;
+    struct OpenedStorage {};
+    return AgcDriver::ThreadScratch<bool, OpenedStorage>();
 }
 
 std::uint64_t Driver::DispatchesAdoptedAhead() const {
@@ -54,8 +55,8 @@ void Driver::SetAheadAdoptHook(void (*hook)()) {
 namespace {
 
 std::size_t& PreviewedUntil() {
-    static thread_local std::size_t until = 0;
-    return until;
+    struct UntilStorage {};
+    return AgcDriver::ThreadScratch<std::size_t, UntilStorage>();
 }
 
 }
@@ -161,8 +162,8 @@ void Driver::resolveGroupAhead(const Submission& submission, const QueueState& l
         }
         PreviewedUntil() = limit;
         if (hasFurtherDispatch) {
-            static thread_local QueueState* previewSlot = nullptr;
-            auto& preview = ShaderRecompiler::ThreadOwned(previewSlot);
+            struct PreviewSlotStorage {};
+            auto& preview = AgcDriver::ThreadScratch<QueueState, PreviewSlotStorage>();
             preview.shader = live.shader;
             preview.predication = live.predication;
             std::vector<PreparedShaders*> pendingShaders;

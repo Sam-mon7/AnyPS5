@@ -211,10 +211,22 @@ TextureCache& Textures() {
     return cache;
 }
 
-thread_local unsigned sampledCacheHeld = 0;
-thread_local unsigned storageCacheHeld = 0;
-thread_local unsigned sampledCacheReclaimable = 0;
-thread_local unsigned storageCacheReclaimable = 0;
+unsigned& sampledCacheHeldThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<unsigned, Slot>();
+}
+unsigned& storageCacheHeldThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<unsigned, Slot>();
+}
+unsigned& sampledCacheReclaimableThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<unsigned, Slot>();
+}
+unsigned& storageCacheReclaimableThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<unsigned, Slot>();
+}
 
 struct CacheHold {
     unsigned& depth;
@@ -502,8 +514,14 @@ TextureCounters& TextureCounts() {
     return counters;
 }
 
-thread_local std::uint64_t sampledLookupKeyScans = 0;
-thread_local std::uint64_t sampledLookupKeyProofs = 0;
+std::uint64_t& sampledLookupKeyScansThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
+std::uint64_t& sampledLookupKeyProofsThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::uint64_t, Slot>();
+}
 
 bool TextureCountersReported() {
     static const bool reported = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -538,24 +556,31 @@ struct LookupRecord {
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
 };
 
-thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
 constexpr std::size_t LookupLogBound = 1024;
 constexpr std::size_t NoBuildLookups = std::numeric_limits<std::size_t>::max();
-thread_local std::size_t buildLookupsStart = NoBuildLookups;
-thread_local bool buildLookupsPastBound = false;
+std::size_t& buildLookupsStartThreadState() {
+    struct State { std::size_t value = NoBuildLookups; };
+    struct Slot {};
+    return AgcDriver::ThreadScratch<State, Slot>().value;
+}
+bool& buildLookupsPastBoundThreadState() {
+    struct Slot {};
+    return AgcDriver::ThreadScratch<bool, Slot>();
+}
 std::atomic<std::uint64_t> lookupBuildsPastBound{0};
 
 std::vector<LookupRecord>& lookupLog() {
-    return ShaderRecompiler::ThreadOwned(lookupLogSlot);
+    struct Slot {};
+    return AgcDriver::ThreadScratch<std::vector<LookupRecord>, Slot>();
 }
 
 void logLookup(LookupRecord record) {
     auto& log = lookupLog();
     if (log.size() >= LookupLogBound) {
-        const auto dropped = std::min(LookupLogBound / 2, buildLookupsStart);
-        if (dropped < LookupLogBound / 2) buildLookupsPastBound = true;
+        const auto dropped = std::min(LookupLogBound / 2, buildLookupsStartThreadState());
+        if (dropped < LookupLogBound / 2) buildLookupsPastBoundThreadState() = true;
         log.erase(log.begin(), log.begin() + static_cast<std::ptrdiff_t>(dropped));
-        if (buildLookupsStart != NoBuildLookups) buildLookupsStart -= dropped;
+        if (buildLookupsStartThreadState() != NoBuildLookups) buildLookupsStartThreadState() -= dropped;
     }
     log.push_back(std::move(record));
 }
@@ -571,12 +596,12 @@ void logTextureLookup(const CachedTexture& entry, const GuestTextureResource& re
 
 class BuildLookups {
 public:
-    BuildLookups() : outermost(buildLookupsStart == NoBuildLookups) { buildLookupsStart = std::min(buildLookupsStart, lookupLog().size()); }
+    BuildLookups() : outermost(buildLookupsStartThreadState() == NoBuildLookups) { buildLookupsStartThreadState() = std::min(buildLookupsStartThreadState(), lookupLog().size()); }
     ~BuildLookups() {
         if (!outermost) return;
-        buildLookupsStart = NoBuildLookups;
-        if (buildLookupsPastBound) lookupBuildsPastBound.fetch_add(1, std::memory_order_relaxed);
-        buildLookupsPastBound = false;
+        buildLookupsStartThreadState() = NoBuildLookups;
+        if (buildLookupsPastBoundThreadState()) lookupBuildsPastBound.fetch_add(1, std::memory_order_relaxed);
+        buildLookupsPastBoundThreadState() = false;
         auto& log = lookupLog();
         if (log.size() > LookupLogBound) log.erase(log.begin(), log.end() - static_cast<std::ptrdiff_t>(LookupLogBound));
         if (log.capacity() > LookupLogBound + LookupLogBound / 2) log.shrink_to_fit();
@@ -1024,8 +1049,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         const auto scans = KeyProofCounts().scanned;
         const auto proofs = KeyProofCounts().proved;
         scanned = ProvedClearKeys(resource, guestBytes, memo.proof);
-        if (KeyProofCounts().scanned != scans) ++sampledLookupKeyScans;
-        if (KeyProofCounts().proved != proofs) ++sampledLookupKeyProofs;
+        if (KeyProofCounts().scanned != scans) ++sampledLookupKeyScansThreadState();
+        if (KeyProofCounts().proved != proofs) ++sampledLookupKeyProofsThreadState();
         if (profile) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return *scanned;
     };
@@ -1034,7 +1059,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto bytes = static_cast<std::size_t>(guestBytes);
     if (profile) StorageTexture::ProfilePendingAccess(resource, guestBytes, StorageTexture::PendingAccess::Read);
     static_cast<void>(FlushDepthPlanes(address, bytes));
-    if (snapshotWait && ArchB::PartialSnapshotActive() && Recorder::ComputeSyncEnabled() && ArchB::Switches::Enabled(ArchB::Feature::FixComputeSnapshotWait) && sampledCacheHeld == 0 && storageCacheHeld == 0 && !ImportsHeldByThisThread() && (depthCompare || !SampledFromStorageEligible(context, resource, guestBytes)) && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+    if (snapshotWait && ArchB::PartialSnapshotActive() && Recorder::ComputeSyncEnabled() && ArchB::Switches::Enabled(ArchB::Feature::FixComputeSnapshotWait) && sampledCacheHeldThreadState() == 0 && storageCacheHeldThreadState() == 0 && !ImportsHeldByThisThread() && (depthCompare || !SampledFromStorageEligible(context, resource, guestBytes)) && Recorder::SnapshotWriteOverlaps(address, bytes)) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             const auto target = recorder->PendingWriterSerial(address, bytes);
             if (target != 0) {
@@ -1171,8 +1196,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // existing vector when it has one. The helpers below answer as `committed` would have.
     const CommittedRanges* scratchCommitted = nullptr;
     if (source == nullptr && generation == 0 && AgcDriver::ArchB::AllocChurnActive()) {
-        thread_local CommittedRanges* rangesSlot = nullptr;
-        auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+        struct RangesSlotStorage {};
+        auto& ranges = AgcDriver::ThreadScratch<CommittedRanges, RangesSlotStorage>();
         if (const auto partial = GuestMemory::CollectCommittedWritesInPlace(address, bytes, ranges); partial != 0) {
             snapshotGeneration = partial;
             scratchCommitted = &ranges;
@@ -1201,9 +1226,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto key = MakeTextureKey(context.device, words, components, depthCompare);
     key.clearSnapshot = ClearSnapshotCacheEnabled() && source == nullptr && IsDccClear(*keys);
     std::lock_guard lock(cache.mutex);
-    const CacheHold held(sampledCacheHeld);
+    const CacheHold held(sampledCacheHeldThreadState());
     const auto createTexture = [&](auto&&... args) {
-        const CacheHold reclaimable(sampledCacheReclaimable);
+        const CacheHold reclaimable(sampledCacheReclaimableThreadState());
         return std::make_shared<Texture>(context, std::forward<decltype(args)>(args)...);
     };
     dropUncachedViews(cache);
@@ -1665,7 +1690,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     std::shared_ptr<StorageTexture> texture;
     {
         std::lock_guard lock(cache.mutex);
-        const CacheHold held(storageCacheHeld);
+        const CacheHold held(storageCacheHeldThreadState());
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
@@ -1692,7 +1717,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (flushed && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             std::shared_ptr<StorageTexture> created;
             {
-                const CacheHold reclaimable(storageCacheReclaimable);
+                const CacheHold reclaimable(storageCacheReclaimableThreadState());
                 created = StorageTexture::Create(context, *context.detiler, resource, mip);
             }
             created->AdoptHandOver(std::move(handOver));
@@ -1827,7 +1852,7 @@ void FlushCachedTextures(VkDevice device) {
     GuestMemory::AssertGpuLockHeld("FlushCachedTextures");
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
-    const CacheHold held(storageCacheHeld);
+    const CacheHold held(storageCacheHeldThreadState());
     for (const auto& entry : cache.entries) {
         if (entry.key.device == device) entry.texture->Flush();
     }
@@ -1838,7 +1863,7 @@ void ClearCachedTextures(VkDevice device) {
     auto& sampled = Textures();
     {
         std::lock_guard lock(sampled.mutex);
-        const CacheHold held(sampledCacheHeld);
+        const CacheHold held(sampledCacheHeldThreadState());
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
             else ++it;
@@ -1850,7 +1875,7 @@ void ClearCachedTextures(VkDevice device) {
     std::vector<std::shared_ptr<StorageTexture>> cleared;
     {
         std::lock_guard lock(storage.mutex);
-        const CacheHold held(storageCacheHeld);
+        const CacheHold held(storageCacheHeldThreadState());
         for (auto it = storage.entries.begin(); it != storage.entries.end();) {
             if (it->key.device != device) {
                 ++it;
@@ -1878,7 +1903,8 @@ void ClearCachedTextures(VkDevice device) {
 }
 
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
-    thread_local bool releasing = false;
+    struct ReleasingThreadStorage {};
+    auto& releasing = AgcDriver::ThreadScratch<bool, ReleasingThreadStorage>();
     if (releasing) return 0;
     releasing = true;
     struct Done {
@@ -1895,8 +1921,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     {
         auto& cache = Textures();
         std::unique_lock lock(cache.mutex, std::defer_lock);
-        const bool inherited = sampledCacheHeld != 0;
-        if ((inherited && (!newImage || sampledCacheReclaimable == 0)) || (!inherited && !lock.try_lock())) {
+        const bool inherited = sampledCacheHeldThreadState() != 0;
+        if ((inherited && (!newImage || sampledCacheReclaimableThreadState() == 0)) || (!inherited && !lock.try_lock())) {
             sampledSkipped = true;
         } else {
             for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
@@ -1914,8 +1940,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     if (freed < bytes) {
         auto& cache = StorageTextures();
         std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
-        const bool inherited = storageCacheHeld != 0;
-        if ((inherited && (!newImage || storageCacheReclaimable == 0)) || !gpu.try_lock()) {
+        const bool inherited = storageCacheHeldThreadState() != 0;
+        if ((inherited && (!newImage || storageCacheReclaimableThreadState() == 0)) || !gpu.try_lock()) {
             storageSkipped = true;
         } else {
             try {
@@ -2066,7 +2092,7 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     const auto resource = StorageSurface(context, viewed);
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
-    const CacheHold held(storageCacheHeld);
+    const CacheHold held(storageCacheHeldThreadState());
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());
     if (it == cache.entries.end() || MetadataMoved(*it->texture, resource)) return nullptr;
@@ -2289,8 +2315,8 @@ struct ThreadBuildProfile {
 };
 
 ThreadBuildProfile& ThreadBuilds() {
-    thread_local ThreadBuildProfile* profileSlot = nullptr;
-    auto& profile = ShaderRecompiler::ThreadOwned(profileSlot);
+    struct ProfileSlotStorage {};
+    auto& profile = AgcDriver::ThreadScratch<ThreadBuildProfile, ProfileSlotStorage>();
     return profile;
 }
 
@@ -2399,8 +2425,8 @@ struct ReusedTable {
 constexpr std::size_t ReusedTableCount = 4;
 
 std::vector<ReusedTable>& ReusedTables() {
-    thread_local std::vector<ReusedTable>* slot = nullptr;
-    return ShaderRecompiler::ThreadOwned(slot);
+    struct SlotStorage {};
+    return AgcDriver::ThreadScratch<std::vector<ReusedTable>, SlotStorage>();
 }
 
 bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler::DescriptorBinding& binding) {
@@ -3775,8 +3801,8 @@ bool ImportAuditAdmitted() {
 
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices) {
     indices.assign(objects.size(), logged.size());
-    thread_local std::vector<std::pair<const void*, std::size_t>>* wantedSlot = nullptr;
-    auto& wanted = ShaderRecompiler::ThreadOwned(wantedSlot);
+    struct WantedSlotStorage {};
+    auto& wanted = AgcDriver::ThreadScratch<std::vector<std::pair<const void*, std::size_t>>, WantedSlotStorage>();
     wanted.clear();
     for (std::size_t i = 0; i < objects.size(); ++i) wanted.emplace_back(objects[i], i);
     const auto byObject = [](const std::pair<const void*, std::size_t>& left, const std::pair<const void*, std::size_t>& right) { return std::less<const void*>{}(left.first, right.first); };
@@ -3808,12 +3834,12 @@ void ShaderResources::captureValidation() {
         return;
     }
     const auto& log = lookupLog();
-    thread_local std::vector<const void*>* loggedSlot = nullptr;
-    auto& logged = ShaderRecompiler::ThreadOwned(loggedSlot);
-    thread_local std::vector<const void*>* objectsSlot = nullptr;
-    auto& objects = ShaderRecompiler::ThreadOwned(objectsSlot);
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& indices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct LoggedSlotStorage {};
+    auto& logged = AgcDriver::ThreadScratch<std::vector<const void*>, LoggedSlotStorage>();
+    struct ObjectsSlotStorage {};
+    auto& objects = AgcDriver::ThreadScratch<std::vector<const void*>, ObjectsSlotStorage>();
+    struct IndicesSlotStorage {};
+    auto& indices = AgcDriver::ThreadScratch<std::vector<std::size_t>, IndicesSlotStorage>();
     logged.clear();
     for (const auto& entry : log) logged.push_back(entry.object);
     objects.clear();
@@ -3871,8 +3897,8 @@ bool ShaderResources::collectPartialSnapshot(ValidatedSurface& surface) {
     }
     if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: collected into a per-thread scratch that keeps its capacity.
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* currentSlot = nullptr;
-        auto& current = ShaderRecompiler::ThreadOwned(currentSlot);
+        struct CurrentSlotStorage {};
+        auto& current = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, CurrentSlotStorage>();
         surface.collected = GuestMemory::CollectCommittedWritesInPlace(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes), current);
         return surface.collected != 0 && current == *surface.committed;
     }
@@ -4533,7 +4559,8 @@ bool ShaderResources::revalidateCensused(std::span<const CompiledShader> shaders
         const auto before = partial ? currentStampSerials() : ResourceEpochProof{};
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending && (partial ? resourceEpochProof == before && PartialSnapshotsUnchanged(validatedTextures) && !HoldsReleasedTexture() && HasCachedStorageImages() : canRememberResourceEpoch())) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
-            thread_local std::uint64_t reuses = 0;
+            struct ReusesThreadStorage {};
+            auto& reuses = AgcDriver::ThreadScratch<std::uint64_t, ReusesThreadStorage>();
             if (verify && ++reuses % 64u == 0u) {
                 const bool ok = revalidateFull(shaders, report);
                 noteEpochProof(true, true, !ok);
@@ -4676,7 +4703,8 @@ std::uint64_t templateTokenVerifyPeriod() {
 bool templateTokenVerifyNow() {
     const auto period = templateTokenVerifyPeriod();
     if (period == 0) return false;
-    thread_local std::uint64_t hits = 0;
+    struct HitsThreadStorage {};
+    auto& hits = AgcDriver::ThreadScratch<std::uint64_t, HitsThreadStorage>();
     return ++hits % period == 0;
 }
 
@@ -4792,8 +4820,8 @@ bool ShaderResources::archcTokenHolds() {
     if (templateTokenVerifyNow()) {
         counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         bool unchanged = true;
-        thread_local std::vector<GuestMemory::UnchangedQuery>* verifySlot = nullptr;
-        auto& queries = ShaderRecompiler::ThreadOwned(verifySlot);
+        struct VerifySlotStorage {};
+        auto& queries = AgcDriver::ThreadScratch<std::vector<GuestMemory::UnchangedQuery>, VerifySlotStorage>();
         queries.clear();
         for (const auto& [begin, end] : stampProof.ranges) {
             const auto bytes = static_cast<std::size_t>(end - begin);
@@ -4882,8 +4910,8 @@ bool stampScanVerifyNow() {
 bool ShaderResources::stampScanPending(bool& overlaps) {
     overlaps = false;
     const auto scanNow = [&] {
-        thread_local std::vector<StorageTexture::PendingQuery>* scanSlot = nullptr;
-        auto& scan = ShaderRecompiler::ThreadOwned(scanSlot);
+        struct ScanSlotStorage {};
+        auto& scan = AgcDriver::ThreadScratch<std::vector<StorageTexture::PendingQuery>, ScanSlotStorage>();
         scan.assign(stampProof.pending.begin(), stampProof.pending.end());
         stampProofCounters().pendingScans.fetch_add(1, std::memory_order_relaxed);
         if (!StorageTexture::ScanPending(scan)) return false;
@@ -4919,8 +4947,8 @@ bool ShaderResources::stampScanPending(bool& overlaps) {
         }
     }
     if (!stampScanToken.registered) {
-        thread_local std::vector<ArchC::EpochRange>* rangesSlot = nullptr;
-        auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+        struct RangesSlotStorage {};
+        auto& ranges = AgcDriver::ThreadScratch<std::vector<ArchC::EpochRange>, RangesSlotStorage>();
         ranges.clear();
         for (const auto& query : stampProof.pending) ranges.push_back({query.begin, query.end});
         ArchC::ImageEpochs::Get().RegisterOwner(&stampScanEpoch, stampScanEpoch, ranges, ArchC::SourceBit(ArchC::EpochSource::PendingInsert));
@@ -4983,8 +5011,8 @@ bool ShaderResources::stampProofHolds() {
     if (tokens) {
         templateTokenCounters().attempts.fetch_add(1, std::memory_order_relaxed);
         if (!archcToken.registered || archcRanges != stampProof.ranges) {
-            thread_local std::vector<ArchC::EpochRange>* rangesSlot = nullptr;
-            auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+            struct RangesSlotStorage {};
+            auto& ranges = AgcDriver::ThreadScratch<std::vector<ArchC::EpochRange>, RangesSlotStorage>();
             ranges.clear();
             for (const auto& [begin, end] : stampProof.ranges) ranges.push_back({begin, end});
             ArchC::ImageEpochs::Get().RegisterOwner(this, archcEpoch, ranges, TemplateTokenSources);
@@ -4995,8 +5023,8 @@ bool ShaderResources::stampProofHolds() {
         tokenEpoch = archcEpoch.load(std::memory_order_acquire);
         tokenLoss = ArchC::ImageEpochs::Get().Loss();
     }
-    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
-    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    struct QueriesSlotStorage {};
+    auto& queries = AgcDriver::ThreadScratch<std::vector<GuestMemory::UnchangedQuery>, QueriesSlotStorage>();
     queries.clear();
     for (const auto& [begin, end] : stampProof.ranges) {
         const auto bytes = static_cast<std::size_t>(end - begin);
@@ -5189,7 +5217,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (epochImports != importsBefore) return EpochRefusal::Imports;
             if (TemplateAuditDue(lastFullWalk)) return EpochRefusal::Audit;
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
-            thread_local std::uint64_t reuses = 0;
+            struct ReusesThreadStorage {};
+            auto& reuses = AgcDriver::ThreadScratch<std::uint64_t, ReusesThreadStorage>();
             if (verify && ++reuses % 64u == 0u) return EpochRefusal::Verify;
             return EpochRefusal::Count;
         }();
@@ -5332,8 +5361,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (stampProofs && !noFast && !epochReused && stampProofHolds()) {
         stampReused = true;
         if (stampProofsVerify()) {
-            thread_local std::vector<PendingOverlap>* verifyOverlapSlot = nullptr;
-            thread_local std::vector<PendingOverlap>* verifyRefreshedSlot = nullptr;
+            struct VerifyOverlapSlotThreadStorage {};
+            auto& verifyOverlapSlot = AgcDriver::ThreadScratch<std::vector<PendingOverlap>*, VerifyOverlapSlotThreadStorage>();
+            struct VerifyRefreshedSlotThreadStorage {};
+            auto& verifyRefreshedSlot = AgcDriver::ThreadScratch<std::vector<PendingOverlap>*, VerifyRefreshedSlotThreadStorage>();
             auto& verifyOverlap = ShaderRecompiler::ThreadOwned(verifyOverlapSlot);
             auto& verifyRefreshed = ShaderRecompiler::ThreadOwned(verifyRefreshedSlot);
             verifyRefreshed.clear();
@@ -5420,8 +5451,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         } else if (depthProofAccepted && depthProofVerifyNow()) {
             auto& c = depthProofCounters();
             c.verified.fetch_add(1, std::memory_order_relaxed);
-            thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* depthVersionsSlot = nullptr;
-            auto& versions = ShaderRecompiler::ThreadOwned(depthVersionsSlot);
+            struct DepthVersionsSlotStorage {};
+            auto& versions = AgcDriver::ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, DepthVersionsSlotStorage>();
             versions.clear();
             for (const auto& surface : validatedTextures) {
                 if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
@@ -5496,8 +5527,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 if (scanToken) scanCounters.live.fetch_add(1, std::memory_order_relaxed);
                 if (scanVerify) scanCounters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
                 if (scanToken && !pendingScanToken.registered) {
-                    thread_local std::vector<ArchC::EpochRange>* scanRangesSlot = nullptr;
-                    auto& scanRanges = ShaderRecompiler::ThreadOwned(scanRangesSlot);
+                    struct ScanRangesSlotStorage {};
+                    auto& scanRanges = AgcDriver::ThreadScratch<std::vector<ArchC::EpochRange>, ScanRangesSlotStorage>();
                     scanRanges.clear();
                     for (const auto& region : directRegions) scanRanges.push_back({region.begin, region.end});
                     for (const auto& [begin, end] : guestMemory.Writes()) scanRanges.push_back({begin, end});
@@ -6611,7 +6642,8 @@ void ShaderResources::PrecollectSurfaces(bool memoVirtualQuery) const {
         double succeededMs = 0;
         double failedMs = 0;
     };
-    static thread_local std::array<Counts, 3> counts{};
+    struct CountsThreadStorage {};
+    auto& counts = AgcDriver::ThreadScratch<std::array<Counts, 3>, CountsThreadStorage>();
     static thread_local auto reportedAt = std::chrono::steady_clock::now();
     const auto packet = GuestMemory::CurrentPacket();
     auto& count = counts[packet.opcode == 0x15 ? 0 : packet.opcode == 0x16 ? 1 : 2];
@@ -7067,8 +7099,8 @@ std::uint32_t SamplerTableCapacityFor(const Context& context, bool updateAfterBi
 }
 
 std::uint64_t& DeviceProcLookups() {
-    thread_local std::uint64_t count = 0;
-    return count;
+    struct CountStorage {};
+    return AgcDriver::ThreadScratch<std::uint64_t, CountStorage>();
 }
 
 std::uint32_t ImageTableCapacity(const Context& context) {
@@ -7552,11 +7584,11 @@ void ShaderResources::resolveImageTables() {
 }
 
 std::uint64_t SampledLookupKeyScans() {
-    return sampledLookupKeyScans;
+    return sampledLookupKeyScansThreadState();
 }
 
 std::uint64_t SampledLookupKeyProofs() {
-    return sampledLookupKeyProofs;
+    return sampledLookupKeyProofsThreadState();
 }
 
 std::uint64_t SampledTexturesCleared() {
@@ -8264,14 +8296,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
         counters.refusedStore.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
-    thread_local std::vector<std::uint64_t>* contentSlot = nullptr;
-    auto& content = ShaderRecompiler::ThreadOwned(contentSlot);
+    struct ContentSlotStorage {};
+    auto& content = AgcDriver::ThreadScratch<std::vector<std::uint64_t>, ContentSlotStorage>();
     content.clear();
-    thread_local std::vector<std::pair<VkBuffer, VkDeviceSize>>* targetsSlot = nullptr;
-    auto& targets = ShaderRecompiler::ThreadOwned(targetsSlot);
+    struct TargetsSlotStorage {};
+    auto& targets = AgcDriver::ThreadScratch<std::vector<std::pair<VkBuffer, VkDeviceSize>>, TargetsSlotStorage>();
     targets.clear();
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    struct ReadsSlotStorage {};
+    auto& reads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsSlotStorage>();
     reads.clear();
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     for (const auto& entry : moved) {
@@ -8454,9 +8486,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto* import = ExistingHostImportFor(context, begin, bytes);
             if (import != nullptr && HostImportOffset(*import, begin) % alignment == 0) counters->importable.fetch_add(1, std::memory_order_relaxed);
         }
-        thread_local std::vector<std::uint64_t>* ringSlot = nullptr;
-        thread_local std::unordered_map<std::uint64_t, std::uint32_t>* seenSlot = nullptr;
-        thread_local std::size_t ringNext = 0;
+        struct RingSlotThreadStorage {};
+        auto& ringSlot = AgcDriver::ThreadScratch<std::vector<std::uint64_t>*, RingSlotThreadStorage>();
+        struct SeenSlotThreadStorage {};
+        auto& seenSlot = AgcDriver::ThreadScratch<std::unordered_map<std::uint64_t, std::uint32_t>*, SeenSlotThreadStorage>();
+        struct RingNextThreadStorage {};
+        auto& ringNext = AgcDriver::ThreadScratch<std::size_t, RingNextThreadStorage>();
         auto& ring = ShaderRecompiler::ThreadOwned(ringSlot);
         auto& seen = ShaderRecompiler::ThreadOwned(seenSlot);
         constexpr std::size_t Window = 8192;
@@ -8486,8 +8521,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (on) bindingsDiag().totalNs.fetch_add(diagNs(start), std::memory_order_relaxed);
         }
     } diagTotal{diag, diagStart};
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-    auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    struct ReadsSlotStorage {};
+    auto& reads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsSlotStorage>();
     // APS5_ARCHB_FIX_SNAPSHOT_CANDIDATES: the checks that depend only on this object come from the list
     // made at build; _VERIFY makes them as well (their answer is used) and counts a differing element.
     const bool candidates = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixSnapshotCandidates);
@@ -8511,8 +8546,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
-    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
-    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    struct SelectedSlotStorage {};
+    auto& selected = AgcDriver::ThreadScratch<std::vector<std::size_t>, SelectedSlotStorage>();
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
@@ -8529,9 +8564,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // a held moved word buffer need no write.
     const bool slotted = drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawReuse) &&
         AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool) && GuestMemory::IsCommitterThread();
-    thread_local std::vector<std::size_t>* slotElementsSlot = nullptr;
-    thread_local std::vector<std::size_t>* slotSizesSlot = nullptr;
-    thread_local std::vector<std::size_t>* slotSnapshotsSlot = nullptr;
+    struct SlotElementsSlotThreadStorage {};
+    auto& slotElementsSlot = AgcDriver::ThreadScratch<std::vector<std::size_t>*, SlotElementsSlotThreadStorage>();
+    struct SlotSizesSlotThreadStorage {};
+    auto& slotSizesSlot = AgcDriver::ThreadScratch<std::vector<std::size_t>*, SlotSizesSlotThreadStorage>();
+    struct SlotSnapshotsSlotThreadStorage {};
+    auto& slotSnapshotsSlot = AgcDriver::ThreadScratch<std::vector<std::size_t>*, SlotSnapshotsSlotThreadStorage>();
     auto& slotElements = ShaderRecompiler::ThreadOwned(slotElementsSlot);
     auto& slotSizes = ShaderRecompiler::ThreadOwned(slotSizesSlot);
     auto& slotSnapshots = ShaderRecompiler::ThreadOwned(slotSnapshotsSlot);
@@ -8583,8 +8621,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (reportUploadWords) {
                     movedWordCounters().held.fetch_add(1, std::memory_order_relaxed);
                     if (movedWordUploadVerify()) {
-                        thread_local std::vector<std::byte>* expectedSlot = nullptr;
-                        auto& expected = ShaderRecompiler::ThreadOwned(expectedSlot);
+                        struct ExpectedSlotStorage {};
+                        auto& expected = AgcDriver::ThreadScratch<std::vector<std::byte>, ExpectedSlotStorage>();
                         expected.resize(override->size);
                         fill(expected.data());
                         auto& counters = movedWordCounters();
@@ -8879,8 +8917,8 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         if (result.fragmentAllocation.set != VK_NULL_HANDLE) result.fragmentLayout = fragment.layout;
     } else {
     std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    struct CountsSlotStorage {};
+    auto& counts = AgcDriver::ThreadScratch<std::array<std::vector<VkDescriptorPoolSize>, 2>, CountsSlotStorage>();
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);
@@ -8906,24 +8944,24 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     }
-    thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
-    auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
+    struct BuffersSlotStorage {};
+    auto& buffers = AgcDriver::ThreadScratch<std::vector<VkDescriptorBufferInfo>, BuffersSlotStorage>();
     buffers = descriptorBuffers;
     if (faultRecord != nullptr) {
         for (const auto& fault : faultDescriptors) buffers[fault.buffer] = faultRecord->Fault();
     }
-    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
-    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
-    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
-    auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    struct WritesSlotStorage {};
+    auto& writes = AgcDriver::ThreadScratch<std::vector<VkWriteDescriptorSet>, WritesSlotStorage>();
+    struct IndicesSlotStorage {};
+    auto& snapshotIndices = AgcDriver::ThreadScratch<std::vector<std::size_t>, IndicesSlotStorage>();
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     if (reuse) {
         // The elements this draw or the set's previous draw points at a snapshot get this draw's
         // snapshot, or the object's own descriptor where only the previous draw had one; every other
         // element still holds the object's own descriptor from the set's full write.
-        thread_local std::vector<std::uint8_t>* marksSlot = nullptr;
-        auto& marks = ShaderRecompiler::ThreadOwned(marksSlot);
+        struct MarksSlotStorage {};
+        auto& marks = AgcDriver::ThreadScratch<std::vector<std::uint8_t>, MarksSlotStorage>();
         marks.assign(allocations.size(), 0);
         for (const auto index : selected) marks[index] = 1;
         for (const auto index : reused.overridden) {
@@ -8935,8 +8973,8 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         const bool cached = slotted && reused.held.size() == reused.overridden.size();
         std::size_t skipped = 0;
         if (cached) {
-            thread_local std::vector<std::size_t>* heldAtSlot = nullptr;
-            auto& heldAt = ShaderRecompiler::ThreadOwned(heldAtSlot);
+            struct HeldAtSlotStorage {};
+            auto& heldAt = AgcDriver::ThreadScratch<std::vector<std::size_t>, HeldAtSlotStorage>();
             heldAt.assign(allocations.size(), reused.held.size());
             for (std::size_t position = 0; position < reused.overridden.size(); ++position) {
                 if (reused.overridden[position] < heldAt.size()) heldAt[reused.overridden[position]] = position;
@@ -9156,8 +9194,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReads(split->own, kind, mayStore);
     } else if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges in a per-thread scratch (NotePendingReads copies them).
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-        auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+        struct ReadsSlotStorage {};
+        auto& reads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsSlotStorage>();
         guestMemory.InPlaceReads(reads);
         recorder.NotePendingReads(reads, kind, mayStore);
     } else {
@@ -9239,8 +9277,8 @@ bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) con
     };
     if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges in a per-thread scratch.
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
-        auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+        struct ReadsSlotStorage {};
+        auto& reads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsSlotStorage>();
         guestMemory.InPlaceReads(reads);
         return overlaps(reads);
     }
@@ -9251,8 +9289,8 @@ void ShaderResources::ComputeChainRanges(std::vector<std::pair<std::uint64_t, st
     guestMemory.DeviceReads(reads);
     if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges through a per-thread scratch.
-        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceSlot = nullptr;
-        auto& inPlace = ShaderRecompiler::ThreadOwned(inPlaceSlot);
+        struct InPlaceSlotStorage {};
+        auto& inPlace = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, InPlaceSlotStorage>();
         guestMemory.InPlaceReads(inPlace);
         reads.insert(reads.end(), inPlace.begin(), inPlace.end());
     } else {

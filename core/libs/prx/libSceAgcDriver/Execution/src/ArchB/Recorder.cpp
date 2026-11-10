@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
@@ -39,6 +40,7 @@ struct State {
     std::uint64_t sequence = 0;
     std::uint64_t frames = 0;
     Recorder::Clock::time_point begin{};
+    std::array<std::uint64_t, 5> allocatorCounters{};
 };
 
 State& state() {
@@ -267,6 +269,18 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
             counter.previous = current;
         }
     }
+    const auto& allocator = HostAllocator::GetCounters();
+    const std::array currentAllocator{
+        allocator.served.load(std::memory_order_relaxed),
+        allocator.fallbackExhausted.load(std::memory_order_relaxed),
+        allocator.releaseOwned.load(std::memory_order_relaxed),
+        allocator.releaseForeign.load(std::memory_order_relaxed),
+        allocator.remoteFrees.load(std::memory_order_relaxed)};
+    constexpr const char* allocatorNames[]{"fix_slab_alloc_served", "fix_slab_alloc_fallback_exhausted", "fix_slab_release_owned", "fix_slab_release_foreign", "fix_slab_remote_frees"};
+    for (std::size_t i = 0; i < currentAllocator.size(); ++i) {
+        result.counters[allocatorNames[i]] += static_cast<double>(currentAllocator[i] - s.allocatorCounters[i]);
+        s.allocatorCounters[i] = currentAllocator[i];
+    }
     {
         for (auto& pointer : threads) {
             auto& t = *static_cast<Thread*>(pointer.get());
@@ -315,6 +329,7 @@ Recorder::Snapshot Recorder::Collect(Clock::time_point now) {
     std::sort(result.shaders.begin(), result.shaders.end(), [](const auto& a, const auto& b) { return cost(a) > cost(b); });
     for (std::size_t i = 40; i < result.shaders.size(); ++i) add(result.other, result.shaders[i]);
     if (result.shaders.size() > 40) result.shaders.resize(40);
+    if (result.counters["fix_cheap_timers_scopes"] != 0) result.counters["fix_cheap_timers_rdtsc"] = CheapClock::GetCalibration().rdtsc ? 1 : 0;
     return result;
 }
 
@@ -395,6 +410,10 @@ extern "C" void AgcDriverRecorderScopeBegin_nid_no_patch(AgcDriver::ArchB::Recor
 
 extern "C" void AgcDriverRecorderScopeMark_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, const char* stage, std::int64_t now) {
     scope->Mark(stage, AgcDriver::ArchB::Recorder::Clock::time_point(AgcDriver::ArchB::Recorder::Clock::duration(now)));
+}
+
+extern "C" void AgcDriverRecorderCount_nid_no_patch(const char* name, double value) {
+    AgcDriver::ArchB::Recorder::Count(name, value);
 }
 
 extern "C" void AgcDriverRecorderScopeEnd_nid_no_patch(AgcDriver::ArchB::Recorder::Scope* scope, std::int64_t now) {

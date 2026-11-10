@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -114,8 +115,8 @@ std::deque<const std::uint32_t*>& Driver::releasedTails() {
 void Driver::noteReleasedTails(const Submission& submission) {
     auto& released = releasedTails();
     released.clear();
-    thread_local Submission* scratchSlot = nullptr;
-    auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+    struct ScratchSlotStorage {};
+    auto& scratch = AgcDriver::ThreadScratch<Submission, ScratchSlotStorage>();
     const std::uint32_t* tail = submission.rewindTail;
     std::size_t words = submission.rewindWords;
     for (std::size_t chunk = 0; chunk < 256 && tail != nullptr; ++chunk) {

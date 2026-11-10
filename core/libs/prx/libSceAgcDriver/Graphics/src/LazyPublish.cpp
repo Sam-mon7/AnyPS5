@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -107,7 +108,9 @@ State& state() {
 std::atomic<std::size_t> liveCount{0};
 // Inside a publication of a lazy range on this thread (the service, or the store hook's own): a driver
 // store then belongs to it and only needs its pages opened.
-thread_local int publishing = 0;
+struct PublishingSlot {};
+int publishing() { return HostThreadSlot<int, PublishingSlot>::Get(); }
+void publishing(int value) { HostThreadSlot<int, PublishingSlot>::Set(value); }
 
 void syncCount(const State& s) {
     liveCount.store(s.live.size(), std::memory_order_relaxed);
@@ -159,9 +162,9 @@ void publishOrphans(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& 
     // opens its page, it does not run the service again).
     const bool explicitScope = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook);
     const bool entered = explicitScope && GuestArena::GuestWtFaultEnterLazyService_nid_no_patch();
-    if (explicitScope) ++publishing;
+    if (explicitScope) publishing(publishing() + 1);
     for (const auto& [begin, end] : orphans) publish(begin, end);
-    if (explicitScope) --publishing;
+    if (explicitScope) publishing(publishing() - 1);
     if (entered) GuestArena::GuestWtFaultLeaveLazyService_nid_no_patch();
 }
 
@@ -240,16 +243,16 @@ void service(std::uintptr_t page, bool write) {
     }
     if (end == 0) {
         c.pageServices.fetch_add(1, std::memory_order_relaxed);
-        ++publishing;
+        publishing(publishing() + 1);
         publish(page, page + PageBytes);
-        --publishing;
+        publishing(publishing() - 1);
         return;
     }
     if (verify() && (StorageTexture::PendingStoreInside(begin, static_cast<std::size_t>(end - begin)) || AnyShadowedOverlaps(begin, static_cast<std::size_t>(end - begin)))) c.newer.fetch_add(1, std::memory_order_relaxed);
     if (verify()) c.verified.fetch_add(1, std::memory_order_relaxed);
-    ++publishing;
+    publishing(publishing() + 1);
     publish(begin, end);
-    --publishing;
+    publishing(publishing() - 1);
     const auto now = GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr);
     {
         std::lock_guard lock(s.mutex);
@@ -281,11 +284,11 @@ bool switchOn() {
 // page faults. Lazy pages without an entry (a range a hook or service dropped while a page stayed
 // watched) are published page-range-wise, as the service's page path would.
 void beforeDriverAccess(std::uint64_t address, std::size_t bytes) {
-    if (liveCount.load(std::memory_order_relaxed) == 0 && publishing == 0) return;
+    if (liveCount.load(std::memory_order_relaxed) == 0 && publishing() == 0) return;
     if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook)) return;
     if (GuestArena::GuestWtFaultWatchedPages_nid_no_patch(static_cast<std::uintptr_t>(address), bytes) == 0) return;
     auto& c = counters();
-    if (publishing != 0) {
+    if (publishing() != 0) {
         // An access of the publication in progress on this thread: open its pages, then it proceeds.
         c.storeHookNested.fetch_add(1, std::memory_order_relaxed);
         GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
@@ -316,13 +319,13 @@ void beforeDriverAccess(std::uint64_t address, std::size_t bytes) {
         taken.emplace_back(address & ~(PageBytes - 1), (end + PageBytes - 1) & ~(PageBytes - 1));
     }
     const bool entered = GuestArena::GuestWtFaultEnterLazyService_nid_no_patch();
-    ++publishing;
+    publishing(publishing() + 1);
     for (const auto& [begin, stop] : taken) {
         publish(begin, stop);
         c.storeHooks.fetch_add(1, std::memory_order_relaxed);
         c.storeHookBytes.fetch_add(stop - begin, std::memory_order_relaxed);
     }
-    --publishing;
+    publishing(publishing() - 1);
     if (entered) GuestArena::GuestWtFaultLeaveLazyService_nid_no_patch();
 }
 

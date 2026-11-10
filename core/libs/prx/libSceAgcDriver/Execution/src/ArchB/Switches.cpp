@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 
@@ -209,6 +210,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::CLabelWake, "C_LABEL_WAKE", false, true, {}},
     {Feature::FixDerivedIndexCache, "FIX_DERIVED_INDEX_CACHE", false, true, {}},
     {Feature::FixComputeSnapshotWait, "FIX_COMPUTE_SNAPSHOT_WAIT", false, true, ComputeSnapshotWaitPrerequisites},
+    {Feature::FixHostSlabAlloc, "FIX_HOST_SLAB_ALLOC", false, true, {}},
+    {Feature::FixCheapTimers, "FIX_CHEAP_TIMERS", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
@@ -378,6 +381,7 @@ void Switches::Initialize() {
             }
             if (const char* path = std::getenv("APS5_ARCHB_CONTROL_FILE")) controlFile = path;
         }
+        if (values[static_cast<std::size_t>(Feature::FixCheapTimers)].load(std::memory_order_acquire)) static_cast<void>(CheapClock::GetCalibration());
         std::fprintf(stderr, "%s\n", describe().c_str());
         initializedFast.store(true, std::memory_order_release);
     });

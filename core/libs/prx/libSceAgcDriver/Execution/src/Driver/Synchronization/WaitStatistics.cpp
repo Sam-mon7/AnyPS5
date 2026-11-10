@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -6,28 +7,28 @@
 namespace AgcDriver::DriverDetail {
 
 PollStats& Driver::pollStats() {
-    static thread_local PollStats stats;
-    return stats;
+    struct StatsStorage {};
+    return AgcDriver::ThreadScratch<PollStats, StatsStorage>();
 }
 
 WaitOutcomes& Driver::waitOutcomes() {
-    static thread_local WaitOutcomes outcomes;
-    return outcomes;
+    struct OutcomesStorage {};
+    return AgcDriver::ThreadScratch<WaitOutcomes, OutcomesStorage>();
 }
 
 Graphics::Recorder::LateStatistics& Driver::lateCountsSeen() {
-    static thread_local Graphics::Recorder::LateStatistics seen{};
-    return seen;
+    struct SeenStorage {};
+    return AgcDriver::ThreadScratch<Graphics::Recorder::LateStatistics, SeenStorage>();
 }
 
 EpochBumps& Driver::epochBumps() {
-    static thread_local EpochBumps bumps;
-    return bumps;
+    struct BumpsStorage {};
+    return AgcDriver::ThreadScratch<EpochBumps, BumpsStorage>();
 }
 
 std::chrono::steady_clock::time_point& Driver::lastEpochBump() {
-    static thread_local std::chrono::steady_clock::time_point at{};
-    return at;
+    struct AtStorage {};
+    return AgcDriver::ThreadScratch<std::chrono::steady_clock::time_point, AtStorage>();
 }
 
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter, GuestMemory::Gen::TicketReason reason) {
