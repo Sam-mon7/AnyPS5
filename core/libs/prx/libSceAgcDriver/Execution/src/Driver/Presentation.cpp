@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/StreamCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -89,6 +90,7 @@ void Driver::TracePresent(std::uint32_t width, std::uint32_t height) {
 void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context) {
     VulkanDevice::PresentationCounters().Attempt();
     ArchB::Switches::PollControl();
+    Graphics::StreamCensus::EndFrame();
     Stage4::Flip();
     GuestMemory::WtFaultFlip();
     const auto timelineBegin = Timeline::Enabled ? Timeline::Emit(Timeline::Kind::PresentBegin, window.timing ? window.timing->Id() : 0) : 0;
