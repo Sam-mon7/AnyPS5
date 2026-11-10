@@ -61,6 +61,7 @@ constexpr Feature ArchcDrawReplayPrerequisites[] = {Feature::ArchcTargetFastpath
 constexpr Feature CLazyPublishPrerequisites[] = {Feature::WtFault, Feature::WtFaultConsumers};
 constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
+constexpr Feature CGpuBlockPublishPrerequisites[] = {Feature::CGpuStagingCarry, Feature::WtFault, Feature::WtFaultConsumers};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
@@ -152,6 +153,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     // addresses read in place through their import, data words in a buffer of the set's own.
     {Feature::ZeroCopyMoved, "ZERO_COPY_MOVED", false, true, {}},
     {Feature::CGpuStagingCarry, "C_GPU_STAGING_CARRY", false, true, {}},
+    {Feature::CGpuBlockPublish, "C_GPU_BLOCK_PUBLISH", false, true, CGpuBlockPublishPrerequisites},
     {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
     {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
     {Feature::CLazyPublish, "C_LAZY_PUBLISH", false, true, CLazyPublishPrerequisites},

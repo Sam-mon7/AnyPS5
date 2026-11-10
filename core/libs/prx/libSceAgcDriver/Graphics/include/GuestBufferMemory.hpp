@@ -439,6 +439,8 @@ public:
         return false;
     }
     void MarkStagedWrites() const;
+    void NoteStagingWrites(Recorder& recorder);
+    void NoteStagingAccesses(Recorder& recorder, const std::function<void()>& notes);
     // APS5_ARCHB_GPU_STAGING_CARRY: called right after the use's pending-write note (MarkGpuWrites):
     // a staged region whose copy-back covered it whole remembers the recorder's note point, so the
     // next use of this build in the same batch can skip its copy-in when nothing noted since then
@@ -509,7 +511,9 @@ private:
         std::uint64_t unwatch = 0;
         std::uint64_t commit = 0;
     };
+    enum class CarryKind { Reconciled, BlockPublished };
     struct CarryToken {
+        CarryKind kind = CarryKind::Reconciled;
         std::uint64_t watch = 0;
         std::uint64_t serial = 0;
         std::uint64_t clock = 0;
@@ -561,6 +565,10 @@ private:
         VkDeviceAddress copySourceAddress = 0;
         bool copiedBack = false;
         std::shared_ptr<Buffer> shadowCopy;
+        std::uint64_t inputClock = 0;
+        std::uint64_t inputAllocations = 0;
+        bool blockPublished = false;
+        std::uint64_t inputWatch = 0;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;

@@ -3791,8 +3791,8 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     return true;
 }
 
-bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter, bool reconcile) {
-    constexpr std::uint32_t PushBytes = 40;
+bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter, bool reconcile, bool blockPublish) {
+    constexpr std::uint32_t PushBytes = 56;
     constexpr std::uint32_t GroupSize = 64;
     if (changedCopyState == 0) {
         changedCopyState = -1;
@@ -3823,6 +3823,32 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
     }
     if (changedCopyState < 0) return false;
     static const bool alwaysCopy = std::getenv("APS5_CHANGED_COPY_ALWAYS") != nullptr;
+    static const bool verifyBlock = [] { const auto* value = std::getenv("APS5_ARCHB_C_GPU_BLOCK_PUBLISH_VERIFY"); return value != nullptr && value[0] == '1'; }();
+    static const bool statsBlock = verifyBlock || [] { const auto* value = std::getenv("APS5_ARCHB_C_GPU_BLOCK_PUBLISH_STATS"); return value != nullptr && value[0] == '1'; }();
+    blockPublish = blockPublish && !alwaysCopy;
+    std::shared_ptr<Buffer> stats, readback;
+    if (blockPublish && statsBlock) {
+        stats = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        readback = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, stats->Handle(), 0, 16, 0);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Keep(stats);
+        Keep(readback);
+        struct Totals {
+            std::array<std::atomic<std::uint64_t>, 4> values{};
+            Totals() {
+                constexpr const char* names[] = {"c_gpu_block_publish_blocks_considered", "c_gpu_block_publish_blocks_rejected", "c_gpu_block_publish_target_dwords_read", "c_gpu_block_publish_verify_mismatches"};
+                for (std::size_t i = 0; i < values.size(); ++i) ArchB::Recorder::RegisterCounter(names[i], values[i]);
+            }
+        };
+        static Totals totals;
+        OnComplete([readback] {
+            std::array<std::uint32_t, 4> counts{};
+            std::memcpy(counts.data(), readback->Bytes().data(), sizeof(counts));
+            for (std::size_t i = 0; i < counts.size(); ++i) totals.values[i].fetch_add(counts[i], std::memory_order_relaxed);
+            if (counts[3] != 0) std::fprintf(stderr, "[gpu-block-publish] VERIFY mismatch: %u dwords differ from full reconciliation\n", counts[3]);
+        });
+    }
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, changedCopyPipeline);
     const auto perDispatch = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::uint64_t{context.limits.maxComputeWorkGroupCount[0]} * GroupSize, std::numeric_limits<std::uint32_t>::max() - GroupSize));
     for (std::uint32_t done = 0; done < dwords;) {
@@ -3832,13 +3858,46 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
             VkDeviceAddress snapshot;
             VkDeviceAddress target;
             VkDeviceAddress counter;
+            VkDeviceAddress reference;
+            VkDeviceAddress stats;
             std::uint32_t count;
             std::uint32_t always;
-        } parameters{result + VkDeviceAddress{done} * 4u, snapshot + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, count, (alwaysCopy ? 1u : 0u) | (reconcile ? 2u : 0u)};
+        } parameters{result + VkDeviceAddress{done} * 4u, snapshot + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, 0, stats != nullptr ? stats->DeviceAddress() : 0, count, (alwaysCopy ? 1u : 0u) | (reconcile ? 2u : 0u) | (blockPublish ? 4u : 0u) | (stats != nullptr ? 8u : 0u)};
         static_assert(sizeof(parameters) == PushBytes);
-        function(cmdPushConstants, "vkCmdPushConstants")(commands, changedCopyLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
-        function(cmdDispatch, "vkCmdDispatch")(commands, (count + GroupSize - 1) / GroupSize, 1, 1);
+        const auto dispatch = [&](const auto& push) {
+            function(cmdPushConstants, "vkCmdPushConstants")(commands, changedCopyLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &push);
+            function(cmdDispatch, "vkCmdDispatch")(commands, (count + GroupSize - 1) / GroupSize, 1, 1);
+        };
+        const auto barrier = [&] { RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); };
+        if (blockPublish && verifyBlock) {
+            auto reference = std::make_shared<Buffer>(context, VkDeviceSize{count} * 12u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Keep(reference);
+            parameters.reference = reference->DeviceAddress();
+            auto clone = parameters;
+            clone.always = 16u;
+            dispatch(clone);
+            barrier();
+            auto full = parameters;
+            full.result = parameters.reference;
+            full.snapshot = full.result + VkDeviceSize{count} * 4u;
+            full.target = full.snapshot + VkDeviceSize{count} * 4u;
+            full.counter = 0;
+            full.always = 2u;
+            dispatch(full);
+            barrier();
+            dispatch(parameters);
+            barrier();
+            auto compare = parameters;
+            compare.always = 32u;
+            dispatch(compare);
+            ArchB::Recorder::Count("c_gpu_block_publish_verified");
+        } else dispatch(parameters);
         done += count;
+    }
+    if (stats != nullptr) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, stats->Handle(), 0, readback->Handle(), 0, 16);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     }
     return true;
 }
@@ -5063,14 +5122,16 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     return false;
 }
 
-std::uint64_t Recorder::WatchCarry(std::uint64_t begin, std::uint64_t end) {
+std::uint64_t Recorder::WatchCarry(std::uint64_t begin, std::uint64_t end, bool input) {
     if (carryWatches.size() >= CarryWatchLimit) {
+        const auto inputs = std::count_if(carryWatches.begin(), carryWatches.end(), [](const auto& watch) { return watch.input; });
+        if (inputs != 0) ArchB::Recorder::Count("c_gpu_block_publish_gpu_watch_overflow", static_cast<double>(inputs));
         carryWatches.clear();
         carryWatchLow = ~std::uint64_t{0};
         carryWatchHigh = 0;
     }
     const auto id = ++carryWatchIds;
-    carryWatches.push_back({begin, end, id});
+    carryWatches.push_back({begin, end, id, input});
     carryWatchLow = std::min(carryWatchLow, begin);
     carryWatchHigh = std::max(carryWatchHigh, end);
     return id;
@@ -5096,8 +5157,11 @@ void Recorder::dropOverlappingCarries(std::uint64_t begin, std::uint64_t end, co
     for (std::size_t index = 0; index < carryWatches.size();) {
         const auto& watch = carryWatches[index];
         if (watch.begin < end && begin < watch.end) {
-            AgcDriver::ArchB::Recorder::Count(source);
-            if (watch.begin == begin && watch.end == end) AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_drop_same_range");
+            if (watch.input) AgcDriver::ArchB::Recorder::Count("c_gpu_block_publish_gpu_invalidated");
+            else {
+                AgcDriver::ArchB::Recorder::Count(source);
+                if (watch.begin == begin && watch.end == end) AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_drop_same_range");
+            }
             carryWatches[index] = carryWatches.back();
             carryWatches.pop_back();
             continue;

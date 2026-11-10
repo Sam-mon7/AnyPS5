@@ -9189,18 +9189,20 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
     const bool mayStore = !BdaReadOnly();
-    if (auto split = guestMemory.SplitInPlaceReads()) {
-        recorder.NotePendingReadList(std::move(split->space), kind, mayStore);
-        recorder.NotePendingReads(split->own, kind, mayStore);
-    } else if (AgcDriver::ArchB::AllocChurnActive()) {
-        // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges in a per-thread scratch (NotePendingReads copies them).
-        struct ReadsSlotStorage {};
-        auto& reads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsSlotStorage>();
-        guestMemory.InPlaceReads(reads);
-        recorder.NotePendingReads(reads, kind, mayStore);
-    } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind, mayStore);
-    }
+    guestMemory.NoteStagingAccesses(recorder, [&] {
+        if (auto split = guestMemory.SplitInPlaceReads()) {
+            recorder.NotePendingReadList(std::move(split->space), kind, mayStore);
+            recorder.NotePendingReads(split->own, kind, mayStore);
+        } else if (AgcDriver::ArchB::AllocChurnActive()) {
+            // APS5_ARCHB_FIX_ALLOC_CHURN: the same ranges in a per-thread scratch (NotePendingReads copies them).
+            struct ReadsSlotStorage {};
+            auto& reads = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, ReadsSlotStorage>();
+            guestMemory.InPlaceReads(reads);
+            recorder.NotePendingReads(reads, kind, mayStore);
+        } else {
+            recorder.NotePendingReads(guestMemory.InPlaceReads(), kind, mayStore);
+        }
+    });
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -9225,7 +9227,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     }
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
+    guestMemory.NoteStagingWrites(recorder);
     guestMemory.NoteStagingCarryPoints(recorder);
     guestMemory.MarkDirectWrites();
     guestMemory.NoteStagingCarryTokens(recorder);
