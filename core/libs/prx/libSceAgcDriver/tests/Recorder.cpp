@@ -1260,6 +1260,32 @@ void changedCopyTests(const Device& device, Recorder& recorder) {
     for (std::uint32_t i = 0; i < words; ++i) {
         Require(stored[i] == expected[i], "changed copy word " + std::to_string(i) + " after a lead: " + std::to_string(stored[i]) + ", expected " + std::to_string(expected[i]));
     }
+
+    const auto checkWords = [&](const std::shared_ptr<Buffer>& buffer, const std::vector<std::uint32_t>& values, const char* what) {
+        std::memcpy(stored.data(), buffer->Bytes().data(), words * 4u);
+        for (std::uint32_t i = 0; i < words; ++i) Require(stored[i] == values[i], std::string(what) + " at word " + std::to_string(i));
+    };
+    checkWords(result, shader, "an ordinary changed copy modified its source");
+    checkWords(snapshot, uploaded, "an ordinary changed copy modified its baseline");
+    const auto recordReconciled = [&] {
+        Require(recorder.RecordChangedCopy(recorder.Commands(), result->DeviceAddress(), snapshot->DeviceAddress(), target->DeviceAddress(), words, 0, true), "the reconciled changed copy kernel is unavailable");
+        recorder.Keep(result);
+        recorder.Keep(snapshot);
+        recorder.Keep(target);
+        recorder.Sync();
+    };
+    std::memcpy(snapshot->Bytes().data(), uploaded.data(), words * 4u);
+    std::memcpy(result->Bytes().data(), shader.data(), words * 4u);
+    std::memcpy(target->Bytes().data(), held.data(), words * 4u);
+    recordReconciled();
+    checkWords(target, expected, "a reconciled copy-back lost the CPU or shader bytes");
+    checkWords(result, expected, "a carried shadow lost the preserved CPU bytes");
+    checkWords(snapshot, expected, "a carried shadow retained its previous input baseline");
+    std::memcpy(result->Bytes().data(), uploaded.data(), words * 4u);
+    recordReconciled();
+    checkWords(target, uploaded, "a carried use could not restore the original bytes");
+    checkWords(result, uploaded, "a carried use left a divergent shadow");
+    checkWords(snapshot, uploaded, "a carried use did not advance its baseline");
 }
 
 void readTrackingTests(const Device& device, Recorder& recorder) {
@@ -4886,6 +4912,50 @@ bool crossCarryTests(const Device& device, Recorder& recorder) {
     GuestBufferMemory::SetCarryCpuProof(nullptr);
     const auto* guest = static_cast<const std::uint8_t*>(block);
     for (std::size_t at = 0; at < bytes; ++at) Require(guest[at] == (at == 4096 + 100 ? 0x77 : 0x5a), "cross carry: the guest bytes differ after the uses");
+
+    {
+        GuestBufferMemory first(context);
+        GuestBufferMemory second(context);
+        for (auto* memory : {&first, &second}) {
+            memory->AllowDeviceStaging();
+            memory->AddWritable(element, elementBytes, false, false);
+            memory->Upload(false);
+            Require(memory->InPlaceReads().empty(), "cross carry baseline: the written element was not staged");
+        }
+        const auto finish = [&](GuestBufferMemory& memory) {
+            memory.RecordCopyBacks(recorder);
+            recorder.NotePendingWrites(memory.Writes());
+            memory.NoteStagingCarryPoints(recorder);
+            memory.MarkDirectWrites();
+            memory.NoteStagingCarryTokens(recorder);
+        };
+        const auto fillWord = [&](GuestBufferMemory& memory, std::size_t offset, std::uint32_t value) {
+            std::uint32_t adjustment = 0;
+            const auto view = memory.Descriptor(element, elementBytes, adjustment);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset + adjustment + offset, sizeof(value), value);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        };
+        const auto before = GuestBufferMemory::CrossCarry();
+        fillWord(first, 64, 0x11111111u);
+        finish(first);
+        second.RecordStagingCopies(recorder);
+        fillWord(second, 64, 0x5a5a5a5au);
+        finish(second);
+        first.RecordStagingCopies(recorder);
+        fillWord(first, 128, 0x22222222u);
+        finish(first);
+        recorder.Sync();
+        const auto after = GuestBufferMemory::CrossCarry();
+        Require(after.carried - before.carried == (on ? 2u : 0u), "cross carry baseline: GPU-written shared shadows were copied in again");
+        if (on && verify) Require(after.mismatches == before.mismatches, "cross carry baseline: a GPU-written carried shadow differed from the import");
+        std::uint32_t restored = 0;
+        std::uint32_t changed = 0;
+        std::memcpy(&restored, guest + 4096 + 64, sizeof(restored));
+        std::memcpy(&changed, guest + 4096 + 128, sizeof(changed));
+        Require(restored == 0x5a5a5a5au && changed == 0x22222222u && guest[4096 + 100] == 0x77u, "cross carry baseline: shared uses lost a GPU update, a value reversion or the CPU's byte");
+    }
     {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
