@@ -519,6 +519,7 @@ private:
         std::uint64_t clock = 0;
         std::uint64_t generation = 0;
         std::uint64_t allocations = 0;
+        bool baseline = false;
     };
     struct CarryShadow;
     struct Region {
@@ -596,6 +597,7 @@ private:
     };
     static CarryToken& carryToken(Region& region);
     static void beginCarryUse(Region& region);
+    bool carryOnUpload(Recorder& recorder, Region& region);
     static std::shared_ptr<Buffer> stagingShadow(const Context& context, Region& region, std::size_t bytes, VkBufferUsageFlags usage);
 
     // How [begin, end) lies against the space's base regions.

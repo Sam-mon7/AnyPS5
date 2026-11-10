@@ -79,6 +79,7 @@ enum class Feature : std::uint8_t {
     ZeroCopyMoved,
     CGpuStagingCarry,
     CGpuBlockPublish,
+    CGpuUploadCarry,
     ArchcImageEpochs,
     ArchcTargetFastpath,
     CLazyPublish,

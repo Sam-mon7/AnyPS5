@@ -6728,7 +6728,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             recorder->OpenBatch();
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
-            gpuCopies.push_back(&region);
+            if (!carryOnUpload(*recorder, region)) gpuCopies.push_back(&region);
             continue;
         }
         if (sparseHeapCandidate(region)) {
@@ -7997,6 +7997,52 @@ GuestBufferMemory::StagingCarryCounts GuestBufferMemory::StagingCarry() {
     return {c.carried.load(), c.copied.load(), c.noPoint.load(), c.otherBatch.load(), c.noted.load(), c.verified.load(), c.mismatches.load()};
 }
 
+bool GuestBufferMemory::carryOnUpload(Recorder& recorder, Region& region) {
+    if (!crossCarry::Enabled() || !region.deviceLocal || region.shared == nullptr || region.buffer == nullptr || region.buffer != region.shared->buffer || !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuUploadCarry)) return false;
+    auto& held = region.shared->token;
+    const auto refuse = [](const char* counter) {
+        AgcDriver::ArchB::Recorder::Count(counter);
+        return false;
+    };
+    if (held.watch == 0) return refuse("c_gpu_upload_carry_no_token");
+    const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+    const bool baseline = changedCopyBacks(context) && region.buffer->DeviceAddress() != 0 && WritesOverlap(region.begin, bytes);
+    if (baseline && (!held.baseline || region.shared->snapshot == nullptr || region.shared->snapshot->DeviceAddress() == 0)) return refuse("c_gpu_upload_carry_no_baseline");
+    if (region.shared->busy != nullptr && region.shared->busy != &region) return refuse("c_gpu_upload_carry_busy");
+    const auto watch = std::exchange(held.watch, 0);
+    const bool sameBatch = held.serial == recorder.OpenSerial();
+    const bool partial = held.kind == CarryKind::BlockPublished;
+    if (!recorder.TakeCarry(watch)) return refuse("c_gpu_upload_carry_noted");
+    if ((partial || !sameBatch) && held.allocations != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return refuse("c_gpu_upload_carry_registry");
+    if (partial ? !crossCarry::blockCarryProof(region.begin, region.end, held.clock, held.generation) : !sameBatch && !crossCarry::cpuProof.load(std::memory_order_relaxed)(region.begin, region.end, held.clock, held.generation)) return refuse("c_gpu_upload_carry_cpu");
+    AgcDriver::ArchB::Recorder::Count("c_gpu_upload_carry_taken");
+    AgcDriver::ArchB::Recorder::Count("c_gpu_upload_carry_bytes", static_cast<double>(bytes));
+    region.copiedBack = false;
+    region.carrySerial = 0;
+    region.carryWhole = false;
+    region.carriedSameBatch = sameBatch;
+    beginCarryUse(region);
+    region.blockPublished = false;
+    recorder.DropCarry(std::exchange(region.inputWatch, 0));
+    region.inputClock = 0;
+    region.inputAllocations = 0;
+    region.shadowCopy = baseline ? region.shared->snapshot : nullptr;
+    if (region.shadowCopy != nullptr && Recorder::ReadTracking() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish)) {
+        region.inputClock = held.clock;
+        region.inputAllocations = held.allocations;
+        region.inputWatch = recorder.WatchCarry(region.begin, region.end, true);
+    }
+    recorder.Keep(region.buffer);
+    if (region.shadowCopy != nullptr) recorder.Keep(region.shadowCopy);
+    region.snapshot.clear();
+    ArchC::LazyCensus::UsedByGpu(region.begin, region.end, ArchC::LazyCensus::GpuUse::Carry, recorder.OpenSerial());
+    if (crossCarry::Verify()) {
+        Region* const carried[] = {&region};
+        recordCarryVerify(recorder, carried, true);
+    }
+    return true;
+}
+
 void GuestBufferMemory::beginCarryUse(Region& region) {
     if (region.shared == nullptr) return;
     if (region.shared->busy != nullptr && region.shared->busy != &region) AgcDriver::ArchB::Recorder::Count("c_gpu_staging_carry_shared_overlap");
@@ -8064,6 +8110,7 @@ void GuestBufferMemory::NoteStagingCarryTokens(Recorder& recorder) {
         }
         static_cast<void>(GuestMemory::CollectWrites(region.begin, size));
         token.kind = region.blockPublished ? CarryKind::BlockPublished : CarryKind::Reconciled;
+        token.baseline = region.shadowCopy != nullptr && (region.shared == nullptr || region.shadowCopy == region.shared->snapshot);
         token.watch = recorder.WatchCarry(region.begin, region.end);
         token.serial = recorder.OpenSerial();
         token.clock = region.blockPublished ? region.inputClock : GuestMemory::FaultClock();
