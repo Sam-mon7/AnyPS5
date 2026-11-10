@@ -2985,8 +2985,8 @@ struct TokenTable {
 };
 
 TokenTable& table() {
-    thread_local TokenTable made{};
-    return made;
+    struct TableStorage {};
+    return HostThreadLocal<TokenTable, TableStorage>();
 }
 
 Token& slotFor(const TargetKey& key) {

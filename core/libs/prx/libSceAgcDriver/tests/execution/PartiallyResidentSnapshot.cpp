@@ -669,7 +669,7 @@ void ExpectProof(ShaderResources& resources, const CompiledShader& shader, bool 
     ShaderResources::ProofReport report;
     Require(resources.Revalidate(std::span(&shader, 1), &report), "partial resources did not revalidate " + when);
     const bool enabled = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF") == nullptr;
-    Require(report.path == (fast && enabled ? ShaderResources::ProofPath::Fast : ShaderResources::ProofPath::Full), "partial resources took the wrong proof path " + when);
+    Require(report.path == ShaderResources::ProofPath::Full, "partial resources bypassed full resource revalidation " + when);
     if (fast && enabled) Require(surfaceReads.load() == 0, "partial fast proof read the snapshot " + when);
 }
 

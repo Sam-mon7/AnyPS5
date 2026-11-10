@@ -120,10 +120,16 @@ if(BUILD_TESTING)
         SKIP_RETURN_CODE 77 TIMEOUT 60 ENVIRONMENT "APS5_ARCHB_FIX_ALLOC_CHURN=1" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     if(WIN32)
         foreach(v1Case IN ITEMS reuse commit protect map unwatch forget coverage threads toggle)
-            add_test(NAME agc_archb_fix_v1_${v1Case} COMMAND agc_write_tracking_tests --vq-memo-${v1Case})
-            set_tests_properties(agc_archb_fix_v1_${v1Case} PROPERTIES TIMEOUT 30
-                ENVIRONMENT "APS5_VERIFY_VQ_MEMO=1"
-                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            foreach(v1Switch IN ITEMS 1 0)
+                set(v1Test agc_archb_fix_v1_${v1Case})
+                if(NOT v1Switch)
+                    string(APPEND v1Test "_off")
+                endif()
+                add_test(NAME ${v1Test} COMMAND agc_write_tracking_tests --vq-memo-${v1Case})
+                set_tests_properties(${v1Test} PROPERTIES TIMEOUT 30
+                    ENVIRONMENT "APS5_VERIFY_VQ_MEMO=1;APS5_ARCHB_FIX_VQ_MEMO=${v1Switch}"
+                    ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+            endforeach()
         endforeach()
         foreach(bookkeepingCase IN ITEMS epoch threads remap reset runs regions toggle)
             add_test(NAME agc_archb_fix_wt_bookkeeping_${bookkeepingCase} COMMAND agc_write_tracking_tests --wt-bookkeeping-${bookkeepingCase})

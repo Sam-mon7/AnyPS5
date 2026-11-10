@@ -2654,12 +2654,11 @@ std::uint64_t threadEpoch() {
     return HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
 }
 
-thread_local EpochWalks epochWalks;
-
 EpochWalks* currentWalks() {
     const auto epoch = threadEpoch();
     if (epoch == 0) return nullptr;
-    auto& walks = epochWalks;
+    struct WalksStorage {};
+    auto& walks = HostThreadLocal<EpochWalks, WalksStorage>();
     if (walks.epoch != epoch) {
         walks.epoch = epoch;
         walks.pages.clear();
