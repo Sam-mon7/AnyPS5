@@ -6203,6 +6203,7 @@ void reportStaging() {
 
 struct GuestBufferMemory::CarryShadow {
     std::shared_ptr<Buffer> buffer;
+    std::shared_ptr<Buffer> snapshot;
     CarryToken token;
     const void* busy = nullptr;
 };
@@ -6973,11 +6974,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             region->shadowCopy = nullptr;
             continue;
         }
+        if (region->shared != nullptr) region->shadowCopy = region->shared->snapshot;
         if (region->shadowCopy == nullptr) region->shadowCopy = stagingBuffer(context, bytes, gpuCopyUsage(context, true));
         if (region->shadowCopy == nullptr || region->shadowCopy->DeviceAddress() == 0) {
             region->shadowCopy = nullptr;
             continue;
         }
+        if (region->shared != nullptr) region->shared->snapshot = region->shadowCopy;
         shadowed.push_back(region);
     }
     if (!shadowed.empty()) {
@@ -7044,7 +7047,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // C_LAZY_COPYBACK: a whole copy-back of a device-local shadow is recorded cancellable; the
         // previous one of this shadow in the open batch dies when this use carried the shadow from it
         // and nothing since its use read or wrote the range (this copy-back stores every byte of it).
-        const bool lazyWhole = lazy && region.shadowCopy == nullptr && region.deviceLocal && region.buffer != nullptr && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
+        const bool wholeRegion = region.deviceLocal && region.buffer != nullptr && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
+        const bool reconcile = wholeRegion && region.shadowCopy != nullptr && region.copySourceAddress != 0 && region.begin % 4u == 0 && region.end % 4u == 0 && region.copySourceBase % 4u == 0 && (stagingCarry::Enabled() || crossCarry::Enabled());
+        bool reconciled = false;
+        const bool lazyWhole = lazy && region.shadowCopy == nullptr && wholeRegion;
         if (lazy && region.buffer != nullptr && !lazyWhole) lazyCopyBack::state().pending.erase(region.buffer->Handle());
         if (lazyWhole) {
             auto& s = lazyCopyBack::state();
@@ -7126,7 +7132,12 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                     counter = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
                     std::memset(counter->Bytes().data(), 0, 16);
                 }
-                if (alignedFrom < alignedTo && recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), counter != nullptr ? counter->DeviceAddress() : 0)) {
+                if (reconcile) {
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
+                if (alignedFrom < alignedTo && recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), counter != nullptr ? counter->DeviceAddress() : 0, reconcile)) {
+                    reconciled = reconcile;
                     if (counter != nullptr) {
                         recorder.Keep(counter);
                         recorder.OnComplete([counter, alignedFrom, alignedTo, regionBegin = region.begin, regionEnd = region.end] {
@@ -7154,7 +7165,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         }
         // APS5_ARCHB_GPU_STAGING_CARRY: the copy-back stores the whole region (the shadow and the
         // import then agree on every byte), the precondition of carrying the shadow to a next use.
-        region.carryWhole = region.shadowCopy == nullptr && region.deviceLocal && std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= region.begin && region.end <= range.second; });
+        region.carryWhole = wholeRegion && (region.shadowCopy == nullptr || reconciled);
         if (region.shared != nullptr && region.shared->busy == &region) region.shared->busy = nullptr;
         // Only once its copies are recorded: a throw above leaves the region counted by
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the

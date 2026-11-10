@@ -28,7 +28,12 @@ void main() {
     uint held = parameters.target.words[index];
     uint changed = differingBytes(value ^ before);
     uint kept = differingBytes(held ^ before);
-    uint stored = parameters.always != 0u ? 0xffffffffu : changed & ~kept;
-    if (stored != 0u) parameters.target.words[index] = (held & ~stored) | (value & stored);
+    uint stored = (parameters.always & 1u) != 0u ? 0xffffffffu : changed & ~kept;
+    uint merged = (held & ~stored) | (value & stored);
+    if (stored != 0u) parameters.target.words[index] = merged;
+    if ((parameters.always & 2u) != 0u) {
+        parameters.result.words[index] = merged;
+        parameters.snapshot.words[index] = merged;
+    }
     if (uint64_t(parameters.counter) != 0ul && (changed & kept) != 0u) atomicAdd(parameters.counter.words[0], 1u);
 }
