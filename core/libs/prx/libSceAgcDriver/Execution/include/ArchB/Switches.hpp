@@ -109,6 +109,7 @@ enum class Feature : std::uint8_t {
     FixCheapTimers,
     ReplayRecognize,
     FixStatePacketFast,
+    FixDrawRelocNested,
     Count
 };
 

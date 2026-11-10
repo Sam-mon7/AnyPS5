@@ -45,6 +45,7 @@ private:
         std::array<std::uint32_t, 5> arguments{};
         std::uint64_t immediate = 0;
         const IrValue* source = nullptr;
+        const IrValue* parentRead = nullptr;
     };
     struct Frame;
     bool evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const;

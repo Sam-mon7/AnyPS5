@@ -6,6 +6,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
@@ -269,6 +271,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.stageEqual += stageEqual;
             counters.variantsCompared += compared;
             if (drawHit) {
+                const bool nestedHit = std::any_of(matched.begin(), matched.end(), [](const auto& variant) { return variant != nullptr && variant->nestedRelocated; });
+                static const bool verifyNested = [] { const auto* value = std::getenv("APS5_ARCHB_FIX_DRAW_RELOC_NESTED_VERIFY"); return value != nullptr && std::string_view(value) == "1"; }();
+                if (nestedHit) ArchB::Recorder::Count("fix_draw_reloc_nested_hits");
                 ++counters.hits;
                 counters.stageDataHits += dataStages;
                 counters.stageDataWords += dataWords;
@@ -305,7 +310,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         ++counters.touches;
                     }
                 }
-                if (verifyDrawEntries()) {
+                if (verifyDrawEntries() || (nestedHit && verifyNested)) {
+                    if (nestedHit && verifyNested) {
+                        ArchB::Recorder::Count("fix_draw_reloc_nested_verified");
+                        ArchB::Recorder::Count("fix_draw_reloc_nested_verify_mismatches", 0);
+                    }
                     ++counters.verifyHits;
                     verifyHit = true;
                     drawHit = false;

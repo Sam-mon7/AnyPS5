@@ -159,6 +159,9 @@ struct RelocatableUserWord {
     std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
     bool value = false;
     std::uint32_t high = 0;
+    std::shared_ptr<const DispatchVariant> nestedVariant;
+    std::uint32_t nestedUserWord = 0;
+    std::uint64_t nestedBase = 0;
 };
 
 struct DrawRelocation {
@@ -173,6 +176,8 @@ struct DrawUserPatch {
 
 struct DrawRelocationPending {
     std::uint64_t key = 0, alias = 0, identity = 0;
+    std::uint64_t censusAlias = 0;
+    bool nested = false;
 };
 
 struct DrawRelocationTrial {

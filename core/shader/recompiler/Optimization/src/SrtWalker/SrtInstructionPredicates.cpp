@@ -24,6 +24,32 @@ bool IsMemoryRead(IrOpcode opcode) {
     return opcode == IrOpcode::ReadConst || opcode == IrOpcode::LoadAddressU32 || opcode == IrOpcode::ReadConstBuffer;
 }
 
+const IrValue* RawReadSource(const IrResourcePlan& program, const IrValue* value) {
+    for (std::size_t depth = 0; value != nullptr && depth < 64; ++depth) {
+        value = value->Resolve();
+        if (IsRawRead(program, *value)) return value;
+        if ((value->Opcode() == IrOpcode::BitCastU32F32 || value->Opcode() == IrOpcode::BitCastF32U32) && value->ArgumentCount() == 1) {
+            value = value->Argument(0);
+            continue;
+        }
+        if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() == 2) {
+            const auto* slot = value->Argument(1)->Resolve();
+            if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= program.srtReads.size()) return nullptr;
+            value = program.srtReads[slot->ImmediateU32()].value;
+            continue;
+        }
+        if (value->Opcode() == IrOpcode::BitwiseAnd32 && value->ArgumentCount() == 2) {
+            const auto* mask = value->Argument(1)->Resolve();
+            if (mask->HasImmediate() && mask->Type() == IrType::U32 && (mask->ImmediateU32() | 3u) == 0xffffffffu) {
+                value = value->Argument(0);
+                continue;
+            }
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
 bool LoadedFromMemory(const IrValue& handle) {
     std::vector<const IrValue*> pending;
     std::vector<const IrValue*> visited;

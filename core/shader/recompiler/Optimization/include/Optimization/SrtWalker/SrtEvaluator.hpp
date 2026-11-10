@@ -213,6 +213,7 @@ private:
     std::uint32_t _addressDepth = 0;
     std::size_t _descriptorBytes = 0;
     EvaluatedValues _cache;
+    std::unordered_map<const IrValue*, std::uint64_t> _readAddresses;
     std::vector<IrValue*> _visiting;
     DenseValues _dense;
 };

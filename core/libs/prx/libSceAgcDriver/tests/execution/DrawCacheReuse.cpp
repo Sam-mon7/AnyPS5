@@ -486,6 +486,91 @@ void BufferBaseProofs() {
     Require(variant.bufferBaseMasks.empty(), "base proof accepted a writable buffer");
 }
 
+void NestedPointerProofs() {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    auto plan = std::make_shared<IrResourcePlan>();
+    plan->srtPlanComplete = plan->resourceTrackingComplete = true;
+    plan->memoryInfo.emplace_back().kind = ResourceKind::ScalarAddress;
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments) {
+        values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        auto* value = values.back().get();
+        for (auto* argument : arguments) value->AddArgument(argument);
+        return value;
+    };
+    const auto constant = [&](std::uint32_t word) {
+        auto* value = make(IrOpcode::Void, IrType::U32, {});
+        value->SetImmediateU32(word);
+        return value;
+    };
+    auto* root = make(IrOpcode::CompositeConstructU64, IrType::U64, {constant(0x1000), constant(0)});
+    auto* low = make(IrOpcode::LoadAddressU32, IrType::U32, {root, constant(0)});
+    auto* high = make(IrOpcode::LoadAddressU32, IrType::U32, {root, constant(4)});
+    auto* handle = make(IrOpcode::CompositeConstructU64, IrType::U64, {low, high});
+    ResourceCapture capture;
+    capture.plan = plan;
+    capture.readTrace.profile = true;
+    capture.readTrace.slotReads = {{low, 0x1000}, {high, 0x1004}};
+    plan->srtReads = {{.value = low, .flatOffset = 0}, {.value = high, .flatOffset = 1}};
+    plan->descriptorSources.resize(1);
+    plan->descriptorSources[0].dwordCount = 4;
+    for (std::uint32_t word = 0; word < 4; ++word) {
+        auto* value = make(IrOpcode::LoadAddressU32, IrType::U32, {handle, constant(0x10 + word * 4)});
+        plan->descriptorSources[0].dwords[word] = value;
+        plan->srtReads.push_back({.value = value, .flatOffset = word + 2});
+        capture.readTrace.slotReads.emplace_back(value, 0x2010 + word * 4);
+    }
+    plan->shaderFlatSlots.assign(6, 0);
+    auto compiled = std::make_shared<RecompileResult>();
+    compiled->bindings.resize(1);
+    compiled->bindings[0].role = DescriptorRole::FlattenedSrt;
+    compiled->bindings[0].guestDescriptor = {0x2000, 0, 0x4000, 0, 64, 0xfac};
+    const auto variant = [&] {
+        auto result = std::make_shared<DispatchVariant>();
+        result->compiled = compiled;
+        result->words = compiled->bindings[0].guestDescriptor;
+        result->runs = {{0x1000, 0x1008}, {0x2010, 0x2020}};
+        result->runBases = {0, -1};
+        result->runParents = {{}, {0, 0}};
+        return result;
+    };
+    auto proven = variant();
+    Driver::tagNestedPointerPositions(*proven, capture);
+    Require(proven->nestedPointerProof && proven->runParents[1] == DispatchVariant::RunParent{0, 0} && proven->nestedPointerPatches.size() == 2, "nested pointer proof rejected an address-only pointer or lost its unused flat-slot patches");
+    const auto refused = [&] {
+        auto result = variant();
+        Driver::tagNestedPointerPositions(*result, capture);
+        Require(!result->nestedPointerProof && std::all_of(result->runParents.begin(), result->runParents.end(), [](const auto& parent) { return parent.run == DispatchVariant::NoFlatBinding; }), "nested pointer proof retained a pointer used as a value or without every derived read");
+    };
+    plan->shaderFlatSlots[0] = 1;
+    refused();
+    plan->shaderFlatSlots[0] = 0;
+    auto* descriptor = plan->descriptorSources[0].dwords[0];
+    plan->descriptorSources[0].dwords[0] = low;
+    refused();
+    plan->descriptorSources[0].dwords[0] = descriptor;
+    plan->controlFlow.resize(1);
+    plan->controlFlow[0].condition = high;
+    refused();
+    plan->controlFlow.clear();
+    handle->ReplaceArgument(0, make(IrOpcode::IAdd32, IrType::U32, {low, constant(0)}));
+    refused();
+    handle->ReplaceArgument(0, low);
+    auto* other = make(IrOpcode::LoadAddressU32, IrType::U32, {handle, constant(0x20)});
+    capture.readTrace.slotReads.emplace_back(other, 0x2020);
+    refused();
+    capture.readTrace.slotReads.pop_back();
+    for (const unsigned kind : {0u, 1u, 2u}) {
+        auto result = variant();
+        if (kind == 0) result->dataPositions = {0};
+        else if (kind == 1) result->bufferBaseMasks = {{0, 0xfffffffcu}};
+        else result->feedback.memory = {{0, 0x60u}};
+        Driver::tagNestedPointerPositions(*result, capture);
+        Require(!result->nestedPointerProof && result->runParents[1].run == DispatchVariant::NoFlatBinding, "nested pointer proof accepted a data, buffer-base or feedback position");
+    }
+}
+
 void BufferBasePath(const std::filesystem::path& control, bool indirect, bool recorder) {
     using namespace AgcDriver::DriverDetail;
     using R = AgcDriver::ArchB::Recorder;
@@ -985,6 +1070,10 @@ void PipelineStateReusePath(const std::filesystem::path& control) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--nested-proof") {
+            NestedPointerProofs();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-base-proof") {
             BufferBaseProofs();
             return 0;

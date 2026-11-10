@@ -14,6 +14,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
@@ -7027,6 +7028,20 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
         return outcome == Compare::Equal;
     });
     return queried ? outcome : Compare::Unmapped;
+}
+
+Compare CopyMapped(std::uint64_t address, std::span<std::byte> out, bool checked) {
+    if (!checked) return CopyMapped(address, out);
+    if (out.empty()) return Compare::Equal;
+    if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, out.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, out.size());
+    if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+#ifdef _WIN32
+    if (address > userAddressLimit() || out.size() - 1 > userAddressLimit() - address) return Compare::Unmapped;
+    return readPages(out.data(), address, out.size()) ? Compare::Equal : Compare::Unmapped;
+#else
+    return GuestCopyIn_nid_no_patch(out.data(), reinterpret_cast<const void*>(address), out.size()) ? Compare::Equal : Compare::Unmapped;
+#endif
 }
 
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {

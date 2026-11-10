@@ -3447,7 +3447,7 @@ struct SrtWalkFixture {
         return result;
     }
 
-    explicit SrtWalkFixture(std::uint32_t count, bool branches) : words(count + 8u) {
+    explicit SrtWalkFixture(std::uint32_t count, bool branches, bool arithmetic = false) : words(count + 8u) {
         using namespace ShaderRecompiler;
         const auto address = reinterpret_cast<std::uintptr_t>(words.data());
         pointer = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
@@ -3460,7 +3460,13 @@ struct SrtWalkFixture {
         auto& root = Binary(IrOpcode::CompositeConstructU64, IrType::U64, UserData(2), UserData(3));
         auto& low = Binary(IrOpcode::LoadAddressU32, IrType::U32, root, Constant(0u));
         auto& high = Binary(IrOpcode::LoadAddressU32, IrType::U32, root, Constant(4u));
-        auto& indirect = Binary(IrOpcode::CompositeConstructU64, IrType::U64, low, high);
+        auto& bits = Make(IrOpcode::BitCastU32F32, IrType::F32);
+        bits.AddArgument(&low);
+        auto& integer = Make(IrOpcode::BitCastF32U32, IrType::U32);
+        integer.AddArgument(&bits);
+        auto& masked = Binary(IrOpcode::BitwiseAnd32, IrType::U32, integer, Constant(0xfffffffcu));
+        auto& lowBase = arithmetic ? Binary(IrOpcode::IAdd32, IrType::U32, masked, Constant(0u)) : masked;
+        auto& indirect = Binary(IrOpcode::CompositeConstructU64, IrType::U64, lowBase, high);
         auto& offset = UserData(4);
         for (std::uint32_t i = 0; i < count; ++i) {
             auto& at = Binary(IrOpcode::IAdd32, IrType::U32, offset, Constant(i * 4u));
@@ -3511,6 +3517,7 @@ void verifyFastSrtWalk(bool benchmark) {
         std::uint64_t asBase = 0;
         std::uint64_t asValue = 0;
         std::vector<std::pair<std::uint64_t, std::int32_t>> origins;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> nested;
         bool operator==(const Captured&) const = default;
     };
     const auto capture = [](SrtWalkFixture& fixture, bool compiled) {
@@ -3540,11 +3547,14 @@ void verifyFastSrtWalk(bool benchmark) {
         out.asBase = use.asBase;
         out.asValue = use.asValue;
         out.origins = std::move(use.reads);
+        out.nested = std::move(use.nested);
         std::sort(out.leaves.begin(), out.leaves.end());
         std::sort(out.otherReads.begin(), out.otherReads.end());
         out.otherReads.erase(std::unique(out.otherReads.begin(), out.otherReads.end()), out.otherReads.end());
         std::sort(out.origins.begin(), out.origins.end());
         out.origins.erase(std::unique(out.origins.begin(), out.origins.end()), out.origins.end());
+        std::sort(out.nested.begin(), out.nested.end());
+        out.nested.erase(std::unique(out.nested.begin(), out.nested.end()), out.nested.end());
         return out;
     };
     for (const auto count : {0u, 1u, 7u, 129u, 300u}) {
@@ -3557,6 +3567,11 @@ void verifyFastSrtWalk(bool benchmark) {
                 for (std::size_t i = 0; i < fixture.words.size(); ++i) fixture.words[i] = static_cast<std::uint32_t>(i * 0x9e3779b9u + iteration);
                 const auto compiled = capture(fixture, true);
                 require(compiled == capture(fixture, false), "SRT fast walk: captured words, flattened values, descriptors, activity or read origins differ from the evaluator");
+                if (!branches && count >= 7u) {
+                    const auto address = reinterpret_cast<std::uintptr_t>(fixture.words.data()) + fixture.userData[4] + sizeof(std::uint32_t);
+                    const auto parent = reinterpret_cast<std::uintptr_t>(fixture.pointer.data());
+                    require(std::find(compiled.nested.begin(), compiled.nested.end(), std::make_pair(static_cast<std::uint64_t>(address), static_cast<std::uint64_t>(parent))) != compiled.nested.end(), "SRT fast walk: the nested read lost its supplying pointer word");
+                }
                 std::vector<MemoryRegion> regions;
                 for (const auto& [address, word] : compiled.memory) regions.push_back({address, std::as_bytes(std::span(&word, 1))});
                 RequestMemoryView memory(regions);
@@ -3569,6 +3584,12 @@ void verifyFastSrtWalk(bool benchmark) {
                 require(Detail::EvaluateRuntimeSourcesImpl(fixture.plan, sources, replay, descriptors, flat, true, fixture.plan.cleanFlatSlots, active) && descriptors == compiled.descriptors && flat == compiled.flat && active == compiled.active, "SRT fast walk: captured regions do not reproduce the old path's values");
             }
         }
+    }
+    {
+        SrtWalkFixture arithmetic(7u, false, true);
+        const auto compiled = capture(arithmetic, true);
+        require(compiled == capture(arithmetic, false), "SRT nested provenance: arithmetic differs between walkers");
+        require(std::none_of(compiled.nested.begin(), compiled.nested.end(), [](const auto& read) { return read.second != 0; }), "SRT nested provenance: arithmetic on a pointer acquired direct provenance");
     }
     SrtWalkFixture fixture(300u, true);
     const auto* tape = Detail::SrtTape::For(fixture.plan);
@@ -3602,12 +3623,14 @@ void verifyFastSrtWalk(bool benchmark) {
     use.asBase = 8u;
     use.asValue = 16u;
     use.reads.emplace_back(12u, 0);
+    use.nested.emplace_back(12u, 8u);
     runtime.readTrace = &trace;
     runtime.userDataUse = &use;
     runtime.readMemory = +[](void*, std::uint64_t, std::uint32_t*) { return false; };
     runtime.readSpecializationMemory = runtime.readMemory;
     require(!run(), "SRT fast walk: a failing reader was accepted");
     require(descriptors == oldDescriptors && flat == oldFlat && active == oldActive && trace.leaves == std::vector<std::pair<std::uint32_t, std::uint64_t>>{{99u, 123u}} && trace.otherReads == std::vector<std::uint64_t>{456u} && trace.slotReads == std::vector<std::pair<const IrValue*, std::uint64_t>>{{nullptr, 789u}} && trace.leaf == nullptr && use.asBase == 8u && use.asValue == 16u && use.reads == std::vector<std::pair<std::uint64_t, std::int32_t>>{{12u, 0}}, "SRT fast walk: refusal changed outputs or retained trace/use observations");
+    require(use.nested == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{12u, 8u}}, "SRT fast walk: refusal retained nested provenance");
     runtime.readMemory = readDirect;
     runtime.readSpecializationMemory = readDirect;
     runtime.readTrace = nullptr;
@@ -3673,6 +3696,7 @@ void verifySrtTape() {
         std::uint64_t asBase = 0;
         std::uint64_t asValue = 0;
         std::vector<std::pair<std::uint64_t, std::int32_t>> userDataReads;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> nested;
         bool operator==(const Walk&) const = default;
     };
     const auto walk = [](const IrResourcePlan& plan, SrtRuntime runtime, bool tape) {
@@ -3698,6 +3722,9 @@ void verifySrtTape() {
         out.userDataReads = use.reads;
         std::sort(out.userDataReads.begin(), out.userDataReads.end());
         out.userDataReads.erase(std::unique(out.userDataReads.begin(), out.userDataReads.end()), out.userDataReads.end());
+        out.nested = use.nested;
+        std::sort(out.nested.begin(), out.nested.end());
+        out.nested.erase(std::unique(out.nested.begin(), out.nested.end()), out.nested.end());
         return out;
     };
     const auto answers = [](const IrResourcePlan& plan, const SrtRuntime& runtime) {
