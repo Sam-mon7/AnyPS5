@@ -59,17 +59,22 @@ public:
         std::size_t first = 0;
         std::size_t last = 0;
         if (!excludedBlocks(address, bytes, first, last)) return false;
+        const auto offset = std::max(address, base) - base;
+        const auto firstPage = offset / PageBytes;
+        const auto endPage = (std::min<std::uint64_t>(address + bytes - base, size) + PageBytes - 1) / PageBytes;
         for (auto index = first / ChunkBlocks; index <= last / ChunkBlocks; ++index) excluded.Ensure(index);
-        for (auto block = first; block <= last; ++block) excludedGenerations.try_emplace(block, 0);
+        for (auto block = first; block <= last; ++block) excludedGenerations.try_emplace(block);
         bool changed = false;
         for (auto block = first; block <= last; ++block) {
-            const auto pages = (std::min<std::uint64_t>(BlockBytes, size - block * BlockBytes) + PageBytes - 1) / PageBytes;
-            const auto mask = pageMask(0, pages);
+            const auto from = block == first ? firstPage % PagesPerBlock : 0;
+            const auto to = block == last ? (endPage - 1) % PagesPerBlock + 1 : PagesPerBlock;
+            const auto mask = pageMask(from, to);
             auto& value = (*excluded.Get(block / ChunkBlocks))[block % ChunkBlocks];
-            changed = changed || value.load(std::memory_order_relaxed) != mask;
-            auto& stamp = excludedGenerations.at(block);
-            stamp = std::max(stamp, std::max<std::uint64_t>(generation, 1));
-            value.store(mask, std::memory_order_release);
+            const auto before = value.load(std::memory_order_relaxed);
+            changed = changed || (before & mask) != mask;
+            auto& stamps = excludedGenerations.at(block);
+            for (auto page = from; page < to; ++page) stamps[page] = std::max(stamps[page], std::max<std::uint64_t>(generation, 1));
+            value.store(static_cast<std::uint16_t>(before | mask), std::memory_order_release);
         }
         return changed;
     }
@@ -92,14 +97,21 @@ public:
         const auto last = (endPage - 1) / PagesPerBlock;
         bool changed = false;
         for (auto block = first; block <= last; ++block) {
-            const auto mask = pageMask(block == first ? firstPage % PagesPerBlock : 0, block == last ? (endPage - 1) % PagesPerBlock + 1 : PagesPerBlock);
-            if ((excludedMask(block) & mask) != 0 && excludedGenerations.at(block) < generation) {
+            const auto from = block == first ? firstPage % PagesPerBlock : 0;
+            const auto to = block == last ? (endPage - 1) % PagesPerBlock + 1 : PagesPerBlock;
+            const auto mask = pageMask(from, to);
+            if ((excludedMask(block) & mask) == 0) continue;
+            const auto& stamps = excludedGenerations.at(block);
+            auto& value = (*excluded.Get(block / ChunkBlocks))[block % ChunkBlocks];
+            auto remaining = value.load(std::memory_order_relaxed);
+            for (auto page = from; page < to; ++page) {
+                const auto bit = static_cast<std::uint16_t>(1u << page);
+                if ((remaining & bit) == 0 || stamps[page] >= generation) continue;
+                remaining &= static_cast<std::uint16_t>(~bit);
                 changed = true;
-                auto& value = (*excluded.Get(block / ChunkBlocks))[block % ChunkBlocks];
-                const auto remaining = static_cast<std::uint16_t>(value.load(std::memory_order_relaxed) & ~mask);
-                value.store(remaining, std::memory_order_release);
-                if (remaining == 0) excludedGenerations.erase(block);
             }
+            value.store(remaining, std::memory_order_release);
+            if (remaining == 0) excludedGenerations.erase(block);
         }
         return changed;
     }
@@ -158,7 +170,7 @@ private:
     std::uint64_t base = 0;
     std::size_t size = 0;
     Chunks excluded;
-    std::unordered_map<std::uint64_t, std::uint64_t> excludedGenerations;
+    std::unordered_map<std::uint64_t, std::array<std::uint64_t, PagesPerBlock>> excludedGenerations;
 };
 
 }

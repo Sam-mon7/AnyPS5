@@ -3,6 +3,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
 #include <memory>
 #include <new>
 #include <random>
@@ -91,8 +92,8 @@ void CheckSimpleReplacement() {
     Require(!source->HasUses() && source->OperandUses().empty());
     Require(first->Argument(0) == target && first->Argument(1) == target && first->Argument(2) == target);
     Require(second->Argument(0) == target);
-    const std::vector<IrUse> expected{{existing, 0}, {first, 2}, {first, 1}, {second, 0}, {first, 0}};
-    Require(std::ranges::equal(target->OperandUses(), expected));
+    const IrUseList expected{{existing, 0}, {first, 2}, {first, 1}, {second, 0}, {first, 0}};
+    Require(target->OperandUses() == expected);
     Require(std::ranges::equal(target->Uses(), std::vector<IrValue*>({existing, first, first, second, first})));
     first->ReplaceArgument(1, source);
     Require(source->UseCount() == 1);
@@ -110,10 +111,10 @@ void CheckTailArgumentRemoval() {
     last->AddArgument(source);
     last->AddArgument(source);
     last->ReplaceArgument(0, nullptr);
-    Require(std::ranges::equal(source->OperandUses(), std::vector<IrUse>({{first, 0}, {last, 1}})));
+    Require(source->OperandUses() == IrUseList({{first, 0}, {last, 1}}));
     last->ReplaceArgument(1, graph.Value(3));
-    Require(std::ranges::equal(source->OperandUses(), std::vector<IrUse>({{first, 0}})));
-    Require(std::ranges::equal(graph.Value(3)->OperandUses(), std::vector<IrUse>({{last, 1}})));
+    Require(source->OperandUses() == IrUseList({{first, 0}}));
+    Require(graph.Value(3)->OperandUses() == IrUseList({{last, 1}}));
     first->Invalidate();
     Require(!source->HasUses() && first->Argument(0) == nullptr);
 }
@@ -218,6 +219,7 @@ void CheckDetachedPhi() {
     Require(empty.PhiBlockCount() == 1 && empty.PhiBlock(0) == &first && input.UseCount() == 1);
 }
 
+
 void CheckGeometricGrowth() {
     constexpr std::size_t count = 4096;
     Graph graph(count + 2);
@@ -296,7 +298,7 @@ int main() {
             current = name;
             test();
         }
-        std::puts("8 IR rewrite suites passed; 2000 differential use graphs and 48000 mutation comparisons");
+        std::printf("%zu IR rewrite suites passed; 2000 differential use graphs and 48000 mutation comparisons\n", std::size(cases));
         return 0;
     } catch (const std::exception& error) {
         failureAfter = -1;

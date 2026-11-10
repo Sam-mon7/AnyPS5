@@ -69,16 +69,24 @@ void Driver::AttachWindow(const PresentationWindow& window) {
     CheckFailure();
     std::unique_lock replacing(deviceReplacement);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+    PerformanceTimer timing("Driver.AttachWindow");
     std::lock_guard lock(GuestMemory::GpuMutex());
+    timing.Mark("gpu_mutex_wait");
     if (device) {
         require(device->Window() == nullptr, "a window is already attached to the device");
         device->PrepareForReplacement();
         replacedDevices.push_back(device);
+        timing.Mark("device_replacement");
     }
     device = std::make_shared<VulkanDevice>(&window);
+    timing.Mark("vulkan_device_create");
 }
 
-void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool opaque, void (*gpuReady)(void*), void* context) {
+void Driver::TracePresent(std::uint32_t width, std::uint32_t height) {
+    if (PerformanceTrace::Configured()) PerformanceTrace::Present(width, height, device.Load().get());
+}
+
+void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buffer, const DisplayBuffer* plane, bool opaque, void (*gpuReady)(void*), void* context) {
     VulkanDevice::PresentationCounters().Attempt();
     ArchB::Switches::PollControl();
     Stage4::Flip();
@@ -147,10 +155,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     presenting->WaitIdle();
                     timing.Mark("device_idle_wait");
                 }
-                submitted = presenting->PresentDisplayBuffer(*buffer);
+                submitted = presenting->PresentDisplayBuffer(*buffer, plane);
                 timing.Mark("present_display_buffer");
             } else {
-                submitted = presenting->PresentClear(window.width, window.height, opaque);
+                submitted = presenting->PresentClear(window.width, window.height, opaque, plane);
                 timing.Mark("present_clear");
             }
             if (submitted && syncFlip) {

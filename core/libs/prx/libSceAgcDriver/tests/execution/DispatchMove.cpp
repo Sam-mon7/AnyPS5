@@ -328,7 +328,7 @@ bool RunCompletionRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& gues
     std::shared_ptr<const AgcDriver::Recipe> recipe;
     AgcDriver::RecipeBuildFailure failure = AgcDriver::RecipeBuildFailure::NotAttempted;
     Reset(guest.OutputO());
-    device.Dispatch(compiled, 1, 1, 1, {}, 0, nullptr, &recipe, std::nullopt, &failure);
+    device.Dispatch(compiled, 1, 1, 1, {}, 0, nullptr, &recipe, std::nullopt, nullptr, &failure);
     device.WaitIdle();
     Expect(guest.InputA(), guest.OutputO(), Constant, "the completion recipe's initial dispatch");
     if (failure == AgcDriver::RecipeBuildFailure::CopiedWrites) {
@@ -416,7 +416,7 @@ void RunPrivateRecording(AgcDriver::VulkanDevice& device, const GuestBlock& gues
         if (round != 0) prepared = device.PrepareDispatch(compiled, {});
         {
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-            device.Dispatch(compiled, round == 2 ? 0 : 1, 1, 1, {}, 0, prepared, nullptr, std::nullopt, nullptr, ready);
+            device.Dispatch(compiled, round == 2 ? 0 : 1, 1, 1, {}, 0, prepared, nullptr, std::nullopt, nullptr, nullptr, ready);
             if (round == 0 && gate != nullptr) {
                 auto* recorder = AgcDriver::Graphics::Recorder::Active();
                 recorder->OnComplete([&] { completed = true; });
@@ -450,7 +450,7 @@ void RunPrivateRecording(AgcDriver::VulkanDevice& device, const GuestBlock& gues
     Reset(guest.OutputO());
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        device.Dispatch(compiled, 1, 1, 1, {}, 0, prepared, nullptr, std::nullopt, nullptr, stale);
+        device.Dispatch(compiled, 1, 1, 1, {}, 0, prepared, nullptr, std::nullopt, nullptr, nullptr, stale);
         device.WaitIdle();
     }
     Expect(guest.InputA(), guest.OutputO(), Constant, "private compute import-epoch fallback");

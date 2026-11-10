@@ -1,0 +1,15 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_archb_c09a_recorder_tests tests/ArchBRecorder.cpp
+        Execution/src/ArchB/Recorder.cpp Execution/src/PerformanceTraceThread.cpp)
+    target_include_directories(agc_archb_c09a_recorder_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    target_link_libraries(agc_archb_c09a_recorder_tests PRIVATE libc)
+    configure_windows_unwind(agc_archb_c09a_recorder_tests)
+    foreach(recorderCase IN ITEMS reconciles no_path_change toggle_interval_tagged shader_table_overflow)
+        add_test(NAME agc_archb_c09a_recorder_${recorderCase} COMMAND agc_archb_c09a_recorder_tests ${recorderCase})
+        set_tests_properties(agc_archb_c09a_recorder_${recorderCase} PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(agc_archb_c09a_recorder_${recorderCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+endif()

@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_epoch_memo_map_tests tests/EpochMemoMap.cpp)
+    target_include_directories(agc_epoch_memo_map_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_epoch_memo_map_tests PRIVATE libc)
+    set_target_properties(agc_epoch_memo_map_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_epoch_memo_map_tests)
+    add_test(NAME agc_archb_fix_alloc_churn_memo_map COMMAND agc_epoch_memo_map_tests)
+    set_tests_properties(agc_archb_fix_alloc_churn_memo_map PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_archb_fix_alloc_churn_memo_map PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

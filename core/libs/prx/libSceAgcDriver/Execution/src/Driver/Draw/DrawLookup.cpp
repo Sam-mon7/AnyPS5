@@ -3,12 +3,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <bit>
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::uint64_t& shapeKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask, bool bufferBases) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, std::uint64_t& shapeKey, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask, bool bufferBases) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
@@ -48,6 +49,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(tess.mergedHull);
             }
             mix(graphics.rectList);
+            mix(graphics.rasterizerDiscard);
             mix(programs.size());
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 const auto& program = programs[i];
@@ -90,20 +92,42 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.orderedPixelShader);
             mix(pixel.stencilRefExportEnable);
             mix(pixel.stencilOperationValueExport);
+            mix(std::bit_cast<std::uint32_t>(pixel.depthExportMin));
+            mix(std::bit_cast<std::uint32_t>(pixel.depthExportMax));
             for (const auto value : pixel.targetOutputMode) mix(value);
             for (const auto value : pixel.targetExportMapping) mix(value);
             for (const auto value : pixel.targetExportPacking) mix(static_cast<std::uint64_t>(value));
             mix(pixel.dualSourceBlend);
             mix(pixel.reversedBlend);
-            mix(pixel.targetMerge.target);
-            mix(pixel.targetMerge.mask);
-            mix(pixel.targetMerge.samples);
-            for (const auto word : pixel.targetMerge.descriptor) mix(word);
-            mix(pixel.targetMerge.depthStencilWrites);
-            mix(pixel.targetMerge.depthStencilTests);
+            mix(pixel.targetMerges.size());
+            for (const auto& merge : pixel.targetMerges) {
+                mix(merge.target);
+                mix(merge.mask);
+                mix(merge.samples);
+                mix(static_cast<std::uint64_t>(merge.packing));
+                mix(merge.blendControl);
+                mix(merge.layered);
+                mix(merge.firstSlice);
+                mix(merge.lastSlice);
+                for (const auto word : merge.descriptor) mix(word);
+                mix(merge.depthStencilWrites);
+                mix(merge.depthStencilTests);
+                if (!merge.blend.enabled) continue;
+                const auto& blend = merge.blend;
+                mix(blend.snorm);
+                mix(blend.colorSource);
+                mix(blend.colorDestination);
+                mix(blend.colorOperation);
+                mix(blend.alphaSource);
+                mix(blend.alphaDestination);
+                mix(blend.alphaOperation);
+                mix(blend.writeMask);
+                for (const auto word : blend.constants) mix(word);
+            }
             mix(pixel.alphaToCoverage);
             mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
             mix(pixel.ditheredAlphaToCoverage);
+            mix(pixel.ditheredAlphaSamples);
             mix(pixel.quadPixelMask);
             for (const auto mask : pixel.quadSampleMask) mix(mask);
             mix(pixel.iteratesSamples);
@@ -167,8 +191,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     bool anyLayout = false;
                     for (std::size_t rank = 0; rank < variants.size(); ++rank) {
                         const auto& variant = variants[rank];
+                        if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
                         if (variant->pushOffset != cursor) continue;
-                        if (!pointerFree && drawParameters.indirect && variant->indirectCapture != nullptr) {
+                        if (!drawCacheIndirect() && !pointerFree && drawParameters.indirect && variant->indirectCapture != nullptr) {
                             const auto& indirect = *drawParameters.indirect;
                             std::vector<std::size_t> patchedWords;
                             for (const auto location : {indirect.baseVertexLocation, indirect.startInstanceLocation, indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u}) {
@@ -225,6 +250,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     }
                     if (matched[i] != nullptr) continue;
                     if (!anyLayout) miss = DrawMiss::Layout;
+                    else if (outcome == EntryOutcome::QueuedStores) miss = DrawMiss::QueuedStores;
                     else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
                     else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
                 }
@@ -233,7 +259,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             if (genShadow) GuestMemory::Gen::NoteDrawLookup(genQueue0, drawHit, drawHit && genAllClean);
             const bool feedbackHit = drawHit && std::any_of(stageData.begin(), stageData.end(), [](const auto& stage) { return stage.feedbackHit; });
             if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
-            constexpr const char* recorderMisses[] = {"draw_cache_miss_front", "draw_cache_miss_fragment", "draw_cache_miss_other", "draw_cache_miss_layout", "draw_cache_miss_gate", "draw_cache_miss_stages"};
+            constexpr std::array<const char*, static_cast<std::size_t>(DrawMiss::Count)> recorderMisses{"draw_cache_miss_front", "draw_cache_miss_fragment", "draw_cache_miss_other", "draw_cache_miss_queued_stores", "draw_cache_miss_layout", "draw_cache_miss_gate", "draw_cache_miss_stages"};
             ArchB::Recorder::Count(miss ? recorderMisses[static_cast<std::size_t>(*miss)] : "draw_cache_hits");
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
@@ -304,6 +330,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const auto& now = programs[i].userData;
                 auto& candidates = dataCandidates[i];
                 for (const auto& variant : dataEntry->stages[i]) {
+                    if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
                     const auto& was = variant->userData.empty() ? dataEntry->decode->programs[i].userData : variant->userData;
                     bool usedEqual = was.size() == now.size(), userFeedback = false, memoryFeedback = false;
                     for (std::size_t w = 0; !pointerFree && w < now.size() && usedEqual; ++w) {

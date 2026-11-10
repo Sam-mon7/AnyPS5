@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string_view>
@@ -63,6 +64,18 @@ std::int64_t steadyNanos() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+std::string configuredDirectory() {
+#ifdef _WIN32
+    const wchar_t* configured = _wgetenv(L"APS5_VIDEOOUT_TELEMETRY_DIR");
+    if (configured == nullptr) return {};
+    const auto text = std::filesystem::path(configured).u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+#else
+    const char* configured = std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR");
+    return configured != nullptr ? configured : std::string();
+#endif
+}
+
 std::int64_t processId() {
 #ifdef _WIN32
     return static_cast<std::int64_t>(::GetCurrentProcessId());
@@ -116,7 +129,7 @@ std::uint64_t BoundedLineQueue::Dropped() const {
 
 Writer::Writer(const std::string& directory, std::size_t capacity, const std::string& commit) : queue(capacity) {
     const std::string path = directory + "/videoout.jsonl";
-    output.open(path, std::ios::binary | std::ios::app);
+    output.open(std::filesystem::path(reinterpret_cast<const char8_t*>(path.c_str())), std::ios::binary | std::ios::app);
     if (!output.is_open()) throw std::runtime_error("VideoOut telemetry: cannot open " + path);
     output.exceptions(std::ios::badbit | std::ios::failbit);
     const auto steady = steadyNanos();
@@ -262,7 +275,7 @@ std::unique_ptr<Writer> OpenFromEnvironment(const char* directory, const std::st
 }
 
 Writer* Instance() {
-    static const std::unique_ptr<Writer> writer = OpenFromEnvironment(std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR"), APS5_TRACE_COMMIT);
+    static const std::unique_ptr<Writer> writer = OpenFromEnvironment(configuredDirectory().c_str(), APS5_TRACE_COMMIT);
     return writer.get();
 }
 

@@ -49,7 +49,7 @@ struct DriverTestAccess {
             const auto found = Driver::Get().drawCache.find(key);
             if (found != Driver::Get().drawCache.end()) lookup.entry = found->second;
         }
-        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, shapeKey, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, packet, false, false, false);
+        Driver::Get().lookupDraw(submission, device, decode.state, decode.pixel, decode.programs, decode.roles, infos, true, key != 0, false, lookup.key, lookup.entry, lookup.matched, lookup.regions, lookup.hit, verify, timing, ms, nullptr, candidates, data, shapeKey, packet, false, false, false);
         Graphics::Require(!verify, "cache regression must use the ordinary hit path");
         return lookup;
     }
@@ -104,6 +104,18 @@ alignas(256) constexpr std::array<std::uint32_t, 30> VertexCode{
     0xf80008cf, 0x11101010,
     0xbf810000,
 };
+
+alignas(256) constexpr auto RuntimeFetchCode = [] {
+    std::array<std::uint32_t, 36> code{};
+    std::copy_n(VertexCode.begin(), 23, code.begin());
+    const std::array<std::uint32_t, 8> stores{
+        0xe0c01000, 0x80020c04, 0xe0c01004, 0x80020d04,
+        0xe0c01008, 0x80020e04, 0xe0c0100c, 0x80020f04
+    };
+    std::copy(stores.begin(), stores.end(), code.begin() + 23);
+    std::copy(VertexCode.begin() + 25, VertexCode.end(), code.begin() + 31);
+    return code;
+}();
 
 alignas(256) constexpr std::array<std::uint32_t, 30> PostAddCode{
     0x7e020280, 0x7e040280,
@@ -348,7 +360,7 @@ constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 32;
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
 alignas(256) std::array<std::uint32_t, 4 * Slots> Output{};
-alignas(256) std::array<std::uint32_t, 2048> VertexSlots{};
+alignas(256) std::array<std::uint32_t, 65538> VertexSlots{};
 alignas(256) std::array<std::uint32_t, 60000> InstanceSlots{};
 alignas(256) std::array<std::uint32_t, 8> BufferTable{};
 alignas(256) constexpr std::array<std::uint16_t, 4> Indices{2, 0, 1, 0};
@@ -407,8 +419,9 @@ public:
         return info;
     }
 
-    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr, bool fromBase = false) const {
-        const auto info = VertexInfo();
+    ShaderRecompiler::RecompileResult Vertex(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool runtimeFetch = false, std::int32_t vertexSgpr = BaseVertexSgpr, std::int32_t instanceSgpr = StartInstanceSgpr, bool fromBase = false) const {
+        auto info = VertexInfo();
+        info.fetchEmbedded = !runtimeFetch;
         const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
             {reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)},
             {reinterpret_cast<std::uintptr_t>(BufferTable.data()), std::as_bytes(std::span(BufferTable))}
@@ -429,7 +442,7 @@ public:
             request.graphics->baseVertexSgpr = BaseVertexSgpr;
         }
         auto result = ShaderRecompiler::Recompile(request);
-        Require(result.vertexOffsetSgpr == vertexSgpr && result.instanceOffsetSgpr == instanceSgpr, "the program folded vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + " into the draw, expected " + std::to_string(vertexSgpr) + ", " + std::to_string(instanceSgpr));
+        if (!runtimeFetch) Require(result.vertexOffsetSgpr == vertexSgpr && result.instanceOffsetSgpr == instanceSgpr, "the program folded vertex " + std::to_string(result.vertexOffsetSgpr) + ", instance " + std::to_string(result.instanceOffsetSgpr) + " into the draw, expected " + std::to_string(vertexSgpr) + ", " + std::to_string(instanceSgpr));
         return result;
     }
 
@@ -474,7 +487,7 @@ public:
         return state;
     }
 
-    void Draw(const ShaderRecompiler::RecompileResult& vertex, const AgcDriver::Pm4::DrawParameters& draw) {
+    void Draw(const ShaderRecompiler::RecompileResult& vertex, const AgcDriver::Pm4::DrawParameters& draw, bool compactRestart = false) {
         const auto vertexPush = static_cast<std::uint32_t>(vertex.pushConstants.size());
         ShaderRecompiler::ShaderPixelStageInfo pixelInfo{};
         pixelInfo.wave32 = true;
@@ -485,7 +498,15 @@ public:
         const auto pixel = ShaderRecompiler::Recompile(pixelRequest);
         const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0u}, {ShaderStage::Fragment, &pixel, PixelPushOffset(vertexPush, device->Target())}}};
         Output.fill(Unwritten);
-        device->Draw(State(), draw, shaders);
+        if (compactRestart) {
+            auto context = device->graphicsContext();
+            context.primitiveListRestart = false;
+            auto state = State();
+            state.primitiveRestart = true;
+            AgcDriver::Graphics::Draw(context, state, draw, shaders);
+        } else {
+            device->Draw(State(), draw, shaders);
+        }
         device->WaitIdle();
     }
 
@@ -542,7 +563,7 @@ std::string PathName(const std::optional<Path>& path) {
 }
 
 std::string Classified(Fixture& fixture, const std::string& what, const ShaderRecompiler::RecompileResult& vertex, const std::vector<std::uint32_t>& userData, AgcDriver::Pm4::DrawParameters& draw, std::optional<Path> expectedPath, Rule expectedRule, bool rectList = false) {
-    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(rectList), Program(userData), Fixture::VertexInfo(), fixture.device, draw, false);
+    const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(rectList), Program(userData), fixture.device, draw, false, Fixture::VertexInfo());
     const auto& indirect = *draw.indirect;
     const bool rules = expectedPath || (indirect.vertexRule == expectedRule && indirect.instanceRule == expectedRule);
     std::cout << what << ": classified to " << PathName(path) << '\n';
@@ -583,6 +604,25 @@ std::string Analysis(Fixture& fixture) {
     return failures;
 }
 
+std::string RuntimeFetch(Fixture& fixture, std::uint32_t index, bool compactRestart) {
+    const auto userData = fixture.UserData(0, 0);
+    const auto vertex = fixture.Vertex(RuntimeFetchCode, userData, true);
+    Require(vertex.vertexAttributes.empty(), "runtime fetch must not become fixed vertex attributes");
+    VertexSlots.fill(0);
+    InstanceSlots.fill(0);
+    alignas(256) static std::array<std::uint32_t, 5> indices{};
+    indices = {0xffffffffu, index, index, index, 0xffffffffu};
+    const auto first = compactRestart ? 0u : 1u;
+    const auto count = compactRestart ? 5u : 3u;
+    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(indices.data() + first), count, 4, 1, 0, true, 0, 0};
+    fixture.Draw(vertex, draw, compactRestart);
+    std::cout << "runtime fetch, index " << index << ", compact restart " << compactRestart
+              << ", attributes " << vertex.vertexAttributes.size() << ": atomic readback "
+              << Output[0] << ' ' << Output[1] << ' ' << Output[2] << ' ' << Output[3] << '\n';
+    const std::array<std::uint32_t, 4> expected{index, 0, index, 0};
+    return std::equal(expected.begin(), expected.end(), Output.begin()) ? "" : "runtime-fetched VertexIndex was changed\n";
+}
+
 void SameResult(const ShaderRecompiler::RecompileResult& patched, const ShaderRecompiler::RecompileResult& full) {
     std::vector<std::byte> patchedBytes, fullBytes;
     ShaderRecompiler::ShaderDiskCache::EncodeResult(patched, patchedBytes);
@@ -590,114 +630,53 @@ void SameResult(const ShaderRecompiler::RecompileResult& patched, const ShaderRe
     Require(patchedBytes == fullBytes && patched.variantId == full.variantId && patched.specializationId == full.specializationId && patched.cacheHit == full.cacheHit, "indirect stage differs from full materialization");
 }
 
-std::string IndirectPushPatches(Fixture& fixture, bool bufferBase) {
-    using Driver = AgcDriver::DriverDetail::Driver;
-    const bool enabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
-    const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
-    auto program = Program(fixture.UserData(0x51u, 0x62u));
-    const std::span<const std::uint32_t> code = bufferBase ? std::span<const std::uint32_t>(BufferBaseCode) : std::span<const std::uint32_t>(VertexCode);
-    program.binary = {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
-    alignas(256) std::array<std::uint32_t, 8> otherTable = BufferTable;
-    std::copy_n(BufferTable.begin() + 4, 4, otherTable.begin());
-    const auto tableAddress = reinterpret_cast<std::uintptr_t>(BufferTable.data());
-    if (bufferBase) {
-        program.userData[8] = static_cast<std::uint32_t>(tableAddress);
-        program.userData[9] = static_cast<std::uint32_t>(tableAddress >> 32u);
-    }
-    const std::array<ShaderRecompiler::MemoryRegion, 3> regions{{
-        {program.binary.codeAddress, std::as_bytes(code)},
-        {tableAddress, std::as_bytes(std::span(BufferTable))},
-        {reinterpret_cast<std::uintptr_t>(otherTable.data()), std::as_bytes(std::span(otherTable))}
-    }};
-    const std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo = bufferBase ? ShaderRecompiler::ShaderVertexStageInfo{} : Fixture::VertexInfo();
-    ShaderRecompiler::RecompileRequest request{
-        program.binary, {32, 8, program.userData, std::nullopt, std::nullopt, vertexInfo, regions}, fixture.device->Target(), {0, 0, 0, 64}
-    };
-    const auto handle = ShaderRecompiler::PrepareShader(request);
-    Require(handle != nullptr, "indirect patch test has no prepared shader");
-    AgcDriver::ShaderMemory memory(regions);
-    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
-    const auto materialize = [&] {
-        const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
-        Require(invocation.has_value(), "indirect patch test lost its prepared invocation");
-        capture = memory.Capture(*invocation);
-        return invocation->Materialize(*capture);
-    };
-    auto result = *materialize();
-    const auto original = result;
-    const auto initialCapture = capture;
-    std::uint32_t materializations = 0;
-    const auto refresh = [&] {
-        return Driver::RefreshIndirectStage(result, capture.get(), program, vertexInfo, [&] {
-            ++materializations;
-            return materialize();
-        });
-    };
-    if (bufferBase) {
-        Require((capture->userDataUse.asBase & (std::uint64_t{1} << 8u)) != 0, "buffer-base test did not capture s16 as a base");
-        const std::array<std::size_t, 1> patchedWords{8};
-        Require(Driver::IndirectStageCacheRefusal(result, capture.get(), program, vertexInfo, patchedWords) == AgcDriver::DriverDetail::IndirectCacheRefusal::CaptureRead, "CPU indirect cache admitted a patched SRT base before its value changed");
-        Require(std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 8u) == 1, "buffer-base test did not also forward s16");
-        const auto otherAddress = reinterpret_cast<std::uintptr_t>(otherTable.data());
-        program.userData[8] = static_cast<std::uint32_t>(otherAddress);
-        program.userData[9] = static_cast<std::uint32_t>(otherAddress >> 32u);
-        Require(!refresh() && materializations == 1, "indirect buffer base did not fall back to materialization");
-        SameResult(result, *materialize());
-        const auto buffers = std::find_if(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
-        Require(buffers != result.bindings.end() && buffers->guestDescriptor.size() >= 4 && std::equal(otherTable.begin(), otherTable.begin() + 4, buffers->guestDescriptor.begin()), "buffer-base fallback retained the old descriptor");
-        std::cout << "indirect buffer-base fallback checked\n";
-        return {};
-    }
-    Require(std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 8u) == 1 && std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 9u) == 1, "indirect patch test did not forward both offset registers");
-    const std::array<std::array<std::uint32_t, 5>, 3> records{{
-        {Vertices, Instances, 0, 700, 59455},
-        {Vertices, Instances, 0, 19, 37},
-        {Vertices, Instances, 0, 0x51u, 0x62u}
-    }};
-    for (std::size_t record = 0; record < records.size(); ++record) std::copy(records[record].begin(), records[record].end(), fixture.Records() + record * 5u);
-    AgcDriver::Pm4::DrawParameters::IndirectDraw indirect{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x38u, 20u, 20u, static_cast<std::uint32_t>(records.size()), false, 0u, 0x10u, 0x11u, NoLocation, false, 0u};
-    indirect.baseVertexSgpr = BaseVertexSgpr;
-    indirect.startInstanceSgpr = StartInstanceSgpr;
-    const auto indexAddress = reinterpret_cast<std::uintptr_t>(Indices.data());
-    AgcDriver::Pm4::DrawParameters packet{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
-    packet.indirect = indirect;
-    std::string failures = Classified(fixture, "multi-record indirect push patch", result, program.userData, packet, Path::NotFolded, Rule::Constant);
-    const std::array<std::uint32_t, Vertices> raw{Indices[0], Indices[1], Indices[2]};
-    for (std::uint32_t record = 0; record < indirect.count; ++record) {
-        const auto arguments = AgcDriver::Pm4::ReadDrawArguments(indirect, record);
-        program.userData[8] = arguments.vertexOffset;
-        program.userData[9] = arguments.firstInstance;
-        if (record == 0 && enabled) {
-            const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
-            Require(invocation.has_value(), "indirect eligibility test lost its prepared invocation");
-            const auto full = invocation->Materialize(*memory.Capture(*invocation));
-            for (std::uint32_t refusal = 0; refusal < 6; ++refusal) {
-                auto candidate = result;
-                auto captured = *capture;
-                auto info = vertexInfo;
-                if (refusal == 0) candidate.shaderDataUserWords.back() = candidate.shaderDataUserWords.front();
-                if (refusal == 1) candidate.shaderDataUserWords.front() = 64;
-                if (refusal == 2) candidate.pushConstants.clear();
-                if (refusal == 3) captured.userDataUse.asValue |= std::uint64_t{1} << 8u;
-                if (refusal == 4) captured.userDataUse.asBase |= std::uint64_t{1} << 8u;
-                if (refusal == 5) info->fetchBufferReg = 8;
-                std::uint32_t calls = 0;
-                Require(!Driver::RefreshIndirectStage(candidate, &captured, program, info, [&] { ++calls; return full; }) && calls == 1, "unsafe indirect push mapping did not fall back");
-                SameResult(candidate, *full);
+std::string BuiltinOffsets(Fixture& fixture) {
+    const auto stale = fixture.UserData(0x51u, 0x62u);
+    const std::array<std::uint32_t, Vertices> raw{2, 0, 1};
+    std::string failures;
+    for (const auto* code : {&VertexCode, &PostAddCode, &NoCarryCode}) {
+        const auto vertex = fixture.Vertex(*code, stale, false, -1, -1, true);
+        Require(!vertex.vertexOffsetShared && !vertex.instanceOffsetShared && !vertex.vertexOffsetConflict && !vertex.instanceOffsetConflict, "builtin offsets retained CPU folding metadata");
+        for (const auto& offsets : {std::array<std::uint32_t, 2>{700, 59455}, std::array<std::uint32_t, 2>{31, 19}, std::array<std::uint32_t, 2>{0, 0}}) {
+            const std::array<std::uint32_t, 4> first{Vertices, Instances, 0, offsets[0]};
+            const std::array<std::uint32_t, 4> last{offsets[1], 0, 0, 0};
+            const auto address = reinterpret_cast<std::uintptr_t>(fixture.Records());
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                Require(fixture.device->FillBuffer(address, 16, first) && fixture.device->FillBuffer(address + 16, 16, last), "could not write indirect arguments on the GPU");
+                Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(address, 20), "the indirect record has no pending GPU writer");
             }
+            AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(Indices.data()), Vertices, 2, 0, 0, true, 0, 0};
+            draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{address, 0x25u, 20u, 20u, 1u, false, 0u, 0x94u, 0x95u, NoLocation, false, 0u};
+            draw.indirect->baseVertexSgpr = BaseVertexSgpr;
+            draw.indirect->startInstanceSgpr = StartInstanceSgpr;
+            draw.indirect->vertexFromBase = true;
+            draw.indirect->instanceFromBase = true;
+            failures += Classified(fixture, "GPU-written builtin offsets", vertex, stale, draw, std::nullopt, Rule::InPlace);
+            fixture.Place(offsets[0], raw, offsets[1]);
+            const auto before = AgcDriver::Graphics::IndirectDrawCounts()[static_cast<std::size_t>(Path::Gpu)];
+            fixture.Draw(vertex, draw);
+            Require(AgcDriver::Graphics::IndirectDrawCounts()[static_cast<std::size_t>(Path::Gpu)] == before + 1u, "the GPU-written builtin record fell back to CPU argument reads");
+            failures += fixture.Check("GPU-written builtin offsets", raw, offsets[0], offsets[1], code == &VertexCode);
         }
-        Require(refresh() == enabled, "forwarded indirect offsets did not select the expected patch path");
-        const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
-        Require(invocation.has_value(), "indirect comparison lost its prepared invocation");
-        SameResult(result, *invocation->Materialize(*memory.Capture(*invocation)));
-        const auto draw = FoldedDraw(result, program.userData, {indexAddress, arguments.count, 2, arguments.instances, 0, true, 0, 0});
-        fixture.Place(arguments.vertexOffset, raw, arguments.firstInstance);
-        fixture.Draw(result, draw);
-        failures += fixture.Check("indirect push patch record " + std::to_string(record), raw, arguments.vertexOffset, arguments.firstInstance, true);
     }
-    Require(materializations == (!enabled || verify ? records.size() : 0u), "indirect patch or verification switch used the wrong number of materializations");
-    SameResult(original, *ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle)->Materialize(*initialCapture));
-    std::cout << "indirect push patch records checked: " << records.size() << ", materializations " << materializations << '\n';
+    const auto vertex = fixture.Vertex(VertexCode, stale, false, -1, -1, true);
+    alignas(256) constexpr std::array<std::uint16_t, Vertices> negativeIndices{702, 700, 701};
+    const std::array<std::uint32_t, 5> negative{Vertices, Instances, 0, static_cast<std::uint32_t>(-700), 7};
+    std::copy(negative.begin(), negative.end(), fixture.Records());
+    AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(negativeIndices.data()), Vertices, 2, 0, 0, true, 0, 0};
+    draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x25u, 20u, 20u, 1u, false, 0u, 0x94u, 0x95u, NoLocation, false, 0u};
+    draw.indirect->baseVertexSgpr = BaseVertexSgpr;
+    draw.indirect->startInstanceSgpr = StartInstanceSgpr;
+    draw.indirect->vertexFromBase = true;
+    draw.indirect->instanceFromBase = true;
+    failures += Classified(fixture, "negative builtin base vertex", vertex, stale, draw, std::nullopt, Rule::InPlace);
+    fixture.Place(0, raw, 7);
+    fixture.Draw(vertex, draw);
+    const std::array<std::uint32_t, Vertices> negativeRaw{702, 700, 701};
+    failures += fixture.Check("negative builtin base vertex", negativeRaw, negative[3], 7, true);
+    draw.indirect->indexLimitKnown = false;
+    failures += Classified(fixture, "builtin offsets with unknown index limit", vertex, stale, draw, Path::IndexLimitUnknown, Rule::InPlace);
     return failures;
 }
 
@@ -824,53 +803,114 @@ std::string CachedIndirectPatches(Fixture& fixture) {
     return failures;
 }
 
-std::string BuiltinOffsets(Fixture& fixture) {
-    const auto stale = fixture.UserData(0x51u, 0x62u);
-    const std::array<std::uint32_t, Vertices> raw{2, 0, 1};
-    std::string failures;
-    for (const auto* code : {&VertexCode, &PostAddCode, &NoCarryCode}) {
-        const auto vertex = fixture.Vertex(*code, stale, -1, -1, true);
-        Require(!vertex.vertexOffsetShared && !vertex.instanceOffsetShared && !vertex.vertexOffsetConflict && !vertex.instanceOffsetConflict, "builtin offsets retained CPU folding metadata");
-        for (const auto& offsets : {std::array<std::uint32_t, 2>{700, 59455}, std::array<std::uint32_t, 2>{31, 19}, std::array<std::uint32_t, 2>{0, 0}}) {
-            const std::array<std::uint32_t, 4> first{Vertices, Instances, 0, offsets[0]};
-            const std::array<std::uint32_t, 4> last{offsets[1], 0, 0, 0};
-            const auto address = reinterpret_cast<std::uintptr_t>(fixture.Records());
-            {
-                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-                Require(fixture.device->FillBuffer(address, 16, first) && fixture.device->FillBuffer(address + 16, 16, last), "could not write indirect arguments on the GPU");
-                Require(AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(address, 20), "the indirect record has no pending GPU writer");
-            }
-            AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(Indices.data()), Vertices, 2, 0, 0, true, 0, 0};
-            draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{address, 0x25u, 20u, 20u, 1u, false, 0u, 0x94u, 0x95u, NoLocation, false, 0u};
-            draw.indirect->baseVertexSgpr = BaseVertexSgpr;
-            draw.indirect->startInstanceSgpr = StartInstanceSgpr;
-            draw.indirect->vertexFromBase = true;
-            draw.indirect->instanceFromBase = true;
-            failures += Classified(fixture, "GPU-written builtin offsets", vertex, stale, draw, std::nullopt, Rule::InPlace);
-            fixture.Place(offsets[0], raw, offsets[1]);
-            const auto before = AgcDriver::Graphics::IndirectDrawCounts()[static_cast<std::size_t>(Path::Gpu)];
-            fixture.Draw(vertex, draw);
-            Require(AgcDriver::Graphics::IndirectDrawCounts()[static_cast<std::size_t>(Path::Gpu)] == before + 1u, "the GPU-written builtin record fell back to CPU argument reads");
-            failures += fixture.Check("GPU-written builtin offsets", raw, offsets[0], offsets[1], code == &VertexCode);
-        }
+std::string IndirectPushPatches(Fixture& fixture, bool bufferBase) {
+    using Driver = AgcDriver::DriverDetail::Driver;
+    const bool enabled = std::getenv("APS5_NO_INDIRECT_PUSH_PATCH") == nullptr;
+    const bool verify = std::getenv("APS5_VERIFY_INDIRECT_PUSH_PATCH") != nullptr;
+    auto program = Program(fixture.UserData(0x51u, 0x62u));
+    const std::span<const std::uint32_t> code = bufferBase ? std::span<const std::uint32_t>(BufferBaseCode) : std::span<const std::uint32_t>(VertexCode);
+    program.binary = {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
+    alignas(256) std::array<std::uint32_t, 8> otherTable = BufferTable;
+    std::copy_n(BufferTable.begin() + 4, 4, otherTable.begin());
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(BufferTable.data());
+    if (bufferBase) {
+        program.userData[8] = static_cast<std::uint32_t>(tableAddress);
+        program.userData[9] = static_cast<std::uint32_t>(tableAddress >> 32u);
     }
-    const auto vertex = fixture.Vertex(VertexCode, stale, -1, -1, true);
-    alignas(256) constexpr std::array<std::uint16_t, Vertices> negativeIndices{702, 700, 701};
-    const std::array<std::uint32_t, 5> negative{Vertices, Instances, 0, static_cast<std::uint32_t>(-700), 7};
-    std::copy(negative.begin(), negative.end(), fixture.Records());
-    AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(negativeIndices.data()), Vertices, 2, 0, 0, true, 0, 0};
-    draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x25u, 20u, 20u, 1u, false, 0u, 0x94u, 0x95u, NoLocation, false, 0u};
-    draw.indirect->baseVertexSgpr = BaseVertexSgpr;
-    draw.indirect->startInstanceSgpr = StartInstanceSgpr;
-    draw.indirect->vertexFromBase = true;
-    draw.indirect->instanceFromBase = true;
-    failures += Classified(fixture, "negative builtin base vertex", vertex, stale, draw, std::nullopt, Rule::InPlace);
-    fixture.Place(0, raw, 7);
-    fixture.Draw(vertex, draw);
-    const std::array<std::uint32_t, Vertices> negativeRaw{702, 700, 701};
-    failures += fixture.Check("negative builtin base vertex", negativeRaw, negative[3], 7, true);
-    draw.indirect->indexLimitKnown = false;
-    failures += Classified(fixture, "builtin offsets with unknown index limit", vertex, stale, draw, Path::IndexLimitUnknown, Rule::InPlace);
+    const std::array<ShaderRecompiler::MemoryRegion, 3> regions{{
+        {program.binary.codeAddress, std::as_bytes(code)},
+        {tableAddress, std::as_bytes(std::span(BufferTable))},
+        {reinterpret_cast<std::uintptr_t>(otherTable.data()), std::as_bytes(std::span(otherTable))}
+    }};
+    const std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertexInfo = bufferBase ? ShaderRecompiler::ShaderVertexStageInfo{} : Fixture::VertexInfo();
+    ShaderRecompiler::RecompileRequest request{
+        program.binary, {32, 8, program.userData, std::nullopt, std::nullopt, vertexInfo, regions}, fixture.device->Target(), {0, 0, 0, 64}
+    };
+    const auto handle = ShaderRecompiler::PrepareShader(request);
+    Require(handle != nullptr, "indirect patch test has no prepared shader");
+    AgcDriver::ShaderMemory memory(regions);
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    const auto materialize = [&] {
+        const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+        Require(invocation.has_value(), "indirect patch test lost its prepared invocation");
+        capture = memory.Capture(*invocation);
+        return invocation->Materialize(*capture);
+    };
+    auto result = *materialize();
+    const auto original = result;
+    const auto initialCapture = capture;
+    std::uint32_t materializations = 0;
+    const auto refresh = [&] {
+        return Driver::RefreshIndirectStage(result, capture.get(), program, vertexInfo, [&] {
+            ++materializations;
+            return materialize();
+        });
+    };
+    if (bufferBase) {
+        Require((capture->userDataUse.asBase & (std::uint64_t{1} << 8u)) != 0, "buffer-base test did not capture s16 as a base");
+        const std::array<std::size_t, 1> patchedWords{8};
+        Require(Driver::IndirectStageCacheRefusal(result, capture.get(), program, vertexInfo, patchedWords) == AgcDriver::DriverDetail::IndirectCacheRefusal::CaptureRead, "CPU indirect cache admitted a patched SRT base before its value changed");
+        Require(std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 8u) == 1, "buffer-base test did not also forward s16");
+        const auto otherAddress = reinterpret_cast<std::uintptr_t>(otherTable.data());
+        program.userData[8] = static_cast<std::uint32_t>(otherAddress);
+        program.userData[9] = static_cast<std::uint32_t>(otherAddress >> 32u);
+        Require(!refresh() && materializations == 1, "indirect buffer base did not fall back to materialization");
+        SameResult(result, *materialize());
+        const auto buffers = std::find_if(result.bindings.begin(), result.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
+        Require(buffers != result.bindings.end() && buffers->guestDescriptor.size() >= 4 && std::equal(otherTable.begin(), otherTable.begin() + 4, buffers->guestDescriptor.begin()), "buffer-base fallback retained the old descriptor");
+        std::cout << "indirect buffer-base fallback checked\n";
+        return {};
+    }
+    Require(std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 8u) == 1 && std::count(result.shaderDataUserWords.begin(), result.shaderDataUserWords.end(), 9u) == 1, "indirect patch test did not forward both offset registers");
+    const std::array<std::array<std::uint32_t, 5>, 3> records{{
+        {Vertices, Instances, 0, 700, 59455},
+        {Vertices, Instances, 0, 19, 37},
+        {Vertices, Instances, 0, 0x51u, 0x62u}
+    }};
+    for (std::size_t record = 0; record < records.size(); ++record) std::copy(records[record].begin(), records[record].end(), fixture.Records() + record * 5u);
+    AgcDriver::Pm4::DrawParameters::IndirectDraw indirect{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x38u, 20u, 20u, static_cast<std::uint32_t>(records.size()), false, 0u, 0x10u, 0x11u, NoLocation, false, 0u};
+    indirect.baseVertexSgpr = BaseVertexSgpr;
+    indirect.startInstanceSgpr = StartInstanceSgpr;
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(Indices.data());
+    AgcDriver::Pm4::DrawParameters packet{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+    packet.indirect = indirect;
+    std::string failures = Classified(fixture, "multi-record indirect push patch", result, program.userData, packet, Path::NotFolded, Rule::Constant);
+    const std::array<std::uint32_t, Vertices> raw{Indices[0], Indices[1], Indices[2]};
+    for (std::uint32_t record = 0; record < indirect.count; ++record) {
+        const auto arguments = AgcDriver::Pm4::ReadDrawArguments(indirect, record);
+        program.userData[8] = arguments.vertexOffset;
+        program.userData[9] = arguments.firstInstance;
+        if (record == 0 && enabled) {
+            const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+            Require(invocation.has_value(), "indirect eligibility test lost its prepared invocation");
+            const auto full = invocation->Materialize(*memory.Capture(*invocation));
+            for (std::uint32_t refusal = 0; refusal < 6; ++refusal) {
+                auto candidate = result;
+                auto captured = *capture;
+                auto info = vertexInfo;
+                if (refusal == 0) candidate.shaderDataUserWords.back() = candidate.shaderDataUserWords.front();
+                if (refusal == 1) candidate.shaderDataUserWords.front() = 64;
+                if (refusal == 2) candidate.pushConstants.clear();
+                if (refusal == 3) captured.userDataUse.asValue |= std::uint64_t{1} << 8u;
+                if (refusal == 4) captured.userDataUse.asBase |= std::uint64_t{1} << 8u;
+                if (refusal == 5) info->fetchBufferReg = 8;
+                std::uint32_t calls = 0;
+                Require(!Driver::RefreshIndirectStage(candidate, &captured, program, info, [&] { ++calls; return full; }) && calls == 1, "unsafe indirect push mapping did not fall back");
+                SameResult(candidate, *full);
+            }
+        }
+        Require(refresh() == enabled, "forwarded indirect offsets did not select the expected patch path");
+        const auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle);
+        Require(invocation.has_value(), "indirect comparison lost its prepared invocation");
+        SameResult(result, *invocation->Materialize(*memory.Capture(*invocation)));
+        const auto draw = FoldedDraw(result, program.userData, {indexAddress, arguments.count, 2, arguments.instances, 0, true, 0, 0});
+        fixture.Place(arguments.vertexOffset, raw, arguments.firstInstance);
+        fixture.Draw(result, draw);
+        failures += fixture.Check("indirect push patch record " + std::to_string(record), raw, arguments.vertexOffset, arguments.firstInstance, true);
+    }
+    Require(materializations == (!enabled || verify ? records.size() : 0u), "indirect patch or verification switch used the wrong number of materializations");
+    SameResult(original, *ShaderRecompiler::PreparedShaderInvocation::TryCreate(request, handle)->Materialize(*initialCapture));
+    std::cout << "indirect push patch records checked: " << records.size() << ", materializations " << materializations << '\n';
     return failures;
 }
 
@@ -954,7 +994,7 @@ std::string Run(Fixture& fixture) {
         }
         {
             const std::string what = "indexed indirect record whose program never reads the registers its packet writes the offsets to, vertex offset 700, start instance 59455";
-            const auto vertex = fixture.Vertex(UnreadOffsetsCode, staleUserData, -1, -1);
+            const auto vertex = fixture.Vertex(UnreadOffsetsCode, staleUserData, false, -1, -1);
             AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
             draw.indirect = indexedIndirect;
             failures += Classified(fixture, what, vertex, staleUserData, draw, std::nullopt, Rule::Constant);
@@ -976,13 +1016,13 @@ std::string Run(Fixture& fixture) {
             draw.indirect->baseVertexSgpr = 10;
             draw.indirect->startInstanceLocation = NoLocation;
             draw.indirect->startInstanceSgpr = -1;
-            const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), program, Fixture::MergedVertexInfo(), fixture.device, draw, false);
+            const auto path = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(vertex, fixture.State(), program, fixture.device, draw, false, Fixture::MergedVertexInfo());
             std::cout << what << ": classified to " << PathName(path) << ", user register reads 0x" << std::hex << vertex.userDataRegisterReads << std::dec << '\n';
             if (!path) failures += what + ": classified to the GPU, but the program reads the register its packet writes the base vertex to\n";
         }
         {
             const std::string what = "indexed indirect record whose packet writes the base vertex over the program's vertex buffer table pointer s12";
-            const auto vertex = fixture.Vertex(UnreadOffsetsCode, staleUserData, -1, -1);
+            const auto vertex = fixture.Vertex(UnreadOffsetsCode, staleUserData, false, -1, -1);
             AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
             draw.indirect = indexedIndirect;
             draw.indirect->baseVertexSgpr = 12;
@@ -1031,7 +1071,21 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         if (mode == "--builtin-offsets" && (!device->DrawIndirectSupport().drawParameters || !device->DrawIndirectSupport().firstInstance)) return VulkanTestSkipped;
         Fixture fixture(device);
-        const auto failures = mode == "--builtin-offsets" ? BuiltinOffsets(fixture) : mode == "--cpu-indirect-cache" ? CachedIndirectPatches(fixture) : mode == "--indirect-push-patch" ? IndirectPushPatches(fixture, false) : mode == "--indirect-buffer-base" ? IndirectPushPatches(fixture, true) : Run(fixture);
+        std::string failures;
+        if (argc == 1) failures = Run(fixture);
+        else if (mode == "--builtin-offsets") failures = BuiltinOffsets(fixture);
+        else if (mode == "--cpu-indirect-cache") failures = CachedIndirectPatches(fixture);
+        else if (mode == "--indirect-push-patch") failures = IndirectPushPatches(fixture, false);
+        else if (mode == "--indirect-buffer-base") failures = IndirectPushPatches(fixture, true);
+        else {
+            Require(argc == 3 || argc == 4, "expected runtime-fetch INDEX [compact-restart]");
+            Require(std::string(argv[1]) == "runtime-fetch", "unknown case");
+            const auto index = std::stoul(argv[2]);
+            Require(index < VertexSlots.size(), "index exceeds the runtime input buffer");
+            const bool compactRestart = argc == 4;
+            if (compactRestart) Require(std::string(argv[3]) == "compact-restart", "unknown index path");
+            failures = RuntimeFetch(fixture, static_cast<std::uint32_t>(index), compactRestart);
+        }
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;

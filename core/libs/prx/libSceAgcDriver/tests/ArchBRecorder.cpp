@@ -83,11 +83,11 @@ void reconciles() {
 
 void noPathChange() {
     const auto start = Recorder::Clock::now();
-    std::array<bool, 1024> off{};
+    std::array<bool, std::size_t{1} << RecorderFixtureHandoffCount> off{};
     for (unsigned enabled = 0; enabled != 2; ++enabled) {
         Recorder::Boundary(enabled != 0, enabled, start);
         for (unsigned bits = 0; bits != off.size(); ++bits) {
-            std::array<bool, 10> values{};
+            std::array<bool, RecorderFixtureHandoffCount> values{};
             for (unsigned i = 0; i != values.size(); ++i) values[i] = (bits & (1u << i)) != 0;
             Recorder::Work work({Recorder::Kind::Draw, bits + 1u});
             AgcDriver::PerformanceTimer timer("fixture draw");

@@ -49,7 +49,8 @@ struct DriverTestAccess {
         submission.queue = queue;
         QueueState state{};
         bool wrote = false, interrupt = false, deferred = false, draw = false, sample = false;
-        Driver::Get().preparePacketMemory(submission, state, packet, packet[0], (packet[0] >> 8u) & 0xffu, wrote, interrupt, deferred, draw, sample);
+        const auto opcode = (packet[0] >> 8u) & 0xffu;
+        Driver::Get().preparePacketMemory(submission, state, packet, packet[0], opcode, Driver::releaseInterrupt(packet, opcode, false), wrote, interrupt, deferred, draw, sample);
         return wrote;
     }
     static bool Deferred() { return !deferredLabels().labels.empty(); }

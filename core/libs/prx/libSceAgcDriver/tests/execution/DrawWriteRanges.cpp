@@ -61,11 +61,20 @@ void ConservativeWrites() {
     program.bdaAbiVersion = 0;
     ShaderRecompiler::DescriptorBinding binding;
     binding.count = 1;
-    for (const auto role : {Role::Gds, Role::BdaPagetable, Role::FaultBuffer}) {
+    for (const auto role : {Role::Gds, Role::BdaPagetable}) {
         binding.role = role;
         program.bindings = {binding};
         unknown("an unbounded shader write domain");
     }
+    binding.role = Role::FaultBuffer;
+    program.bindings = {binding};
+    for (const auto abi : {0u, 1u}) {
+        program.bdaAbiVersion = abi;
+        bool bounded = false;
+        Require(DispatchWriteRanges(program, bounded).empty() && bounded, "a fault-buffer-only shader reported guest dispatch writes");
+        for (const bool exact : {false, true}) Require(DrawWriteRanges({}, stages, exact).empty(), "a fault-buffer-only shader reported guest draw writes");
+    }
+    program.bdaAbiVersion = 0;
     binding.role = Role::GuestBuffers;
     program.bindings = {binding};
     unknown("a truncated written buffer");
@@ -324,6 +333,23 @@ int main() {
         Require(bounded, "a dispatch whose written images are a real one and a null one is not bounded");
         Require(Contains(dispatchRanges, written, written + surfaceBytes), "a written image next to a null one is not a dispatch write range");
         Require(!Touches(dispatchRanges, 0, surfaceBytes), "a null storage image is a dispatch write range");
+        auto typeZero = ImageWords(0x500000000ull, 256, 128);
+        typeZero[3] &= 0x0fffffffu;
+        auto typeOne = typeZero;
+        typeOne[3] |= 1u << 28u;
+        const std::array<std::uint32_t, 8> reported{0x04efd000u, 0x00040011u, 0x00017a00u, 0x00005204u, 0x0af00000u, 0u, 0x00000612u, 0x00fff000u};
+        for (const auto& [words, base] : {std::pair{typeZero, 0x500000000ull}, std::pair{typeOne, 0x500000000ull}, std::pair{reported, 0x1104efd00000ull}}) {
+            std::copy(words.begin(), words.end(), program.bindings[0].guestDescriptor.begin() + 8);
+            for (const bool exact : {false, true}) {
+                const auto ranges = DrawWriteRanges(state, stages, exact);
+                Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a TYPE 0 or 1 one is not a write range");
+                Require(!Touches(ranges, base, base + surfaceBytes), "a TYPE 0 or 1 storage image is a write range");
+            }
+            bool typedBounded = false;
+            const auto typedRanges = AgcDriver::DriverDetail::DispatchWriteRanges(program, typedBounded);
+            Require(typedBounded && Contains(typedRanges, written, written + surfaceBytes), "a dispatch whose written images are a real one and a TYPE 0 or 1 one lost the real one");
+            Require(!Touches(typedRanges, base, base + surfaceBytes), "a TYPE 0 or 1 storage image is a dispatch write range");
+        }
         AgcDriver::Graphics::State targets{};
         targets.hasColorTarget = true;
         auto& color = targets.color;

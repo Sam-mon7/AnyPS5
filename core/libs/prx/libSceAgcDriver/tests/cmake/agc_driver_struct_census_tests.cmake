@@ -1,0 +1,7 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_archb_struct_repeat_census COMMAND agc_driver_struct_census_tests)
+    set_tests_properties(agc_archb_struct_repeat_census PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_property(TEST agc_archb_struct_repeat_census APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

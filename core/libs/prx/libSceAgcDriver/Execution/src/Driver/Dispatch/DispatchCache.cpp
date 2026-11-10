@@ -51,7 +51,7 @@ std::uint64_t Driver::DispatchCacheBytes() {
     static const std::uint64_t bytes = [] {
         const char* text = std::getenv("APS5_DISPATCH_CACHE_BYTES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{256} << 20u;
+        return parsed != 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{1} << 30u;
     }();
     return bytes;
 }
@@ -67,9 +67,10 @@ Driver::DispatchCacheFootprint Driver::DispatchCacheSize() {
 }
 
 std::uint64_t Driver::variantBytes(const DispatchVariant& variant) {
-    std::uint64_t feedbackBytes = variant.feedback.bindings.size() * sizeof(WordBitMasks);
-    for (const auto& binding : variant.feedback.bindings) feedbackBytes += binding.size() * sizeof(std::pair<std::uint32_t, std::uint32_t>);
-    return variant.bufferBaseMasks.size() * sizeof(WordBitMasks::value_type) + variant.bufferBasePatches.size() * sizeof(DispatchVariant::BufferBasePatch) + feedbackBytes + sizeof(DispatchVariant) + (variant.feedback.memory.size() + variant.feedback.userData.size() + variant.feedback.pushConstants.size()) * sizeof(std::pair<std::uint32_t, std::uint32_t>) + variant.userData.size() * sizeof(std::uint32_t) + variant.words.size() * sizeof(std::uint32_t) + variant.shared.size() * sizeof(SharedWords) + variant.runs.size() * sizeof(std::pair<std::uint64_t, std::uint64_t>) + variant.captured.size() * sizeof(ShaderRecompiler::MemoryRegion) + (variant.vertexInfo != nullptr ? sizeof(ShaderRecompiler::ShaderVertexStageInfo) : 0) + (variant.indirectCapture != nullptr ? sizeof(ShaderRecompiler::ResourceCapture) + variant.indirectCapture->snapshot.userData.size() * sizeof(std::uint32_t) : 0);
+    const auto held = [](const auto& values) { return static_cast<std::uint64_t>(values.capacity() * sizeof(values[0])); };
+    std::uint64_t feedbackBytes = held(variant.feedback.bindings) + held(variant.feedback.memory) + held(variant.feedback.userData) + held(variant.feedback.pushConstants);
+    for (const auto& binding : variant.feedback.bindings) feedbackBytes += held(binding);
+    return sizeof(DispatchVariant) + held(variant.runs) + held(variant.words) + held(variant.shared) + held(variant.dataPositions) + held(variant.dataSlots) + held(variant.runBases) + held(variant.shaderDataPatches) + held(variant.captured) + held(variant.spans) + (variant.registeredViews != nullptr ? held(*variant.registeredViews) : 0u) + (variant.vertexInfo != nullptr ? sizeof(ShaderRecompiler::ShaderVertexStageInfo) : 0) + (variant.memory != nullptr ? variant.memory->Bytes() : 0) + held(variant.bufferBaseMasks) + held(variant.bufferBasePatches) + feedbackBytes + held(variant.userData) + (variant.indirectCapture != nullptr ? sizeof(ShaderRecompiler::ResourceCapture) + variant.indirectCapture->snapshot.userData.size() * sizeof(std::uint32_t) : 0);
 }
 
 void Driver::accountVariant(const DispatchVariant& variant, bool added) {

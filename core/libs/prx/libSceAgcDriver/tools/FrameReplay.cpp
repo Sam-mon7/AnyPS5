@@ -1,8 +1,8 @@
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
-#include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -40,6 +40,11 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#endif
+#ifdef __linux__
+#include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -83,7 +88,13 @@ struct Options {
 
 class Frames {
 public:
+    void SetSize(std::uint32_t displayWidth, std::uint32_t displayHeight) {
+        width = displayWidth;
+        height = displayHeight;
+    }
+
     void MarkReady() {
+        AgcDriverTracePresent_nid_postfix(width, height);
         std::lock_guard lock(mutex);
         ready.push_back(Clock::now());
     }
@@ -107,6 +118,8 @@ private:
     mutable std::mutex mutex;
     std::vector<Clock::time_point> ready;
     std::exception_ptr failure;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
 };
 
 class ReplayFlip final : public AgcDriver::IFlipRequest {
@@ -156,11 +169,33 @@ bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
         at = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
     }
     return true;
+#elif defined(__linux__)
+    auto cursor = address;
+    HostMapping::Walk(address, address + bytes, "frame replay", [&](const HostMapping::Mapping& mapping) {
+        if (mapping.start > cursor || !mapping.readable || !mapping.writable) return;
+        cursor = std::max(cursor, mapping.end);
+    });
+    return cursor >= address + bytes;
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
     return false;
 #endif
+}
+
+void commit(const FrameMemoryChunk& chunk) {
+    auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
+    const auto bytes = static_cast<std::size_t>(chunk.bytes);
+#ifdef __linux__
+    const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    const auto begin = chunk.address & ~(page - 1);
+    const auto end = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
+    if (begin != chunk.address || end != chunk.address + chunk.bytes) {
+        GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), 0x04);
+        return;
+    }
+#endif
+    GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 0x04, bytes);
 }
 
 std::pair<std::uint64_t, std::uint64_t> progress();
@@ -203,6 +238,31 @@ void mapHostRanges(const FrameCaptureReader& reader, Skipped& skipped) {
         if ((chunk->access & FrameRangeAccess::Gpu) != 0) throw std::runtime_error("frame replay: cannot map the GPU-visible host range at " + std::to_string(chunk->address));
         skipped.Add(*chunk);
     }
+#elif defined(__linux__)
+    const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    std::sort(host.begin(), host.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> envelopes;
+    for (const auto* chunk : host) {
+        const auto begin = chunk->address & ~(page - 1);
+        const auto end = (chunk->address + chunk->bytes + page - 1) & ~(page - 1);
+        if (!envelopes.empty() && begin < envelopes.back().second) envelopes.back().second = std::max(envelopes.back().second, end);
+        else envelopes.emplace_back(begin, end);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> refused;
+    for (const auto& [begin, end] : envelopes) {
+        auto* const wanted = reinterpret_cast<void*>(static_cast<std::uintptr_t>(begin));
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        void* const placed = mmap(wanted, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (placed == wanted) continue;
+        if (placed != MAP_FAILED) munmap(placed, bytes);
+        refused.emplace_back(begin, end);
+    }
+    for (const auto* chunk : host) {
+        const bool blocked = std::any_of(refused.begin(), refused.end(), [&](const auto& range) { return chunk->address < range.second && range.first < chunk->address + chunk->bytes; });
+        if (!blocked) continue;
+        if ((chunk->access & FrameRangeAccess::Gpu) != 0) throw std::runtime_error("frame replay: cannot map the GPU-visible host range at " + std::to_string(chunk->address));
+        skipped.Add(*chunk);
+    }
 #else
     for (const auto* chunk : host) skipped.Add(*chunk);
 #endif
@@ -224,6 +284,7 @@ void restoreSnapshot(const FrameCaptureReader& reader, const Skipped& skipped) {
 }
 
 Skipped restoreMemory(const FrameCaptureReader& reader) {
+    if (reader.Version() < 2) throw std::runtime_error("frame replay: calls format 1 does not record whether GPU writes had landed before each memory delta was read; record the capture again");
     std::uintptr_t base = 0;
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
@@ -231,12 +292,15 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     progress();
     Skipped skipped;
     mapHostRanges(reader, skipped);
+    std::vector<bool> owned;
+    for (const auto& chunk : reader.Chunks()) owned.push_back(chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host && committedWritable(chunk.address, chunk.bytes));
     {
         GuestAllocations::Mutation mutation;
-        for (const auto& chunk : reader.Chunks()) {
+        for (std::size_t index = 0; index < reader.Chunks().size(); ++index) {
+            const auto& chunk = reader.Chunks()[index];
             if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
-            if (committedWritable(chunk.address, chunk.bytes)) {
+            if (owned[index]) {
                 if (!gpu) skipped.Add(chunk);
                 else std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
                 continue;
@@ -250,7 +314,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
                 skipped.Add(chunk);
                 continue;
             }
-            GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 0x04, bytes);
+            commit(chunk);
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
     }
@@ -276,7 +340,7 @@ std::pair<std::uint64_t, std::uint64_t> progress() {
 struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
-    Frames frames;
+    Frames& frames = *new Frames;
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::mutex memoryMutex;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
@@ -424,13 +488,7 @@ struct Replay {
             return;
         case FrameCallKind::Memory: {
             std::lock_guard lock(memoryMutex);
-            const auto found = groups.find(call.values.at(0));
-            if (found == groups.end()) return;
-            for (const auto* chunk : found->second) {
-                if (skipped.Overlaps(*chunk)) continue;
-                restore(reader, *chunk);
-                deltaBytes += chunk->bytes;
-            }
+            restoreGroup(call.values.at(0));
             return;
         }
         case FrameCallKind::FrameStart:
@@ -439,6 +497,58 @@ struct Replay {
             return;
         }
         throw std::runtime_error("frame replay: unknown call kind");
+    }
+
+    static bool rewindWait(const AgcDriver::AwaitedWait& wait) {
+        return wait.function == 0 && wait.bytes == 0;
+    }
+
+    void restoreGroup(std::uint64_t group) {
+        const auto found = groups.find(group);
+        if (found == groups.end()) return;
+        std::array<AgcDriver::AwaitedWait, 64> awaited{};
+        const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
+        std::vector<std::uint64_t> parked;
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            if (rewindWait(awaited[slot])) parked.push_back(awaited[slot].address);
+        }
+        std::vector<std::pair<std::uint32_t*, std::uint32_t>> controls;
+        for (const auto* chunk : found->second) {
+            if (skipped.Overlaps(*chunk)) continue;
+            auto bytes = reader.Read(*chunk);
+            auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
+            AgcDriverPrepareCommandWrite_nid_no_patch(chunk->address, static_cast<std::size_t>(chunk->bytes));
+            for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, bytes.data() + at, sizeof(value));
+                if ((value & AgcDriver::Pm4::RewindValid) == 0) continue;
+                std::uint32_t header = 0;
+                if (at >= 4) std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
+                const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
+                if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
+                controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
+                std::memcpy(bytes.data() + at, target + at, sizeof(value));
+            }
+            std::memcpy(target, bytes.data(), bytes.size());
+            deltaBytes += chunk->bytes;
+        }
+        for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
+    }
+
+    bool releaseRewind(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
+        if (call.kind != FrameCallKind::Memory) return false;
+        const auto found = groups.find(call.values.at(0));
+        if (found == groups.end()) return false;
+        for (const auto* chunk : found->second) {
+            if (chunk->address > wait.address || wait.address + 4 > chunk->address + chunk->bytes || skipped.Overlaps(*chunk)) continue;
+            const auto bytes = reader.Read(*chunk);
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes.data() + (wait.address - chunk->address), sizeof(value));
+            if ((value & AgcDriver::Pm4::RewindValid) == 0) return false;
+            restoreGroup(call.values.at(0));
+            return true;
+        }
+        return false;
     }
 
     static std::uint64_t load(std::uint64_t address, std::size_t bytes) {
@@ -506,6 +616,11 @@ struct Replay {
             const std::size_t bytes = wait.bytes == 8 ? 8 : 4;
             if (wait.function != 0 && satisfies(wait, load(wait.address, bytes))) continue;
             bool released = false;
+            if (rewindWait(wait)) {
+                for (auto index = from; index < calls.size() && !released; ++index) released = releaseRewind(calls[index], wait);
+                if (released) ++earlyReleases;
+                continue;
+            }
             for (auto index = from; index < calls.size() && !released; ++index) released = writeRecordedValue(calls[index], wait);
             for (auto index = std::min(from, calls.size()); index > 0 && !released; --index) {
                 released = writeRecordedValue(calls[index - 1], wait);
@@ -654,8 +769,7 @@ int usage() {
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
                          "  --profile-draws <f> sets APS5_PROFILE_DRAW and APS5_PROFILE_DRAW_SHADERS and writes to <f> one JSON line per\n"
-                         "                      pass and draw program set: its draw packets and the worker's time in each driver draw\n"
-                         "                      phase, slowest first\n"
+                         "                      pass and draw program set, with packet counts and worker draw phases, slowest first\n"
                          "  --shaders           replays nothing and maps no guest memory; lists each shader registration with its code\n"
                          "                      address, size and code hash as the snapshot and the captured writes before it hold them,\n"
                          "                      and how many registrations share that code\n"
@@ -745,6 +859,46 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
     return check;
 }
 
+#ifdef _WIN32
+constexpr int RelaunchAttempts = 8;
+
+int relaunchAttempt() {
+    const char* const text = std::getenv("APS5_FRAME_REPLAY_ATTEMPT");
+    if (text == nullptr) return 0;
+    const std::string_view value = text;
+    int attempt = 0;
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), attempt);
+    if (error != std::errc{} || end != value.data() + value.size() || attempt < 0 || attempt > RelaunchAttempts)
+        throw std::runtime_error("frame replay: APS5_FRAME_REPLAY_ATTEMPT must be a whole number from 0 to " + std::to_string(RelaunchAttempts) + ", not '" + std::string(value) + "'");
+    return attempt;
+}
+
+void relaunchIfHostRegionBlocks(const FrameCaptureReader& reader) {
+    const int attempt = relaunchAttempt() + 1;
+    const auto& chunks = reader.Chunks();
+    const auto blocked = std::find_if(chunks.begin(), chunks.end(), [](const FrameMemoryChunk& chunk) {
+        return chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host && (chunk.access & FrameRangeAccess::Gpu) != 0 &&
+               GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(chunk.address), static_cast<std::size_t>(chunk.bytes));
+    });
+    if (blocked == chunks.end()) return;
+    if (attempt > RelaunchAttempts) return;
+    std::fprintf(stderr, "[frame-replay] a host region sits in the captured GPU range 0x%llx+0x%llx; relaunching (%d of %d)\n", static_cast<unsigned long long>(blocked->address),
+                 static_cast<unsigned long long>(blocked->bytes), attempt, RelaunchAttempts);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (_putenv_s("APS5_FRAME_REPLAY_ATTEMPT", std::to_string(attempt).c_str()) != 0) throw std::runtime_error("frame replay: cannot pass the relaunch count to the next process");
+    std::wstring commandLine = GetCommandLineW();
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process)) throw std::runtime_error("frame replay: cannot relaunch, error " + std::to_string(GetLastError()));
+    CloseHandle(process.hThread);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD code = 2;
+    GetExitCodeProcess(process.hProcess, &code);
+    std::_Exit(static_cast<int>(code));
+}
+#endif
 std::uint64_t contentHash(const std::byte* bytes, std::size_t size) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     for (std::size_t index = 0; index < size; ++index) {
@@ -822,6 +976,11 @@ private:
     std::vector<std::byte> data;
 };
 
+std::uint64_t registeredCode(const Shader& fields) {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
+}
+
+
 template<typename TVisit>
 void visitRegistrations(const FrameCaptureReader& reader, TVisit&& visit) {
     CapturedMemory memory(reader);
@@ -851,9 +1010,6 @@ void visitRegistrations(const FrameCaptureReader& reader, TVisit&& visit) {
     }
 }
 
-std::uint64_t registeredCode(const Shader& fields) {
-    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
-}
 
 std::map<std::uint64_t, std::uint64_t> codeHashes(const FrameCaptureReader& reader) {
     std::map<std::uint64_t, std::uint64_t> hashes;
@@ -863,10 +1019,12 @@ std::map<std::uint64_t, std::uint64_t> codeHashes(const FrameCaptureReader& read
     return hashes;
 }
 
+
 const char* stageName(std::uint8_t stage) {
     static constexpr std::array<const char*, 8> names{"compute", "vertex", "tessellation_control", "tessellation_evaluation", "geometry", "fragment", "local", "mesh"};
     return stage < names.size() ? names[stage] : "unknown";
 }
+
 
 class DrawProfileWriter {
 public:
@@ -923,22 +1081,43 @@ private:
     std::ofstream file;
 };
 
+
 int listShaders(const Options& options) {
     const FrameCaptureReader reader(options.directory);
+    CapturedMemory memory(reader);
     if (!options.shaderCode.empty()) std::filesystem::create_directories(options.shaderCode);
+    std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Delta) groups[chunk.group].push_back(&chunk);
+    }
+    const auto& calls = reader.Calls();
+    const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     std::map<std::uint64_t, std::size_t> copies;
     std::size_t listed = 0, inWindow = 0, unreadable = 0;
-    visitRegistrations(reader, [&](const FrameCall& call, const Shader* fields, const std::vector<std::byte>* bytes, bool window) {
-        if (fields == nullptr || bytes == nullptr) {
-            ++unreadable;
-            return;
+    for (auto call = calls.begin(); call != calls.end(); ++call) {
+        if (call->kind == FrameCallKind::Memory) {
+            if (const auto found = groups.find(call->values.at(0)); found != groups.end()) memory.Apply(found->second);
+            continue;
         }
-        const auto code = registeredCode(*fields);
+        if (call->kind != FrameCallKind::RegisterShader) continue;
+        const auto header = memory.Read(call->address, sizeof(Shader));
+        if (!header) {
+            ++unreadable;
+            continue;
+        }
+        Shader fields{};
+        std::memcpy(&fields, header->data(), sizeof(Shader));
+        const auto code = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code)));
+        const auto bytes = fields.shader_size != 0 ? memory.Read(code, fields.shader_size) : std::nullopt;
+        if (!bytes) {
+            ++unreadable;
+            continue;
+        }
         const auto hash = contentHash(bytes->data(), bytes->size());
         const auto copy = ++copies[hash];
         if (copy == 1 && !options.shaderCode.empty()) {
             char name[64];
-            std::snprintf(name, sizeof(name), "type%u-%016llx.bin", static_cast<unsigned>(fields->type), static_cast<unsigned long long>(hash));
+            std::snprintf(name, sizeof(name), "type%u-%016llx.bin", static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash));
             const auto path = options.shaderCode / name;
             std::ofstream file(path, std::ios::binary | std::ios::trunc);
             if (!file.is_open()) throw std::runtime_error("frame replay: cannot open " + path.string());
@@ -949,11 +1128,12 @@ int listShaders(const Options& options) {
             file.close();
             if (!file) throw std::runtime_error("frame replay: cannot close " + path.string());
         }
+        const bool window = frameStart != calls.end() && call > frameStart;
         ++listed;
         inWindow += window ? 1 : 0;
-        std::printf("{\"ordinal\":%llu,\"in_window\":%s,\"header\":%llu,\"code\":%llu,\"bytes\":%u,\"type\":%u,\"hash\":\"%016llx\",\"copy\":%zu}\n", static_cast<unsigned long long>(call.ordinal), window ? "true" : "false",
-                    static_cast<unsigned long long>(call.address), static_cast<unsigned long long>(code), fields->shader_size, static_cast<unsigned>(fields->type), static_cast<unsigned long long>(hash), copy);
-    });
+        std::printf("{\"ordinal\":%llu,\"in_window\":%s,\"header\":%llu,\"code\":%llu,\"bytes\":%u,\"type\":%u,\"hash\":\"%016llx\",\"copy\":%zu}\n", static_cast<unsigned long long>(call->ordinal), window ? "true" : "false",
+                    static_cast<unsigned long long>(call->address), static_cast<unsigned long long>(code), fields.shader_size, static_cast<unsigned>(fields.type), static_cast<unsigned long long>(hash), copy);
+    }
     std::printf("{\"registrations\":%zu,\"in_window\":%zu,\"distinct_code\":%zu,\"unreadable\":%zu}\n", listed, inWindow, copies.size(), unreadable);
     std::fflush(stdout);
     return 0;
@@ -1068,6 +1248,9 @@ int run(const Options& options) {
     if (!options.profileDraws.empty()) drawProfile.emplace(options.profileDraws);
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
+#ifdef _WIN32
+    relaunchIfHostRegionBlocks(reader);
+#endif
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
@@ -1077,6 +1260,8 @@ int run(const Options& options) {
         if (chunk.kind == FrameMemoryKind::Delta) replay.groups[chunk.group].push_back(&chunk);
     }
     const auto& calls = reader.Calls();
+    const auto display = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::DisplayBuffer && call.values.size() >= 4; });
+    if (display != calls.end()) replay.frames.SetSize(static_cast<std::uint32_t>(display->values[2]), static_cast<std::uint32_t>(display->values[3]));
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
     for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
     const auto journalStart = Clock::now();
@@ -1224,15 +1409,20 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
     configureEnvironment(options);
     int code = 2;
+    const bool listing = options.shaders || options.submits != 0;
     try {
-        const bool listing = options.shaders || options.submits != 0;
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
-        if (code == 0 && !listing) {
-            AgcDriverShutdown_nid_postfix();
-            return 0;
-        }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+    }
+    if (!listing) {
+        try {
+            AgcDriverShutdown_nid_postfix();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
+            if (code == 0) code = 2;
+        }
+        if (code == 0) return 0;
     }
     std::fflush(stdout);
     std::fflush(stderr);

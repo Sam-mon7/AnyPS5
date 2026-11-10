@@ -64,7 +64,7 @@ struct DriverTestAccess {
         if (holdLock) lock.lock();
         const auto bytes = Pm4::WaitAwaitedBytes(packet);
         const auto address = (packet[2] & (bytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
-        return driver.storedSince(packet, address, bytes, received, &writer, &seen);
+        return driver.storedSince(packet, address, bytes, received, 0, &writer, &seen);
     }
 };
 
@@ -292,6 +292,11 @@ void CheckCommandBufferSubmission() {
     Require(sceAgcDriverSubmitMultiCommandBuffers(&graphicsCtx, cmdBufs, cmdSizes, 0) == 0, "empty multi submission failed");
     Require(sceAgcDriverSubmitMultiCommandBuffers(&graphicsCtx, cmdBufs, cmdSizes, 1) == 0, "graphics context multi submit failed");
     Require(sceAgcDriverSubmitMultiCommandBuffers(&computeCtx, cmdBufs, cmdSizes, 1) == 0, "compute context multi submit failed");
+
+    alignas(alignof(std::uint32_t)) char unalignedBuffer[sizeof(MockQueueContext) + 4]{};
+    auto* unalignedCtx = reinterpret_cast<void*>(unalignedBuffer + 1);
+    Require(sceAgcDriverSubmitCommandBuffer(unalignedCtx, &emptyPacket) == 0, "unaligned context submit must succeed");
+    Require(sceAgcDriverSubmitMultiCommandBuffers(unalignedCtx, cmdBufs, cmdSizes, 1) == 0, "unaligned context multi submit must succeed");
 
     bool submitRejected = false;
     try {

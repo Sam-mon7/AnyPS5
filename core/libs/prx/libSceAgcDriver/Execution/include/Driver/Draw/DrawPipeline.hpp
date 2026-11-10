@@ -33,6 +33,8 @@ public:
     // Transition: the first queue-0 submission after APS5_ARCHB_PIPE_Q0_COMMITTER turned off drains
     // what the pipelined submissions before it left queued.
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Transition, Count };
+    enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
+    enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
     // What an item commits, for the pipe_commits_* counters only (the `draw` flag of Enqueue keeps
     // its own meaning: a non-draw item breaks proofs after it runs).
     enum class ItemKind : std::uint8_t { Other, Draw, Dispatch, Label, Dma, Fill, Count };
@@ -155,12 +157,16 @@ public:
     // Never waits while the calling thread holds the GPU mutex: a full pipeline then takes the item
     // past its capacity (the committer needs the mutex to make room).
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind kind = ItemKind::Other, std::shared_ptr<ResolveSlot> resolve = nullptr);
+    void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind itemKind = ItemKind::Other, std::shared_ptr<ResolveSlot> resolve = nullptr);
+    void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
+    static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     // Waits until every queued item has committed. A caller holding the GPU mutex must drain before
     // taking it; if one does not, the wait runs with its hold given up (counted, see LockedDrains).
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, DrainCause cause = DrainCause::None);
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    static std::uint64_t DrainRequestsByReason(DrainReason reason);
     bool Busy() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
@@ -177,6 +183,7 @@ public:
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
     static std::uint64_t HeldReadQueries();
     void ReleaseRunningReads();
+    QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
 
     static bool MetadataPassesPipelined();
     static void CountPipelinedMetadataPass();
@@ -189,6 +196,8 @@ private:
         std::vector<std::byte> labelBytes;
         std::vector<Range> reads;
         bool draw = false;
+        bool store = false;
+        CommitKind commitKind = CommitKind::Other;
         ItemKind kind = ItemKind::Other;
         // APS5_COLLECT_AHEAD_CENSUS: when queue 0 enqueued the item, and the collect clock then.
         std::uint64_t enqueuedNs = 0;
@@ -200,6 +209,7 @@ private:
         std::vector<Range> writes;
     };
     DrawPipeline() = default;
+    void enqueue(Item item);
     void run();
     void runResolver();
     void startResolvers();
@@ -243,6 +253,9 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

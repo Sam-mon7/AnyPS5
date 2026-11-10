@@ -1,4 +1,5 @@
 #include "Optimization/SrtWalker/SrtTape.hpp"
+#include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
@@ -377,6 +378,8 @@ struct SrtTape::Frame {
     std::uint8_t* states;
     bool fast = false;
     bool nullRoot = false;
+    std::uint32_t addressDepth = 0;
+    std::size_t descriptorBytes = 0;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -442,6 +445,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
     }
     std::array<std::uint64_t, 5> operand{};
     std::int32_t origin = -1;
+    const bool addressCone = node.op == Op::Read || node.op == Op::ReadConstBuffer;
     for (std::uint8_t index = 0; index < node.argumentCount; ++index) {
         if (index == 0 && node.baseWord >= 0 && frame.runtime.userDataUse != nullptr && static_cast<std::size_t>(node.baseWord) < frame.runtime.userData.size()) {
             origin = node.baseWord;
@@ -453,7 +457,11 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             operand[index] = node.arguments[index];
             continue;
         }
-        if (!evaluate(frame, node.arguments[index], operand[index])) return false;
+        const bool nestedAddress = addressCone || (node.op == Op::Select && index == 0u);
+        if (nestedAddress) ++frame.addressDepth;
+        const bool ok = evaluate(frame, node.arguments[index], operand[index]);
+        if (nestedAddress) --frame.addressDepth;
+        if (!ok) return false;
     }
     const auto a = operand[0];
     const auto b = operand[1];
@@ -502,7 +510,11 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             const auto reader = node.clean ? frame.runtime.readSpecializationMemory : frame.runtime.readMemory;
             std::uint32_t word = 0;
             if (reader != nullptr) {
-                if (!reader(frame.runtime.userContext, address, &word)) return false;
+                const bool scoped = frame.addressDepth == 0u && frame.descriptorBytes != 0u && frame.runtime.descriptorScope != nullptr;
+                if (scoped) static_cast<void>(frame.runtime.descriptorScope(frame.runtime.userContext, frame.descriptorBytes));
+                const bool ok = reader(frame.runtime.userContext, address, &word);
+                if (scoped) static_cast<void>(frame.runtime.descriptorScope(frame.runtime.userContext, 0u));
+                if (!ok) return false;
             } else {
                 std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
             }
@@ -627,6 +639,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         return false;
     };
     struct Scratch {
+        std::uint32_t attempt = 0;
         std::vector<std::uint64_t> values;
         std::vector<std::uint8_t> states;
         std::vector<std::uint8_t> active;
@@ -639,6 +652,11 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     };
     struct ScratchStorage {};
     auto& sharedScratch = HostThreadLocal<Scratch, ScratchStorage>();
+    struct AttemptScope {
+        std::uint32_t& depth;
+        ~AttemptScope() { --depth; }
+    } attemptScope{sharedScratch.attempt};
+    const auto attempt = sharedScratch.attempt++;
     std::optional<Scratch> localScratch;
     if (fast && sharedScratch.busy) localScratch.emplace();
     auto& scratch = localScratch ? *localScratch : sharedScratch;
@@ -667,6 +685,8 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
     Frame frame {runtime, values, states, fast};
+    const SrtForceSyncScope forceSync(runtime, attempt == 2u);
+    const auto invalidationsBefore = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
     auto& active = scratch.active;
     const auto imageBase = plan.descriptorSources.size();
     if (fast) active.assign(initialActive.begin(), initialActive.end());
@@ -704,7 +724,11 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             for (const auto image : block.images) active[imageBase + image] = 1u;
             for (const auto slot : block.flatSlots) activeFlat[slot] = 1u;
             std::uint64_t condition = 0;
-            const bool cleanEvaluable = block.condition != nullptr && runtime.readSpecializationMemory != nullptr && conditionRoots[index] != NoNode && evaluate(frame, conditionRoots[index], condition);
+            bool cleanEvaluable = false;
+            {
+                const SrtBranchScope branch;
+                cleanEvaluable = block.condition != nullptr && runtime.readSpecializationMemory != nullptr && conditionRoots[index] != NoNode && evaluate(frame, conditionRoots[index], condition);
+            }
             if (frame.nullRoot) return refuse();
             if (cleanEvaluable) {
                 if (block.successors.size() < 2) return refuse();
@@ -714,6 +738,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             }
         }
     }
+    if (!plan.controlFlow.empty() && !ApplySourceBlockGuards(plan, scratch.visited, active)) return refuse();
     auto& evaluated = scratch.evaluated;
     evaluated.clear();
     evaluated.reserve(plan.materializationSources.size());
@@ -725,7 +750,10 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         if (active[sourceIndex]) {
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
                 std::uint64_t word = 0;
-                if (!evaluate(frame, sourceDwords[sourceIndex][dword], word)) return refuse();
+                frame.descriptorBytes = source.dwordCount > 1u ? static_cast<std::size_t>(source.dwordCount - dword) * sizeof(std::uint32_t) : 0u;
+                const bool ok = evaluate(frame, sourceDwords[sourceIndex][dword], word);
+                frame.descriptorBytes = 0u;
+                if (!ok) return refuse();
                 value.dwords[dword] = static_cast<std::uint32_t>(word);
             }
         }
@@ -747,6 +775,10 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         if (pure) trace->leaf = nullptr;
         if (!ok) return refuse();
         flattened[read.flatOffset] = static_cast<std::uint32_t>(word);
+    }
+    if (runtime.descriptorScope != nullptr && runtime.descriptorScope(runtime.userContext, 0u) != invalidationsBefore) {
+        refuse();
+        return attempt + 1u < 3u && Run(plan, runtime, results, flat, activeSources);
     }
     results.swap(evaluated);
     activeSources.swap(active);

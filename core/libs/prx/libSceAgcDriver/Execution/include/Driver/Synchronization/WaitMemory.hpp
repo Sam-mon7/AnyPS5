@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace AgcDriver::DriverDetail {
 
@@ -49,6 +50,8 @@ struct EpochBumps {
 };
 
 void PollSleep();
+
+bool OwnStoreRejects(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes, std::uint32_t queue);
 
 }
 

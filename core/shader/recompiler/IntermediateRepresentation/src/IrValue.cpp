@@ -5,24 +5,8 @@
 
 namespace ShaderRecompiler {
 
-IrValue::IrValue(IrOpcode opcode, IrType type, std::uint32_t id) : opcode(opcode), type(type), id(id), hasImmediate(false), parent(nullptr) {
+IrValue::IrValue(IrOpcode opcode, IrType type, std::uint32_t id, std::pmr::memory_resource* useArena) : opcode(opcode), type(type), id(id), hasImmediate(false), useArena(useArena), parent(nullptr) {
     arguments.reserve(IrOpcodeOperandCount(opcode));
-}
-
-std::uint32_t IrValue::Id() const {
-    return id;
-}
-
-const std::vector<IrValue*>& IrValue::Arguments() const {
-    return arguments;
-}
-
-IrBlock* IrValue::Parent() const {
-    return parent;
-}
-
-std::uint32_t IrValue::ImmediateU32() const {
-    return static_cast<std::uint32_t>(immediateBits);
 }
 
 void IrValue::AddArgument(IrValue* argument) {
@@ -97,20 +81,8 @@ bool IrValue::IsEmpty() const {
     return opcode == IrOpcode::Void;
 }
 
-bool IrValue::IsPhi() const {
-    return opcode == IrOpcode::Phi;
-}
-
 bool IrValue::MayHaveSideEffects() const {
     return IrOpcodeHasSideEffects(opcode);
-}
-
-bool IrValue::HasUses() const {
-    return operandUses != nullptr && !operandUses->empty();
-}
-
-std::size_t IrValue::UseCount() const {
-    return operandUses != nullptr ? operandUses->size() : 0;
 }
 
 std::size_t IrValue::PhiBlockCount() const {
@@ -124,17 +96,24 @@ IrBlock* IrValue::PhiBlock(std::size_t index) const {
     return (*phiBlocks)[index];
 }
 
-std::span<const IrUse> IrValue::OperandUses() const {
-    return operandUses != nullptr ? std::span<const IrUse>(*operandUses) : std::span<const IrUse>{};
+const IrUseList& IrValue::OperandUses() const {
+    static const IrUseList empty;
+    return operandUses != nullptr ? *operandUses : empty;
 }
 
 std::size_t IrValue::OperandUseCapacity() const {
     return operandUses != nullptr ? operandUses->capacity() : 0;
 }
 
-std::vector<IrUse>& IrValue::MutableUses() {
-    if (operandUses == nullptr) operandUses = std::make_unique<std::vector<IrUse>>();
+IrUseList& IrValue::MutableUses() {
+    if (operandUses == nullptr) operandUses = std::make_unique<IrUseList>(IrUseAllocator<IrUse>(useArena));
     return *operandUses;
+}
+
+void IrValue::MoveUsesToHeap() {
+    useArena = nullptr;
+    if (operandUses == nullptr || operandUses->get_allocator().Arena() == nullptr) return;
+    *operandUses = IrUseList(operandUses->begin(), operandUses->end(), IrUseAllocator<IrUse>{});
 }
 
 std::uint64_t IrValue::ImmediateU64() const {

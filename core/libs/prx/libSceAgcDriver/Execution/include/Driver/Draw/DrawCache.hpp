@@ -80,6 +80,7 @@ struct DrawEntry {
     std::uint64_t touched = 0;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
+    std::shared_ptr<DrawEntry> donor;
 };
 
 struct DrawDataCandidate {
@@ -97,7 +98,7 @@ struct StageDataHit {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
 
-enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
+enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, QueuedStores, Layout, Gate, Stages, Count };
 
 enum class IndirectCacheRefusal : std::size_t { None, Disabled, EntriesDisabled, Path, Capture, Plan, CaptureRead, VertexDecode, PushMapping, Admission, Count };
 
@@ -109,7 +110,7 @@ struct DrawEntryCounters {
 
     std::uint64_t registerKeyLookups = 0, registerKeyHits = 0, decodeSkipped = 0, decodePartial = 0, facadeMismatches = 0, verifyDecodes = 0, verifyDecodeMismatches = 0;
     double keyUs = 0;
-    std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
+    std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0, byteEvictions = 0;
     std::uint64_t skippedIndirectCpu = 0, skippedNotAdmitted = 0;
     std::uint64_t indirectCpuHits = 0, indirectCpuMisses = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(IndirectCacheRefusal::Count)> indirectCpuRefused{};
@@ -117,6 +118,7 @@ struct DrawEntryCounters {
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
+    std::uint64_t recordWordsForwarded = 0, recordStagesRecompiled = 0, recordWordsRefused = 0, recordWordsVerified = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -138,6 +140,7 @@ enum class DrawVerdict { Drawn, Nothing, Rejected };
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied;
     std::uint64_t forgetSerial = 0;
@@ -153,6 +156,8 @@ struct StageCapture {
 struct RelocatableUserWord {
     std::uint32_t reg;
     std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
+    bool value = false;
+    std::uint32_t high = 0;
 };
 
 struct DrawRelocation {

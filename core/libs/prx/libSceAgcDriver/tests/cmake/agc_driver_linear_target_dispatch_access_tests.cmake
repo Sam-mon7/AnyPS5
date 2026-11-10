@@ -1,0 +1,10 @@
+if(BUILD_TESTING)
+    foreach(computeSyncMode IN ITEMS 0 1)
+        add_test(NAME agc_archb_fix_compute_sync_unlocked_stress_${computeSyncMode} COMMAND agc_driver_linear_target_dispatch_access_tests --compute-sync)
+        set_tests_properties(agc_archb_fix_compute_sync_unlocked_stress_${computeSyncMode} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+            ENVIRONMENT "APS5_ARCHB_FIX_COMPUTE_SYNC_UNLOCKED=${computeSyncMode};APS5_ARCHB_RECORDER=1;ANYPS5_NO_SHADER_CACHE=1")
+        if(WIN32)
+            set_tests_properties(agc_archb_fix_compute_sync_unlocked_stress_${computeSyncMode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+        endif()
+    endforeach()
+endif()
