@@ -2231,7 +2231,7 @@ Recorder::LazyFenceScope::~LazyFenceScope() {
 bool Recorder::DeferWriterWait(std::uint64_t address, std::size_t bytes, std::uint64_t writer, bool imported) {
     if (writer == 0 || bytes == 0 || !LazyFenceEnabled()) return false;
     auto& state = lazyFenceThread();
-    if (state.allowed == 0 || completionDepth != 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    if (state.allowed == 0 || completionDepth() != 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     auto& counters = lazyFenceCounters();
     counters.candidates.fetch_add(1, std::memory_order_relaxed);
     if (state.depth != 0) counters.depthCandidates.fetch_add(1, std::memory_order_relaxed);
@@ -6336,7 +6336,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         if (censusSite.on) {
             const bool active = activeSyncSite != NoSyncSite && activeSyncSite < syncSites.size();
             const auto packet = GuestMemory::CurrentPacket();
-            censusSite.key = FenceCensusKey{GuestMemory::IsCommitterThread() ? CommitterRole : GuestMemory::GpuLockThreadTag(), active ? syncSites[activeSyncSite].source : -1, active ? syncSites[activeSyncSite].site : nullptr, static_cast<std::uint8_t>(GuestMemory::CurrentReadSite()), packet.opcode, static_cast<std::uint8_t>(fenceThread().reason), completionDepth != 0, GuestMemory::GpuMutex().DepthOnThisThread() > 1, batch->serial == submissions};
+            censusSite.key = FenceCensusKey{GuestMemory::IsCommitterThread() ? CommitterRole : GuestMemory::GpuLockThreadTag(), active ? syncSites[activeSyncSite].source : -1, active ? syncSites[activeSyncSite].site : nullptr, static_cast<std::uint8_t>(GuestMemory::CurrentReadSite()), packet.opcode, static_cast<std::uint8_t>(fenceThread().reason), completionDepth() != 0, GuestMemory::GpuMutex().DepthOnThisThread() > 1, batch->serial == submissions};
             censusSite.signaled = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
             censusSite.start = std::chrono::steady_clock::now();
         }
