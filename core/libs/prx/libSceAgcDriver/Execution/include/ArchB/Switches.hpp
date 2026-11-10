@@ -104,6 +104,7 @@ enum class Feature : std::uint8_t {
     FixComputeSnapshotWait,
     FixHostSlabAlloc,
     FixCheapTimers,
+    ReplayRecognize,
     Count
 };
 

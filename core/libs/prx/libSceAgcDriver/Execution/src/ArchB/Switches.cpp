@@ -212,6 +212,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixComputeSnapshotWait, "FIX_COMPUTE_SNAPSHOT_WAIT", false, true, ComputeSnapshotWaitPrerequisites},
     {Feature::FixHostSlabAlloc, "FIX_HOST_SLAB_ALLOC", false, true, {}},
     {Feature::FixCheapTimers, "FIX_CHEAP_TIMERS", false, true, {}},
+    {Feature::ReplayRecognize, "REPLAY_RECOGNIZE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

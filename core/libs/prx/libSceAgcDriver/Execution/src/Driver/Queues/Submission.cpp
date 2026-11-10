@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionRecognizer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -539,6 +542,44 @@ void Driver::SubmitFlip(const FlipInfo& info) {
     Submit(&packet, 0, true);
 }
 
+namespace {
+
+void recognizeRegion(std::uint32_t queue, std::span<const std::uint32_t> commands, bool endsFrame) {
+    if (!ArchB::Switches::Enabled(ArchB::Feature::ReplayRecognize)) return;
+    static auto* const recognizer = new Replay::RegionRecognizer;
+    static auto* const guard = new std::mutex;
+    static auto* const kindNames = new std::map<std::uint32_t, std::string>;
+    const std::lock_guard lock(*guard);
+    const auto report = recognizer->Observe(queue, commands);
+    static constexpr const char* names[3][4] = {
+        {"replay_rec_regions_new", "replay_rec_draws_new", "replay_rec_dispatches_new", "replay_rec_packets_new"},
+        {"replay_rec_regions_structure", "replay_rec_draws_structure", "replay_rec_dispatches_structure", "replay_rec_packets_structure"},
+        {"replay_rec_regions_exact", "replay_rec_draws_exact", "replay_rec_dispatches_exact", "replay_rec_packets_exact"},
+    };
+    const auto& name = names[static_cast<std::size_t>(report.match)];
+    ArchB::Recorder::Count(name[0]);
+    ArchB::Recorder::Count(name[1], report.draws);
+    ArchB::Recorder::Count(name[2], report.dispatches);
+    ArchB::Recorder::Count(name[3], report.packets);
+    if (report.patchWords != 0) {
+        ArchB::Recorder::Count("replay_rec_patch_words", report.patchWords);
+        ArchB::Recorder::Count("replay_rec_patch_words_alternating", report.alternatingWords);
+        ArchB::Recorder::Count(report.stablePatches ? "replay_rec_patch_regions_stable" : "replay_rec_patch_regions_moving");
+        for (const auto& [kind, words] : report.patchWordsByKind) {
+            auto& name = (*kindNames)[kind];
+            if (name.empty()) {
+                char text[48];
+                std::snprintf(text, sizeof(text), "replay_rec_patch_kind_%03x", kind);
+                name = text;
+            }
+            ArchB::Recorder::Count(name.c_str(), words);
+        }
+    }
+    if (endsFrame) recognizer->EndFrame();
+}
+
+}
+
 void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
@@ -597,6 +638,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
         checkStopping();
         require(accepted != std::numeric_limits<std::uint64_t>::max(), "submission serial overflow");
         reserveOutputs(submission);
+        recognizeRegion(queue, submission.commands, !submission.flips.empty());
         if (unorderedFlip && capture == nullptr && accepted != 0 && flipsAhead.load(std::memory_order_acquire) == 0) {
             const auto now = FrameTiming::Clock::now();
             auto frame = std::make_shared<FrameTiming>(++frameSerial);
