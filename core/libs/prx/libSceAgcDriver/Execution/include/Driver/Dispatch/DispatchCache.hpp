@@ -160,6 +160,8 @@ struct DataMask {
     std::span<const std::pair<std::uint32_t, std::uint32_t>> feedback;
     bool* feedbackHit = nullptr;
     std::span<const std::pair<std::uint32_t, std::uint32_t>> bufferBases;
+    std::span<const std::uint32_t> storedWords;
+    std::vector<std::uint32_t>* refreshedWords = nullptr;
 };
 
 bool SameCapturedRuns(std::span<const std::pair<std::uint64_t, std::uint64_t>> before, std::span<const std::pair<std::uint64_t, std::uint64_t>> after);

@@ -359,7 +359,7 @@ private:
     static std::shared_ptr<const ShaderRecompiler::RecompileResult> patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words, bool bufferBases = false);
     bool syncPendingRuns(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& synced, PendingView& pending, std::optional<SampledReadScope>& sampling, std::span<const VouchedRegions> skipped = {});
     // `consumer` names the validation for the write-generation counters (GEN_DRAW_VALIDATION).
-    EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr, bool feedbackMask = false, bool* feedbackHit = nullptr, bool bufferBases = false, GuestMemory::Gen::Consumer consumer = GuestMemory::Gen::Consumer::DrawValidate);
+    EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr, bool feedbackMask = false, bool* feedbackHit = nullptr, bool bufferBases = false, GuestMemory::Gen::Consumer consumer = GuestMemory::Gen::Consumer::DrawValidate, std::vector<std::uint32_t>* refreshedWords = nullptr);
     static int waitTimeoutMs();
     static bool pollReapAll();
     static bool pollTryEach();

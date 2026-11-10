@@ -95,6 +95,10 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
             const auto position = static_cast<std::uint32_t>(first + i);
             if (((stored ^ fresh) & ~WordMask(data->feedback, position)) == 0u) {
                 if (data->feedbackHit != nullptr) *data->feedbackHit = true;
+                if (data->refreshedWords != nullptr) {
+                    if (data->refreshedWords->empty()) data->refreshedWords->assign(data->storedWords.begin(), data->storedWords.end());
+                    (*data->refreshedWords)[position] = fresh;
+                }
                 continue;
             }
             const bool bufferBase = ((stored ^ fresh) & ~WordMask(data->bufferBases, position)) == 0u;
@@ -128,6 +132,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         reachedPending = 0;
         if (data != nullptr && data->live != nullptr) data->live->clear();
         if (data != nullptr && data->feedbackHit != nullptr) *data->feedbackHit = false;
+        if (data != nullptr && data->refreshedWords != nullptr) data->refreshedWords->clear();
         for (std::size_t i = 0, range = 0; i < captured.size(); ++i) {
             if (range < skipped.size() && i == skipped[range].begin) {
                 first += skipped[range].words;

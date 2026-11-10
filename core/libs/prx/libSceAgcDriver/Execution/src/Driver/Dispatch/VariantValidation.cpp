@@ -215,11 +215,12 @@ GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer cons
     return verdict;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, bool feedbackMask, bool* feedbackHit, bool bufferBases, GuestMemory::Gen::Consumer consumer, std::vector<std::uint32_t>* refreshedWords) {
     namespace Gen = GuestMemory::Gen;
     variantCompared = false;
     variantExact = false;
     if (live != nullptr) live->clear();
+    if (refreshedWords != nullptr) refreshedWords->clear();
     if (feedbackHit != nullptr) *feedbackHit = false;
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
@@ -232,7 +233,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     const bool masked = live != nullptr && (!variant.dataPositions.empty() || refreshBuffers);
     const bool feedback = feedbackMask && !validateLegacy() && !variant.feedback.memory.empty();
     if (feedbackMask && validateLegacy() && !variant.feedback.memory.empty()) ArchB::Recorder::Count("fix_tsharp_mask_refused_legacy");
-    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit, refreshBuffers ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.bufferBaseMasks) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}};
+    const DataMask mask{masked ? std::span<const std::uint32_t>(variant.dataPositions) : std::span<const std::uint32_t>{}, live, feedback ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, feedbackHit, refreshBuffers ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(variant.bufferBaseMasks) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}, variant.words, feedback ? refreshedWords : nullptr};
     if (bufferBases && validateLegacy() && !variant.bufferBaseMasks.empty()) ArchB::Recorder::Count("fix_buffer_base_refused_legacy");
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);

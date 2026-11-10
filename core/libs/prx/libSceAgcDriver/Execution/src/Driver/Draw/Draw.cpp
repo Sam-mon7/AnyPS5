@@ -372,7 +372,7 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
                 noteHeld(stage == ShaderRecompiler::ShaderStage::Fragment ? HeldReason::NullFragment : stage == ShaderRecompiler::ShaderStage::Vertex ? HeldReason::NullVertex : HeldReason::NullOther);
                 return held;
             }
-            for (const auto& [candidate, regions, feedbackHit] : tail.dataCandidates[i]) {
+            for (const auto& [candidate, regions, feedbackHit, words] : tail.dataCandidates[i]) {
                 if (candidate == nullptr || candidate->compiled == nullptr) {
                     noteHeld(HeldReason::NullOther);
                     return held;
@@ -1283,6 +1283,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
                 matched[i] = candidate->variant;
                 stageCaptures[i].registeredViews = matched[i]->registeredViews;
+                if (!candidate->words.empty()) stageData[i].words = std::move(candidate->words);
                 matchedRegions[i] = std::move(candidate->regions);
                 reused[i] = true;
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
