@@ -57,6 +57,7 @@
 #include "Sample3D_spv.h"
 #include "Cover_vert_spv.h"
 #include "Cover_frag_spv.h"
+#include "ReplaySplitFaces_vert_spv.h"
 #include "VertexRange_vert_spv.h"
 #include "VertexRangeProducer_frag_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
@@ -15931,13 +15932,15 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
     const char* verifyText = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_VERIFY");
     const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
     constexpr std::size_t unit = 65536;
-    constexpr std::size_t bytes = unit * 2;
+    const bool splitFaces = scenario.starts_with("split_faces_");
+    const std::size_t bytes = unit * (splitFaces ? 4 : 2);
     void* watched = AllocateWatched(bytes, unit);
     if (watched == nullptr) return 77;
     struct Release {
         void* watched;
+        std::size_t bytes;
         ~Release() { ReleaseWatched(watched, bytes); }
-    } release{watched};
+    } release{watched, bytes};
     auto* block = static_cast<std::byte*>(watched);
     std::fill_n(block, bytes, std::byte{0});
     const auto address = reinterpret_cast<std::uint64_t>(block);
@@ -15953,11 +15956,13 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
         const Context& context;
         Recorder& recorder;
         void* block;
+        std::size_t bytes;
         ~Cleanup() {
             recorder.Sync();
             WaitForOptimizedPipelines(context.device);
             SharedResourceCache().Clear();
             ClearCachedTextures(context.device);
+            ClearDepthSurfaces(context.device);
             recorder.Sync();
             ClearCachedPipelines(context.device);
             {
@@ -15966,7 +15971,7 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
             }
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
         }
-    } cleanup{context, recorder, block};
+    } cleanup{context, recorder, block, bytes};
     if (HostImportFor(context, address, bytes) == nullptr) return 77;
     AgcDriver::GuestMemory::MarkCommitterThread();
     const auto shader = [](auto& words, std::uint64_t variant) {
@@ -15975,7 +15980,7 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
         program->variantId = variant;
         return program;
     };
-    const auto vertex = shader(COVER_VERT_SPV, 301);
+    const auto vertex = splitFaces ? shader(REPLAY_SPLIT_FACES_VERT_SPV, 304) : shader(COVER_VERT_SPV, 301);
     const auto pixel = shader(COVER_FRAG_SPV, 302);
     const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
     const auto stateFor = [](std::uint64_t base, std::int32_t width) {
@@ -15995,12 +16000,31 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
     };
     const auto whole = stateFor(address, 64);
     const auto left = stateFor(address, 32);
+    if (splitFaces) {
+        whole->depth = DepthTarget{address + unit * 3, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 0.5f, 0};
+        whole->depthTest = true;
+        whole->depthCompare = VK_COMPARE_OP_ALWAYS;
+        whole->depthWrite = false;
+        whole->depthBias = true;
+        whole->depthBiasPerFace = true;
+        whole->backDepthBiasConstant = 1.0f;
+        whole->cullMode = VK_CULL_MODE_NONE;
+        whole->blend.blendEnable = VK_TRUE;
+        whole->blend.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+        whole->blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        whole->blend.colorBlendOp = VK_BLEND_OP_ADD;
+        whole->blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        whole->blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        whole->blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        whole->blends = {whole->blend};
+        whole->blendConstants.fill(1.0f / 255.0f);
+    }
     const auto arguments = address + unit;
     const auto writeArguments = [&](std::uint32_t vertices) {
         const std::array<std::uint32_t, 4> record{vertices, 1, 0, 0};
         AgcDriver::GuestMemory::Write(arguments, std::as_bytes(std::span(record)));
     };
-    writeArguments(3);
+    writeArguments(splitFaces ? 6 : 3);
     AgcDriver::Pm4::DrawParameters indirect{0, 0, 0, 0, 0, false};
     indirect.indirect.emplace();
     indirect.indirect->arguments = arguments;
@@ -16030,6 +16054,71 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
         return read;
     };
     const auto counts = [] { return ArchcReplayCounts(); };
+    if (splitFaces) {
+        using Census = AgcDriver::ArchB::Recorder;
+        Require(on, "split-face cases require draw replay and its prerequisites");
+        Require(scenario == "split_faces_on" || scenario == "split_faces_verify" || scenario == "split_faces_off", "unknown split-face case");
+        const bool expectedVerify = scenario == "split_faces_verify";
+        Require(verify == expectedVerify, "split-face VERIFY environment does not match the case");
+        for (int i = 0; i < 4; ++i) {
+            draw(whole, wholeIdentity);
+            settle();
+        }
+        draw(whole, wholeIdentity);
+        draw(whole, wholeIdentity);
+        static_cast<void>(Census::Collect(Census::Clock::now()));
+        const auto before = counts();
+        for (int i = 0; i < 3; ++i) draw(whole, wholeIdentity);
+        const auto after = counts();
+        auto counters = Census::Collect(Census::Clock::now()).counters;
+        if (scenario == "split_faces_off") {
+            Require(after.hits == 0 && after.captures == 0 && after.legacy == before.legacy + 3, "split-face draws replayed with the split-face switch off");
+            Require(counters["archc_replay_ineligible_shape"] == 3, "split-face draws were not counted as ineligible shapes with the switch off");
+        } else {
+            if (expectedVerify) Require(after.verifyChecks == before.verifyChecks + 3 && after.verifyMismatches == 0, "split-face VERIFY did not check every later draw or found a mismatch");
+            else Require(after.hits == before.hits + 3 && after.legacy == before.legacy, "later identical split-face draws did not replay");
+            Require(counters["archc_replay_ineligible_shape"] == 0, "enabled split-face draws were counted as ineligible shapes");
+        }
+        const auto actual = texels(*whole);
+        const char* control = std::getenv("APS5_ARCHB_CONTROL_FILE");
+        Require(control != nullptr, "split-face reference needs a runtime control file");
+        {
+            std::ofstream stream(control);
+            stream << "1 C_DRAW_REPLAY=0 C_REPLAY_SPLIT_FACES=0\n";
+            Require(stream.good(), "cannot write split-face reference switches");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (Switches::Sequence() != 1 && std::chrono::steady_clock::now() < deadline) {
+            Switches::PollControl();
+            std::this_thread::yield();
+        }
+        Require(!Switches::Enabled(Feature::ArchcDrawReplay) && !Switches::Enabled(Feature::CReplaySplitFaces), "the reference draw switches did not turn off");
+        std::filesystem::remove(control);
+        const auto reference = std::make_shared<State>(*whole);
+        reference->color.address = address + unit * 2;
+        reference->colors = {reference->color};
+        const DrawSlotIdentity referenceIdentity{reference, {{vertex}, {pixel}}};
+        const auto referenceBefore = counts();
+        for (int i = 0; i < 4; ++i) {
+            draw(reference, referenceIdentity);
+            settle();
+        }
+        for (int i = 0; i < 5; ++i) draw(reference, referenceIdentity);
+        Require(counts().hits == referenceBefore.hits && counts().captures == referenceBefore.captures, "the reference used draw replay with both switches off");
+        const auto expected = texels(*reference);
+        Require(std::all_of(expected.begin(), expected.end(), [](std::byte value) { return value == std::byte{18}; }), "both faces did not contribute once per draw to every legacy target pixel");
+        const auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+        if (mismatch.first != actual.end()) {
+            throw std::runtime_error("split-face replay pixels differ from the same draws with both switches off: byte " + std::to_string(mismatch.first - actual.begin())
+                    + " is " + std::to_string(std::to_integer<unsigned>(*mismatch.first)) + ", expected " + std::to_string(std::to_integer<unsigned>(*mismatch.second))
+                    + "; later replay hits " + std::to_string(after.hits - before.hits));
+        }
+        std::cout << "agc_archc_replay_" << scenario << ": ok (later hits " << after.hits - before.hits
+                  << ", ineligible shapes " << counters["archc_replay_ineligible_shape"]
+                  << ", verify checks " << after.verifyChecks - before.verifyChecks << ", verify mismatches " << after.verifyMismatches
+                  << "; all 16384 target bytes equal legacy and 18)\n";
+        return 0;
+    }
     for (int i = 0; i < 4; ++i) {
         draw(whole, wholeIdentity);
         settle();
@@ -18066,6 +18155,18 @@ void smallElementDetileTests(Device& device) {
 }
 
 int main(int argc, char** argv) {
+    struct SplitFacesControl {
+        std::filesystem::path path;
+        ~SplitFacesControl() { if (!path.empty()) std::filesystem::remove(path); }
+    } splitFacesControl;
+    if (argc == 3 && std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) {
+        splitFacesControl.path = std::filesystem::temp_directory_path() / ("anyps5-split-faces-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+#ifdef _WIN32
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str());
+#else
+        setenv("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str(), 1);
+#endif
+    }
 #ifdef _WIN32
     if (argc == 3 && std::string_view(argv[1]) == "--block-publish" && std::string_view(argv[2]) == "toggle") {
         const auto* scratch = std::getenv("ANYPS5_TEST_SCRATCH");

@@ -1,3 +1,13 @@
+set(agcReplaySplitFacesSource "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/ReplaySplitFaces.vert")
+set(agcReplaySplitFacesSpv "${agcTestShaderGeneratedRoot}/ReplaySplitFaces.vert.spv")
+set(agcReplaySplitFacesHeader "${agcTestShaderGeneratedRoot}/ReplaySplitFaces_vert_spv.h")
+add_custom_command(OUTPUT "${agcReplaySplitFacesHeader}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcReplaySplitFacesSpv}" "${agcReplaySplitFacesSource}"
+        COMMAND "${CMAKE_COMMAND}" -DINPUT=${agcReplaySplitFacesSpv} -DOUTPUT=${agcReplaySplitFacesHeader} -DSYMBOL=REPLAY_SPLIT_FACES_VERT_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcReplaySplitFacesSource}" glslang-standalone
+        VERBATIM)
+
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
         tests/BdaShader.cpp
@@ -10,6 +20,7 @@ add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         ${agcMipChainShaderHeaders}
         ${agcCoverShaderHeaders}
         ${agcBufferUpdateHeader}
+        ${agcReplaySplitFacesHeader}
 )
 
 target_include_directories(agc_driver_recorder_tests PRIVATE
@@ -699,6 +710,23 @@ if(BUILD_TESTING)
         endif()
     endforeach()
     set(archcReplayCuts "APS5_ARCHB_C_REPLAY_QUIET_TEMPLATE=1;APS5_ARCHB_C_REPLAY_SLOT_BINDINGS=1;APS5_ARCHB_C_REPLAY_SLOT_INPUTS=1;APS5_ARCHB_C_REPLAY_DEPTH_EPOCH=1")
+    foreach(splitFacesCase on verify off)
+        set(splitFacesSwitch 1)
+        set(splitFacesVerify 0)
+        if(splitFacesCase STREQUAL "off")
+            set(splitFacesSwitch 0)
+        elseif(splitFacesCase STREQUAL "verify")
+            set(splitFacesVerify 1)
+        endif()
+        add_test(NAME agc_archc_replay_split_faces_${splitFacesCase} COMMAND agc_driver_recorder_tests --archc-replay split_faces_${splitFacesCase})
+        set_tests_properties(agc_archc_replay_split_faces_${splitFacesCase} PROPERTIES
+                SKIP_RETURN_CODE 77 TIMEOUT 30
+                FAIL_REGULAR_EXPRESSION "VUID-;[Vv]alidation [Ee]rror;was not found but was requested by env var VK_INSTANCE_LAYERS;VERIFY mismatch"
+                ENVIRONMENT "${archcReplayOn};APS5_ARCHB_GATE_RUN=1;APS5_ARCHB_C_REPLAY_SPLIT_FACES=${splitFacesSwitch};APS5_ARCHB_C_DRAW_REPLAY_VERIFY=${splitFacesVerify}")
+        if(WIN32)
+            set_tests_properties(agc_archc_replay_split_faces_${splitFacesCase} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     foreach(archcScenario hit cpu_store arguments identity)
         add_test(NAME agc_archc_replay_cuts_${archcScenario} COMMAND agc_driver_recorder_tests --archc-replay ${archcScenario})
         set_tests_properties(agc_archc_replay_cuts_${archcScenario} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "${archcReplayOn};${archcReplayCuts};APS5_ARCHB_C_DRAW_REPLAY_VERIFY=0")
