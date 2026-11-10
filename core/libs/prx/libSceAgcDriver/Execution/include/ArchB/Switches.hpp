@@ -105,6 +105,7 @@ enum class Feature : std::uint8_t {
     FixHostSlabAlloc,
     FixCheapTimers,
     ReplayRecognize,
+    FixStatePacketFast,
     Count
 };
 

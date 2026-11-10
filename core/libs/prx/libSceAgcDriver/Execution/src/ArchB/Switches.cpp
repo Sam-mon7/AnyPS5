@@ -213,6 +213,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixHostSlabAlloc, "FIX_HOST_SLAB_ALLOC", false, true, {}},
     {Feature::FixCheapTimers, "FIX_CHEAP_TIMERS", false, true, {}},
     {Feature::ReplayRecognize, "REPLAY_RECOGNIZE", false, true, {}},
+    {Feature::FixStatePacketFast, "FIX_STATE_PACKET_FAST", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

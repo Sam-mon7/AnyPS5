@@ -57,6 +57,13 @@ bool orderedFills() {
     return ordered;
 }
 
+bool statePacket(std::uint32_t opcode) {
+    switch (opcode) {
+        case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x69: case 0x76: case 0x79: return true;
+        default: return false;
+    }
+}
+
 bool keepsDrawFinisher(std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
@@ -322,6 +329,13 @@ void Driver::execute(const Submission& submission) {
         }
     } settleFinisher{submission.queue == 0};
     auto* const executingPacket = workerPacket();
+    std::uint64_t statePacketsFast = 0;
+    struct CountStatePackets {
+        const std::uint64_t& packets;
+        ~CountStatePackets() {
+            if (packets != 0) ArchB::Recorder::Count("fix_state_packet_fast", static_cast<double>(packets));
+        }
+    } countStatePackets{statePacketsFast};
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -349,6 +363,13 @@ void Driver::execute(const Submission& submission) {
             if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr) {
                 recorder->EndComputeChain(force);
             }
+        }
+        if ((header >> 30u) == 3u && statePacket(opcode) && !(Pm4::Predicated(header) && queue.predication.operation != 0) && !profilePackets && !Timeline::Enabled && !CaptureTrace::Enabled() && !(submission.queue == 0 && DrawFinisher::Busy()) && !(submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) && ArchB::Switches::Enabled(ArchB::Feature::FixStatePacketFast)) {
+            Pm4::Execute(packet, queue);
+            if (submission.queue == 0 && pendingFrameTiming != nullptr) pendingFrameTiming->NotePacket(submission.serial, cursor, opcode, count, {});
+            ++statePacketsFast;
+            cursor += count;
+            continue;
         }
         Timeline::PacketScope timelinePacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.serial, cursor);
         auto nextCursor = cursor + count;
