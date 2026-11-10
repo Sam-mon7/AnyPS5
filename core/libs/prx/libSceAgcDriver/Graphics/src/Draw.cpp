@@ -5657,7 +5657,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     if (!pass.filled) return refuse(IneligiblePass);
     const auto& pipeline = prepared.pipeline;
     const bool lds = PixelFunctionLdsSubgroup(shaders) != 0u || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
-    if (!prepared.stencilReferences.empty() || !prepared.stencilReplay.empty() || state.stencilReplayReference || pipeline == nullptr || pipeline->SplitsFaces() || pipeline->SplitsSecondChannel() || pipeline->ReordersSamples() || prepared.depthLocations.has_value() || !prepared.reordered.empty() || state.stages.mesh || state.stages.tessellation || state.tessellationCapture != nullptr || UsesMeshWindow(shaders) || lds || prepared.framebuffer == nullptr) return refuse(IneligibleShape);
+    if (!prepared.stencilReferences.empty() || !prepared.stencilReplay.empty() || state.stencilReplayReference || pipeline == nullptr || (pipeline->SplitsFaces() && !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplaySplitFaces)) || pipeline->SplitsSecondChannel() || pipeline->ReordersSamples() || prepared.depthLocations.has_value() || !prepared.reordered.empty() || state.stages.mesh || state.stages.tessellation || state.tessellationCapture != nullptr || UsesMeshWindow(shaders) || lds || prepared.framebuffer == nullptr) return refuse(IneligibleShape);
     for (const auto& binding : prepared.targets) {
         if (binding.resident == nullptr || binding.proxied || binding.multisampled || binding.color.partialWriteMask != 0 || archcTargets::shapeRefusal(binding.color) != archcTargets::FastRefusalCount) return refuse(IneligibleTargets);
     }
