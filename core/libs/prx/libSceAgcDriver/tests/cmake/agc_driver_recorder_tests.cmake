@@ -336,6 +336,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_archc_lazy_copyback_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_LAZY_COPYBACK=1;APS5_ARCHB_C_LAZY_COPYBACK_VERIFY=1")
     if(WIN32)
         add_test(NAME agc_archc_lazy_copyback_cpu_old_value COMMAND agc_driver_recorder_tests --lazy-copyback-cpu-store-only old-value)
+        add_test(NAME agc_deferred_staging_carry_off COMMAND agc_driver_recorder_tests --deferred-staging-carry-only)
+        add_test(NAME agc_deferred_staging_carry_on COMMAND agc_driver_recorder_tests --deferred-staging-carry-only)
+        add_test(NAME agc_deferred_staging_carry_verify COMMAND agc_driver_recorder_tests --deferred-staging-carry-only)
+        add_test(NAME agc_deferred_gpu_staging_carry_on COMMAND agc_driver_recorder_tests --deferred-staging-carry-only)
+        add_test(NAME agc_deferred_gpu_staging_carry_verify COMMAND agc_driver_recorder_tests --deferred-staging-carry-only)
+        set_tests_properties(agc_deferred_staging_carry_off agc_deferred_staging_carry_on agc_deferred_staging_carry_verify agc_deferred_gpu_staging_carry_on agc_deferred_gpu_staging_carry_verify PROPERTIES
+                SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_deferred_staging_carry_on PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1")
+        set_tests_properties(agc_deferred_staging_carry_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_C_GPU_STAGING_CARRY=1;APS5_ARCHB_C_GPU_STAGING_CARRY_VERIFY=1")
+        set_tests_properties(agc_deferred_gpu_staging_carry_on PROPERTIES ENVIRONMENT "APS5_ARCHB_GPU_STAGING_CARRY=1")
+        set_tests_properties(agc_deferred_gpu_staging_carry_verify PROPERTIES ENVIRONMENT "APS5_ARCHB_GPU_STAGING_CARRY=1;APS5_ARCHB_GPU_STAGING_CARRY_VERIFY=1")
         add_test(NAME agc_archc_lazy_copyback_cpu_window COMMAND agc_driver_recorder_tests --lazy-copyback-cpu-store-only window)
         set_tests_properties(agc_archc_lazy_copyback_cpu_old_value agc_archc_lazy_copyback_cpu_window PROPERTIES
                 SKIP_RETURN_CODE 77 TIMEOUT 30

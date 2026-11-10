@@ -4819,6 +4819,72 @@ bool stagingCarryTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+bool deferredStagingCarryTests(const Device& device, Recorder& recorder) {
+#ifdef _WIN32
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) return false;
+    constexpr std::size_t bytes = 4u << 20u;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    Require(block != nullptr, "cannot allocate the deferred staging block");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto element = address + 4096;
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    Require(HostImportFor(context, address, bytes) != nullptr, "the deferred staging block cannot be imported");
+    {
+        std::lock_guard gpu(GpuMutex());
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+        { auto flags = binding.Flags(); flags.bufferWritten = {true}; binding.SetFlags(std::move(flags)); }
+        program.bindings.push_back(binding);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        auto resources = std::make_shared<ShaderResources>(context, compute);
+        Require(resources->HasStagedCopies(), "the deferred writable region was not staged");
+        const auto before = GuestBufferMemory::CrossCarry();
+        const auto legacyBefore = GuestBufferMemory::StagingCarry();
+        const bool on = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuStagingCarry);
+        const bool legacy = !on && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::GpuStagingCarry);
+        const auto watches = recorder.CarryWatches();
+        const void* owner = resources->MemoryOwner();
+        std::vector<Recorder::RunAccess> accesses;
+        resources->RunAccesses(accesses);
+        recorder.Commands();
+        recorder.DeferDispatchBarrier(0x20, std::span(&owner, 1), accesses);
+        resources->CopyBacksAfterRun(resources);
+        resources->MarkGpuWrites(recorder);
+        Require(recorder.RunOpen() && recorder.CarryWatches() == watches, "a staging token was registered before its deferred publication");
+        recorder.Commands();
+        Require(!recorder.RunOpen() && recorder.CarryWatches() == watches + (on ? 1u : 0u), "the completed dispatch run did not register its staging token");
+        Require(resources->Revalidate(std::span(&compute, 1)), "the deferred staging resources could not be reused");
+        const auto after = GuestBufferMemory::CrossCarry();
+        Require(after.carried == before.carried + (on ? 1u : 0u), "an untouched deferred shadow was copied in again");
+        Require(GuestBufferMemory::StagingCarry().carried == legacyBefore.carried + (legacy ? 1u : 0u), "an untouched deferred shadow was copied in again by the same-batch carry path");
+        resources->MarkGpuWrites(recorder);
+        recorder.Keep(resources);
+        recorder.Sync();
+        Require(GuestBufferMemory::CrossCarry().mismatches == before.mismatches, "a deferred carried shadow differed from the eager publication");
+        Require(GuestBufferMemory::StagingCarry().mismatches == legacyBefore.mismatches, "a deferred same-batch carried shadow differed from the eager publication");
+        const auto* guest = reinterpret_cast<const std::uint8_t*>(element);
+        for (std::size_t index = 0; index < elementBytes; ++index) Require(guest[index] == 0, "deferred staging changed an untouched guest byte");
+    }
+    GuestAllocations::Mutation().Remove(block);
+    HostImportFor(context, address, bytes);
+    Require(VirtualFree(block, 0, MEM_RELEASE) != 0, "cannot release the deferred staging block");
+    return true;
+#else
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    return false;
+#endif
+}
+
 bool lazyCopyBackCpuStoreTests(const Device& device, Recorder& recorder, std::string_view scenario) {
 #ifdef _WIN32
     if (device.GetContext().hostImportAlignment == 0 || !LazyCopyBack::Active()) return false;
@@ -17854,6 +17920,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--lazy-copyback-cpu-store-only") {
             if (!lazyCopyBackCpuStoreTests(device, recorder, argv[2])) return 77;
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--deferred-staging-carry-only") {
+            if (!deferredStagingCarryTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {
