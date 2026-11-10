@@ -3846,6 +3846,12 @@ std::size_t ShaderResources::LookupLogCapacity() {
 
 bool ShaderResources::collectPartialSnapshot(ValidatedSurface& surface) {
     if (surface.source != nullptr || surface.keys != DccKeys::Uncompressed || !surface.committed.has_value() || surface.generation == 0) return false;
+    if (ArchB::Switches::Enabled(ArchB::Feature::WtFault)) {
+        for (const auto& [begin, end] : *surface.committed) {
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            if (!GuestMemory::FaultUnchangedSince(begin, bytes, surface.generation) && GuestMemory::CollectWritesUncached(begin, bytes) == 0) return false;
+        }
+    }
     if (AgcDriver::ArchB::AllocChurnActive()) {
         // APS5_ARCHB_FIX_ALLOC_CHURN: collected into a per-thread scratch that keeps its capacity.
         thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* currentSlot = nullptr;
@@ -3996,10 +4002,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (DepthBlocksProof(context.device, address, bytes) && !depthProofAccepts(address, bytes)) return fail(FastFail::Depth);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) {
-            countCollectRefusal(false, address, bytes);
-            return fail(FastFail::Collect);
+        if (!surface.committed.has_value()) {
+            surface.collected = GuestMemory::CollectWrites(address, bytes);
+            if (surface.collected == 0) {
+                countCollectRefusal(false, address, bytes);
+                return fail(FastFail::Collect);
+            }
         }
         const auto* source = surface.source;
         if (ClearSnapshotCacheEnabled() && source != nullptr && surface.resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) return fail(FastFail::Keys);
@@ -4140,8 +4148,10 @@ bool ShaderResources::fastRevalidateEach() {
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (DepthBlocksProof(context.device, address, bytes)) return false;
         if (!FlushDepthPlanes(address, bytes).empty()) return false;
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) return false;
+        if (!surface.committed.has_value()) {
+            surface.collected = GuestMemory::CollectWrites(address, bytes);
+            if (surface.collected == 0) return false;
+        }
         if (PendingStorageOverlaps(address, bytes, surface.source)) return false;
         if (surface.source != nullptr && surface.resource.dccAddress != 0 && surface.resource.dccAddress != surface.source->Descriptor().dccAddress) return false;
         if (ClearSnapshotCacheEnabled() && surface.source != nullptr && surface.resource.dccAddress != 0 && IsDccClear(surface.source->FilledKeys())) return false;
@@ -4332,12 +4342,29 @@ bool ShaderResources::EpochProofs() {
 }
 
 namespace {
-bool HasWholeSurfaceTracking(const auto& surfaces, const auto& images) {
+bool PartialSnapshotsUnchanged(const auto& surfaces) {
+    for (const auto& surface : surfaces) {
+        if (!surface.committed.has_value()) continue;
+        for (const auto& [begin, end] : *surface.committed) {
+            if (!GuestMemory::FaultUnchangedSince(begin, static_cast<std::size_t>(end - begin), surface.generation)) return false;
+        }
+    }
+    return true;
+}
+
+bool HasSurfaceTracking(const auto& surfaces, const auto& images) {
     const auto tracked = [](std::uint64_t address, std::size_t bytes) {
         return GuestMemory::Watched(address, bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes);
     };
     for (const auto& surface : surfaces) {
-        if (!surface.valid || surface.committed.has_value()) return false;
+        if (!surface.valid) return false;
+        if (surface.committed.has_value()) {
+            if (surface.source != nullptr || surface.keys != DccKeys::Uncompressed || surface.generation == 0 || surface.committed->empty()) return false;
+            for (const auto& [begin, end] : *surface.committed) {
+                if (end <= begin || !GuestMemory::Watched(begin, static_cast<std::size_t>(end - begin))) return false;
+            }
+            continue;
+        }
         if (!surface.depth && !tracked(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes))) return false;
     }
     for (const auto& image : images) {
@@ -4441,7 +4468,7 @@ bool ShaderResources::revalidateCensused(std::span<const CompiledShader> shaders
         return false;
     }
     const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
-    if (trustProofs && provedOnce && HasWholeSurfaceTracking(validatedTextures, storageTextures)) {
+    if (trustProofs && provedOnce && HasSurfaceTracking(validatedTextures, storageTextures)) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbTrustProofs);
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         return true;
@@ -4485,7 +4512,9 @@ bool ShaderResources::revalidateCensused(std::span<const CompiledShader> shaders
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending && canRememberResourceEpoch()) {
+        const bool partial = std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const auto& surface) { return surface.committed.has_value(); });
+        const auto before = partial ? currentStampSerials() : ResourceEpochProof{};
+        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending && (partial ? resourceEpochProof == before && PartialSnapshotsUnchanged(validatedTextures) && !HoldsReleasedTexture() && HasCachedStorageImages() : canRememberResourceEpoch())) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
@@ -4505,10 +4534,11 @@ bool ShaderResources::revalidateCensused(std::span<const CompiledShader> shaders
         const bool ok = revalidateFull(shaders, report);
         if (globalOnly && ok && GuestMemory::Gen::ShadowActive()) GuestMemory::Gen::NoteGlobalOnlyRefusal();
         noteEpochProof(false, false, false);
-        if (ok && canRememberResourceEpoch()) {
+        if (ok && canRememberResourceEpoch() && (!partial || ((before.forgotten & 1u) == 0 && currentStampSerials() == before))) {
             provedEpoch = epoch;
             provedProof = proof;
             provedPending = pending;
+            resourceEpochProof = before;
         } else {
             provedEpoch = 0;
         }
@@ -4791,11 +4821,12 @@ void ShaderResources::archcTokenMake(bool drained, std::uint64_t epochBefore, st
 }
 
 ShaderResources::ResourceEpochProof ShaderResources::currentStampSerials() {
-    auto serials = currentResourceEpochProof();
-    serials.epoch = 0;
-    serials.writes = 0;
-    serials.tracker = 0;
-    return serials;
+#ifdef _WIN32
+    const auto committed = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#else
+    const std::uint64_t committed = 0;
+#endif
+    return {0, 0, StorageTexture::PendingSerial(), 0, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), committed, GuestMemory::ForgetSerial(), GuestMemory::UnwatchSerial(), DepthSurfacesSerial(), DepthSurfacesReleased()};
 }
 
 namespace {
@@ -5023,7 +5054,7 @@ bool ShaderResources::stampEligible() const {
     };
     for (const auto& surface : validatedTextures) {
         if (!surface.valid || surface.depth || DepthSurfaceOverlaps(context.device, surface.resource.baseAddress, surface.bytes)) return false;
-        if (surface.committed.has_value()) return false;
+        if (surface.committed.has_value()) continue;
         if (!trackedKeys(surface.resource, surface.bytes) || (surface.source == nullptr ? surface.generation == 0 : surface.source->Generation() == 0)) return false;
         if (!GuestMemory::Watched(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes))) return false;
         if (surface.source != nullptr && !trackedKeys(surface.source->Descriptor(), surface.source->GuestBytes())) return false;
@@ -5033,7 +5064,7 @@ bool ShaderResources::stampEligible() const {
         if (DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) return false;
         if (image->Generation() == 0 || !trackedKeys(image->Descriptor(), image->GuestBytes()) || !GuestMemory::Watched(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()))) return false;
     }
-    return HasWholeSurfaceTracking(validatedTextures, storageTextures);
+    return HasSurfaceTracking(validatedTextures, storageTextures);
 }
 
 bool ShaderResources::canRememberResourceEpoch() const {
@@ -5050,7 +5081,7 @@ bool ShaderResources::canRememberResourceEpoch() const {
     for (const auto& surface : validatedTextures) {
         if (!surface.valid) return fail(EpochIneligible::Records);
         if (surface.depth || DepthSurfaceOverlaps(context.device, surface.resource.baseAddress, surface.bytes)) return fail(EpochIneligible::Depth);
-        if (surface.committed.has_value()) return fail(EpochIneligible::Partial);
+        if (surface.committed.has_value()) continue;
         if (!trackedKeys(surface.resource, surface.bytes) || (surface.source == nullptr ? surface.generation == 0 : surface.source->Generation() == 0)) return fail(EpochIneligible::Tracking);
         if (!GuestMemory::Watched(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes))) return fail(EpochIneligible::Tracking);
         if (surface.source != nullptr && !trackedKeys(surface.source->Descriptor(), surface.source->GuestBytes())) return fail(EpochIneligible::Tracking);
@@ -5060,13 +5091,13 @@ bool ShaderResources::canRememberResourceEpoch() const {
         if (DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) return fail(EpochIneligible::Depth);
         if (image->Generation() == 0 || !trackedKeys(image->Descriptor(), image->GuestBytes()) || !GuestMemory::Watched(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()))) return fail(EpochIneligible::Tracking);
     }
-    if (!HasWholeSurfaceTracking(validatedTextures, storageTextures)) return fail(EpochIneligible::Tracking);
+    if (!HasSurfaceTracking(validatedTextures, storageTextures)) return fail(EpochIneligible::Tracking);
     return true;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, bool epochProofs) {
     const bool skipDispatchProofWalk = ArchB::Switches::Enabled(ArchB::Feature::UbSkipDispatchProofWalk);
-    if (skipDispatchProofWalk && !drawBuild && HasWholeSurfaceTracking(validatedTextures, storageTextures)) {
+    if (skipDispatchProofWalk && !drawBuild && HasSurfaceTracking(validatedTextures, storageTextures)) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipDispatchProofWalk);
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         return true;
@@ -5133,6 +5164,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (resourceEpochProof.allocations != epochBefore.allocations || resourceEpochProof.commits != epochBefore.commits || resourceEpochProof.forgotten != epochBefore.forgotten || (epochBefore.forgotten & 1u) != 0 || resourceEpochProof.unwatched != epochBefore.unwatched) return EpochRefusal::Mapping;
             if (resourceEpochProof.depth != epochBefore.depth || resourceEpochProof.depthReleased != epochBefore.depthReleased) return EpochRefusal::Depth;
             if (resourceEpochProof.tracker != epochBefore.tracker) return EpochRefusal::Tracker;
+            if (!PartialSnapshotsUnchanged(validatedTextures)) return EpochRefusal::Tracker;
             if (HoldsReleasedTexture() || !HasCachedStorageImages()) return EpochRefusal::Cache;
             for (const auto& entry : epochImages) {
                 if (entry.image->Version() != entry.version || entry.image->Descriptor().dccAddress != entry.keys) return EpochRefusal::Images;

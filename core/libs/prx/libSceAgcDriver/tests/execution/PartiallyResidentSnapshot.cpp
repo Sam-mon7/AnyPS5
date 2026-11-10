@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -15,6 +16,7 @@
 #include "FixtureDeviceSelection.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "SpirvBackend/SpirvModule.hpp"
 #include <SDL_loadso.h>
@@ -111,6 +113,9 @@ public:
             queue.pQueuePriorities = &priority;
             VkPhysicalDeviceFeatures enabled{};
             enabled.shaderInt64 = VK_TRUE;
+            VkPhysicalDeviceFeatures supported{};
+            function<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(context.physical, &supported);
+            enabled.textureCompressionBC = supported.textureCompressionBC;
             address.pNext = &bytes;
             const std::array<const char*, 2> extensionsEnabled{VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_8BIT_STORAGE_EXTENSION_NAME};
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &address};
@@ -126,6 +131,7 @@ public:
             function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
             context.limits = properties.limits;
             context.bufferDeviceAddress = true;
+            context.textureCompressionBC = enabled.textureCompressionBC;
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             context.imageFormatProperties = function<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
@@ -184,10 +190,11 @@ public:
     ReservedSurface(const ReservedSurface&) = delete;
     ReservedSurface& operator=(const ReservedSurface&) = delete;
 
-    void Commit(std::size_t offset, std::size_t bytes) {
+    void Commit(std::size_t offset, std::size_t bytes, std::size_t granule = 0) {
 #ifdef _WIN32
-        GuestArena::GuestArenaCommit_nid_postfix(block + offset, bytes, PAGE_READWRITE, bytes);
+        GuestArena::GuestArenaCommit_nid_postfix(block + offset, bytes, PAGE_READWRITE, granule == 0 ? bytes : granule);
 #else
+        static_cast<void>(granule);
         Require(mmap(block + offset, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED, "partially resident snapshot: cannot commit a page");
         GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block + offset, bytes);
 #endif
@@ -669,8 +676,80 @@ void ExpectProof(ShaderResources& resources, const CompiledShader& shader, bool 
     ShaderResources::ProofReport report;
     Require(resources.Revalidate(std::span(&shader, 1), &report), "partial resources did not revalidate " + when);
     const bool enabled = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF") == nullptr;
-    Require(report.path == ShaderResources::ProofPath::Full, "partial resources bypassed full resource revalidation " + when);
+    Require(report.path == (fast && enabled ? ShaderResources::ProofPath::Fast : ShaderResources::ProofPath::Full), "partial resources took the wrong proof path " + when);
     if (fast && enabled) Require(surfaceReads.load() == 0, "partial fast proof read the snapshot " + when);
+}
+
+void ResidencyProof(Context context, std::string_view shape, std::string_view mutation) {
+    namespace Memory = AgcDriver::GuestMemory;
+    using Counters = AgcDriver::ArchB::Recorder;
+    const bool array = shape == "array";
+    Require(array || shape == "mip", "invalid residency proof shape");
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    const auto bytes = array ? std::size_t{44} * 1024 * 1024 : std::size_t{86} * BlockBytes;
+    ReservedSurface surface(bytes);
+    auto words = ArrayDescriptor(surface.Address(), array ? 1024u : 2048u, array ? 64u : 1u, array ? 11u : 12u);
+    words[1] = (words[1] & ~(0x1ffu << 20u)) | ((array ? 170u : 177u) << 20u);
+    words[3] = (words[3] & ~((0x1fu << 20u) | (0xfu << 28u))) | (9u << 20u) | ((array ? 13u : 9u) << 28u) | (array ? 0u : 3u << 12u);
+    const auto resource = DecodeTextureResource(words);
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.guestBytes == bytes && resource.baseLevel == (array ? 0u : 3u) && resource.lastLevel == (array ? 10u : 11u), "residency proof descriptor footprint differs from its fixture");
+    const auto committed = array ? 3 * geometry.layerBytes : 2 * BlockBytes;
+    Require(committed < bytes, "residency proof needs a partially committed allocation");
+    surface.Commit(0, static_cast<std::size_t>(committed), BlockBytes);
+    std::memset(surface.Data(), 0x5a, static_cast<std::size_t>(committed));
+    auto program = SampledProgram(words);
+    if (array) program.bindings.front().imageShape = ShaderRecompiler::DescriptorImageShape::Image2DArray;
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    Memory::BumpCollectEpoch();
+    Require(Memory::CollectWrites(surface.Address(), static_cast<std::size_t>(committed)) != 0, "residency proof could not arm its committed prefix");
+    GuestArena::GuestWtFaultSetCold_nid_no_patch(static_cast<std::uintptr_t>(surface.Address()), static_cast<std::size_t>(committed), true);
+    Memory::WtFaultFlip(false);
+    Require(Memory::FaultUnchangedSince(surface.Address(), static_cast<std::size_t>(committed), Memory::WriteGeneration()), "residency proof fault and tracker clocks did not settle");
+    ShaderResources resources(context, shader);
+    Require(resources.Reusable() && !resources.SampledTextures().front()->ViewsStorageImage(), "residency proof needs a reusable sampled snapshot");
+    const bool enabled = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF") == nullptr;
+    const bool epoch = Memory::ResourceEpochProofsEnabled();
+    const bool pipeline = !epoch && std::getenv("APS5_DRAW_PIPELINE") != nullptr;
+    const bool stamp = !epoch && !pipeline && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeResolveProofs);
+    Counters::Boundary(true, 1, Counters::Clock::now());
+    ShaderResources::ProofReport report{};
+    for (int pass = 0; pass != 2; ++pass) Require(resources.Revalidate(shader, &report), "residency proof did not warm");
+    static_cast<void>(Counters::Collect(Counters::Clock::now()));
+    Require(resources.Revalidate(shader, &report), "residency proof did not hold unchanged");
+    auto warm = Counters::Collect(Counters::Clock::now());
+    for (const auto& [name, value] : warm.counters) {
+        if (value != 0 && (name.starts_with("pipe_proof_memo_") || name.starts_with("proof_"))) std::printf("warm %s %.0f\n", name.c_str(), value);
+    }
+    Require(report.path == (enabled && !pipeline ? ShaderResources::ProofPath::Fast : ShaderResources::ProofPath::Full), "residency proof did not exercise its selected path");
+    Require(report.stampReused == (enabled && stamp) && report.epochReused == (enabled && epoch), "residency proof did not exercise its selected memo");
+    Require(warm.counters["proof_fast_pass_epoch_memo"] == (enabled && pipeline ? 1 : 0), "residency proof did not exercise the legacy pipeline memo");
+    const auto collectEpoch = Memory::CollectEpoch();
+    if (mutation == "commit") surface.Commit(static_cast<std::size_t>(committed), BlockBytes);
+    else if (mutation == "decommit") surface.Decommit(0, BlockBytes);
+    else if (mutation == "protect") {
+#ifdef _WIN32
+        DWORD previous = 0;
+        Require(GuestArena::GuestArenaVirtualProtect_nid_no_patch(surface.Data(), BlockBytes, PAGE_NOACCESS, &previous) != 0, "cannot make a residency proof page inaccessible");
+#else
+        GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(surface.Address()), BlockBytes, 0x01u);
+#endif
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(surface.Address()), BlockBytes);
+    } else {
+        Require(mutation == "write", "invalid residency proof mutation");
+        *static_cast<volatile std::uint8_t*>(surface.Data()) = 0x77;
+    }
+    const bool accepted = resources.Revalidate(shader, &report);
+    auto changed = Counters::Collect(Counters::Clock::now());
+    std::printf("residency %s %s: accepted=%d full=%d stamp=%d epoch=%d pipeline=%.0f\n", std::string(shape).c_str(), std::string(mutation).c_str(), accepted ? 1 : 0, report.path == ShaderResources::ProofPath::Full ? 1 : 0, report.stampReused ? 1 : 0, report.epochReused ? 1 : 0, changed.counters["proof_fast_pass_epoch_memo"]);
+    Require(Memory::CollectEpoch() == collectEpoch, "the residency mutation changed the collect epoch");
+    Require(!report.stampReused && !report.epochReused && changed.counters["proof_fast_pass_epoch_memo"] == 0, "a residency mutation reused a stale memo");
+    Require(!accepted || report.path == ShaderResources::ProofPath::Full, "a residency mutation took a stale fast proof");
+    Counters::Boundary(false, 2, Counters::Clock::now());
+    ClearCachedTextures(context.device);
 }
 
 void ResourceProof(Context context, ReservedSurface& surface) {
@@ -1006,7 +1085,8 @@ int main(int argc, char** argv) {
             const bool partialSnapshot = argc == 2 && std::string_view(argv[1]).starts_with("--psnap-");
             ReservedSurface surface(large || largeAlias || partialSnapshot ? LargeSurfaceBytes : SurfaceBytes);
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-            if (large) {
+            if (argc == 4 && std::string_view(argv[1]) == "--residency") ResidencyProof(context, argv[2], argv[3]);
+            else if (large) {
                 LargeTracked(context, surface, LargeSurfaceBytes);
                 LargeTracked(context, surface, BlockBytes);
             } else if (largeAlias) LargeAlias(context, surface);
