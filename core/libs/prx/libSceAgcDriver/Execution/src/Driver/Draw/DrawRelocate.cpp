@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -57,14 +58,30 @@ std::uint64_t Driver::nestedContentKey(const RelocatableUserWord& word, std::uin
     if (requireProof && !variant.nestedPointerProof) return relocatedContentKey(word, value, readable);
     if (variant.runParents.size() != variant.runs.size() || std::find(variant.runBases.begin(), variant.runBases.end(), static_cast<std::int8_t>(word.nestedUserWord)) == variant.runBases.end()) return relocatedContentKey(word, value, readable);
     const auto offsets = runWordOffsets(variant);
-    std::vector<std::uint64_t> addresses(variant.runs.size());
-    std::vector<std::uint8_t> states(variant.runs.size());
+    struct AddressesTag {};
+    struct StatesTag {};
+    struct LiveTag {};
+    auto& addresses = AgcDriver::ThreadScratch<std::vector<std::uint64_t>, AddressesTag>();
+    auto& states = AgcDriver::ThreadScratch<std::vector<std::uint8_t>, StatesTag>();
+    auto& live = AgcDriver::ThreadScratch<std::vector<std::uint32_t>, LiveTag>();
+    addresses.assign(variant.runs.size(), 0);
+    states.assign(variant.runs.size(), 0);
+    live.resize(variant.words.size());
     std::uint64_t hash = 0x9e3779b97f4a7c15ull;
     const auto mix = [&](std::uint64_t mixed) { hash = (hash ^ mixed) * 0x100000001b3ull; };
     mix(value & 3u);
     if (value == 0) readable = false;
+    const auto wordMask = [&](std::size_t run, std::size_t index) {
+        auto mask = relocationMask(variant, offsets[run] + index);
+        for (const auto& child : variant.runParents) {
+            if (child.run != run) continue;
+            if (index == child.word) mask |= 0xfffffffcu;
+            if (index == child.word + 1) mask = 0xffffffffu;
+        }
+        return mask;
+    };
     const auto visit = [&](auto&& self, std::size_t run) -> bool {
-        if (states[run] != 0) return states[run] == 2;
+        if (states[run] != 0) return states[run] >= 2;
         states[run] = 1;
         const auto& parent = variant.runParents[run];
         std::uint64_t address = 0;
@@ -74,35 +91,35 @@ std::uint64_t Driver::nestedContentKey(const RelocatableUserWord& word, std::uin
             relative = static_cast<std::int64_t>(variant.runs[run].first - word.nestedBase);
             address = AlignedWord(value) + static_cast<std::uint64_t>(relative);
         } else {
-            if (parent.run >= variant.runs.size() || !self(self, parent.run)) return false;
-            std::uint64_t live = 0, old = 0;
+            if (parent.run >= variant.runs.size() || !self(self, parent.run) || states[parent.run] != 2) return false;
+            std::uint64_t current = 0, old = 0;
             const auto position = offsets[parent.run] + parent.word;
             if (position + 1 >= variant.words.size()) return false;
             std::memcpy(&old, variant.words.data() + position, sizeof(old));
-            if (GuestMemory::CopyMapped(addresses[parent.run] + parent.word * sizeof(std::uint32_t), std::as_writable_bytes(std::span(&live, 1)), true) != GuestMemory::Compare::Equal || live == 0) {
+            std::memcpy(&current, live.data() + position, sizeof(current));
+            if (current == 0) {
                 readable = false;
                 return false;
             }
             relative = static_cast<std::int64_t>(variant.runs[run].first - (old & 0x0000fffffffffffcull));
-            address = (live & 0x0000fffffffffffcull) + static_cast<std::uint64_t>(relative);
+            address = (current & 0x0000fffffffffffcull) + static_cast<std::uint64_t>(relative);
         }
         addresses[run] = address;
+        const auto count = offsets[run + 1] - offsets[run];
         mix(static_cast<std::uint64_t>(relative));
-        mix(offsets[run + 1] - offsets[run]);
-        std::vector<std::uint32_t> content(offsets[run + 1] - offsets[run]);
-        if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content)), true) != GuestMemory::Compare::Equal) {
+        mix(count);
+        bool opaque = true;
+        for (std::size_t index = 0; opaque && index < count; ++index) opaque = wordMask(run, index) == 0xffffffffu;
+        if (opaque && std::none_of(variant.runParents.begin(), variant.runParents.end(), [&](const auto& child) { return child.run == run; })) {
+            for (std::size_t index = 0; index < count; ++index) mix(0);
+            states[run] = 3;
+            return true;
+        }
+        if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(live).subspan(offsets[run], count)), true) != GuestMemory::Compare::Equal) {
             readable = false;
             return false;
         }
-        for (std::size_t index = 0; index < content.size(); ++index) {
-            auto mask = relocationMask(variant, offsets[run] + index);
-            for (const auto& child : variant.runParents) {
-                if (child.run != run) continue;
-                if (index == child.word) mask |= 0xfffffffcu;
-                if (index == child.word + 1) mask = 0xffffffffu;
-            }
-            mix(content[index] & ~mask);
-        }
+        for (std::size_t index = 0; index < count; ++index) mix(live[offsets[run] + index] & ~wordMask(run, index));
         states[run] = 2;
         return true;
     };
