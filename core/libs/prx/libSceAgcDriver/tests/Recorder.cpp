@@ -4734,6 +4734,162 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+#ifdef _WIN32
+class UploadCarryCopies {
+public:
+    explicit UploadCarryCopies(const Context& context) : copy(context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")) { active = this; }
+    ~UploadCarryCopies() { active = nullptr; }
+    VkBuffer source = VK_NULL_HANDLE;
+    VkBuffer destination = VK_NULL_HANDLE;
+    VkDeviceSize bytes = 0;
+    static VKAPI_ATTR void VKAPI_CALL Record(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+        if (source == active->source && destination == active->destination) {
+            for (std::uint32_t index = 0; index < count; ++index) active->bytes += regions[index].size;
+        }
+        active->copy(commands, source, destination, count, regions);
+    }
+private:
+    PFN_vkCmdCopyBuffer copy;
+    static inline UploadCarryCopies* active = nullptr;
+};
+#endif
+
+bool uploadCarryTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+#ifdef _WIN32
+    using Trace = AgcDriver::ArchB::Recorder;
+    auto context = device.GetContext();
+    if (context.hostImportAlignment == 0) return false;
+    UploadCarryCopies copies(context);
+    DeviceFunctions functions{};
+    if (context.functions != nullptr) functions = *context.functions;
+    functions.cmdCopyBuffer = UploadCarryCopies::Record;
+    context.functions = &functions;
+    Trace::Boundary(true, 1, Trace::Clock::now());
+    constexpr std::size_t bytes = 4u << 20u;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "cannot allocate upload carry fixture");
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const auto element = address + 4096;
+    auto* words = reinterpret_cast<volatile std::uint32_t*>(element);
+    GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            GuestAllocations::Mutation().Remove(block);
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } cleanup{context, recorder, block};
+    const auto* imported = HostImportFor(context, address, bytes);
+    Require(imported != nullptr, "the upload carry fixture cannot be imported");
+    copies.source = imported->buffer;
+    GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    AgcDriver::GuestMemory::WtFaultFlip(false);
+    Require(AgcDriver::GuestMemory::FaultUnchangedSince(element, elementBytes, AgcDriver::GuestMemory::FaultClock()), "the upload carry fixture pages were not armed");
+    const auto finish = [&](const std::shared_ptr<GuestBufferMemory>& memory) {
+        memory->RecordCopyBacks(recorder);
+        memory->NoteStagingWrites(recorder);
+        memory->MarkDirectWrites();
+        memory->NoteStagingCarryTokens(recorder);
+    };
+    auto first = std::make_shared<GuestBufferMemory>(context);
+    first->AllowDeviceStaging();
+    first->AddWritable(element, elementBytes, false, true);
+    if (scenario == "no_baseline") {
+        first->UploadPrepare(false);
+        const auto refused = StagingShadowsRefused();
+        {
+            struct Full {
+                Full() { SetDeviceLocalFullForTests(true); }
+                ~Full() { SetDeviceLocalFullForTests(false); }
+            } full;
+            first->UploadFinish(false);
+        }
+        Require(StagingShadowsRefused() > refused, "the producer did not exercise baseline allocation refusal");
+    } else first->Upload(false);
+    Require(first->HasStagedCopies() && first->InPlaceReads().empty(), "the first resource set was not staged");
+    std::uint32_t adjustment = 0;
+    const auto firstView = first->Descriptor(element, elementBytes, adjustment);
+    auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, firstView.buffer, firstView.offset + adjustment, 4, 1);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    finish(first);
+    if (scenario == "cross_batch" || scenario == "cpu") recorder.Sync();
+    if (scenario == "cpu") words[128] = 7;
+    if (scenario == "noted") {
+        commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, imported->buffer, HostImportOffset(*imported, element + 512), 4, 7);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        recorder.NotePendingWrite(element + 512, 4);
+    }
+    const auto producer = Trace::Collect(Trace::Clock::now()).counters;
+    const auto count = [](const auto& counters, const char* key) { const auto it = counters.find(key); return it == counters.end() ? 0.0 : it->second; };
+    Require(count(producer, "c_gpu_staging_carry_tokens") == 1, "the producer did not leave a staging carry token");
+    Require(count(producer, "c_gpu_block_publish_verify_mismatches") == 0, "the producer's block publication differs from reconciliation");
+    if (AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CGpuBlockPublish)) Require(count(producer, "c_gpu_block_publish_publications") == 1 && count(producer, "c_gpu_block_publish_verified") == 1, "the producer did not leave a verified block-published token");
+    copies.destination = firstView.buffer;
+    copies.bytes = 0;
+    auto second = std::make_shared<GuestBufferMemory>(context);
+    second->AllowDeviceStaging();
+    second->AddWritable(element, elementBytes, false, true);
+    second->Upload(false);
+    const auto uploaded = Trace::Collect(Trace::Clock::now()).counters;
+    const bool taken = scenario == "taken" || scenario == "cross_batch";
+    if (taken) {
+        Require(count(uploaded, "c_gpu_upload_carry_taken") == 1, "the new resource set did not take the pooled staging shadow");
+        Require(count(uploaded, "c_gpu_upload_carry_bytes") == elementBytes && copies.bytes == 0, "a taken upload carry still copied in guest bytes");
+    } else {
+        Require(count(uploaded, "c_gpu_upload_carry_taken") == 0 && copies.bytes == elementBytes, "a refused or disabled upload carry did not copy in afresh");
+        if (scenario == "cpu") Require(count(uploaded, "c_gpu_upload_carry_cpu") == 1, "the CPU store did not refuse upload carry");
+        if (scenario == "noted") Require(count(uploaded, "c_gpu_upload_carry_noted") == 1, "the recorded GPU writer did not refuse upload carry");
+        if (scenario == "no_baseline") Require(count(uploaded, "c_gpu_upload_carry_no_baseline") == 1, "a token without a reconciled baseline was accepted by a writer");
+        if (scenario == "off") for (const auto& [name, value] : uploaded) if (name.starts_with("c_gpu_upload_carry_")) Require(value == 0, "the disabled upload carry path recorded a decision");
+    }
+    auto view = second->Descriptor(element, elementBytes, adjustment);
+    Require(view.buffer == firstView.buffer, "the new resource set did not share the pooled shadow");
+    auto readback = std::make_shared<Buffer>(context, 520, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), 0, 520);
+    CopyBuffer(context, commands, view.buffer, view.offset + adjustment, view.buffer, view.offset + adjustment + 4, 4);
+    CopyBuffer(context, commands, view.buffer, view.offset + adjustment + 512, view.buffer, view.offset + adjustment + 516, 4);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    finish(second);
+    recorder.Keep(readback);
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Sync();
+    const std::uint32_t expectedCpu = scenario == "cpu" || scenario == "noted" ? 7u : 0u;
+    std::uint32_t gpuFirst = 0, gpuCpu = 0;
+    std::memcpy(&gpuFirst, readback->Bytes().data(), 4);
+    std::memcpy(&gpuCpu, readback->Bytes().data() + 512, 4);
+    Require(gpuFirst == 1 && gpuCpu == expectedCpu, "the new resource set did not read its producer's result or the intervening store");
+    std::vector<std::byte> expected(bytes);
+    const std::uint32_t one = 1;
+    std::memcpy(expected.data() + 4096, &one, 4);
+    std::memcpy(expected.data() + 4100, &one, 4);
+    std::memcpy(expected.data() + 4096 + 512, &expectedCpu, 4);
+    std::memcpy(expected.data() + 4096 + 516, &expectedCpu, 4);
+    Require(std::memcmp(block, expected.data(), bytes) == 0, "the new resource set published bytes different from fresh input");
+    const auto completed = Trace::Collect(Trace::Clock::now()).counters;
+    Require(count(completed, "c_gpu_staging_carry_mismatches") == 0 && count(completed, "c_gpu_block_publish_verify_mismatches") == 0, "upload carry verification found a mismatched shadow");
+    Require(!taken || count(completed, "c_gpu_staging_carry_verified") == 1, "the taken upload carry was not verified");
+    std::cout << "upload carry " << scenario << " passed\n";
+    return true;
+#else
+    static_cast<void>(device);
+    static_cast<void>(recorder);
+    static_cast<void>(scenario);
+    return false;
+#endif
+}
+
 bool blockPublishTests(const Device& device, Recorder& recorder, std::string_view scenario) {
 #ifdef _WIN32
     using Trace = AgcDriver::ArchB::Recorder;
@@ -18327,6 +18483,7 @@ int main(int argc, char** argv) {
             parkedImportUnmapTests(device);
             return 0;
         }
+        if (argc == 3 && std::string_view(argv[1]) == "--upload-carry") return uploadCarryTests(device, recorder, argv[2]) ? 0 : 77;
         if (argc == 3 && std::string_view(argv[1]) == "--block-publish") return blockPublishTests(device, recorder, argv[2]) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--changed-copy-only") {
             changedCopyTests(device, recorder);
