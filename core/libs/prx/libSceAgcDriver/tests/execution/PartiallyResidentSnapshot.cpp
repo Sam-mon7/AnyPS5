@@ -61,6 +61,29 @@ constexpr std::uint32_t LargeSide = 512;
 constexpr std::size_t LargeSurfaceBytes = std::size_t{LargeSide} * LargeSide * 4u;
 constexpr int Skipped = 77;
 
+PFN_vkGetDeviceProcAddr snapshotDeviceProc = nullptr;
+bool snapshotFencePending = false;
+std::optional<std::uint32_t> snapshotWaitDepth;
+
+VKAPI_ATTR VkResult VKAPI_CALL SnapshotFenceStatus(VkDevice device, VkFence fence) {
+    if (snapshotFencePending) return VK_NOT_READY;
+    return reinterpret_cast<PFN_vkGetFenceStatus>(snapshotDeviceProc(device, "vkGetFenceStatus"))(device, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL SnapshotFenceWait(VkDevice device, std::uint32_t count, const VkFence* fences, VkBool32 all, std::uint64_t timeout) {
+    if (snapshotFencePending) {
+        snapshotWaitDepth = AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread();
+        snapshotFencePending = false;
+    }
+    return reinterpret_cast<PFN_vkWaitForFences>(snapshotDeviceProc(device, "vkWaitForFences"))(device, count, fences, all, timeout);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL SnapshotDeviceProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkGetFenceStatus") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&SnapshotFenceStatus);
+    if (std::strcmp(name, "vkWaitForFences") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&SnapshotFenceWait);
+    return snapshotDeviceProc(device, name);
+}
+
 class Device {
 public:
     Device() {
@@ -915,6 +938,13 @@ void PendingStores(Context context, ReservedSurface& surface) {
 }
 
 void PartialSnapshot(Context context, ReservedSurface& surface, std::string_view mode) {
+    const bool prewait = mode.starts_with("prewait");
+    if (prewait) {
+        snapshotDeviceProc = context.deviceProc;
+        context.deviceProc = &SnapshotDeviceProc;
+        AgcDriver::GuestMemory::TagGpuLockThread(0x30);
+    }
+    const Recorder::ComputeSyncScope computeSync(prewait && mode != "prewait-disabled");
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
     TextureCache textures(context);
@@ -953,7 +983,7 @@ void PartialSnapshot(Context context, ReservedSurface& surface, std::string_view
     if (mode == "cpu") {
         WriteBytes(surface.Address() + geometry.GuestLayerOffset(1), static_cast<std::size_t>(geometry.layerBytes), std::byte{0x11});
         Require(lookup(words, true) == previous, "a CPU layer rewrite replaced the partial snapshot");
-    } else if (mode == "pending") {
+    } else if (mode == "pending" || prewait) {
         const auto address = surface.Address() + geometry.GuestLayerOffset(2) + 4096;
         std::vector<std::byte> original(reinterpret_cast<const std::byte*>(surface.Data() + geometry.GuestLayerOffset(2) + 4096), reinterpret_cast<const std::byte*>(surface.Data() + geometry.GuestLayerOffset(2) + 8192));
         const auto landed = std::make_shared<bool>(false);
@@ -964,8 +994,20 @@ void PartialSnapshot(Context context, ReservedSurface& surface, std::string_view
             *landed = true;
         });
         recorder.Submit();
-        Require(lookup(words, true) == previous, "a pending GPU layer write replaced the partial snapshot");
+        snapshotFencePending = prewait;
+        snapshotWaitDepth.reset();
+        std::unique_lock nested(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+        if (mode == "prewait-nested") nested.lock();
+        const auto after = lookup(words, true);
+        if (nested.owns_lock()) nested.unlock();
+        Require(after == previous, "a pending GPU layer write replaced the partial snapshot");
         Require(*landed, "the partial snapshot update did not wait for its pending GPU write");
+        Require(surface.Data()[geometry.GuestLayerOffset(2) + 4096] == 0x22, "the partial snapshot update lost the completed write");
+        if (prewait) {
+            Require(snapshotWaitDepth.has_value(), "the pending snapshot fence was not waited for");
+            Require((*snapshotWaitDepth == 0) == (mode == "prewait"), "the snapshot fence wait used the wrong GPU mutex ownership");
+            Require(AgcDriver::GuestMemory::GpuMutex().DepthOnThisThread() == 1, "the snapshot wait did not restore the outer hold");
+        }
     } else if (mode == "boundary") {
         const auto boundary = surface.Address() + geometry.GuestLayerOffset(1);
         WriteBytes(boundary - 4096, 8192, std::byte{0x33});
