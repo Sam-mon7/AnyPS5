@@ -1857,9 +1857,15 @@ void testSubmissionRingFailureReportHeap() {
     submitWords(words);
     AgcDriverWaitIdle_nid_postfix();
     std::vector<std::string> lines;
+    std::vector<std::string> names;
+    names.reserve(4096);
     {
         CrtHeapTrap trap;
-        check(trap.Allocations([&] { check(AgcDriver::Pm4::Name(words[0]) == "INDEX_BUFFER_SIZE", "INDEX_BUFFER_SIZE is misnamed"); }) != 0, "the heap trap does not see the allocation of a packet name");
+        const auto seen = trap.Allocations([&] {
+            for (std::size_t i = 0; i < names.capacity(); ++i) names.push_back(AgcDriver::Pm4::Name(words[0]));
+        });
+        check(names.back() == "INDEX_BUFFER_SIZE", "INDEX_BUFFER_SIZE is misnamed");
+        check(seen != 0, "the heap trap does not see the allocation of packet names");
         CapturedStderr capture;
         const auto allocations = trap.Allocations([] { LibcRunFailureReports_nid_no_patch(); });
         lines = capture.RingLines();
