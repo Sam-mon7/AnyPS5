@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -26,7 +27,7 @@ void WriteData(std::vector<std::uint32_t>& words, const void* destination, std::
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     // APS5_ARCHB_PIPE_Q0_COMMITTER=1 from the test environment pipelines queue 0 through the runtime
     // switch instead (APS5_PIPELINED_DRAWS, when set, decides alone).
     const char* pipeSwitch = std::getenv("APS5_ARCHB_PIPE_Q0_COMMITTER");
@@ -38,6 +39,10 @@ int main() {
 #endif
     }
     try {
+        if (CriticalPath::Enabled()) {
+            CriticalPath::Name("j5b pipeline fixture");
+            CriticalPath::Present(0);
+        }
         Predicate = {1, 0, 0, 0};
         Target = {0, 0, 0, 0};
         const auto predicate = reinterpret_cast<std::uintptr_t>(Predicate.data());
@@ -49,7 +54,16 @@ int main() {
         check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
         AgcDriverWaitIdle_nid_postfix();
         check(Target[0] == 2, "a predicated WRITE_DATA landed after the unpredicated WRITE_DATA that follows it (target " + std::to_string(Target[0]) + ", expected 2)");
+        if (argc == 2 && std::string(argv[1]) == "j5b-lineage") {
+            std::vector<std::uint32_t> fresh;
+            WriteData(fresh, Target.data(), 3, false);
+            Packet next{fresh.data(), static_cast<std::uint32_t>(fresh.size()), 0, {}};
+            check(sceAgcDriverSubmitDcb(&next) == 0, "fresh unpredicated submission failed");
+            AgcDriverWaitIdle_nid_postfix();
+            check(Target[0] == 3, "queued unpredicated WRITE_DATA did not complete");
+        }
         LibcRunShutdown_nid_postfix();
+        if (CriticalPath::Enabled()) CriticalPath::Present(1);
         std::puts("pipelined predicated label order test passed");
         return 0;
     } catch (const std::exception& error) {

@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceVideoOut/include/VideoOut.hpp"
 #include <algorithm>
 #include <array>
@@ -375,7 +376,9 @@ int APS5_VABI sceVideoOutWaitVblank(int handle) try {
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     const uint64_t count = cfg->vblankStatus.count;
+    CriticalPath::Wait criticalWait("video.title_vblank", CriticalPath::Object(cfg.get()));
     cfg->vblankCond.wait(lock, cfg->shutdownToken, [&] { return !cfg->opened || cfg->closing || cfg->failure || cfg->vblankStatus.count != count; });
+    criticalWait.End();
     cfg->Check();
     return 0;
 } catch (const ProcessShutdown&) {

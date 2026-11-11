@@ -86,6 +86,8 @@ public:
     static void ProfileStore(std::uint64_t address, std::size_t bytes, std::uint32_t queue, std::uint32_t opcode, WaitStage stage, std::shared_ptr<WaitBatch> batch = {}, bool cpu = false);
     static WaitWriterSnapshot ProfileWriter(std::uint64_t address, std::size_t bytes);
     static void ReportWaitLabels(bool force = false);
+    static std::uint64_t CriticalLabelSource(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    static std::uint64_t CriticalLabelObserved(std::uint64_t source);
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
     explicit Recorder(const Context& context, bool timelineSemaphores = false);
     ~Recorder();
@@ -528,6 +530,8 @@ public:
         // Taken under the late rule: `generation` is the oldest group generation of the dwords.
         bool late;
         std::uint64_t generation;
+        std::uint64_t criticalSource = 0;
+        std::uint64_t criticalClose = 0;
     };
     // Why a lookup refused a late candidate (an entry with stamp <= afterStamp), for the trace.
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory
@@ -906,6 +910,7 @@ private:
         AgcDriver::FaultToken lastToken = 0;
         std::uint64_t traceId = 0;
         std::uint64_t timelineId = 0;
+        std::uint64_t criticalBatch = 0;
         bool submitted = false;
         bool guestWork = false;
         std::atomic<bool> submitStarted{false};
@@ -1046,6 +1051,8 @@ private:
         bool overwritten = false;
         // The value lands in memory only when the batch's completion actions run (LabelRefusal::BehindCompletion).
         bool behindCompletion = false;
+        std::uint64_t criticalSource = 0;
+        std::uint64_t criticalClose = 0;
     };
     void readGpuTiming(Batch& batch);
     void beginSamples(Batch& batch);

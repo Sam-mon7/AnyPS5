@@ -86,6 +86,8 @@ public:
         std::function<std::uint64_t(std::vector<Range>&)> run;
         std::atomic<std::uint8_t> state{0};
         std::uint64_t startedAt = 0;
+        std::uint64_t criticalEnqueue = 0;
+        std::uint64_t criticalDone = 0;
         std::uint64_t plan = 0;
         std::uint64_t ns = 0;
         std::vector<Range> reads;
@@ -203,6 +205,8 @@ private:
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
         std::shared_ptr<ResolveSlot> resolve;
+        std::uint64_t criticalEnqueue = 0;
+        std::shared_ptr<std::uint64_t> criticalRetirement;
     };
     struct Applied {
         std::uint64_t serial = 0;

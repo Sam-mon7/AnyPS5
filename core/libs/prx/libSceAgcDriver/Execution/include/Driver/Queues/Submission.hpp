@@ -46,6 +46,7 @@ struct Submission {
     std::chrono::steady_clock::time_point enqueuedAt{};
     std::chrono::steady_clock::time_point dequeuedAt{};
     std::chrono::steady_clock::time_point orderedAt{};
+    std::uint64_t criticalQueued = 0;
     const std::uint32_t* rewindTail = nullptr;
     std::size_t rewindWords = 0;
 };

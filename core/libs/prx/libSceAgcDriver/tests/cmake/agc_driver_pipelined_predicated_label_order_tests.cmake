@@ -1,3 +1,11 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_pipelined_predicated_label_order)
 endif()
+
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_j5b_pipeline_lineage COMMAND agc_driver_pipelined_predicated_label_order_tests j5b-lineage)
+    set_tests_properties(agc_driver_j5b_pipeline_lineage PROPERTIES ENVIRONMENT "APS5_PIPELINED_DRAWS=1;ANYPS5_NO_SHADER_CACHE=1" TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_j5b_pipeline_lineage PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

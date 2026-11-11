@@ -20,6 +20,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include <atomic>
 #include <array>
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -654,6 +656,7 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
 }
 
 std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submission& submission, DrawTail& tail) {
+    CriticalPath::Scope selectTiming("draw_live_select_q0");
     const auto started = std::chrono::steady_clock::now();
     const auto found = LiveIndex().entries.find(tail.liveKey);
     if (found == LiveIndex().entries.end()) { CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_no_template"); return {}; }
@@ -694,7 +697,10 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         candidate.live = true;
         candidate.commitTemplate = entry->link;
         CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_gathers");
-        auto plan = RunGatherShadow(candidate);
+        auto plan = [&] {
+            CriticalPath::Scope gatherTiming("draw_live_gather_q0");
+            return RunGatherShadow(candidate);
+        }();
         if (plan == nullptr || !plan->complete || entry->allocationGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
             if (plan == nullptr) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_no_plan");
             else if (plan->complete) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_allocation_generation");
@@ -1446,7 +1452,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         shadow.limits = GatherLimitsOf(*localDevice, graphics);
         shadow.live = tail.liveEnabled && !tail.liveVerify;
         shadow.commitTemplate = tail.liveEntry != nullptr ? tail.liveEntry->link : nullptr;
-        tail.gatherPlan = RunGatherShadow(shadow);
+        {
+            std::optional<CriticalPath::Scope> gatherTiming;
+            if (shadow.live && submission.queue == 0) gatherTiming.emplace("draw_live_gather_q0");
+            tail.gatherPlan = RunGatherShadow(shadow);
+        }
         ArmGatherValidationLog(false);
         gatherLogScope.armed = false;
     }
@@ -1565,6 +1575,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 }
 
 void Driver::enqueueGatherDraw(DrawTail& tail) {
+    CriticalPath::Scope enqueueTiming("draw_live_enqueue");
     const auto live = tail.live;
     CountLiveDraw(live->parameters, "draw_templates_live_enqueued");
     const auto link = live->entry->link;
@@ -1578,6 +1589,7 @@ void Driver::enqueueGatherDraw(DrawTail& tail) {
     const auto ticket = GuestMemory::Gen::Required();
     auto reference = live->verify ? tail.self.lock() : nullptr;
     auto commit = [this, live, link, reference, localDevice = tail.localDevice, commitQueue = tail.submissionQueue, commitPacket = tail.packetOpcode, epoch, ticket, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey] {
+        CriticalPath::Scope commitTiming("draw_live_commit");
         const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
         const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
         const ArchB::AllocChurnScope allocChurnScope(allocChurn);
@@ -2214,6 +2226,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     const RecaptureScope recapture;
                     return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
                 }
+                CriticalPath::Scope enqueueTiming("draw_enqueue");
                 phaseTiming.Phase(DrawRowVectors);
                 auto writes = queuedDrawWrites(tail, graphics, stages);
                 if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
@@ -2302,6 +2315,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             const RecaptureScope recapture;
             return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
         }
+        CriticalPath::Scope enqueueTiming("draw_enqueue");
         phaseTiming.Phase(DrawRowVectors);
         auto writes = queuedDrawWrites(tail, graphics, stages);
         if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
