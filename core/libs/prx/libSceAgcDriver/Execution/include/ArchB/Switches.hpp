@@ -111,6 +111,9 @@ enum class Feature : std::uint8_t {
     FixStatePacketFast,
     FixDrawRelocNested,
     FixSampledArrayGpu,
+    DrawHitCensus,
+    DispatchTiming,
+    DispatchRelocationRecipe,
     Count
 };
 

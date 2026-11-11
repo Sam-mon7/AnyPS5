@@ -5,3 +5,4 @@
 #include "prx/libc/include/exceptions/Unwind.hpp"
 #include "prx/libc/include/SonyCrt.hpp"
 #include "prx/libc/include/WindowsFormatting.hpp"
+#include "prx/libc/include/CriticalPathTrace.hpp"

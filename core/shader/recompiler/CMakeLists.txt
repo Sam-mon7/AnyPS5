@@ -245,6 +245,12 @@ function(add_shader_recompiler target runtimeTarget)
     set(shaderCacheReviewedNames
             Detail::ComputeFlatSlotReasons
             Detail::IsRawRead
+            Detail::AddSignedAddress
+            Detail::IsRuntimeSelect
+            Detail::IsMemoryRead
+            Detail::IsRuntimeUniformOp
+            Detail::IsDescriptorHandle
+            RegIndex
             BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders

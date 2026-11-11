@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -130,6 +131,8 @@ int main() {
         Input = NewBlock();
         Output = NewBlock();
 
+        const bool timingFixture = std::getenv("APS5_TEST_DISPATCH_TIMING") != nullptr;
+        if (timingFixture) CriticalPath::Present(1);
         Round(0x11112222u, "the first dispatch");
         const std::array<std::uint32_t, 4> values{0x33334444u, 0x55556666u, 0x7a7b7c7du, 0x0f1e2d3cu};
         for (std::size_t round = 0; round < values.size(); ++round) {
@@ -141,6 +144,7 @@ int main() {
         }
         std::printf("dispatch data hit words: %zu data hits resolved ahead read their own live words\n", values.size());
 
+        if (timingFixture) CriticalPath::Present(2);
         LibcRunShutdown_nid_postfix();
         std::puts("dispatch data hit words tests passed");
         return 0;

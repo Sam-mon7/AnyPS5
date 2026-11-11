@@ -170,7 +170,7 @@ void Reset(std::uint32_t* output) {
     std::fill(output, output + Words, Sentinel);
 }
 
-ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const std::uint32_t* input, std::uint32_t inputBytes, const std::uint32_t* output) {
+ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const std::uint32_t* input, std::uint32_t inputBytes, const std::uint32_t* output, std::uint32_t pushBytes = 128) {
     const auto in = BufferDescriptor(input, inputBytes);
     const auto out = BufferDescriptor(output, Bytes);
     std::copy(in.begin(), in.end(), Table.begin());
@@ -185,7 +185,7 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
         device.Target(),
-        {0, 0, 0, 128}
+        {0, 0, 0, pushBytes}
     };
     request.useCache = false;
     return ShaderRecompiler::Recompile(request);
@@ -312,6 +312,101 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     const auto total = AgcDriver::VulkanDevice::DispatchMoveCounts();
     std::printf("dispatch move: in total: checked %llu, exact %llu, moved %llu, refused %llu, dropped by stage A %llu\n", static_cast<unsigned long long>(total.checked), static_cast<unsigned long long>(total.exact), static_cast<unsigned long long>(total.moved), static_cast<unsigned long long>(total.refused), static_cast<unsigned long long>(total.filtered));
     return templates;
+}
+
+bool RunRelocationRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    using AgcDriver::VulkanDevice;
+    GuestAllocations::Mapped ranges;
+    for (const auto& range : GuestAllocations::GuestAllocationsAcquire_nid_postfix()) {
+        if (range->address == reinterpret_cast<std::uintptr_t>(guest.InputA())) ranges.push_back(range);
+    }
+    Require(ranges.size() == 1, "relocation recipe: guest memory registration missing");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.ImportGuestMemory(ranges, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true), "relocation recipe: explicit guest memory import failed");
+    }
+    Fill(guest.InputA(), 0x6000u);
+    auto donor = Compile(device, guest.InputA(), Bytes, guest.OutputO());
+    std::shared_ptr<const AgcDriver::Recipe> recipe;
+    auto failure = AgcDriver::RecipeBuildFailure::NotAttempted;
+    Reset(guest.OutputO());
+    device.Dispatch(donor, 1, 1, 1, {}, 0, nullptr, &recipe, std::nullopt, nullptr, &failure);
+    device.WaitIdle();
+    Expect(guest.InputA(), guest.OutputO(), Constant, "the relocation recipe's initial dispatch");
+    const std::array<const char*, 13> failureNames{"not-attempted", "none", "disabled", "uncacheable", "overlay", "address-table", "lease", "copied-writes", "not-reusable", "completion", "objects", "key", "count"};
+    std::printf("relocation recipe: build failure %s (%zu), pipeline variant %llu, identity empty %d, push bytes %zu\n", failureNames.at(static_cast<std::size_t>(failure)), static_cast<std::size_t>(failure), static_cast<unsigned long long>(donor.PipelineVariantId()), donor.Identity().Empty(), donor.pushConstants.size());
+    Require(recipe != nullptr, "relocation recipe: the Vulkan device did not produce the required reusable recipe");
+    const auto resources = recipe->templateRef.lock();
+    Require(resources != nullptr, "relocation recipe: the template expired");
+    const auto originalPush = recipe->pushBytes;
+    const auto originalHash = recipe->dataWordsHash;
+    const auto originalKey = recipe->key;
+    const auto originalDonorPush = donor.pushConstants;
+    const auto unchanged = VulkanDevice::RelocateDispatchRecipe(donor, donor, recipe);
+    Require(unchanged != nullptr && unchanged.get() != recipe.get(), "relocation recipe: identical resources did not produce a private recipe");
+    Require(unchanged->key == originalKey && unchanged->device == recipe->device && unchanged->templateRef.lock() == resources && unchanged->objects.lock() == recipe->objects.lock(), "relocation recipe: lifetime or cache identity changed");
+    auto hit = device.PrepareRecipe(unchanged, false);
+    Require(hit != nullptr, "relocation recipe: the unchanged recipe pre-check failed");
+    auto verify = device.PrepareDispatch(donor, {});
+    Reset(guest.OutputO());
+    AgcDriver::VulkanDevice::IndirectOutcome outcome{};
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.DispatchRecipe(donor, 1, 1, 1, 0, 0, hit, outcome, verify) == AgcDriver::RecipeOutcome::Recorded, "relocation recipe: the unchanged recipe rebuilt");
+    }
+    device.WaitIdle();
+    Expect(guest.InputA(), guest.OutputO(), Constant, "the relocated recipe's actual output");
+    Require(!donor.pushConstants.empty(), "relocation recipe: the test needs a push constant payload");
+    auto live = donor;
+    for (auto& byte : live.pushConstants) byte ^= std::byte{0x5a};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> liveShaders{{{ShaderStage::Compute, &live, 0}}};
+    auto expectedPush = AgcDriver::Graphics::AssemblePushConstants(liveShaders);
+    const auto unpatchedPush = expectedPush;
+    resources->PatchPushConstants(expectedPush);
+    const auto relocated = VulkanDevice::RelocateDispatchRecipe(donor, live, recipe);
+    Require(relocated != nullptr && relocated->pushBytes == expectedPush && relocated->pushBytes != originalPush, "relocation recipe: live push constants or template adjustments were lost");
+    std::printf("relocation recipe: immutable push adjustments exercised %s\n", expectedPush != unpatchedPush ? "yes" : "no (device needs none)");
+    Require(recipe->pushBytes == originalPush && recipe->dataWordsHash == originalHash && recipe->key == originalKey && donor.pushConstants == originalDonorPush, "relocation recipe: the donor was mutated");
+    Require(VulkanDevice::RelocateDispatchRecipe(donor, donor, nullptr) == nullptr, "relocation recipe: missing recipe accepted");
+    auto expired = std::make_shared<AgcDriver::Recipe>(*recipe);
+    expired->templateRef.reset();
+    Require(VulkanDevice::RelocateDispatchRecipe(donor, donor, expired) == nullptr, "relocation recipe: expired template accepted");
+    auto wrongPush = std::make_shared<AgcDriver::Recipe>(*recipe);
+    wrongPush->pushBytes.back() ^= std::byte{1};
+    Require(VulkanDevice::RelocateDispatchRecipe(donor, donor, wrongPush) == nullptr, "relocation recipe: mismatched donor push accepted");
+    auto changed = donor;
+    changed.fullSubgroups = !changed.fullSubgroups;
+    Require(VulkanDevice::RelocateDispatchRecipe(donor, changed, recipe) == nullptr, "relocation recipe: another pipeline accepted");
+    changed = donor;
+    const auto guestBinding = std::find_if(changed.bindings.begin(), changed.bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && !binding.guestDescriptor.empty(); });
+    Require(guestBinding != changed.bindings.end(), "relocation recipe: no guest resource for the guard");
+    guestBinding->guestDescriptor[0] ^= 4u;
+    Require(VulkanDevice::RelocateDispatchRecipe(donor, changed, recipe) == nullptr, "relocation recipe: changed non-data resource accepted");
+    auto wrongDonor = donor;
+    wrongDonor.bindings.push_back({ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::ShaderData, 0, 99, 1, {0x1234u}});
+    Require(VulkanDevice::RelocateDispatchRecipe(wrongDonor, wrongDonor, recipe) == nullptr, "relocation recipe: an unrelated donor accepted");
+    const auto dataDonor = Compile(device, guest.InputA(), Bytes, guest.OutputO(), 0);
+    std::shared_ptr<const AgcDriver::Recipe> dataRecipe;
+    Reset(guest.OutputO());
+    failure = AgcDriver::RecipeBuildFailure::NotAttempted;
+    device.Dispatch(dataDonor, 1, 1, 1, {}, 0, nullptr, &dataRecipe, std::nullopt, nullptr, &failure);
+    device.WaitIdle();
+    Expect(guest.InputA(), guest.OutputO(), Constant, "the data recipe's actual output");
+    std::printf("relocation recipe: data build failure %s (%zu)\n", failureNames.at(static_cast<std::size_t>(failure)), static_cast<std::size_t>(failure));
+    Require(dataRecipe != nullptr, "relocation recipe: no data-buffer recipe");
+    auto dataLive = dataDonor;
+    bool testedData = false;
+    for (auto& binding : dataLive.bindings) {
+        if ((binding.role != ShaderRecompiler::DescriptorRole::ShaderData && binding.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) || binding.guestDescriptor.empty()) continue;
+        binding.guestDescriptor[0] ^= 1u;
+        testedData = true;
+    }
+    Require(testedData, "relocation recipe: no runtime data payload");
+    Require(VulkanDevice::RelocateDispatchRecipe(dataDonor, dataDonor, dataRecipe) != nullptr, "relocation recipe: unchanged data rejected");
+    const auto refreshed = VulkanDevice::RelocateDispatchRecipe(dataDonor, dataLive, dataRecipe);
+    Require((refreshed != nullptr) == VulkanDevice::TemplateDataRefresh(), "relocation recipe: changed data ignored refresh policy");
+    if (refreshed != nullptr) Require(refreshed->dataWordsHash == AgcDriver::Graphics::ShaderResources::DataWordsHash({ShaderStage::Compute, &dataLive, 0}), "relocation recipe: live data hash not updated");
+    return true;
 }
 
 bool RunCompletionRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
@@ -478,6 +573,12 @@ int main(int argc, char** argv) {
             AgcDriver::GuestMemory::TagGpuLockThread(0x28);
             if (!RunCompletionRecipe(*device, guest)) return VulkanTestSkipped;
             std::puts("completion recipe tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--relocation-recipe") {
+            AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+            if (!RunRelocationRecipe(*device, guest)) return VulkanTestSkipped;
+            std::puts("relocation recipe guard tests passed");
             return 0;
         }
         Require(argc == 1, "unknown dispatch move test arguments");

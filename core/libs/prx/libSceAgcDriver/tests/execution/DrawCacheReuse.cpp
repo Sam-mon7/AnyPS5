@@ -1,3 +1,15 @@
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+#include <span>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -20,6 +32,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -150,6 +163,45 @@ unsigned BrightestColorByte() {
     unsigned brightest = 0;
     for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(value));
     return brightest;
+}
+
+void DrawHitCensusPath() {
+    AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto unchanged = Submit(32.0f, {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f});
+    Require(unchanged.hits == 4, "census changed the ordinary repeated-draw hit count");
+    auto commands = Draws(32.0f, VertexCode.data(), 1, PixelCode.data(), 1, {{std::bit_cast<std::uint32_t>(1.0f)}});
+    commands[commands.size() - 2] = 6;
+    const auto changed = Submit(std::move(commands));
+    Require(changed.hits == 5, "census changed ordinary validation after a packet change");
+    const auto snapshot = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now());
+    const auto& counts = snapshot.counters;
+    const auto count = [&](const char* name) { const auto it = counts.find(name); return it == counts.end() ? 0.0 : it->second; };
+    const bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::DrawHitCensus);
+    Require(count("j3_old_hits") == (enabled ? 5 : 0), "census did not observe each ordinary hit exactly once");
+    Require(count("j3_prediction_mismatch") == 0, "census prediction disagreed with the actual draw-cache lookup");
+    Require(count("j3b_draw_nonindirect") == (enabled ? 7 : 0), "attribution did not count the draw population");
+    Require(count("j3b_finish_hit") == (enabled ? 5 : 0), "attribution did not count finishing cache hits");
+    const auto phase = [&](const char* name) {
+        double total = 0;
+        for (const auto& [thread, phases] : snapshot.phases) {
+            if (const auto found = phases.find(name); found != phases.end()) total += found->second;
+        }
+        return total;
+    };
+    for (const char* name : {"Driver.Draw.j3_prologue_precheck", "Driver.Draw.j3_prepare_keys_nonindirect", "Driver.Draw.j3_prepare_decode_programs", "Driver.Draw.j3_setup_before_lookup", "Driver.Draw.j3_stage_assembly_hit_nonindirect", "Shader.J3PrimaryStage.j3_capture_invocation"}) {
+        Require((phase(name) > 0) == enabled, "attribution phase missing when enabled or present when disabled");
+    }
+    if (AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeQ0Committer)) {
+        Require((phase("J3.EnqueueReclaim") > 0) == enabled, "enqueue reclamation attribution is missing");
+        const auto committedDraws = count("j3c_replayed_count") + count("j3c_recipe_count") + count("j3c_legacy_count");
+        Require(committedDraws == (enabled ? 7 : 0), "committer census changed or omitted the draw population");
+        Require((count("j3c_replayed_commit_ns") + count("j3c_recipe_commit_ns") + count("j3c_legacy_commit_ns") > 0) == enabled, "committer draw timing is missing");
+        Require(count("j3c_failed_commits") == 0, "committer census observed a failed draw");
+        Require(count("j3b_enqueue_draw_calls") == (enabled ? 7 : 0), "enqueue attribution changed the draw population: " + std::to_string(count("j3b_enqueue_draw_calls")));
+    }
+    std::cout << "Draw-hit census preserves repeated-draw and changed-packet results\n";
 }
 
 void ThirdDrawHitsTheCache(bool libraries) {
@@ -484,6 +536,178 @@ void BufferBaseProofs() {
     plan->info.buffers[0].written = true;
     RecordBufferBasePatches(variant, capture);
     Require(variant.bufferBaseMasks.empty(), "base proof accepted a writable buffer");
+}
+
+void DispatchRelocationProofs() {
+    using namespace ShaderRecompiler;
+    using namespace AgcDriver::DriverDetail;
+    struct Fixture {
+        std::shared_ptr<IrResourcePlan> plan = std::make_shared<IrResourcePlan>();
+        ResourceCapture capture;
+        DispatchVariant variant;
+        IrValue* handle = nullptr;
+        IrValue* first = nullptr;
+        std::uint32_t id = 0;
+        IrValue* Make(IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) {
+            auto* value = plan->valueStorage.Create(opcode, type, id++);
+            for (auto* argument : arguments) value->AddArgument(argument);
+            return value;
+        }
+        IrValue* Constant(std::uint32_t word) {
+            auto* value = Make(IrOpcode::Void, IrType::U32);
+            value->SetImmediateU32(word);
+            return value;
+        }
+        IrValue* User(std::uint32_t index) {
+            auto* reg = Make(IrOpcode::Void, IrType::ScalarReg);
+            reg->SetRegister({RegisterBank::UserData, plan->userDataBase + index});
+            return Make(IrOpcode::GetUserData, IrType::U32, {reg});
+        }
+        IrValue* Boolean(bool enabled) {
+            auto* value = Make(IrOpcode::Void, IrType::U1);
+            value->SetImmediateBool(enabled);
+            return value;
+        }
+        IrValue* Load(IrValue* source, IrValue* offset) {
+            auto* value = Make(IrOpcode::LoadAddressU32, IrType::U32, {source, offset, Constant(0), Boolean(true)});
+            value->SetFlags(MemoryFlags{0, 0});
+            return value;
+        }
+        Fixture() {
+            plan->valueStorage.Reserve(256);
+            plan->srtPlanComplete = plan->resourceTrackingComplete = true;
+            plan->userDataBase = 16;
+            plan->memoryInfo.emplace_back().kind = ResourceKind::ScalarAddress;
+            capture.plan = plan;
+            variant.userData.resize(16);
+            variant.userData[12] = 0x1000;
+            variant.userData[14] = 0x2000;
+            capture.snapshot.userData = variant.userData;
+            variant.relocatableWords = std::uint64_t{1} << 12;
+            capture.userDataUse.asBase = variant.relocatableWords;
+            handle = Make(IrOpcode::CompositeConstructU64, IrType::U64, {User(12), User(13)});
+            for (std::uint32_t word = 0; word < 8; ++word) {
+                auto* load = Load(handle, Constant(word * 4));
+                if (word == 0) first = load;
+                plan->srtReads.push_back({.value = load, .flatOffset = word});
+                capture.userDataUse.reads.emplace_back(0x1000 + word * 4, 12);
+            }
+            variant.runs = {{0x1000, 0x1020}};
+            variant.runBases = {12};
+            variant.runParents.resize(1);
+            variant.words.resize(8);
+        }
+        bool Accepted() const { return Driver::dispatchRelocationDirect(variant, capture); }
+    };
+    const auto reject = [](const char* message, const auto& mutate) {
+        Fixture fixture;
+        mutate(fixture);
+        Require(!fixture.Accepted(), message);
+    };
+    Fixture direct;
+    Require(direct.Accepted(), "direct relocation proof rejected a complete direct root");
+    Fixture immediateHigh;
+    immediateHigh.handle->ReplaceArgument(1, immediateHigh.Constant(0));
+    Require(immediateHigh.Accepted(), "direct relocation proof rejected an immediate high word");
+    Fixture two;
+    auto* secondHandle = two.Make(IrOpcode::CompositeConstructU64, IrType::U64, {two.User(14), two.User(15)});
+    auto* second = two.Load(secondHandle, two.Constant(0));
+    two.plan->srtReads.push_back({.value = second, .flatOffset = 8});
+    two.variant.relocatableWords |= std::uint64_t{1} << 14;
+    two.capture.userDataUse.asBase = two.variant.relocatableWords;
+    two.capture.userDataUse.reads.emplace_back(0x2000, 14);
+    two.variant.runs.emplace_back(0x2000, 0x2004);
+    two.variant.runBases.push_back(14);
+    two.variant.runParents.emplace_back();
+    two.variant.words.push_back(0);
+    Require(two.Accepted(), "direct relocation proof rejected two independent direct roots");
+    Fixture reference;
+    auto* readConst = reference.Make(IrOpcode::ReadConst, IrType::U32, {reference.Make(IrOpcode::GetSrtResource, IrType::SrtResource), reference.Constant(0)});
+    reference.plan->descriptorSources.resize(1);
+    reference.plan->descriptorSources[0].dwordCount = 1;
+    reference.plan->descriptorSources[0].dwords[0] = readConst;
+    Require(reference.Accepted(), "direct relocation proof rejected a valid flat-slot reference");
+    reject("direct relocation proof accepted an unobserved scalar buffer read", [](auto& f) {
+        f.plan->memoryInfo.emplace_back().kind = ResourceKind::ScalarBuffer;
+        auto* descriptor = f.Make(IrOpcode::GetBufferResource, IrType::BufferResource, {f.User(0), f.User(1), f.User(2), f.User(3)});
+        auto* extra = f.Make(IrOpcode::ReadConstBuffer, IrType::U32, {descriptor, f.Constant(12)});
+        extra->SetFlags(MemoryFlags{1, 0});
+    });
+    for (const auto child : {0x1000u, 0x3000u}) {
+        reject("direct relocation proof accepted nested reads hidden by parent overlap", [child](auto& f) {
+            f.variant.words[0] = child;
+            auto* nested = f.Make(IrOpcode::CompositeConstructU64, IrType::U64, {f.first, f.Constant(0)});
+            auto* extra = f.Load(nested, f.Constant(0));
+            f.plan->srtReads.push_back({.value = extra, .flatOffset = 8});
+        });
+    }
+    reject("direct relocation proof accepted an inactive read", [](auto& f) { f.first->ReplaceArgument(3, f.Boolean(false)); });
+    reject("direct relocation proof accepted a variable active mask", [](auto& f) { f.first->ReplaceArgument(3, f.Make(IrOpcode::IEqual32, IrType::U1, {f.User(0), f.Constant(0)})); });
+    reject("direct relocation proof accepted a nonzero high offset", [](auto& f) { f.first->ReplaceArgument(2, f.Constant(1)); });
+    reject("direct relocation proof accepted a variable high offset", [](auto& f) { f.first->ReplaceArgument(2, f.User(0)); });
+    reject("direct relocation proof accepted a full-address read", [](auto& f) { f.plan->memoryInfo[0].addressIsFull = true; });
+    reject("direct relocation proof accepted a non-word read", [](auto& f) { f.plan->memoryInfo[0].dataBits = 16; });
+    reject("direct relocation proof accepted a multiword read", [](auto& f) { f.plan->memoryInfo[0].dataDwords = 2; });
+    reject("direct relocation proof accepted a malformed two-argument load", [](auto& f) { f.Make(IrOpcode::LoadAddressU32, IrType::U32, {f.handle, f.Constant(0)})->SetFlags(MemoryFlags{0, 0}); });
+    reject("direct relocation proof accepted a read-derived offset", [](auto& f) { f.first->ReplaceArgument(1, f.plan->srtReads[1].value); });
+    reject("direct relocation proof accepted select topology", [](auto& f) { f.Make(IrOpcode::SelectU32, IrType::U32, {f.Constant(1), f.first, f.Constant(0)}); });
+    reject("direct relocation proof accepted phi topology", [](auto& f) { f.Make(IrOpcode::Phi, IrType::U32, {f.first}); });
+    reject("direct relocation proof accepted a conditional", [](auto& f) { f.plan->controlFlow.resize(1); f.plan->controlFlow[0].condition = f.first; });
+    reject("direct relocation proof accepted a guard", [](auto& f) { f.plan->guardedSrtSlots.push_back(0); });
+    reject("direct relocation proof accepted null-root reads", [](auto& f) { f.capture.snapshot.nullRootReads = 1; });
+    reject("direct relocation proof accepted poison", [](auto& f) { f.capture.snapshot.srtPoison.emplace_back(); });
+    reject("direct relocation proof accepted table reads", [](auto& f) { f.plan->descriptorSources.resize(1); f.plan->descriptorSources[0].tableColumn.emplace(); });
+    reject("direct relocation proof accepted table snapshots", [](auto& f) { f.capture.snapshot.tables.tables.emplace_back(); });
+    reject("direct relocation proof accepted uniform fill", [](auto& f) { f.plan->uniformFill.fill.kind = UniformFillKind::Buffer; });
+    reject("direct relocation proof accepted missing expected reads", [](auto& f) { f.capture.userDataUse.reads.pop_back(); });
+    reject("direct relocation proof accepted an unattributed read", [](auto& f) { f.capture.userDataUse.reads[0].second = -1; });
+    reject("direct relocation proof accepted an unattributed run", [](auto& f) { f.variant.runBases[0] = -1; });
+    reject("direct relocation proof accepted nested provenance", [](auto& f) { f.capture.userDataUse.nested.emplace_back(0x1000, 0x1004); });
+    reject("direct relocation proof accepted a run parent", [](auto& f) { f.variant.runParents[0] = {0, 0}; });
+    reject("direct relocation proof accepted conflicting origins", [](auto& f) { f.capture.userDataUse.reads.emplace_back(0x1000, 14); });
+    reject("direct relocation proof accepted overlapping roots", [](auto& f) {
+        f.variant.userData[14] = f.capture.snapshot.userData[14] = 0x1000;
+        f.variant.relocatableWords |= std::uint64_t{1} << 14;
+        auto* handle = f.Make(IrOpcode::CompositeConstructU64, IrType::U64, {f.User(14), f.User(15)});
+        f.Load(handle, f.Constant(0));
+    });
+    reject("direct relocation proof accepted invalid low register", [](auto& f) { f.handle->ReplaceArgument(0, f.User(64)); });
+    reject("direct relocation proof accepted invalid high register", [](auto& f) { f.handle->ReplaceArgument(1, f.User(64)); });
+    reject("direct relocation proof accepted relocatable high word", [](auto& f) { f.variant.relocatableWords |= std::uint64_t{1} << 13; });
+    reject("direct relocation proof accepted missing words", [](auto& f) { f.variant.words.pop_back(); });
+    reject("direct relocation proof accepted extra words", [](auto& f) { f.variant.words.push_back(0); });
+    reject("direct relocation proof accepted missing bases", [](auto& f) { f.variant.runBases.clear(); });
+    reject("direct relocation proof accepted malformed range", [](auto& f) { f.variant.runs[0].second = 0x1001; });
+    reject("direct relocation proof accepted mismatched user words", [](auto& f) { ++f.capture.snapshot.userData[12]; });
+    reject("direct relocation proof accepted incomplete SRT plan", [](auto& f) { f.plan->srtPlanComplete = false; });
+    reject("direct relocation proof accepted incomplete tracking", [](auto& f) { f.plan->resourceTrackingComplete = false; });
+    reject("direct relocation proof accepted specialization memory", [](auto& f) { f.plan->requiresSpecializationMemory = true; });
+    reject("direct relocation proof accepted invalid memory index", [](auto& f) { f.first->SetFlags(MemoryFlags{99, 0}); });
+    reject("direct relocation proof accepted invalid descriptor count", [](auto& f) { f.plan->descriptorSources.resize(1); f.plan->descriptorSources[0].dwordCount = 99; });
+    reject("direct relocation proof accepted missing parent counts", [](auto& f) { f.variant.runParents.clear(); });
+    reject("direct relocation proof accepted duplicate run coverage", [](auto& f) { f.variant.runs.push_back(f.variant.runs[0]); f.variant.runBases.push_back(12); f.variant.runParents.emplace_back(); f.variant.words.resize(16); });
+    reject("direct relocation proof accepted an invalid flat-slot reference", [](auto& f) { f.Make(IrOpcode::ReadConst, IrType::U32, {f.Make(IrOpcode::GetSrtResource, IrType::SrtResource), f.Constant(99)}); });
+    reject("direct relocation proof accepted a missing plan", [](auto& f) { f.capture.plan.reset(); });
+    const auto ranges = [](std::initializer_list<std::pair<std::uint64_t, std::uint64_t>> runs, std::size_t words, bool expected, const char* message) {
+        DispatchVariant variant;
+        variant.runs.assign(runs);
+        variant.words.resize(words);
+        Require(Driver::dispatchRelocationRangesValid(variant) == expected, message);
+    };
+    constexpr auto limit = std::uint64_t{1} << 48;
+    ranges({{limit - 4, limit}}, 1, true, "relocation range proof rejected the final 48-bit word");
+    ranges({{0x1000, 0x1004}, {0x1004, 0x1008}}, 2, true, "relocation range proof rejected adjacent ranges");
+    ranges({{0x2000, 0x2004}, {0x1000, 0x1004}}, 2, true, "relocation range proof rejected disjoint unordered ranges");
+    ranges({{limit - 4, 0}}, 1, false, "relocation range proof accepted wrapped endpoints");
+    ranges({{limit - 4, limit + 4}}, 2, false, "relocation range proof accepted bytes above the 48-bit domain");
+    ranges({{0x1001, 0x1005}}, 1, false, "relocation range proof accepted a misaligned begin");
+    ranges({{0x1000, 0x1005}}, 1, false, "relocation range proof accepted a misaligned end");
+    ranges({{0x1000, 0x1000}}, 0, false, "relocation range proof accepted an empty run");
+    ranges({}, 0, false, "relocation range proof accepted no runs");
+    ranges({{0x1000, 0x1008}}, 1, false, "relocation range proof accepted too few words");
+    ranges({{0x1000, 0x1004}}, 2, false, "relocation range proof accepted surplus words");
+    ranges({{0x1000, 0x1008}, {0x1004, 0x100c}}, 4, false, "relocation range proof accepted overlapping ranges");
+    std::puts("dispatch relocation direct proof tests passed");
 }
 
 void NestedPointerProofs() {
@@ -966,14 +1190,58 @@ void TsharpCachePath(bool dispatch, bool user, bool toggle) {
 // texture's value (a miss, or a data hit if that word is refreshable data); without
 // the switch every moved pointer misses. With queue 0 pipelined (PIPE_Q0_COMMITTER) the relocated
 // dispatches still fall back from the pre-check (exact key absent) and then hit in the lookup.
-alignas(256) std::array<std::array<std::uint32_t, 16>, 5> RelocationTables{};
+alignas(256) std::array<std::array<std::uint32_t, 16>, 12> RelocationTables{};
 alignas(256) std::array<std::byte, 4096> RelocationTexture{};
 
-void DispatchRelocationPath() {
+class DispatchRelocationOutput {
+public:
+    explicit DispatchRelocationOutput(bool enabled) {
+        if (!enabled) return;
+#ifdef _WIN32
+        block = static_cast<float*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Bytes));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, Bytes, PAGE_READWRITE, Bytes);
+#else
+        void* mapped = mmap(nullptr, 2 * Bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped != MAP_FAILED) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
+            const auto aligned = (begin + Bytes - 1) & ~(Bytes - 1);
+            if (aligned != begin) munmap(mapped, aligned - begin);
+            if (aligned + Bytes != begin + 2 * Bytes) munmap(reinterpret_cast<void*>(aligned + Bytes), begin + Bytes - aligned);
+            block = reinterpret_cast<float*>(aligned);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, Bytes);
+        }
+#endif
+        Require(block != nullptr, "cannot allocate importable dispatch relocation output");
+        GuestAllocations::Mutation().Add(block, Bytes, true, true, true);
+    }
+    ~DispatchRelocationOutput() {
+        if (block == nullptr) return;
+        AgcDriverWaitIdle_nid_postfix();
+        GuestAllocations::Mutation().Remove(block);
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(block, Bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, Bytes);
+#else
+        munmap(block, Bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, Bytes);
+#endif
+    }
+    DispatchRelocationOutput(const DispatchRelocationOutput&) = delete;
+    DispatchRelocationOutput& operator=(const DispatchRelocationOutput&) = delete;
+    float* Data() const { return block != nullptr ? block : FeedbackOutput.data(); }
+private:
+    static constexpr std::size_t Bytes = 65536;
+    float* block = nullptr;
+};
+
+void DispatchRelocationPath(bool recipeMode = false) {
     using namespace AgcDriver::DriverDetail;
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
-    const bool enabled = Switches::Enabled(Feature::FixDispatchRelocation);
+    DispatchRelocationOutput storage(recipeMode);
+    const std::span<float, 32> outputWords(storage.Data(), 32);
+    const bool enabled = Switches::Enabled(recipeMode ? Feature::DispatchRelocationRecipe : Feature::FixDispatchRelocation);
+    if (recipeMode && std::getenv("APS5_TEST_REQUIRE_DISPATCH_RELOCATION_RECIPE") != nullptr) Require(enabled, "required dispatch relocation recipe switch is disabled");
     AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
     FeedbackTexture.fill(std::byte{255});
     const auto texture = reinterpret_cast<std::uintptr_t>(FeedbackTexture.data());
@@ -984,33 +1252,52 @@ void DispatchRelocationPath() {
     const auto otherTexture = reinterpret_cast<std::uintptr_t>(RelocationTexture.data());
     RelocationTables[4][0] = static_cast<std::uint32_t>(otherTexture >> 8);
     RelocationTables[4][1] = static_cast<std::uint32_t>(otherTexture >> 40) | (56u << 20u);
-    const std::vector<std::uint32_t> code{0xf40c0202u, 0xfa000000u, 0xf4000402u, 0xfa000020u, 0xf4080502u, 0xfa000030u, 0xbf8cc07fu,
+    std::vector<std::uint32_t> code{0xf40c0202u, 0xfa000000u, 0xf4000402u, 0xfa000020u, 0xf4080502u, 0xfa000030u, 0xbf8cc07fu,
         0x7e2802ffu, 0x3f000000u, 0x7e2a02ffu, 0x3f000000u, 0xf09c0f08u, 0x00a20a14u, 0xbf8c3f70u, 0x10001410u,
         0x7e020280u, 0xe0700000u, 0x80000001u, 0xbf810000u};
+    if (recipeMode) {
+        code[2] = 0xf4040402u;
+        code[15] = 0x7e020211u;
+        code[16] = 0xe0701000u;
+    }
     std::copy(code.begin(), code.end(), FeedbackCode.begin());
     Registered(FeedbackHeader, FeedbackCode.data(), code.size() * 4, 0);
-    const auto submit = [&](const std::array<std::uint32_t, 16>& from) {
+    const auto appendDispatch = [&](std::vector<std::uint32_t>& commands, const std::array<std::uint32_t, 16>& from, std::size_t outputIndex, bool queuedScalar) {
         const auto pointer = reinterpret_cast<std::uintptr_t>(from.data());
-        const auto output = reinterpret_cast<std::uintptr_t>(FeedbackOutput.data());
-        const std::array<std::uint32_t, 6> words{static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32) & 0xffffu, sizeof(FeedbackOutput), 0x31016facu, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32)};
+        const auto output = reinterpret_cast<std::uintptr_t>(outputWords.data() + outputIndex);
+        const std::array<std::uint32_t, 6> words{static_cast<std::uint32_t>(output), static_cast<std::uint32_t>(output >> 32) & 0xffffu, static_cast<std::uint32_t>(sizeof(FeedbackOutput) - outputIndex * sizeof(float)), 0x31016facu, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32)};
         const auto address = reinterpret_cast<std::uintptr_t>(FeedbackCode.data());
-        std::vector<std::uint32_t> commands;
         Append(commands, 0x76, {0x20c, static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40)});
         Append(commands, 0x76, {0x207, 1, 1, 1});
         Append(commands, 0x76, {0x213, static_cast<std::uint32_t>(words.size()) << 1});
         for (std::size_t w = 0; w < words.size(); ++w) Append(commands, 0x76, {0x240u + static_cast<std::uint32_t>(w), words[w]});
+        if (queuedScalar) {
+            const auto scalar = pointer + 8 * sizeof(std::uint32_t);
+            Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(scalar), static_cast<std::uint32_t>(scalar >> 32u), std::bit_cast<std::uint32_t>(0.75f)});
+        }
         Append(commands, 0x15, {1, 1, 1, 0x8041});
-        FeedbackOutput.fill(0.0f);
+    };
+    const auto submit = [&](const std::array<std::uint32_t, 16>& from, std::size_t outputIndex = 0, bool queuedScalar = false) {
+        std::vector<std::uint32_t> commands;
+        appendDispatch(commands, from, outputIndex, queuedScalar);
+        const auto output = reinterpret_cast<std::uintptr_t>(outputWords.data() + outputIndex);
+        std::fill(outputWords.begin(), outputWords.end(), 0.0f);
         Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "relocation dispatch submission failed");
         AgcDriverWaitIdle_nid_postfix();
-        AgcDriver::GuestMemory::FlushGpuWrites(output, sizeof(FeedbackOutput));
-        return std::pair{Driver::Get().DispatchCacheCounters().equal, static_cast<unsigned>(FeedbackOutput[0] * 255.0f + 0.5f)};
+        AgcDriver::GuestMemory::FlushGpuWrites(output, sizeof(FeedbackOutput) - outputIndex * sizeof(float));
+        return std::pair{Driver::Get().DispatchCacheCounters().equal, static_cast<unsigned>(outputWords[outputIndex] * 255.0f + 0.5f)};
     };
     const auto [taught, first] = submit(RelocationTables[0]);
     Require(first == 64, "the teaching dispatch did not write the table's constant");
     const auto [moved, second] = submit(RelocationTables[1]);
     Require(second == 64, "a dispatch whose table moved wrote another value");
+    if (recipeMode && (moved == taught + 1) != enabled) {
+        const auto diagnostic = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now());
+        for (const auto& [name, value] : diagnostic.counters) {
+            if (name.find("relocation") != std::string::npos || name.find("recipe") != std::string::npos) std::fprintf(stderr, "%s=%.0f\n", name.c_str(), value);
+        }
+    }
     Require((moved == taught + 1) == enabled, enabled ? "a dispatch whose table moved to equal content missed the relocation alias" : "a moved table hit without FIX_DISPATCH_RELOCATION");
     const auto [again, third] = submit(RelocationTables[2]);
     Require(third == 64 && (again == moved + 1) == enabled, "a second move did not take the same cache path");
@@ -1021,12 +1308,73 @@ void DispatchRelocationPath() {
     static_cast<void>(image);
     const auto [back, fifth] = submit(RelocationTables[0]);
     Require(fifth == 64 && back == image + 1, "the first table's exact key no longer hit");
+    if (recipeMode) {
+        for (std::size_t i = 5; i < 9; ++i) {
+            const auto [hits, value] = submit(RelocationTables[i]);
+            Require(value == 64, "repeated moved dispatch reused stale table data");
+            static_cast<void>(hits);
+        }
+        RelocationTables[6][8] = std::bit_cast<std::uint32_t>(0.75f);
+        Require(submit(RelocationTables[6]).second == 191, "a changed scalar in a cached moved table was not refreshed");
+        RelocationTables[6][8] = std::bit_cast<std::uint32_t>(0.25f);
+        Require(submit(RelocationTables[6]).second == 64, "restoring a moved table's scalar retained stale data");
+        Require(submit(RelocationTables[7], 4).second == 64, "a changed output binding retained the donor's destination");
+        Require(outputWords[0] == 0.0f, "a moved recipe wrote the previous output destination");
+        Require(submit(RelocationTables[8], 0, true).second == 191, "queued scalar writes were not observed before relocated dispatch");
+        Require(submit(RelocationTables[4]).second == 32, "a relocated recipe retained the wrong sampled texture");
+        Require(submit(RelocationTables[0]).second == 64, "returning to the original table retained moved state");
+    }
     const auto counts = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters;
     const auto count = [&](const char* name) { const auto it = counts.find(name); return it == counts.end() ? 0.0 : it->second; };
     std::fprintf(stderr, "dispatch relocation: learned %.0f, lookups %.0f, donors %.0f, refused %.0f, hits %.0f (data %.0f); queue-0 misses %.0f, misses then hit %.0f\n", count("fix_dispatch_relocation_learned"), count("fix_dispatch_relocation_lookups"), count("fix_dispatch_relocation_donors"), count("fix_dispatch_relocation_refused"), count("fix_dispatch_relocation_hits"), count("fix_dispatch_relocation_data_hits"), count("pipe_q0_dispatch_miss"), count("pipe_q0_dispatch_miss_then_hit"));
-    if (enabled) Require(count("fix_dispatch_relocation_hits") >= 2.0 && count("fix_dispatch_relocation_hits") <= 4.0, "relocation hits were not counted as expected");
-    else Require(count("fix_dispatch_relocation_hits") == 0.0, "relocation hits without the switch");
-    if (enabled && Switches::Enabled(Feature::PipeQ0Committer)) Require(count("pipe_q0_dispatch_miss_then_hit") >= 2, "relocated queue-0 dispatches were not served after the pre-check miss");
+    if (recipeMode) {
+        std::fprintf(stderr, "dispatch relocation recipe: candidates %.0f, hits %.0f, verified %.0f, items %.0f, misses then hit %.0f\n", count("dispatch_relocation_recipe_candidate"), count("dispatch_relocation_recipe_hit"), count("dispatch_relocation_recipe_verified"), count("pipe_q0_dispatch_item"), count("pipe_q0_dispatch_miss_then_hit"));
+        if (enabled) {
+            Require(count("dispatch_relocation_recipe_candidate") >= 2, "moved dispatches did not resolve recipe candidates before precheck");
+            Require(count("dispatch_relocation_recipe_hit") >= 2, "moved dispatches did not reuse donor recipes");
+            const auto validated = count("dispatch_relocation_validation_equal") + count("dispatch_relocation_validation_equal_data");
+            Require(validated > 0 && validated >= count("dispatch_relocation_recipe_hit"), "relocated recipe hits were not covered by successful live validation");
+            if (Switches::Enabled(Feature::PipeQ0Committer)) {
+                Require(count("pipe_q0_dispatch_item") >= 2, "moved dispatch recipes did not reach the committer");
+                Require(count("pipe_q0_dispatch_miss_then_hit") == 0, "relocated dispatches still drained before a cache hit");
+            }
+            if (std::getenv("APS5_VERIFY_DISPATCH_RELOCATION_RECIPE") != nullptr) Require(count("dispatch_relocation_recipe_verified") > 0, "dispatch relocation recipe VERIFY did not run");
+        }
+        if (!enabled) Require(count("dispatch_relocation_recipe_candidate") == 0 && count("dispatch_relocation_recipe_hit") == 0, "dispatch relocation recipe path ran while disabled");
+    } else {
+        if (enabled) Require(count("fix_dispatch_relocation_hits") >= 2.0 && count("fix_dispatch_relocation_hits") <= 4.0, "relocation hits were not counted as expected");
+        else Require(count("fix_dispatch_relocation_hits") == 0.0, "relocation hits without the switch");
+        if (enabled && Switches::Enabled(Feature::PipeQ0Committer)) Require(count("pipe_q0_dispatch_miss_then_hit") >= 2, "relocated queue-0 dispatches were not served after the pre-check miss");
+    }
+    if (recipeMode) {
+        std::vector<std::uint32_t> commands;
+        std::array<float, FeedbackOutput.size()> expected{};
+        constexpr std::array<float, 3> values{0.25f, 0.5f, 0.25f};
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            auto& entry = RelocationTables[9 + i];
+            entry[8] = std::bit_cast<std::uint32_t>(values[i]);
+            entry[9] = static_cast<std::uint32_t>((i + 1) * 4 * sizeof(float));
+            expected[(i + 1) * 4] = values[i];
+            appendDispatch(commands, entry, 0, false);
+        }
+        std::fill(outputWords.begin(), outputWords.end(), 0.0f);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "batched relocation dispatch submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(outputWords.data()), sizeof(FeedbackOutput));
+        Require(std::memcmp(outputWords.data(), expected.data(), sizeof(FeedbackOutput)) == 0, "batched relocated A-B-A dispatches changed output bytes or shared live data");
+        const auto batchCounts = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now()).counters;
+        const auto batchCount = [&](const char* name) { const auto it = batchCounts.find(name); return it == batchCounts.end() ? 0.0 : it->second; };
+        std::fprintf(stderr, "batched dispatch relocation recipe: candidates %.0f, hits %.0f, items %.0f, misses then hit %.0f\n", batchCount("dispatch_relocation_recipe_candidate"), batchCount("dispatch_relocation_recipe_hit"), batchCount("pipe_q0_dispatch_item"), batchCount("pipe_q0_dispatch_miss_then_hit"));
+        if (enabled) {
+            Require(batchCount("dispatch_relocation_recipe_candidate") >= 3 && batchCount("dispatch_relocation_recipe_hit") >= 3, "batched relocated dispatches did not reuse recipes for all three live-data values");
+            const auto validated = batchCount("dispatch_relocation_validation_equal") + batchCount("dispatch_relocation_validation_equal_data");
+            Require(validated > 0 && validated >= batchCount("dispatch_relocation_recipe_hit"), "batched recipe hits were not covered by successful live validation");
+            if (Switches::Enabled(Feature::PipeQ0Committer)) Require(batchCount("pipe_q0_dispatch_item") >= 3 && batchCount("pipe_q0_dispatch_miss_then_hit") == 0, "batched relocation dispatches fell back instead of using commit items");
+        } else {
+            Require(batchCount("dispatch_relocation_recipe_candidate") == 0 && batchCount("dispatch_relocation_recipe_hit") == 0, "disabled batched relocation dispatch used recipe reuse");
+        }
+    }
 }
 
 void PipelineStateReusePath(const std::filesystem::path& control) {
@@ -1070,6 +1418,10 @@ void PipelineStateReusePath(const std::filesystem::path& control) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-relocation-proof") {
+            DispatchRelocationProofs();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--nested-proof") {
             NestedPointerProofs();
             return 0;
@@ -1128,10 +1480,10 @@ int main(int argc, char** argv) {
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-relocation") {
+        if (argc == 2 && (std::string_view(argv[1]) == "--dispatch-relocation" || std::string_view(argv[1]) == "--dispatch-relocation-recipe")) {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
-            DispatchRelocationPath();
+            DispatchRelocationPath(std::string_view(argv[1]) == "--dispatch-relocation-recipe");
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
@@ -1150,6 +1502,13 @@ int main(int argc, char** argv) {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
             PipelineStateReusePath(control.path);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--j3-census") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            DrawHitCensusPath();
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
