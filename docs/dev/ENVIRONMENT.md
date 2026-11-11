@@ -1,5 +1,11 @@
 # Environment variables
 
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `APS5_ARCHB_GPU_AUTHORITY_CENSUS` | `0` | Observe GPU publications, producer identities and subsequent explicit CPU/GPU readers; runtime switch, no resource policy changes. |
+| `APS5_ARCHB_GPU_AUTHORITY_CENSUS_VERIFY` | `0` | Compare every reader query with up to 16 live segments, otherwise one in 1024, with a full interval scan; `n5c_verify_mismatches` counts differences. |
+| `APS5_GPU_AUTHORITY_CENSUS_FILE` | `gpu-authority-census.csv` | CSV journal: P publication-frame observations, E retired lifetime observations, X observations censored after 60 presents or switch-off, T existing GPU timestamp ranges, R CPU reader calls that overlap publications. CPU masks use GuestMemory ReadSite numbers, plus 32 guest fault, 33 driver fault, 34 host read hook, 35 lazy service. GPU masks use LazyCensus GpuUse numbers. Optional existing `APS5_ARCHB_C_LAZY_CENSUS=1` supplies fault observations with its existing watch coverage limits. |
+
 The ArchB switch table also constructs runtime environment names from APS5_ARCHB_ and each feature name. APS5_ARCHB_FIX_COMPUTE_SYNC_UNLOCKED=1 enables fence waits without the GPU mutex before compute dispatch label recording; it defaults to off and is sampled once per dispatch. Fence lifetime is retained through the wait. Completion, pending-write publication and the subsequent label readback rescan run under the mutex. Nested waits, resource-build waits and depth-conversion waits retain their locked path. With the recorder enabled, `fix_csync_*` counters report unlocked waits, wait and relock milliseconds, refusals and teardown.
 
 The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetting`, `MaskFromEnvironment`, `EnvInt`, `GetEnvironmentVariableA`, `GetEnvironmentVariableW` and `_wgetenv` with a wide literal, `configured`, `PipelineSwitch`, `environmentCount`, `EnvironmentNumber`, `MebibytesFromEnvironment` and `addWideString` (the wide names the Windows entry stub reads). This table lists every `APS5_*` and `ANYPS5_*` name it reads, its kind, the value used when it is unset and what it does, one table per library. Regenerate the names with `python3 tools/env_reference.py --table`; the Conventions check fails when a name the code reads has no row here, or a row's name is no longer read.

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
@@ -292,6 +293,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     recorder->EndGpuTiming(timing, bytes);
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::Published(begin, end, GpuAuthorityCensus::Kind::ShadowPublish, recorder, recorder->OpenSerial(), timing);
     recorder->NotePendingWrites(ranges);
     recorder->OnComplete([host, pieces = std::move(pieces), checked] {
         host->Invalidate();
@@ -343,9 +345,11 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     Recorder::CountBarriers(CommandClass::ShadowPublish);
     if (batch) {
         batch->SubmitAndWait();
+        if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::Published(begin, end, GpuAuthorityCensus::Kind::ShadowPublish);
         return;
     }
     recorder->EndGpuTiming(timing, bytes);
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::Published(begin, end, GpuAuthorityCensus::Kind::ShadowPublish, recorder, recorder->OpenSerial(), timing);
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.

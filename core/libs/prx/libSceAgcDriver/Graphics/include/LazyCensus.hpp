@@ -26,6 +26,7 @@ void LabelStored(bool queue0);
 void NoteFenceWait(std::uint64_t ns);
 std::uint64_t ThreadFenceWaitNs();
 void Flip();
+void Drain();
 
 struct UseScope {
     UseScope();

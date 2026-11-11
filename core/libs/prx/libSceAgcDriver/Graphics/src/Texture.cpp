@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -4665,6 +4666,12 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         // shadowed ones reach it through a publish, which notes its own.
         if (!imported.empty()) recorder->NotePendingWrites(imported);
     }
+    if (GpuAuthorityCensus::Enabled()) {
+        const auto* reason = flushReasonThreadState();
+        const bool depth = reason != nullptr && (std::strstr(reason, "depth plane") || std::strstr(reason, "stencil plane"));
+        for (const auto& range : shadowed) GpuAuthorityCensus::Published(range.begin, range.end, depth ? GpuAuthorityCensus::Kind::DepthPlane : GpuAuthorityCensus::Kind::StorageShadow, recorder, recorder ? recorder->OpenSerial() : 0, timing);
+        for (const auto& [begin, end] : imported) GpuAuthorityCensus::StoragePublished(begin, end, flushReasonThreadState(), recorder, recorder ? recorder->OpenSerial() : 0, timing);
+    }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
     return storedBytes;
@@ -4710,6 +4717,7 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
+    GpuAuthorityCensus::Produced(descriptor.baseAddress, descriptor.baseAddress + guestBytes, descriptor.baseAddress);
     // Write generations: the storage image's results stay on the GPU until flushed (the pending
     // registry), announced over its guest range.
     if (GuestMemory::Gen::Active() && guestBytes != 0) GuestMemory::Gen::NotePending(descriptor.baseAddress, descriptor.baseAddress + guestBytes, reinterpret_cast<std::uintptr_t>(this));
@@ -4733,6 +4741,7 @@ void StorageTexture::MarkSliceDirty(std::uint32_t slice, std::uint32_t count) {
         MarkDirty();
         return;
     }
+    GpuAuthorityCensus::Produced(layerBegin(first), layerBegin(last - 1) + layerBytes(last - 1), descriptor.baseAddress);
     markLayersPending(first, last - first);
 }
 
@@ -5170,6 +5179,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
         return storedBytes;
     }
     recorder->EndGpuTiming(timing, storedBytes);
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : stores) GpuAuthorityCensus::StoragePublished(begin, end, flushReasonThreadState(), recorder, recorder->OpenSerial(), timing);
     recorder->MarkShaderReadsCovered();
     recorder->NotePendingWrite(hullBegin, hullBytes);
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
@@ -7994,6 +8004,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             batch->SubmitAndWait();
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
+            if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : importStores) GpuAuthorityCensus::StoragePublished(begin, end, flushReasonThreadState(), recorder, recorder->OpenSerial(), timing);
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
@@ -8152,6 +8163,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
         const auto length = static_cast<std::size_t>(to - from);
         GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+        GpuAuthorityCensus::Published(from, to, GpuAuthorityCensus::Kind::CpuWriteBack);
         std::memcpy(original.data() + offset, current.data() + offset, length);
     }
     // The texels now hold the whole image, so later reads must see them rather than a fast clear

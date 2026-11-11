@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -219,6 +220,11 @@ void traceLockedService(std::uintptr_t page, bool write) {
 }
 
 void service(std::uintptr_t page, bool write) {
+    struct ReadObservation {
+        std::uintptr_t page;
+        bool write;
+        ~ReadObservation() { if (!write) GpuAuthorityCensus::CpuRead(page, 4096, 35); }
+    } readObservation{page, write};
     auto& s = state();
     auto& c = counters();
     const auto start = GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr);

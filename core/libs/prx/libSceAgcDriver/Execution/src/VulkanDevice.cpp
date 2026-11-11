@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -3515,7 +3516,10 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.FlushStoresOverlapping(address, bytes);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
+    const Graphics::GpuAuthorityCensus::ProducerScope censusFillProducer(4);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
+    Graphics::GpuAuthorityCensus::Produced(address, address + bytes);
+    Graphics::GpuAuthorityCensus::Published(address, address + bytes, Graphics::GpuAuthorityCensus::Kind::Fill, &recorder, recorder.OpenSerial(), timing);
     if (Graphics::Recorder::BarrierValidate()) {
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
         recorder.NoteAccess(CommandClass::Fill, Graphics::Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -3821,6 +3825,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.
+    const Graphics::GpuAuthorityCensus::ProducerScope censusCopyProducer(3, programAddress);
     const auto classTiming = recorder.BeginGpuTiming(CommandClass::Copy);
     if (Graphics::Recorder::BarrierValidate()) {
         const std::pair<std::uint64_t, std::uint64_t> read{source, source + bytes}, written{destination, destination + bytes};
@@ -3845,6 +3850,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
     Graphics::Recorder::CountBarriers(CommandClass::Copy);
     recorder.EndGpuTiming(classTiming, bytes);
+    Graphics::GpuAuthorityCensus::Produced(destination, destination + bytes);
+    Graphics::GpuAuthorityCensus::Published(destination, destination + bytes, Graphics::GpuAuthorityCensus::Kind::CopyDestination, &recorder, recorder.OpenSerial(), classTiming);
     recorder.MarkCovered(copiedAccess);
     recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
     GuestMemory::MarkWritten(destination, bytes);
@@ -6232,6 +6239,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    const Graphics::GpuAuthorityCensus::ProducerScope censusProducer(1, record.programAddress);
     PerformanceTimer recorderTiming("Vulkan.RecordDispatch", ArchB::Recorder::Phase::Record);
     auto& d = Dispatches();
     auto& recorder = *state->recorder;

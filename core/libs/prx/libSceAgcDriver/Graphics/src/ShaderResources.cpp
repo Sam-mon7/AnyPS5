@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -9293,6 +9294,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
             recorder.NotePendingReads(guestMemory.InPlaceReads(), kind, mayStore);
         }
     });
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : guestMemory.Writes()) GpuAuthorityCensus::Produced(begin, end);
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

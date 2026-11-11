@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -176,6 +177,9 @@ void closeEntry(State& s, std::map<std::uint64_t, Entry>::iterator it, Outcome o
     c.live.store(s.live.size(), std::memory_order_relaxed);
     const auto k = static_cast<std::size_t>(entry.kind);
     const auto bytes = entry.end - begin;
+    if (outcome != Outcome::GuestRead && outcome != Outcome::DriverRead) GpuAuthorityCensus::WatchCoverage(begin, entry.end, false);
+    if (outcome == Outcome::GuestRead || outcome == Outcome::DriverRead) GpuAuthorityCensus::CpuRead(begin, static_cast<std::size_t>(bytes), outcome == Outcome::GuestRead ? 32 : 33, ticks);
+    if (outcome == Outcome::GuestWrite) GpuAuthorityCensus::Overwritten(begin, entry.end, ticks);
     c.count[k][static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
     c.bytes[k][static_cast<std::size_t>(outcome)].fetch_add(bytes, std::memory_order_relaxed);
     const bool cpu = cpuOutcome(outcome);
@@ -265,6 +269,7 @@ void commit(const Deferred& item) {
     GuestArena::GuestWtFaultSetWatchSplit_nid_no_patch(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CWatchSplit));
     const auto watchStart = GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr);
     const auto watched = GuestArena::GuestWtFaultWatchCauses_nid_no_patch(static_cast<std::uintptr_t>(item.begin), static_cast<std::size_t>(item.end - item.begin), causes.data());
+    GpuAuthorityCensus::WatchCoverage(item.begin, item.end, watched == pages);
     c.watchNs.fetch_add(static_cast<std::uint64_t>(static_cast<double>(GuestArena::GuestWtFaultTicks_nid_no_patch(nullptr) - watchStart) * s.nsPerTick), std::memory_order_relaxed);
     c.watchCalls.fetch_add(1, std::memory_order_relaxed);
     c.watchedPages[k].fetch_add(watched, std::memory_order_relaxed);
@@ -340,6 +345,8 @@ void Published(std::uint64_t begin, std::uint64_t end, Kind kind, std::uint8_t r
 }
 
 void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use, std::uint64_t serial) {
+    if (use == GpuUse::Carry || use == GpuUse::StagingInSame) GpuAuthorityCensus::GpuRead(begin, end, static_cast<std::uint32_t>(use));
+    if (GpuAuthorityCensus::Enabled() && use != GpuUse::Write && use != GpuUse::LabelStore) return;
     if (!Enabled() || end <= begin) return;
     auto& s = state();
     std::lock_guard lock(s.mutex);
@@ -349,6 +356,9 @@ void UsedByGpu(std::uint64_t begin, std::uint64_t end, GpuUse use, std::uint64_t
 }
 
 void UsedByGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, GpuUse use) {
+    if (GpuAuthorityCensus::Enabled()) {
+        if (use != GpuUse::Write && use != GpuUse::LabelStore) return;
+    }
     if (!Enabled() || ranges.empty()) return;
     auto& s = state();
     std::lock_guard lock(s.mutex);
@@ -385,6 +395,13 @@ void NoteFenceWait(std::uint64_t ns) {
 
 std::uint64_t ThreadFenceWaitNs() {
     return threadFenceWaitNs;
+}
+
+void Drain() {
+    if (!Enabled()) return;
+    auto& s = state();
+    std::lock_guard lock(s.mutex);
+    drainLocked(s);
 }
 
 void Flip() {
