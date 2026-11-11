@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PointerSet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -348,13 +349,33 @@ void Driver::tagNestedPointerPositions(DispatchVariant& variant, const ShaderRec
     if (capture.plan == nullptr || variant.compiled == nullptr || !capture.readTrace.profile) return refuse();
     const auto& plan = *capture.plan;
     if (!plan.srtPlanComplete || !plan.resourceTrackingComplete || plan.requiresSpecializationMemory || !capture.snapshot.tables.tables.empty() || !capture.snapshot.srtPoison.empty() || capture.snapshot.nullRootReads != 0 || plan.uniformFill.fill.kind != ShaderRecompiler::UniformFillKind::None || plan.shaderFlatSlots.size() != plan.srtReads.size()) return refuse();
-    std::map<const ShaderRecompiler::IrValue*, std::set<std::uint64_t>> addresses;
-    std::map<std::uint64_t, std::set<const ShaderRecompiler::IrValue*>> readers;
+    struct AddressesTag {};
+    struct ReadersTag {};
+    struct ForbiddenTag {};
+    struct VisitedTag {};
+    auto& addresses = AgcDriver::ThreadScratch<std::vector<std::pair<const ShaderRecompiler::IrValue*, std::uint64_t>>, AddressesTag>();
+    auto& readers = AgcDriver::ThreadScratch<std::vector<std::pair<std::uint64_t, const ShaderRecompiler::IrValue*>>, ReadersTag>();
+    auto& forbidden = AgcDriver::ThreadScratch<PointerSet, ForbiddenTag>();
+    auto& visited = AgcDriver::ThreadScratch<PointerSet, VisitedTag>();
+    addresses.clear();
+    readers.clear();
+    forbidden.clear();
+    visited.clear();
     for (const auto& [raw, address] : capture.readTrace.slotReads) {
         if (raw == nullptr) continue;
-        addresses[raw->Resolve()].insert(address);
-        readers[address].insert(raw->Resolve());
+        addresses.emplace_back(raw->Resolve(), address);
+        readers.emplace_back(address, raw->Resolve());
     }
+    std::sort(addresses.begin(), addresses.end());
+    addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+    std::sort(readers.begin(), readers.end());
+    readers.erase(std::unique(readers.begin(), readers.end()), readers.end());
+    const auto capturedBy = [&](const ShaderRecompiler::IrValue* value) {
+        return std::equal_range(addresses.begin(), addresses.end(), std::make_pair(value, std::uint64_t{0}), [](const auto& left, const auto& right) { return std::less<const ShaderRecompiler::IrValue*>{}(left.first, right.first); });
+    };
+    const auto readersOf = [&](std::uint64_t address) {
+        return std::equal_range(readers.begin(), readers.end(), std::make_pair(address, static_cast<const ShaderRecompiler::IrValue*>(nullptr)), [](const auto& left, const auto& right) { return left.first < right.first; });
+    };
     const auto source = [&](const ShaderRecompiler::IrValue* value) {
         std::uint32_t mask = 0xffffffffu;
         for (std::size_t depth = 0; value != nullptr && depth < 64; ++depth) {
@@ -372,11 +393,10 @@ void Driver::tagNestedPointerPositions(DispatchVariant& variant, const ShaderRec
         }
         return std::make_pair(static_cast<const ShaderRecompiler::IrValue*>(nullptr), mask);
     };
-    std::unordered_set<const ShaderRecompiler::IrValue*> forbidden, visited;
     const auto markValue = [&](auto&& self, const ShaderRecompiler::IrValue* value) -> void {
         if (value == nullptr) return;
         value = value->Resolve();
-        if (!visited.insert(value).second) return;
+        if (!visited.insert(value)) return;
         if (ShaderRecompiler::Detail::IsRawRead(plan, *value)) {
             forbidden.insert(value);
             return;
@@ -394,11 +414,14 @@ void Driver::tagNestedPointerPositions(DispatchVariant& variant, const ShaderRec
         if (plan.shaderFlatSlots[slot] != 0 || (slot < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[slot] != 0) || source(plan.srtReads[slot].value).first == nullptr) markValue(markValue, plan.srtReads[slot].value);
     }
     const auto addressOf = [&](const ShaderRecompiler::IrValue* value) -> std::optional<std::uint64_t> {
-        const auto found = addresses.find(value);
-        if (found == addresses.end() || found->second.size() != 1) return {};
-        return *found->second.begin();
+        const auto found = capturedBy(value);
+        if (found.second - found.first != 1) return {};
+        return found.first->second;
     };
-    for (const auto& [raw, captured] : addresses) {
+    for (auto group = addresses.begin(); group != addresses.end();) {
+        const auto* raw = group->first;
+        const auto captured = capturedBy(raw);
+        group = captured.second;
         if (!ShaderRecompiler::Detail::IsRawRead(plan, *raw) || raw->ArgumentCount() < 2) continue;
         const auto* handle = raw->Argument(0)->Resolve();
         if (handle->ArgumentCount() < 2) return refuse();
@@ -408,7 +431,8 @@ void Driver::tagNestedPointerPositions(DispatchVariant& variant, const ShaderRec
         const bool pointer = raw->Opcode() == ShaderRecompiler::IrOpcode::LoadAddressU32 && lowAddress && highAddress && *highAddress == *lowAddress + 4u && (low.second | 3u) == 0xffffffffu && (high.second & 0xffffu) == 0xffffu;
         bool covered = pointer;
         if (pointer) {
-            for (const auto address : captured) {
+            for (auto entry = captured.first; entry != captured.second; ++entry) {
+                const auto address = entry->second;
                 bool child = false;
                 for (std::size_t run = 0; run < variant.runs.size(); ++run) {
                     const auto& parent = variant.runParents[run];
@@ -432,9 +456,9 @@ void Driver::tagNestedPointerPositions(DispatchVariant& variant, const ShaderRec
         const auto address = variant.runs[parent.run].first + parent.word * 4u;
         const auto position = offsets[parent.run] + parent.word;
         for (std::uint32_t half = 0; half < 2; ++half) {
-            const auto found = readers.find(address + half * 4u);
-            if (found == readers.end() || found->second.size() != 1 || position + half >= variant.words.size() || relocationMask(variant, position + half) != 0 || WordMask(variant.feedback.memory, position + half) != 0) return refuse();
-            const auto* raw = *found->second.begin();
+            const auto found = readersOf(address + half * 4u);
+            if (found.second - found.first != 1 || position + half >= variant.words.size() || relocationMask(variant, position + half) != 0 || WordMask(variant.feedback.memory, position + half) != 0) return refuse();
+            const auto* raw = found.first->second;
             if (forbidden.contains(raw) || !addressOf(raw)) return refuse();
             for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
                 const auto flatSource = source(plan.srtReads[slot].value);

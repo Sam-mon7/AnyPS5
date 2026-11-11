@@ -390,16 +390,16 @@ struct Site {
 };
 
 SRWLOCK sitesLock = SRWLOCK_INIT;
-std::array<Site, 256> sites{};
+std::array<Site, 4096> sites{};
 
 void ReportSites() {
-    std::array<Site, 256> copy;
+    std::array<Site, 4096> copy;
     AcquireSRWLockShared(&sitesLock);
     copy = sites;
     ReleaseSRWLockShared(&sitesLock);
     std::sort(copy.begin(), copy.end(), [](const Site& left, const Site& right) { return left.calls > right.calls; });
     std::fprintf(stderr, "[host-alloc-sites] top allocations\n");
-    for (std::size_t i = 0; i < 20 && copy[i].calls != 0; ++i) {
+    for (std::size_t i = 0; i < 36 && copy[i].calls != 0; ++i) {
         HMODULE module = nullptr;
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<const char*>(copy[i].address), &module);
         const auto offset = reinterpret_cast<std::uintptr_t>(copy[i].address) - reinterpret_cast<std::uintptr_t>(module);
@@ -418,18 +418,17 @@ void RecordSite(void* address, std::size_t bytes) noexcept {
     }();
     if (!enabled || !AgcDriver::HostAllocator::InsideScope()) return;
     AcquireSRWLockExclusive(&sitesLock);
-    Site* empty = nullptr;
-    for (auto& site : sites) {
-        if (site.address == address) {
-            ++site.calls;
-            site.bytes += bytes;
-            ReleaseSRWLockExclusive(&sitesLock);
-            return;
-        }
-        if (empty == nullptr && site.address == nullptr) empty = &site;
+    for (std::size_t probe = 0, slot = (reinterpret_cast<std::uintptr_t>(address) >> 2) % sites.size(); probe < 64; ++probe, slot = (slot + 1) % sites.size()) {
+        auto& site = sites[slot];
+        if (site.address == nullptr) site.address = address;
+        if (site.address != address) continue;
+        ++site.calls;
+        site.bytes += bytes;
+        break;
     }
-    if (empty != nullptr) *empty = {address, 1, bytes};
     ReleaseSRWLockExclusive(&sitesLock);
+    static std::atomic<std::uint64_t> recorded{0};
+    if ((recorded.fetch_add(1, std::memory_order_relaxed) + 1) % 4000000u == 0) ReportSites();
 }
 
 void* Allocate(std::size_t bytes, void* site) {
