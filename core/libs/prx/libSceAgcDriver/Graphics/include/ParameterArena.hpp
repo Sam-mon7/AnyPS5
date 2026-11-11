@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,7 +31,7 @@ public:
     static std::size_t ClassBytes(std::size_t bytes, std::size_t alignment) {
         return std::bit_ceil(std::max({bytes, MinimumBytes, alignment}));
     }
-    std::optional<Slice> Allocate(std::size_t bytes) {
+    std::optional<Slice> Allocate(std::size_t bytes, std::size_t chunkLimit = std::numeric_limits<std::size_t>::max()) {
         if (bytes == 0) return std::nullopt;
         const auto size = ClassBytes(bytes, alignment);
         if (size > chunkBytes) return std::nullopt;
@@ -41,6 +42,7 @@ public:
             return slice;
         }
         if (chunks == 0 || cursor + size > chunkBytes) {
+            if (chunks >= chunkLimit) return std::nullopt;
             ++chunks;
             cursor = 0;
         }
@@ -98,9 +100,9 @@ public:
         return static_cast<std::size_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
     }
     using Lease = ParameterLease;
-    static std::shared_ptr<Lease> Allocate(const std::shared_ptr<ParameterArena>& arena, std::size_t bytes) {
+    static std::shared_ptr<Lease> Allocate(const std::shared_ptr<ParameterArena>& arena, std::size_t bytes, std::size_t byteLimit = std::numeric_limits<std::size_t>::max()) {
         std::lock_guard lock(arena->mutex);
-        auto slice = arena->slices.Allocate(bytes);
+        auto slice = arena->slices.Allocate(bytes, byteLimit / Flights / arena->slices.ChunkBytes());
         if (!slice.has_value()) return {};
         arena->grow(arena->slices.Chunks());
         auto lease = std::make_shared<Lease>();

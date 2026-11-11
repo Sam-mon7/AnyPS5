@@ -261,6 +261,8 @@ public:
         std::vector<VkDeviceSize> slotOffsets;
         std::vector<std::size_t> slotSizes;
         std::uint64_t serial = 0;
+        bool captureDescriptors = false;
+        std::vector<VkDescriptorBufferInfo> capturedDescriptors;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -281,7 +283,8 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool captureDescriptors = false) const;
+    bool BoundElementBytes(const MovedBuffer& entry, const DrawBindings* bound, VkDescriptorBufferInfo& descriptor, std::vector<std::byte>& bytes) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
@@ -835,7 +838,7 @@ private:
     struct MovedSetCache;
     mutable std::shared_ptr<MovedSetCache> movedSetCache;
     mutable std::vector<std::shared_ptr<TemplateSets>> templateSetsHeld;
-    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
+    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool captureDescriptors) const;
 
 public:
     // Arch C P3b (C_REPLAY_SLOT_BINDINGS): the conditions of MovedReadOnlyBuffers that do not depend only on the

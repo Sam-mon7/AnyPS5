@@ -23,6 +23,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParameterArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -560,6 +562,9 @@ public:
             enabled.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
             enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
             enabled.shaderStorageImageMultisample = supported.shaderStorageImageMultisample;
+            if (std::getenv("ANYPS5_TEST_EXACT_ROBUST") != nullptr) {
+                enabled.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
+            }
             context.storageImageMultisample = supported.shaderStorageImageMultisample == VK_TRUE;
             context.singlePassStorage = supported.shaderStorageImageReadWithoutFormat == VK_TRUE && supported.shaderStorageImageWriteWithoutFormat == VK_TRUE;
             address.pNext = &bytes;
@@ -645,14 +650,18 @@ public:
             } else {
                 context.descriptorIndexing = context.partiallyBound = context.variableDescriptorCount = context.runtimeDescriptorArray = false;
             }
+            if (std::getenv("ANYPS5_TEST_EXACT_ROBUST") != nullptr && hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) extensionsEnabled.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
             VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
                 function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
                 nullDescriptors = robustness.nullDescriptor == VK_TRUE;
+                context.exactRobustLoads = std::getenv("ANYPS5_TEST_EXACT_ROBUST") != nullptr && robustness.robustBufferAccess2 == VK_TRUE;
             }
             robustness = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             robustness.nullDescriptor = VK_TRUE;
+            robustness.robustBufferAccess2 = context.exactRobustLoads;
+            if (context.exactRobustLoads) enabled.robustBufferAccess = VK_TRUE;
             if (nullDescriptors) {
                 extensionsEnabled.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
                 robustness.pNext = address.pNext;
@@ -18168,6 +18177,7 @@ int parameterArenaTests(const Device& device) {
     Require(whole.has_value() && whole->chunk == 1 && whole->offset == 0 && slices.Chunks() == 2, "a slice that does not fit grew no new chunk");
     const auto after = slices.Allocate(200);
     Require(after.has_value() && after->chunk == 2 && after->offset == 0 && slices.Chunks() == 3, "a slice after a full chunk did not open a new chunk");
+    Require(!slices.Allocate(4096, 3).has_value() && slices.Chunks() == 3, "a capped arena grew a retained chunk");
     auto slice = *first;
     std::array<bool, ParameterSlices::Flights> taken{};
     for (std::size_t use = 0; use < ParameterSlices::Flights; ++use) {
@@ -18206,6 +18216,7 @@ int parameterArenaTests(const Device& device) {
     auto grown = ParameterArena::Allocate(arena, 4096);
     Require(grown != nullptr && grown->slice.chunk == 1 && arena->Chunks() == 2, "a full arena did not grow a chunk");
     for (std::size_t flight = 0; flight < handles.size(); ++flight) Require(arena->Handle(flight, 0) == handles[flight] && arena->Bytes(flight, 0)[lease->slice.offset] == static_cast<std::byte>(flight + 1), "growth moved a slice already handed out");
+    Require(ParameterArena::Allocate(arena, 4096, 2 * 4096 * ParameterArena::Flights) == nullptr && arena->Chunks() == 2, "the Vulkan arena bypassed its retained-buffer budget");
     const auto offset = lease->slice.offset;
     lease.reset();
     Require(arena->Freed() == 1, "a released lease did not return its slice");
@@ -18225,13 +18236,30 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
     const char* verifyText = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_VERIFY");
     const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
     constexpr std::size_t unit = 65536;
-    constexpr std::size_t bytes = unit * 3;
-    void* watched = AllocateWatched(bytes, unit);
+    constexpr std::size_t bytes = unit * 5;
+    void* watched = nullptr;
+    bool arenaOwned = false;
+#ifdef _WIN32
+    if (scenario == "publish") {
+        watched = GuestArena::GuestArenaAllocate_nid_postfix(bytes, unit);
+        if (watched != nullptr) {
+            GuestArena::GuestArenaCommit_nid_postfix(watched, bytes, PAGE_READWRITE, bytes);
+            arenaOwned = true;
+        }
+    } else
+#endif
+    watched = AllocateWatched(bytes, unit);
     if (watched == nullptr) return 77;
     struct Release {
         void* watched;
-        ~Release() { ReleaseWatched(watched, bytes); }
-    } release{watched};
+        bool arenaOwned;
+        ~Release() {
+            if (arenaOwned) {
+                GuestArena::GuestArenaReset_nid_postfix(watched, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(watched, bytes);
+            } else ReleaseWatched(watched, bytes);
+        }
+    } release{watched, arenaOwned};
     auto* block = static_cast<std::byte*>(watched);
     std::fill_n(block, bytes, std::byte{0});
     const auto address = reinterpret_cast<std::uint64_t>(block);
@@ -18270,7 +18298,9 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
             HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
         }
     } cleanup{context, recorder, block};
+    if (scenario == "publish") SetImportWatch(context, ImportWatch::Watch);
     if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    if (scenario == "tail" && !context.exactRobustLoads) return 77;
     AgcDriver::GuestMemory::MarkCommitterThread();
     const auto arguments = address + unit;
     const auto data = address + unit * 2;
@@ -18324,9 +18354,61 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         shaderData.guestDescriptor = {0, 0, 0, 0};
         vertex->bindings.push_back(shaderData);
     }
+    if (scenario == "fault") {
+        auto spirv = vertex->spirv.Words();
+        std::vector<std::uint32_t> module(spirv.begin(), spirv.end());
+        const auto id = module[3]++;
+        std::uint32_t pointer = 0;
+        std::size_t annotations = 0, variables = 0;
+        for (std::size_t at = 5; at < module.size();) {
+            const auto count = module[at] >> 16u;
+            const auto opcode = module[at] & 0xffffu;
+            if (annotations == 0 && opcode >= spv::OpTypeVoid && opcode <= spv::OpTypeForwardPointer) annotations = at;
+            if (opcode == spv::OpVariable && module[at + 3] == spv::StorageClassStorageBuffer) pointer = module[at + 1];
+            if (opcode == spv::OpFunction) { variables = at; break; }
+            at += count;
+        }
+        Require(pointer != 0 && annotations != 0 && variables != 0, "the fault fixture has no storage declaration to extend");
+        const std::array<std::uint32_t, 4> variable{(4u << 16u) | spv::OpVariable, pointer, id, spv::StorageClassStorageBuffer};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(variables), variable.begin(), variable.end());
+        const std::array<std::uint32_t, 8> decorations{(4u << 16u) | spv::OpDecorate, id, spv::DecorationDescriptorSet, 0, (4u << 16u) | spv::OpDecorate, id, spv::DecorationBinding, 3};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(annotations), decorations.begin(), decorations.end());
+        vertex->spirv = std::move(module);
+        vertex->bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+        ShaderRecompiler::DescriptorBinding fault{};
+        fault.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        fault.role = ShaderRecompiler::DescriptorRole::FaultBuffer;
+        fault.binding = 3;
+        fault.count = 1;
+        fault.readOnly = false;
+        vertex->bindings.push_back(fault);
+    }
     auto pixel = std::make_shared<ShaderRecompiler::RecompileResult>();
     pixel->spirv = std::vector<std::uint32_t>(std::begin(TEMPLATEPARAMS_FRAG_SPV), std::end(TEMPLATEPARAMS_FRAG_SPV));
     pixel->variantId = 402;
+    if (scenario == "tail") {
+        constexpr std::array<std::uint32_t, 7> code{0xe0300004u, 0x80000000u, 0xbf8c3f70u, 0x7e0202f2u, 0xf800180fu, 0x01010100u, 0xbf810000u};
+        const auto words = vsharp(data + 4, 5);
+        ShaderRecompiler::RecompileRequest request{};
+        request.shader = {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userData = words;
+        request.context.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
+        request.context.pixel->wave32 = true;
+        request.context.pixel->targetOutputMode[0] = 9;
+        request.context.pixel->targetExportMapping.fill(0xe4u);
+        request.target.vulkanVersion = VK_API_VERSION_1_1;
+        request.target.spirvVersion = 0x00010300;
+        const std::array<std::uint32_t, 1> capabilities{spv::CapabilityShader};
+        request.target.supportedCapabilities = capabilities;
+        request.target.robustBufferAccess2 = true;
+        request.target.exactRobustLoads = true;
+        request.target.fixedPushSlots = true;
+        request.layout = {0, 0, 0, 128};
+        request.useCache = false;
+        *pixel = ShaderRecompiler::Recompile(request);
+        pixel->variantId = 402;
+    }
     std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> programs;
     const auto stateFor = [](std::uint64_t base, bool additive) {
         auto state = std::make_shared<State>();
@@ -18352,7 +18434,7 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         state->blends = {state->blend};
         return state;
     };
-    const auto target = stateFor(address, scenario == "flights");
+    const auto target = stateFor(address, scenario == "flights" || scenario == "publish");
     const auto variant = std::make_shared<std::uint64_t>(vertex->variantId);
     const auto draw = [&](std::uint64_t at, std::uint32_t size, std::uint32_t word) {
         auto current = std::make_shared<ShaderRecompiler::RecompileResult>(*vertex);
@@ -18361,8 +18443,17 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         programs.push_back(current);
         auto words = current->bindings[0].guestDescriptor;
         words.insert(words.end(), current->bindings[1].guestDescriptor.begin(), current->bindings[1].guestDescriptor.end());
-        const DrawSlotIdentity identity{target, {{vertex, variant, std::move(words), true, false}, {pixel}}};
-        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, current.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        auto currentPixel = pixel;
+        if (scenario == "tail") {
+            currentPixel = std::make_shared<ShaderRecompiler::RecompileResult>(*pixel);
+            const auto guest = std::find_if(currentPixel->bindings.begin(), currentPixel->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
+            Require(guest != currentPixel->bindings.end(), "the translated tail shader has no buffer element");
+            guest->guestDescriptor = vsharp(at, 5);
+            programs.push_back(currentPixel);
+        }
+        DrawSlotIdentity identity{target, {{vertex, variant, std::move(words), true, false}, {pixel}}};
+        if (scenario == "tail") identity.stages[1] = {pixel, variant, {}, true, false};
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, current.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, currentPixel.get(), 0u}};
         Draw(context, *target, indirect, shaders, {}, nullptr, nullptr, 0, nullptr, false, &identity);
         WaitForOptimizedPipelines(context.device);
     };
@@ -18388,6 +18479,33 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         for (const auto& [name, value] : counters) total[name] += value;
         return counters;
     };
+    if (scenario == "fault") {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const std::array stages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        ShaderResources resources(context, stages, target->color, 1, 0, 0);
+        const auto serial = recorder.OpenSerial();
+        static_cast<void>(recorder.Commands());
+        recorder.Sync();
+        Require(recorder.CompletedThrough() >= serial, "the fault fixture's actual submission did not complete");
+        const auto reclaimed = BdaResources::FaultSlots(context.device).reclaimed;
+        bool wasReclaimed = false;
+        {
+            std::vector<std::unique_ptr<BdaResources>> pressure;
+            while (BdaResources::FaultSlots(context.device).reclaimed == reclaimed && pressure.size() < 20000) pressure.push_back(std::make_unique<BdaResources>(context, true));
+            wasReclaimed = BdaResources::FaultSlots(context.device).reclaimed > reclaimed;
+        }
+        const auto retired = BdaResources::FaultSlots(context.device);
+        std::cout << "fault retirement: completed " << recorder.CompletedThrough() << " reclaimed " << retired.reclaimed << " before " << reclaimed << " held " << retired.held << " chunks " << retired.chunks << " slots " << retired.slots << std::endl;
+        Require(wasReclaimed && retired.chunks == 0, "the fault retirement test did not reclaim and retire the idle fault chunk");
+        const auto retaken = BdaResources::FaultSlots(context.device).retaken;
+        Buffer buffer(context, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const std::array<std::pair<VkBuffer, VkDeviceSize>, 1> flights{{{buffer.Handle(), 0}}};
+        auto made = resources.MakeTemplateSets({}, flights);
+        Require(made != nullptr && resources.TemplateStaticMismatches(*made, 0) == 0, "a template initialized with a retired fault descriptor");
+        Require(BdaResources::FaultSlots(context.device).retaken > retaken, "the retired fault slot was not retaken before descriptor initialization");
+        std::cout << "agc_draw_templates_fault: ok\n";
+        return 0;
+    }
     const auto base = data + 4;
     put(base, 0x0101u);
     for (int i = 0; i < 4; ++i) {
@@ -18457,7 +18575,7 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         counters = collect();
         if (on) Require(counters["draw_templates_replays"] == 6 && counters["draw_templates_built_new"] + counters["draw_templates_built_shape"] <= 1, "alternating between two element shapes rebuilt a template on each use");
         std::cout << "agc_draw_templates_stream" << (on ? "" : " (off)") << ": ok\n";
-    } else if (scenario == "flights") {
+    } else if (scenario == "flights" || scenario == "publish") {
         expect(warmDraws, warmDraws, warmDraws, "the additive warm-up draws");
         static_cast<void>(collect());
         std::uint32_t red = warmDraws;
@@ -18474,15 +18592,15 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
             blue += k + 3;
         }
         auto counters = collect();
-        if (on) Require(counters["draw_templates_replays"] == 5 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 2, "five uses of one template in one batch did not take five flights of two flight groups");
-        else Require(counters["draw_templates_replays"] == 0, "the template path ran with its switch off");
+        if (on && scenario == "flights") Require(counters["draw_templates_replays"] == 5 && counters["draw_templates_refused_flight_busy"] == 0 && (scenario == "publish" || counters["draw_templates_flight_groups"] == 2), "five uses of one template in one batch did not take five flights of two flight groups");
+        else if (!on) Require(counters["draw_templates_replays"] == 0, "the template path ran with its switch off");
         expect(red, green, blue, "five additive replays of one template in one batch");
         draw(data + 0x100 + 4, 16, 2);
         red += 1;
         green += 1;
         blue += 2;
         counters = collect();
-        if (on) Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 0, "a flight was not free again after its batch completed");
+        if (on && scenario == "flights") Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 0, "a flight was not free again after its batch completed");
         expect(red, green, blue, "an additive replay after the batch completed");
         struct Gate {
             const Context& context;
@@ -18523,10 +18641,75 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
             blue += k + 4;
         }
         counters = collect();
-        if (on) Require(counters["draw_templates_replays"] == 8 && counters["draw_templates_refused_flight_busy"] == 0, "the draws around a held submission were not templated");
+        if (on && scenario == "flights") Require(counters["draw_templates_replays"] == 8 && counters["draw_templates_refused_flight_busy"] == 0, "the draws around a held submission were not templated");
         gate.Release();
         expect(red, green, blue, "additive replays recorded while an earlier batch that read a flight was held on the GPU");
+        if (scenario == "publish") {
+            if ((context.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0) return 77;
+            DepthTarget source{data, address + 4 * unit, {64, 64}, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.0f, 0, address + 3 * unit, false, 4};
+            source.depthSwizzle = 24;
+            source.iterate256 = true;
+            source.htilePipeAligned = true;
+            source.htileDepthOnly = true;
+            {
+                std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                Require(DepthSurfaceView(context, source) != VK_NULL_HANDLE, "the flight publication fixture has no native depth view");
+                NoteDepthSurfaceWrite(context, source);
+                std::cout << "publication source: " << DescribeDepthOverlaps(context.device, data, unit) << " watched " << AgcDriver::GuestMemory::Watched(data, unit) << " guarded " << ResidentDepthGuardOverlaps_nid_no_patch(data, unit) << std::endl;
+            }
+            recorder.Sync();
+            for (int warm = 0; warm < 4; ++warm) {
+                draw(base, 16, 1);
+                ++blue;
+                expect(red, green, blue, "warming a slot over the existing native depth owner");
+            }
+            {
+                std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                NoteDepthSurfaceWrite(context, source);
+            }
+            ShaderRecompiler::RecompileResult neutralVertex, neutralPixel;
+            neutralVertex.spirv = std::vector<std::uint32_t>(std::begin(COVER_VERT_SPV), std::end(COVER_VERT_SPV));
+            std::vector<std::uint32_t> neutralWords(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+            for (auto& word : neutralWords) if (word == 0x3f800000u) word = 0;
+            neutralPixel.spirv = std::move(neutralWords);
+            neutralVertex.variantId = 403;
+            neutralPixel.variantId = 404;
+            const std::array neutralStages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &neutralVertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &neutralPixel, 0}};
+            Draw(context, *target, indirect, neutralStages);
+            WaitForOptimizedPipelines(context.device);
+            static_cast<void>(collect());
+            const auto beforePublication = recorder.OpenSerial();
+            draw(base, 16, 2);
+            Require(recorder.OpenSerial() > beforePublication, "the static native depth read did not submit during template preparation");
+            Gate publicationGate{context, recorder};
+            Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &publicationGate.semaphore), "publication hold semaphore");
+            recorder.HoldNextSubmit(publicationGate.semaphore, 1);
+            const auto publicationSerial = recorder.OpenSerial();
+            recorder.Submit();
+            for (std::uint32_t word = 3; word <= 6; ++word) draw(base, 16, word);
+            Require(recorder.CompletedThrough() < publicationSerial, "the publication draw's submission did not remain held");
+            const auto publicationCounts = collect();
+            if (on && publicationCounts.at("draw_templates_replays") != 5) {
+                for (const auto& [name, value] : publicationCounts) if (value != 0 && (name.starts_with("draw_templates_") || name.starts_with("archc_replay_refused_"))) std::cout << name << " " << value << "\n";
+            }
+            if (on) Require(publicationCounts.at("draw_templates_replays") == 5, "the publication flight case did not take the template path for all five draws");
+            publicationGate.Release();
+            blue += 20;
+            expect(red, green, blue, "a held template flight stamped after static native depth publication submitted its earlier batch");
+        }
         std::cout << "agc_draw_templates_flights" << (on ? "" : " (off)") << ": ok\n";
+    } else if (scenario == "tail") {
+        static_cast<void>(collect());
+        for (std::uint32_t round = 0; round < 3; ++round) {
+            const auto moved = data + 0x100 * (round + 1) + 4;
+            put(moved, 0x4231u);
+            put(moved + 4, 0x3f800000u);
+            draw(moved, 16, round + 2);
+            expect(0, 255, 255, "a translated DWORD load spanning the five-byte element's tail");
+        }
+        const auto counters = collect();
+        if (on) Require(counters.at("draw_templates_replays") == 3, "the translated tail loads did not use templates");
+        std::cout << "agc_draw_templates_tail: ok\n";
     } else if (scenario == "budget") {
         static_cast<void>(collect());
         const auto moved = data + 0x100 + 4;
@@ -18537,6 +18720,10 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         }
         auto counters = collect();
         Require(counters["draw_templates_refused_budget"] == 2 && counters["draw_templates_replays"] == 2 && counters["draw_templates_built_new"] == 1, "a second template generation was built over the budget");
+        for (std::uint32_t round = 0; round < 80; ++round) draw(moved, 32 + round * 4, round + 2);
+        expect(0x31, 0x42, 81, "a long open batch with template generation churn under the allocation caps");
+        counters = collect();
+        Require(counters["draw_templates_refused_budget"] == 80 && counters["draw_templates_sets_allocated"] == 0, "outstanding generations bypassed the set budget");
         std::cout << "agc_draw_templates_budget: ok\n";
     } else {
         throw std::runtime_error("unknown draw template scenario");

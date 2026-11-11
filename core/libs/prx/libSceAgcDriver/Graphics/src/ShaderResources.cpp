@@ -8364,6 +8364,7 @@ struct ShaderResources::MovedSetCache {
         DescriptorCache::SetAllocation allocation;
         DescriptorCache::SetAllocation fragmentAllocation;
         std::vector<std::shared_ptr<Buffer>> words;
+        std::vector<VkDescriptorBufferInfo> buffers;
         ~Set() {
             if (cache == nullptr) return;
             if (allocation.set != VK_NULL_HANDLE) cache->Recycle(layout, allocation);
@@ -8386,7 +8387,7 @@ struct ShaderResources::MovedSetCache {
     std::uint64_t uses = 0;
 };
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool captureDescriptors) const {
     auto& counters = movedSetCounters();
     if (context.descriptorCache == nullptr || !faultDescriptors.empty()) return {};
     // A GPU store already in the open batch may be a label the guest waits on: once the GPU stores it,
@@ -8481,7 +8482,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
             set->fragmentLayout = fragment.layout;
             Require(set->fragmentAllocation.set != VK_NULL_HANDLE, "cached moved set allocation failed");
         }
-        auto buffers = descriptorBuffers;
+        auto& buffers = set->buffers;
+        buffers = descriptorBuffers;
         auto writes = descriptorWrites;
         std::size_t target = 0;
         for (const auto& entry : moved) {
@@ -8495,7 +8497,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
                 Require(write != writes.end(), "a moved element has no buffer descriptor write");
                 const auto slot = static_cast<std::size_t>(write->pBufferInfo - descriptorBuffers.data()) + static_cast<std::size_t>(position - binding.allocations.begin());
                 if (entry.words.empty()) {
-                    buffers[slot] = {targets[target].first, targets[target].second, static_cast<VkDeviceSize>(reads[target].second - reads[target].first)};
+                    buffers[slot] = wholeDwordRange({targets[target].first, targets[target].second, static_cast<VkDeviceSize>(reads[target].second - reads[target].first)});
                     ++target;
                 } else {
                     auto words = std::make_shared<Buffer>(context, entry.size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
@@ -8537,6 +8539,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
     result->allocation = entry.set->allocation;
     result->fragmentAllocation = entry.set->fragmentAllocation;
     result->cachedSet = entry.set;
+    if (captureDescriptors) result->capturedDescriptors = entry.set->buffers;
     result->inPlaceReads = entry.reads;
     result->movedProof = entry.proof;
     static const bool noNotes = std::getenv("APS5_ZC_MOVED_NO_READNOTES") != nullptr;
@@ -8715,6 +8718,44 @@ bool ShaderResources::ExpectedElementBytes(const MovedBuffer& entry, std::vector
     return true;
 }
 
+bool ShaderResources::BoundElementBytes(const MovedBuffer& entry, const DrawBindings* bound, VkDescriptorBufferInfo& descriptor, std::vector<std::byte>& bytes) const {
+    std::optional<std::size_t> slot;
+    for (const auto& binding : bindings) {
+        const auto at = std::find(binding.allocations.begin(), binding.allocations.end(), entry.allocation);
+        if (at == binding.allocations.end()) continue;
+        const auto original = setOf(binding) == 0 ? _set : fragment.set;
+        const auto write = std::find_if(descriptorWrites.begin(), descriptorWrites.end(), [&](const VkWriteDescriptorSet& value) { return value.dstSet == original && value.dstBinding == binding.layout.binding && value.pBufferInfo != nullptr; });
+        if (write == descriptorWrites.end()) return false;
+        slot = static_cast<std::size_t>(write->pBufferInfo - descriptorBuffers.data()) + static_cast<std::size_t>(at - binding.allocations.begin());
+        break;
+    }
+    const auto& buffers = bound != nullptr ? bound->capturedDescriptors : descriptorBuffers;
+    if (!slot || *slot >= buffers.size()) return false;
+    descriptor = buffers[*slot];
+    const auto copy = [&](Buffer& buffer) {
+        if (buffer.Handle() != descriptor.buffer) return false;
+        auto mapped = buffer.Bytes();
+        if (descriptor.offset > mapped.size() || descriptor.range > mapped.size() - descriptor.offset) return false;
+        bytes.assign(mapped.begin() + static_cast<std::ptrdiff_t>(descriptor.offset), mapped.begin() + static_cast<std::ptrdiff_t>(descriptor.offset + descriptor.range));
+        return true;
+    };
+    if (bound != nullptr) {
+        for (const auto& snapshot : bound->snapshots) if (copy(*snapshot.buffer)) return true;
+        if (bound->cachedSet != nullptr) {
+            const auto cached = std::static_pointer_cast<MovedSetCache::Set>(bound->cachedSet);
+            for (const auto& word : cached->words) if (copy(*word)) return true;
+        }
+    }
+    const auto& allocation = allocations[entry.allocation];
+    if (allocation.buffer != nullptr && copy(*allocation.buffer)) return true;
+    if (!entry.words.empty()) return false;
+    const auto [begin, size] = MovedView(entry);
+    const auto* import = ExistingHostImportFor(context, begin, size);
+    if (import == nullptr || descriptor.buffer != import->buffer || descriptor.offset != HostImportOffset(*import, begin) || descriptor.range > size) return false;
+    bytes.resize(static_cast<std::size_t>(descriptor.range));
+    return GuestMemory::CopyMapped(begin, bytes, true) == GuestMemory::Compare::Equal;
+}
+
 std::size_t ShaderResources::TemplateStaticMismatches(const TemplateSets& sets, std::size_t flight) const {
     const auto& buffers = sets.buffers[flight];
     if (buffers.size() != descriptorBuffers.size() || sets.images.size() != descriptorImages.size()) return 1;
@@ -8729,7 +8770,7 @@ std::size_t ShaderResources::TemplateStaticMismatches(const TemplateSets& sets, 
     return mismatches;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, bool captureDescriptors) const {
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
     prepareFaultSlot();
@@ -8792,7 +8833,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // APS5_ARCHB_ZERO_COPY_MOVED (on top of ZERO_COPY_STORAGE, which leaves every other element as the
     // object's set binds it): a cached immutable set for this moved content; nothing when refused.
     if (!moved.empty() && Recorder::ZeroCopyStorageActive() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ZeroCopyMoved)) {
-        if (auto cached = cachedMovedBindings(recorder, moved)) return cached;
+        if (auto cached = cachedMovedBindings(recorder, moved, captureDescriptors)) return cached;
     }
     // APS5_DRAW_BINDINGS_DIAG: the call's time by snapshot path (diagnostic).
     const bool diag = Recorder::SnapshotDiagEnabled();
@@ -9094,6 +9135,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     movedCensusScope.set = true;
+    result->captureDescriptors = captureDescriptors;
     writeDrawSets(*result, selected, faultRecord, &recorder, slotted, slotElements, slotSizes, slotSnapshots);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
@@ -9300,7 +9342,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
                     const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                     if (snapshotIndex == selected.size()) continue;
                     const auto& snapshot = result.snapshots[snapshotIndex];
-                    buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes};
+                    buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
                 }
                 for (std::size_t element = 0; element < binding.allocations.size();) {
                     if (marks[binding.allocations[element]] == 0) {
@@ -9332,6 +9374,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
             if (writes.empty()) reuseCounters.noWrite.fetch_add(1, std::memory_order_relaxed);
         }
         if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        if (result.captureDescriptors) result.capturedDescriptors = buffers;
         adopt();
         return;
     }
@@ -9362,6 +9405,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (result.captureDescriptors) result.capturedDescriptors = buffers;
     adopt();
 }
 

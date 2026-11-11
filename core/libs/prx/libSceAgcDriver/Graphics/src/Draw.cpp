@@ -5883,6 +5883,13 @@ struct TemplatePlan {
     std::size_t flight = 0;
     std::uint64_t serial = 0;
     bool committed = false;
+    bool verify = false;
+    struct Reference {
+        VkDescriptorBufferInfo descriptor{};
+        std::vector<std::byte> bytes;
+        bool valid = false;
+    };
+    std::vector<Reference> reference;
 };
 
 TemplatePlan& templatePlan() {
@@ -5903,24 +5910,26 @@ void verifyTemplate(const Context& context, const ShaderResources& resources, co
     const auto alignment = ParameterArena::Alignment(context);
     const auto group = flight / ParameterArena::Flights;
     const auto chunk = sets.leases[group]->slice.chunk;
-    struct ExpectedStorage {};
-    auto& expected = AgcDriver::ThreadScratch<std::vector<std::byte>, ExpectedStorage>();
+    const auto& reference = templatePlan().reference;
     for (std::size_t i = 0; i < moved.size(); ++i) {
         const auto& element = sets.elements[i];
         if (element.allocation != moved[i].allocation || element.words != !moved[i].words.empty()) mismatch(MismatchElementSet, "a streamed element is not the moved element at its position");
         const auto& info = sets.buffers[flight][sets.streamed[i]];
+        if (i >= reference.size() || !reference[i].valid) {
+            mismatch(MismatchElementBytes, "the old binding path did not expose the bound bytes");
+            continue;
+        }
+        const auto& old = reference[i];
+        if (info.range != old.descriptor.range || info.offset % (element.inPlace ? std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4) : alignment) != 0) mismatch(MismatchElementRange, "a descriptor's range or alignment differs from the old binding path");
         if (element.inPlace) {
             const auto [begin, bytes] = resources.MovedView(moved[i]);
             const auto* import = ExistingHostImportFor(context, begin, bytes);
-            const auto old = import == nullptr ? VkDescriptorBufferInfo{} : resources.TemplateDescriptor({import->buffer, HostImportOffset(*import, begin), static_cast<VkDeviceSize>(bytes)});
-            if (import == nullptr || info.buffer != old.buffer || info.offset != old.offset || info.range != old.range) mismatch(MismatchElementRange, "an in-place descriptor differs from the import descriptor the old path binds");
-            if (import != nullptr && std::memcmp(reinterpret_cast<const void*>(import->base + (old.offset - import->lead)), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(old.range)) != 0) mismatch(MismatchElementBytes, "the bytes behind an in-place descriptor are not the moved range");
-            continue;
+            if (import == nullptr || info.buffer != import->buffer || info.offset != HostImportOffset(*import, begin)) mismatch(MismatchElementRange, "an in-place descriptor differs from its live import");
+            if (old.bytes.size() != info.range || std::memcmp(reinterpret_cast<const void*>(begin), old.bytes.data(), old.bytes.size()) != 0) mismatch(MismatchElementBytes, "the in-place bytes differ from what the old binding path binds");
+        } else {
+            if (info.buffer != sets.arena->Handle(flight % ParameterArena::Flights, chunk)) mismatch(MismatchElementRange, "a streamed descriptor points outside the flight");
+            if (old.bytes.size() != info.range || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, old.bytes.data(), old.bytes.size()) != 0) mismatch(MismatchElementBytes, "the slice bytes differ from what the old binding path binds");
         }
-        const auto copied = resources.StreamBytes(moved[i]);
-        const auto old = resources.TemplateDescriptor({info.buffer, info.offset, static_cast<VkDeviceSize>(copied)});
-        if (info.buffer != sets.arena->Handle(flight % ParameterArena::Flights, chunk) || info.offset % alignment != 0 || info.range != old.range) mismatch(MismatchElementRange, "a streamed descriptor's buffer, alignment or range differs from the old path's");
-        if (!resources.ExpectedElementBytes(moved[i], expected) || expected.size() != copied || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, expected.data(), expected.size()) != 0) mismatch(MismatchElementBytes, "the bytes behind a streamed descriptor differ from the bytes behind the old path's descriptor");
     }
     if (resources.TemplateStaticMismatches(sets, flight) != 0) mismatch(MismatchStatic, "a static binding of the template set differs from the template's own");
     if (sets.push != slot.push) mismatch(MismatchPush, "the slot's push block changed under its template");
@@ -5946,6 +5955,8 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
     plan.inPlace.clear();
     plan.reads.clear();
     plan.committed = false;
+    plan.verify = templateVerifyNow();
+    plan.reference.clear();
     const auto refuse = [&](TemplateRefusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
         plan.sets.reset();
@@ -5989,6 +6000,14 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
         plan.inPlace.emplace_back(index, resources.TemplateDescriptor({import->buffer, offset, static_cast<VkDeviceSize>(bytes)}));
         plan.reads.emplace_back(begin, begin + bytes);
     }
+    if (plan.verify) {
+        auto bound = resources.PrepareDrawBindings(recorder, moved, false, nullptr, true);
+        plan.reference.resize(moved.size());
+        for (std::size_t i = 0; i < moved.size(); ++i) {
+            auto& reference = plan.reference[i];
+            reference.valid = resources.BoundElementBytes(moved[i], bound.get(), reference.descriptor, reference.bytes);
+        }
+    }
     std::shared_ptr<ShaderResources::TemplateSets> sets;
     std::size_t held = slot.templates.size();
     bool other = false;
@@ -6020,8 +6039,8 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
         }
         if (!templateBudgetHolds(groupSets, groupBytes)) return refuse(TemplateBudget);
         auto arena = parameterArena(context, recorder);
-        auto lease = ParameterArena::Allocate(arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)));
-        if (lease == nullptr) return refuse(TemplateLarge);
+        auto lease = ParameterArena::Allocate(arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)), static_cast<std::size_t>(templateByteBudget()));
+        if (lease == nullptr) return refuse(total > ParameterArena::ChunkBytes ? TemplateLarge : TemplateBudget);
         const auto flights = groupFlights(*arena, *lease);
         sets = resources.MakeTemplateSets(shape, flights);
         if (sets == nullptr) return refuse(TemplateSetsRefused);
@@ -6057,8 +6076,8 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
     if (!freeFlight(*sets, recorder).has_value()) {
         if (sets->leases.size() >= TemplateGroupLimit) return refuse(TemplateFlightBusy);
         if (!templateBudgetHolds(groupSets, groupBytes)) return refuse(TemplateBudget);
-        auto lease = ParameterArena::Allocate(sets->arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)));
-        if (lease == nullptr) return refuse(TemplateLarge);
+        auto lease = ParameterArena::Allocate(sets->arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)), static_cast<std::size_t>(templateByteBudget()));
+        if (lease == nullptr) return refuse(total > ParameterArena::ChunkBytes ? TemplateLarge : TemplateBudget);
         const auto before = std::pair{sets->sets, sets->writes};
         resources.AddTemplateFlights(*sets, groupFlights(*sets->arena, *lease));
         sets->leases.push_back(std::move(lease));
@@ -6102,7 +6121,7 @@ std::size_t commitTemplate(const Context& context, Recorder& recorder, const Sha
     }
     counts.bytes.fetch_add(copied, std::memory_order_relaxed);
     counts.replays.fetch_add(1, std::memory_order_relaxed);
-    if (templateVerifyNow()) verifyTemplate(context, resources, sets, flight, moved, slot);
+    if (plan.verify) verifyTemplate(context, resources, sets, flight, moved, slot);
     plan.flight = flight;
     plan.serial = recorder.OpenSerial();
     plan.committed = true;
