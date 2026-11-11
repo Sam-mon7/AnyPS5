@@ -298,6 +298,11 @@ public:
         std::uint64_t checked, presyncs, keyChecks, keyWaits;
     };
     static PresyncStatistics PresyncCounts();
+    struct DispatchSpaceReuseStats {
+        bool enabled;
+        std::uint64_t built, hits, inFlight, spaceChanged, guardChanged, snapshotRefused, revalidateFailed, verified, mismatches;
+    };
+    static DispatchSpaceReuseStats DispatchSpaceReuseCounts();
     static std::uint64_t UpscaledPresents();
     // Stage A of a dispatch's resource build, run WITHOUT GuestMemory::GpuMutex before Dispatch or
     // DispatchIndirect: the binding plan, data buffers, imports already serving the guest buffers,

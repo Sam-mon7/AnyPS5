@@ -220,6 +220,18 @@ std::span<std::byte> BdaResources::faultBytes() const {
     return faultChunk->buffer->Bytes().subspan(static_cast<std::size_t>(faultOffset), static_cast<std::size_t>(faultChunk->slotBytes));
 }
 
+void BdaResources::PinFaultSlot() {
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    ++faultPins;
+}
+
+void BdaResources::UnpinFaultSlot() {
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    --faultPins;
+}
+
 void BdaResources::NoteUse(std::uint64_t serial) {
     auto& arenas = faultArenas();
     std::lock_guard lock(arenas.mutex);
@@ -257,7 +269,7 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     if (shared && source == arena.chunks.rend() && GuestMemory::GpuMutex().HeldByThisThread()) {
         std::vector<BdaResources*> idle;
         for (auto* holder : arena.holders) {
-            if (holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
+            if (holder->faultPins == 0 && holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
         }
         if (!idle.empty()) {
             const auto reclaim = (idle.size() + 1) / 2;

@@ -7395,6 +7395,16 @@ void GuestBufferMemory::bindShadowAddresses() {
     RecordMemoryBarrier(context, recorder->Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 }
 
+bool GuestBufferMemory::RebindShadowAddresses() {
+    GuestMemory::AssertGpuLockHeld("GuestBufferMemory::RebindShadowAddresses");
+    if (!ShadowAddressEnabled() || !shadowAddressReads || !context.bufferDeviceAddress || Recorder::Active() == nullptr || Recorder::InCompletion()) return false;
+    auto previous = std::move(shadowRanges);
+    shadowRanges.clear();
+    shadowPins.clear();
+    bindShadowAddresses();
+    return previous.size() == shadowRanges.size() && (previous.empty() || std::memcmp(previous.data(), shadowRanges.data(), previous.size() * sizeof(previous.front())) == 0);
+}
+
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
