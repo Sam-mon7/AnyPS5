@@ -18,9 +18,9 @@ namespace AgcDriver::DriverDetail {
 struct DrawProgram;
 struct DrawEntry;
 
-enum class GatherWord : std::uint8_t { Structure, Hidden, Callee, WalkedValue, TableBase, ValueWord, PushWord, FlatData, BufferBase, NestedPointer, Feedback, Count };
+enum class GatherWord : std::uint8_t { Structure, Hidden, Callee, WalkedValue, TableBase, ValueWord, PushWord, FlatData, BufferBase, NestedPointer, Feedback, ValueRecord, Count };
 
-enum class GatherDiffer : std::uint8_t { None, Layout, UserStructure, UserHidden, UserCallee, UserWalked, TableBaseAlignment, RunStructure, NestedPointer, PointerUnreadable, Unreadable, Pending, Count };
+enum class GatherDiffer : std::uint8_t { None, Layout, UserStructure, UserHidden, UserCallee, UserWalked, TableBaseAlignment, RunStructure, NestedPointer, PointerUnreadable, Unreadable, Pending, RecordCount, Count };
 
 enum class GatherElement : std::uint8_t { Vsharp, Flat, ShaderData, Push, Indirect, Count };
 
@@ -90,6 +90,19 @@ struct GatherVsharp {
     std::array<std::uint32_t, 4> words{};
     std::uint64_t address = 0;
     std::uint64_t size = 0;
+    std::uint64_t extent = 0;
+    std::uint32_t adjustment = 0;
+};
+
+struct GatherIndirectPlan {
+    bool present = false;
+    bool countIndirect = false;
+    std::uint64_t arguments = 0;
+    std::uint64_t countAddress = 0;
+    std::uint32_t count = 0;
+    std::uint32_t recordBytes = 0;
+    std::uint64_t rangeBytes = 0;
+    bool operator==(const GatherIndirectPlan&) const = default;
 };
 
 struct GatherStagePlan {
@@ -101,8 +114,20 @@ struct GatherStagePlan {
     std::array<std::uint64_t, static_cast<std::size_t>(GatherElement::Count)> bytes{};
 };
 
+enum GatherIncomplete : std::uint32_t { GatherIncompleteNone = 0, GatherPendingWords = 1, GatherPendingVsharp = 2, GatherPendingIndirect = 4, GatherGenerationMoved = 8, GatherNotTemplatable = 16, GatherUnmatched = 32 };
+
+struct GatherBufferLimits {
+    std::uint64_t maxRange = 0;
+    std::uint32_t alignment = 4;
+    std::uint64_t targetAddress = 0;
+    std::uint64_t (*readableEnd)(std::uint64_t) = nullptr;
+};
+
 struct GatherDrawPlan {
     std::vector<GatherStagePlan> stages;
+    GatherIndirectPlan indirect;
+    GatherBufferLimits limits;
+    std::uint32_t incomplete = GatherIncompleteNone;
     bool complete = false;
 };
 
@@ -111,6 +136,7 @@ struct GatherCheck {
     std::array<std::uint64_t, static_cast<std::size_t>(GatherElement::Count)> mismatched{};
     std::uint64_t vsharpAddress = 0;
     std::uint64_t vsharpSize = 0;
+    std::uint64_t vsharpExtent = 0;
     std::uint64_t stagesMissing = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(GatherWord::Count)> mismatchedFrom{};
 };
@@ -125,11 +151,17 @@ struct GatherValidation {
 
 constexpr std::uint64_t GatherSmallElementBytes = 4096;
 
+struct GatherExtent {
+    std::uint64_t bytes = 0;
+    std::uint32_t adjustment = 0;
+};
+
+GatherExtent GatherBufferExtent(const std::array<std::uint32_t, 4>& words, const GatherBufferLimits& limits);
 std::shared_ptr<const GatherTemplate> BuildGatherTemplate(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::uint32_t hiddenUserWords, const GatherOptions& options);
 GatherOutcome EvaluateGather(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, const GatherReader& read, std::vector<std::uint32_t>& liveWords, std::vector<std::uint64_t>* liveAddresses, bool diagnose);
-void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, std::span<const std::uint32_t> liveWords, GatherStagePlan& plan);
-void CheckGatherStage(const GatherStagePlan& plan, const ShaderRecompiler::RecompileResult& program, GatherCheck& check);
-void CheckGatherDrawPlan(const GatherDrawPlan& plan, std::span<const Graphics::CompiledShader> stages);
+void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, std::span<const std::uint32_t> liveWords, GatherStagePlan& plan, const GatherBufferLimits& limits = {});
+void CheckGatherStage(const GatherStagePlan& plan, const ShaderRecompiler::RecompileResult& program, GatherCheck& check, const GatherBufferLimits& limits = {});
+GatherCheck CheckGatherDrawPlan(const GatherDrawPlan& plan, std::span<const Graphics::CompiledShader> stages, std::uint64_t targetAddress, const GatherIndirectPlan& committed);
 void CountGatherPlanUnchecked(const char* reason);
 const char* GatherWordName(GatherWord word);
 const char* GatherDifferName(GatherDiffer differ);
@@ -139,6 +171,18 @@ std::vector<GatherValidation>* GatherValidationLog();
 bool GatherRunsPending(const DispatchVariant& variant);
 void ArmGatherValidationLog(bool armed);
 
+struct GatherShadowStats {
+    std::uint64_t built = 0;
+    std::uint64_t trueMatch = 0;
+    std::uint64_t trueDiffer = 0;
+    std::uint64_t falseMatch = 0;
+    std::uint64_t nestedDirect = 0;
+    std::uint64_t falseDiffer = 0;
+    std::uint64_t pendingRefused = 0;
+    std::uint64_t generationRefused = 0;
+    std::uint64_t reads = 0;
+};
+
 struct GatherShadowDraw {
     std::span<const DrawProgram> programs;
     const DrawEntry* entry = nullptr;
@@ -146,9 +190,11 @@ struct GatherShadowDraw {
     bool hit = false;
     bool keyed = false;
     GatherOptions options;
-    std::uint64_t indirectArguments = 0;
-    std::uint64_t indirectBytes = 0;
-    std::uint64_t indirectCountAddress = 0;
+    GatherIndirectPlan indirect;
+    GatherBufferLimits limits;
+    const GatherReader* read = nullptr;
+    const std::function<bool(std::uint64_t, std::size_t)>* busy = nullptr;
+    GatherShadowStats* stats = nullptr;
 };
 
 std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw);

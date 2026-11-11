@@ -409,6 +409,38 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     return held;
 }
 
+GatherIndirectPlan GatherIndirectOf(const Pm4::DrawParameters& parameters) {
+    GatherIndirectPlan plan;
+    if (!parameters.indirect) return plan;
+    const auto& indirect = *parameters.indirect;
+    plan.present = true;
+    plan.arguments = indirect.arguments;
+    plan.countIndirect = indirect.countIndirect;
+    plan.countAddress = indirect.countIndirect ? indirect.countAddress : 0;
+    plan.count = indirect.count;
+    plan.recordBytes = indirect.recordBytes;
+    plan.rangeBytes = std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes);
+    return plan;
+}
+
+std::uint64_t GatherTargetAddress(const Graphics::State& graphics) {
+    return graphics.hasColorTarget ? graphics.color.MemoryAddress() : 0;
+}
+
+GatherBufferLimits GatherLimitsOf(VulkanDevice& device, const Graphics::State& graphics) {
+    thread_local std::uint64_t serial = 0;
+    thread_local GatherBufferLimits limits;
+    if (serial != device.Serial() || limits.maxRange == 0) {
+        const auto context = device.graphicsContext();
+        limits.maxRange = context.limits.maxStorageBufferRange;
+        limits.alignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
+        serial = device.Serial();
+    }
+    auto result = limits;
+    result.targetAddress = GatherTargetAddress(graphics);
+    return result;
+}
+
 bool EmptyIndirectSkip() {
     static const bool enabled = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return enabled;
@@ -1050,12 +1082,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         shadow.hit = drawHit || verifyHit;
         shadow.keyed = registerKey;
         shadow.options = {drawStageDataHits(), drawStageDataHits() && tail.bufferBases && !validateLegacy(), tail.feedbackMask && !validateLegacy(), tail.nestedRelocation};
-        if (drawParameters.indirect) {
-            const auto& indirect = *drawParameters.indirect;
-            shadow.indirectArguments = indirect.arguments;
-            shadow.indirectBytes = std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes);
-            shadow.indirectCountAddress = indirect.countIndirect ? indirect.countAddress : 0;
-        }
+        shadow.indirect = GatherIndirectOf(drawParameters);
+        shadow.limits = GatherLimitsOf(*localDevice, graphics);
         tail.gatherPlan = RunGatherShadow(shadow);
         ArmGatherValidationLog(false);
         gatherLogScope.armed = false;
@@ -1901,7 +1929,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     slotIdentity.stages.push_back(std::move(entry));
                 }
             }
-            if (gatherPlan != nullptr) CheckGatherDrawPlan(*gatherPlan, stages);
+            if (gatherPlan != nullptr) CheckGatherDrawPlan(*gatherPlan, stages, GatherTargetAddress(decode->state), GatherIndirectOf(drawParameters));
             const bool nostageCensus = nostageWhy >= 0 && Graphics::ArchcNostageCensus();
             if (nostageCensus) Graphics::ArchcNostageArm(nostageWhy);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
@@ -1932,7 +1960,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     noteDrawWriters(stages, submission.queue);
     if (tail.gatherPlan != nullptr) {
         for (std::size_t i = 0; i < tail.gatherPlan->stages.size() && i < programResults.size(); ++i) tail.gatherPlan->stages[i].program = programResults[i];
-        CheckGatherDrawPlan(*tail.gatherPlan, stages);
+        CheckGatherDrawPlan(*tail.gatherPlan, stages, GatherTargetAddress(graphics), GatherIndirectOf(drawParameters));
         tail.gatherPlan = nullptr;
     }
     phaseTiming.Phase(DrawRowVectors);
