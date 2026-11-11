@@ -52,6 +52,7 @@ alignas(256) constexpr std::array<std::uint32_t, 16> OffsetTriangleVertexCode{
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
+std::byte* DrawColorTarget = nullptr;
 alignas(256) std::array<float, 4> PixelConstant{};
 
 struct Header {
@@ -86,7 +87,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 }
 
 std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, std::uint32_t vertexUserSgprs, const std::uint32_t* pixelCode, std::uint32_t pixelUserSgprs, const std::vector<std::vector<std::uint32_t>>& pixelWords) {
-    const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+    const auto color = reinterpret_cast<std::uintptr_t>(DrawColorTarget != nullptr ? DrawColorTarget : ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
@@ -1068,6 +1069,107 @@ void DispatchRelocationPath() {
     if (enabled && Switches::Enabled(Feature::PipeQ0Committer)) Require(count("pipe_q0_dispatch_miss_then_hit") >= 2, "relocated queue-0 dispatches were not served after the pre-check miss");
 }
 
+void PairedHitPath() {
+    using R = AgcDriver::ArchB::Recorder;
+    alignas(256) static constexpr std::array<std::uint32_t, 11> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+    alignas(8) static Header header{};
+    alignas(256) static std::array<std::uint32_t, 4> descriptor{};
+    alignas(256) static std::array<std::uint32_t, 4> twin{};
+    alignas(256) static std::array<std::array<float, 64>, 4> data{};
+    alignas(256) static std::array<std::uint32_t, 8> arguments{3, 1, 0, 0, 3, 1, 0, 0};
+    alignas(256) static std::array<std::byte, ColorMemory.size()> otherColor{};
+    const bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::DrawPairedHit);
+    const bool verify = enabled && std::getenv("APS5_ARCHB_DRAW_PAIRED_HIT_VERIFY") != nullptr;
+    const bool taking = enabled && !verify;
+    R::Boundary(true, 0, R::Clock::now());
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code.data(), sizeof(code), 1);
+    data[0][0] = 0.25f;
+    data[1][0] = 1.0f;
+    data[2][0] = 1.0f;
+    data[3][0] = 0.5f;
+    const auto point = [&](std::array<std::uint32_t, 4>& table, std::size_t index) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data[index].data());
+        table = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 64, 0x30016fac};
+    };
+    const auto submit = [&](std::size_t count, const std::array<std::uint32_t, 4>& table, std::uint32_t offset, const std::vector<std::uint32_t>& between) {
+        const auto address = reinterpret_cast<std::uintptr_t>(table.data());
+        const auto commands = Draws(32.0f, TriangleVertexCode.data(), 0, code.data(), 2, std::vector<std::vector<std::uint32_t>>(count, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)}));
+        std::vector<std::uint32_t> changed;
+        const auto records = reinterpret_cast<std::uintptr_t>(arguments.data());
+        Append(changed, 0x11, {1, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
+        bool first = true;
+        for (std::size_t at = 0; at < commands.size();) {
+            const auto size = ((commands[at] >> 16u) & 0x3fffu) + 2u;
+            if (((commands[at] >> 8u) & 0xffu) == 0x2d) {
+                if (!first) changed.insert(changed.end(), between.begin(), between.end());
+                first = false;
+                Append(changed, 0x24, {offset, 0x8c, 0, 2});
+            } else {
+                changed.insert(changed.end(), commands.begin() + static_cast<std::ptrdiff_t>(at), commands.begin() + static_cast<std::ptrdiff_t>(at + size));
+            }
+            at += size;
+        }
+        ColorMemory.fill(std::byte{0});
+        Submit(std::move(changed));
+        return R::Collect(R::Clock::now()).counters;
+    };
+    const auto count = [](const auto& counts, const char* name) {
+        const auto found = counts.find(name);
+        return found == counts.end() ? 0.0 : found->second;
+    };
+    const auto expect = [&](const auto& counts, double taken, const char* refusal, double refused, unsigned brightness, const char* what) {
+        Require(brightness > 0xff || BrightestColorByte() == brightness, std::string(what) + ": rendered " + std::to_string(BrightestColorByte()) + ", expected " + std::to_string(brightness));
+        Require(count(counts, "draw_paired_q0_taken") == (taking ? taken : 0.0), std::string(what) + ": paired hits taken " + std::to_string(count(counts, "draw_paired_q0_taken")) + ", expected " + std::to_string(taking ? taken : 0.0));
+        Require(count(counts, "draw_paired_verify_checks") == (verify ? taken : 0.0), std::string(what) + ": verified proofs " + std::to_string(count(counts, "draw_paired_verify_checks")));
+        if (refusal != nullptr) Require(count(counts, refusal) == (enabled ? refused : 0.0), std::string(what) + ": " + refusal + " " + std::to_string(count(counts, refusal)) + ", expected " + std::to_string(enabled ? refused : 0.0));
+        for (const char* mismatch : {"draw_paired_verify_outcome_mismatches", "draw_paired_verify_entry_mismatches", "draw_paired_verify_stage_mismatches"}) Require(count(counts, mismatch) == 0, std::string(what) + ": " + mismatch);
+        const auto committed = count(counts, "draw_paired_c_replayed") + count(counts, "draw_paired_c_verified") + count(counts, "draw_paired_c_refused") + count(counts, "draw_paired_c_new") + count(counts, "draw_paired_c_legacy");
+        Require(committed == (taking ? taken : 0.0), std::string(what) + ": the committer ran " + std::to_string(committed) + " paired draws");
+    };
+    R::Collect(R::Clock::now());
+    const auto settle = [&](const std::array<std::uint32_t, 4>& table, std::uint32_t offset) {
+        submit(2, table, offset, {});
+        submit(1, table, offset, {});
+    };
+    point(descriptor, 0);
+    settle(descriptor, 0);
+    expect(submit(2, descriptor, 0, {}), 2, nullptr, 0, 64, "a repeated indirect draw");
+    point(descriptor, 1);
+    expect(submit(2, descriptor, 0, {}), 0, "draw_paired_q0_refused_differs", 2, 255, "a changed buffer base in captured memory");
+    settle(descriptor, 0);
+    expect(submit(2, descriptor, 0, {}), 2, nullptr, 0, 255, "the changed buffer once validated");
+    descriptor[1] ^= 4u << 16u;
+    expect(submit(1, descriptor, 0, {}), 0, "draw_paired_q0_refused_differs", 1, 0x100, "a changed descriptor stride word");
+    descriptor[1] ^= 4u << 16u;
+    settle(descriptor, 0);
+    expect(submit(2, descriptor, 0, {}), 2, nullptr, 0, 255, "the restored descriptor");
+    expect(submit(2, descriptor, 16, {}), 1, "draw_paired_q0_refused_no_memo", 1, 255, "a changed packet word");
+    arguments[4] = 0;
+    expect(submit(1, descriptor, 16, {}), 1, nullptr, 0, 0, "changed indirect arguments read at commit");
+    arguments[4] = 3;
+    expect(submit(1, descriptor, 16, {}), 1, nullptr, 0, 255, "restored indirect arguments");
+    point(twin, 1);
+    expect(submit(1, twin, 16, {}), 0, "draw_paired_q0_refused_no_memo", 1, 255, "a changed user-data pointer");
+    DrawColorTarget = otherColor.data();
+    const auto moved = submit(1, descriptor, 16, {});
+    DrawColorTarget = nullptr;
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(otherColor.data()), otherColor.size());
+    Require(std::any_of(otherColor.begin(), otherColor.end(), [](std::byte value) { return value != std::byte{0}; }), "the draw into another color target left it empty");
+    expect(moved, 0, "draw_paired_q0_refused_no_memo", 1, 0, "a changed color target");
+    settle(descriptor, 16);
+    const auto other = reinterpret_cast<std::uintptr_t>(data[3].data());
+    std::vector<std::uint32_t> store;
+    const auto at = reinterpret_cast<std::uintptr_t>(descriptor.data());
+    Append(store, 0x37, {0x00100200u, static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u), static_cast<std::uint32_t>(other)});
+    const auto written = submit(2, descriptor, 16, store);
+    Require(BrightestColorByte() == 127, "a draw after a queued store to its descriptor rendered " + std::to_string(BrightestColorByte()) + ", expected 127");
+    const auto gated = count(written, "draw_paired_q0_refused_queued") + count(written, "draw_paired_q0_refused_pending_gpu") + count(written, "draw_paired_q0_refused_differs");
+    Require(gated == (enabled ? 1.0 : 0.0), "a queued store over captured memory was not refused: " + std::to_string(gated));
+    Require(count(written, "draw_paired_q0_taken") == (taking ? 1.0 : 0.0), "a queued store over captured memory: the first draw was not taken");
+    std::cout << "Paired draw-cache hits " << (taking ? "taken" : verify ? "verified" : "off") << " with every input change refused\n";
+}
+
 void PipelineStateReusePath(const std::filesystem::path& control) {
     using R = AgcDriver::ArchB::Recorder;
     using S = AgcDriver::ArchB::Switches;
@@ -1109,6 +1211,13 @@ void PipelineStateReusePath(const std::filesystem::path& control) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--paired-hit") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            PairedHitPath();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--nested-proof") {
             NestedPointerProofs();
             return 0;

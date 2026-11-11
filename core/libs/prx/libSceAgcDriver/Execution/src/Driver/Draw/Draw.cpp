@@ -13,6 +13,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -34,6 +38,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
@@ -127,6 +132,26 @@ std::string_view TrimmedReason(std::string_view reason) {
 }
 
 
+struct PairedDrawMemo {
+    std::vector<std::uint32_t> packet;
+    Pm4::DrawParameters parameters{};
+    Pm4::DrawParameters finalParameters{};
+    const VulkanDevice* device = nullptr;
+    std::shared_ptr<const DrawDecode> decode;
+    std::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::vector<std::vector<std::uint32_t>> words;
+    std::vector<ShaderRecompiler::MemoryRegion> memory;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::int32_t> regionStage;
+    std::vector<std::uint32_t> regionWord;
+    std::vector<Graphics::CompiledShader> stages;
+    std::uint64_t frontCode = 0;
+    std::vector<DrawPipeline::Range> writes;
+    std::vector<DrawPipeline::Range> reads;
+    ArchB::Recorder::Key recorderKey;
+    std::function<void(std::uint64_t, std::uint64_t)> commit;
+};
+
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     ArchB::Recorder::Key recorderKey;
@@ -146,6 +171,10 @@ struct DrawTail {
     bool registerKey = false;
     bool ubPointerFree = false;
     bool ubSkipCpuIndirect = false;
+    bool paired = false;
+    int pairedRefused = -1;
+    Pm4::DrawParameters pairedParameters{};
+    std::shared_ptr<PairedDrawMemo> pairedVerify;
     // APS5_ARCHB_PIPE_INDIRECT_GPU_ARGS, sampled once per draw: the enqueue did not drain for arguments
     // queued items write; CPU reads of them drain first (drainBeforeArgumentRead).
     bool indirectGpuArgs = false;
@@ -467,6 +496,212 @@ void drainBeforeArgumentRead(const Pm4::DrawParameters::IndirectDraw& indirect, 
     if (pipeline.Overlaps(indirect.arguments, argumentBytes) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4))) pipeline.Drain(DrawPipeline::DrainReason::Indirect, 0x100, cause);
 }
 
+enum class PairedRefusal : std::size_t { NoMemo, Packet, Parameters, Device, Finisher, Labels, Programs, CpuIndirect, IndexRange, Views, Queued, PendingGpu, Storage, Forget, Differs, Unmapped, Serials, Volatile, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(PairedRefusal::Count)> PairedRefusalNames{"draw_paired_q0_refused_no_memo", "draw_paired_q0_refused_packet", "draw_paired_q0_refused_parameters", "draw_paired_q0_refused_device", "draw_paired_q0_refused_finisher", "draw_paired_q0_refused_labels", "draw_paired_q0_refused_programs", "draw_paired_q0_refused_cpu_indirect", "draw_paired_q0_refused_index_range", "draw_paired_q0_refused_views", "draw_paired_q0_refused_queued", "draw_paired_q0_refused_pending_gpu", "draw_paired_q0_refused_storage", "draw_paired_q0_refused_forget", "draw_paired_q0_refused_differs", "draw_paired_q0_refused_unmapped", "draw_paired_q0_refused_serials", "draw_paired_q0_refused_volatile"};
+enum class PairedUnrecorded : std::size_t { Miss, VerifyHit, CpuIndirect, ResolveSplit, Finisher, Volatile, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(PairedUnrecorded::Count)> PairedUnrecordedNames{"draw_paired_q0_unrecorded_miss", "draw_paired_q0_unrecorded_verify_hit", "draw_paired_q0_unrecorded_cpu_indirect", "draw_paired_q0_unrecorded_resolve_split", "draw_paired_q0_unrecorded_finisher", "draw_paired_q0_unrecorded_volatile"};
+enum class PairedCommit : std::size_t { Replayed, Verified, Refused, New, Legacy, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(PairedCommit::Count)> PairedCommitNames{"draw_paired_c_replayed", "draw_paired_c_verified", "draw_paired_c_refused", "draw_paired_c_new", "draw_paired_c_legacy"};
+
+struct PairedCounters {
+    std::atomic<std::uint64_t> taken{0}, recorded{0}, regions{0}, bytes{0};
+    std::atomic<std::uint64_t> verifyChecks{0}, verifyOutcome{0}, verifyEntry{0}, verifyStages{0};
+    std::atomic<std::uint64_t> noMemoRelocated{0}, differsRelocated{0}, refusedRelocated{0}, verifyObjects{0};
+    std::atomic<std::uint64_t> differsProgram{0}, differsVariantMasked{0}, differsVariantOther{0}, differsWords{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PairedRefusal::Count)> refused{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PairedUnrecorded::Count)> unrecorded{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PairedCommit::Count)> commits{};
+    PairedCounters() {
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_taken", taken);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_recorded", recorded);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_regions", regions);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_bytes", bytes);
+        ArchB::Recorder::RegisterCounter("draw_paired_verify_checks", verifyChecks);
+        ArchB::Recorder::RegisterCounter("draw_paired_verify_outcome_mismatches", verifyOutcome);
+        ArchB::Recorder::RegisterCounter("draw_paired_verify_entry_mismatches", verifyEntry);
+        ArchB::Recorder::RegisterCounter("draw_paired_verify_stage_mismatches", verifyStages);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_refused_relocated", refusedRelocated);
+        ArchB::Recorder::RegisterCounter("draw_paired_verify_entry_objects_differ", verifyObjects);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_differs_program", differsProgram);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_differs_variant_masked", differsVariantMasked);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_differs_variant_other", differsVariantOther);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_differs_words", differsWords);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_refused_no_memo_relocated", noMemoRelocated);
+        ArchB::Recorder::RegisterCounter("draw_paired_q0_refused_differs_relocated", differsRelocated);
+        for (std::size_t i = 0; i < refused.size(); ++i) ArchB::Recorder::RegisterCounter(PairedRefusalNames[i], refused[i]);
+        for (std::size_t i = 0; i < unrecorded.size(); ++i) ArchB::Recorder::RegisterCounter(PairedUnrecordedNames[i], unrecorded[i]);
+        for (std::size_t i = 0; i < commits.size(); ++i) ArchB::Recorder::RegisterCounter(PairedCommitNames[i], commits[i]);
+    }
+};
+
+PairedCounters& pairedCounters() {
+    static auto* made = new PairedCounters();
+    return *made;
+}
+
+bool PairedVerifyEnabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_ARCHB_DRAW_PAIRED_HIT_VERIFY");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return on;
+}
+
+std::uint64_t PairedMemoKey(std::uint64_t drawKey, std::span<const std::uint32_t> packet) {
+    std::uint64_t key = drawKey ^ 0x5041495245444b59ull;
+    for (const auto word : packet) key = (key ^ word) * 0x100000001b3ull;
+    return key;
+}
+
+struct PairedMemosStorage {};
+
+constexpr std::uint32_t PairedVolatileAfter = 4;
+constexpr std::uint32_t PairedVolatileProbe = 8;
+
+struct PairedMemoSlots {
+    std::array<std::shared_ptr<PairedDrawMemo>, 2> memos;
+    std::uint32_t differs = 0;
+};
+
+struct PairedMemoTable {
+    static constexpr std::size_t Generation = 2048;
+    std::unordered_map<std::uint64_t, PairedMemoSlots> current;
+    std::unordered_map<std::uint64_t, PairedMemoSlots> previous;
+
+    PairedMemoSlots* Find(std::uint64_t key) {
+        if (const auto found = current.find(key); found != current.end()) return &found->second;
+        const auto old = previous.find(key);
+        if (old == previous.end()) return nullptr;
+        auto* moved = &current.insert_or_assign(key, std::move(old->second)).first->second;
+        previous.erase(old);
+        return moved;
+    }
+
+    PairedMemoSlots& At(std::uint64_t key) {
+        if (auto* found = Find(key)) return *found;
+        auto& made = current[key];
+        if (current.size() >= Generation) {
+            previous = std::move(current);
+            current = {};
+        }
+        return made;
+    }
+};
+
+PairedMemoTable& PairedMemos() {
+    return HostThreadLocal<PairedMemoTable, PairedMemosStorage>();
+}
+
+struct PairedCommitStorage {};
+
+bool& PairedCommitting() {
+    return HostThreadLocal<bool, PairedCommitStorage>();
+}
+
+struct PairedCommitScope {
+    bool previous;
+    explicit PairedCommitScope(bool paired) : previous(std::exchange(PairedCommitting(), paired)) {}
+    ~PairedCommitScope() { PairedCommitting() = previous; }
+};
+
+void CountPairedCommit(int outcome) {
+    const auto kind = outcome == 0 ? PairedCommit::Replayed : outcome == 1 ? PairedCommit::Verified : outcome == 2 ? PairedCommit::Refused : outcome == 3 ? PairedCommit::New : PairedCommit::Legacy;
+    pairedCounters().commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+bool SameIndirectDraw(const Pm4::DrawParameters::IndirectDraw& a, const Pm4::DrawParameters::IndirectDraw& b) {
+    return a.arguments == b.arguments && a.opcode == b.opcode && a.recordBytes == b.recordBytes && a.stride == b.stride && a.count == b.count && a.countIndirect == b.countIndirect && a.countAddress == b.countAddress && a.baseVertexLocation == b.baseVertexLocation && a.startInstanceLocation == b.startInstanceLocation && a.drawIndexLocation == b.drawIndexLocation && a.drawIndexEnabled == b.drawIndexEnabled && a.indxOffset == b.indxOffset && a.indexLimitKnown == b.indexLimitKnown && a.vertexRule == b.vertexRule && a.instanceRule == b.instanceRule && a.vertexConstant == b.vertexConstant && a.instanceConstant == b.instanceConstant && a.baseVertexSgpr == b.baseVertexSgpr && a.startInstanceSgpr == b.startInstanceSgpr && a.drawIndexSgpr == b.drawIndexSgpr && a.instanceFromBase == b.instanceFromBase && a.vertexFromBase == b.vertexFromBase;
+}
+
+bool SameDrawParameters(const Pm4::DrawParameters& a, const Pm4::DrawParameters& b) {
+    if (a.indexAddress != b.indexAddress || a.indexCount != b.indexCount || a.indexSize != b.indexSize || a.instanceCount != b.instanceCount || a.flags != b.flags || a.indexed != b.indexed || a.firstVertex != b.firstVertex || a.firstInstance != b.firstInstance || a.indirect.has_value() != b.indirect.has_value()) return false;
+    return !a.indirect.has_value() || SameIndirectDraw(*a.indirect, *b.indirect);
+}
+
+bool SameRegions(std::span<const ShaderRecompiler::MemoryRegion> a, std::span<const ShaderRecompiler::MemoryRegion> b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].guestAddress != b[i].guestAddress || a[i].bytes.size() != b[i].bytes.size()) return false;
+        if (!a[i].bytes.empty() && std::memcmp(a[i].bytes.data(), b[i].bytes.data(), a[i].bytes.size()) != 0) return false;
+    }
+    return true;
+}
+
+const std::vector<std::uint32_t>& ValidatedWords(const std::shared_ptr<DispatchVariant>& variant, const std::vector<std::uint32_t>& refreshed) {
+    return !refreshed.empty() || variant == nullptr ? refreshed : variant->words;
+}
+
+bool SameValidatedVariant(const std::shared_ptr<DispatchVariant>& a, const std::vector<std::uint32_t>& aWords, const std::shared_ptr<DispatchVariant>& b, const std::vector<std::uint32_t>& bWords) {
+    if ((a == nullptr) != (b == nullptr)) return false;
+    if (a == nullptr) return true;
+    if (a->compiled == nullptr || b->compiled == nullptr) return a == b;
+    return a->compiled->variantId == b->compiled->variantId && a->runs == b->runs && a->pushOffset == b->pushOffset && ValidatedWords(a, aWords) == ValidatedWords(b, bWords);
+}
+
+bool SameStages(std::span<const Graphics::CompiledShader> a, std::span<const Graphics::CompiledShader> b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].stage != b[i].stage || a[i].pushConstantOffset != b[i].pushConstantOffset || (a[i].program == nullptr) != (b[i].program == nullptr)) return false;
+        if (a[i].program == nullptr) continue;
+        const auto& x = *a[i].program;
+        const auto& y = *b[i].program;
+        if (x.variantId != y.variantId || x.pushConstants != y.pushConstants || x.bindings.size() != y.bindings.size()) return false;
+        for (std::size_t k = 0; k < x.bindings.size(); ++k) {
+            if (x.bindings[k].guestDescriptor != y.bindings[k].guestDescriptor) return false;
+        }
+    }
+    return true;
+}
+
+void ClassifyPairedDiffers(const PairedDrawMemo& memo, std::size_t index) {
+    auto& counts = pairedCounters();
+    const auto& region = memo.memory[index];
+    const auto stage = index < memo.regionStage.size() ? memo.regionStage[index] : -1;
+    const auto words = region.bytes.size() / sizeof(std::uint32_t);
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) return;
+    const auto* live = reinterpret_cast<const std::uint32_t*>(region.guestAddress);
+    const auto* kept = reinterpret_cast<const std::uint32_t*>(region.bytes.data());
+    bool masked = true;
+    std::uint64_t differing = 0;
+    for (std::size_t w = 0; w < words; ++w) {
+        if (live[w] == kept[w]) continue;
+        ++differing;
+        if (stage < 0 || static_cast<std::size_t>(stage) >= memo.matched.size() || memo.matched[stage] == nullptr) continue;
+        const auto& variant = *memo.matched[stage];
+        const auto position = static_cast<std::uint32_t>(memo.regionWord[index] + w);
+        const bool data = std::find(variant.dataPositions.begin(), variant.dataPositions.end(), position) != variant.dataPositions.end();
+        if (!data && WordMask(variant.bufferBaseMasks, position) == 0 && WordMask(variant.feedback.memory, position) == 0) masked = false;
+    }
+    counts.differsWords.fetch_add(differing, std::memory_order_relaxed);
+    if (stage < 0) counts.differsProgram.fetch_add(1, std::memory_order_relaxed);
+    else (masked ? counts.differsVariantMasked : counts.differsVariantOther).fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReportPairedMismatch(const char* what, std::uint64_t key) {
+    static std::atomic<unsigned> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 12) std::fprintf(stderr, "[draw-paired] verify: %s differs from the old path (key 0x%llx)\n", what, static_cast<unsigned long long>(key));
+}
+
+void VerifyPairedDraw(const PairedDrawMemo& memo, std::uint64_t key, std::span<const std::shared_ptr<DispatchVariant>> matched, std::span<const StageDataHit> stageData, std::span<const Graphics::CompiledShader> stages, const Pm4::DrawParameters& parameters, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const DrawPipeline::Range> writes, std::span<const DrawPipeline::Range> reads) {
+    auto& counts = pairedCounters();
+    bool entry = matched.size() == memo.matched.size() && stageData.size() == memo.words.size();
+    bool objects = entry;
+    for (std::size_t i = 0; entry && i < matched.size(); ++i) {
+        entry = SameValidatedVariant(matched[i], stageData[i].words, memo.matched[i], memo.words[i]);
+        objects = objects && matched[i] == memo.matched[i];
+    }
+    if (entry && !objects) counts.verifyObjects.fetch_add(1, std::memory_order_relaxed);
+    const bool prepared = SameStages(stages, memo.stages) && SameDrawParameters(parameters, memo.finalParameters) && SameRegions(memory, memo.memory) && std::ranges::equal(writes, memo.writes) && std::ranges::equal(reads, memo.reads);
+    if (!entry) {
+        counts.verifyEntry.fetch_add(1, std::memory_order_relaxed);
+        ReportPairedMismatch("the chosen entry or its validated words", key);
+    }
+    if (!prepared) {
+        counts.verifyStages.fetch_add(1, std::memory_order_relaxed);
+        ReportPairedMismatch("the prepared stages, parameters, captured memory or ranges", key);
+    }
+}
+
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
@@ -531,6 +766,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         TraceDrawAttemptException(traceToken, "resolve-draw", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
     }
+    const bool pairedSwitch = ArchB::Switches::Enabled(ArchB::Feature::DrawPairedHit);
+    if (pairedSwitch) tail.pairedParameters = drawParameters;
     tail.pipelined = DrawPipeline::Active();
     const bool pipelined = tail.pipelined;
     tail.narrowDrawWrites = pipelined && ArchB::Switches::Enabled(ArchB::Feature::PipeNarrowDrawWrites);
@@ -629,6 +866,76 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.ubSkipCpuIndirect = ArchB::Switches::Enabled(ArchB::Feature::UbSkipCpuIndirect);
     tail.registerKey = useDrawEntries && registerKeyEnabled() && !tail.ubPointerFree;
     const bool registerKey = tail.registerKey;
+    static const bool pairedBlocked = std::getenv("APS5_TRACE_DRAW_PROGRAMS") != nullptr || std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
+    tail.paired = pairedSwitch && registerKey && pipelined && pipelinedIndirect && drawParameters.indirect.has_value() && submission.queue == 0 && !profile && !lockedPrepare && !pairedBlocked && traceToken == 0 && !traceDrawCache() && !verifyDrawDataHits() && !verifyDrawRecipe() && !verifyDrawEntries();
+    const auto provePaired = [&](std::uint64_t key) -> std::shared_ptr<PairedDrawMemo> {
+        auto& counts = pairedCounters();
+        const auto check = [&](const std::shared_ptr<PairedDrawMemo>& memo) -> PairedRefusal {
+            if (!std::ranges::equal(packet, memo->packet)) return PairedRefusal::Packet;
+            if (!SameDrawParameters(tail.pairedParameters, memo->parameters)) return PairedRefusal::Parameters;
+            if (memo->device != localDevice.get()) return PairedRefusal::Device;
+            if (DrawFinisher::Busy()) return PairedRefusal::Finisher;
+            if (!deferredLabels().labels.empty()) return PairedRefusal::Labels;
+            if (!DecodeProgramsCurrent(*memo->decode, *submission.shaders)) return PairedRefusal::Programs;
+            if (EmptyIndirectSkip()) {
+                auto& known = CpuIndirectPrograms();
+                const auto program = known.find(memo->frontCode);
+                if (program != known.end() && program->second) return PairedRefusal::CpuIndirect;
+            }
+            const auto& final = memo->finalParameters;
+            if (final.indexed && !GuestMemory::Accessible(reinterpret_cast<const void*>(final.indexAddress), static_cast<std::size_t>(final.indexCount) * final.indexSize)) return PairedRefusal::IndexRange;
+            for (const auto& variant : memo->matched) {
+                if (variant != nullptr && variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) return PairedRefusal::Views;
+            }
+            runCaptureCheckHook();
+            auto& pipeline = DrawPipeline::Queue0();
+            if (pipeline.Busy() && pipeline.OverlapsAny(memo->runs)) return PairedRefusal::Queued;
+            PendingView pending;
+            pending.Load();
+            for (const auto& [begin, end] : memo->runs) {
+                if (pending.Overlaps(begin, static_cast<std::size_t>(end - begin))) return PairedRefusal::PendingGpu;
+            }
+            if (Graphics::StorageTexture::AnyPendingOverlaps(memo->runs) || Graphics::AnyShadowedOverlaps(memo->runs)) return PairedRefusal::Storage;
+            const auto forget = GuestMemory::ForgetSerial();
+            if ((forget & 1) != 0) return PairedRefusal::Forget;
+            const auto publish = Graphics::Recorder::PublishGeneration();
+            const auto pendingSerial = Graphics::StorageTexture::PendingSerial();
+            for (std::size_t index = 0; index < memo->memory.size(); ++index) {
+                const auto& region = memo->memory[index];
+                const auto outcome = GuestMemory::CompareMapped(region.guestAddress, region.bytes);
+                if (outcome == GuestMemory::Compare::Differs) {
+                    if (PairedVerifyEnabled()) ClassifyPairedDiffers(*memo, index);
+                    return PairedRefusal::Differs;
+                }
+                if (outcome == GuestMemory::Compare::Unmapped) return PairedRefusal::Unmapped;
+            }
+            if (Graphics::Recorder::PublishGeneration() != publish || Graphics::StorageTexture::PendingSerial() != pendingSerial || GuestMemory::ForgetSerial() != forget) return PairedRefusal::Serials;
+            return PairedRefusal::Count;
+        };
+        auto* found = PairedMemos().Find(key);
+        auto why = PairedRefusal::NoMemo;
+        if (found != nullptr && found->differs >= PairedVolatileAfter && found->differs++ % PairedVolatileProbe != 0) {
+            why = PairedRefusal::Volatile;
+        } else if (found != nullptr) {
+            for (const auto& memo : found->memos) {
+                if (memo == nullptr) continue;
+                why = check(memo);
+                if (why == PairedRefusal::Count) {
+                    found->differs = 0;
+                    std::uint64_t bytes = 0;
+                    for (const auto& region : memo->memory) bytes += region.bytes.size();
+                    counts.regions.fetch_add(memo->memory.size(), std::memory_order_relaxed);
+                    counts.bytes.fetch_add(bytes, std::memory_order_relaxed);
+                    return memo;
+                }
+                if (why != PairedRefusal::Differs) break;
+            }
+            if (why == PairedRefusal::Differs) ++found->differs;
+        }
+        counts.refused[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        tail.pairedRefused = static_cast<int>(why);
+        return nullptr;
+    };
     auto& drawKey = tail.drawKey;
     std::array<std::uint64_t, 5> drawKeyComponents{};
     auto& entry = tail.entry;
@@ -667,6 +974,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         shapeKey = packetKey(shapeKey);
         drawAlias = packetKey(drawAlias);
         DrawPipeline::NoteDrawKey(drawKey, shapeKey);
+        if (tail.paired && drawKey != 0) {
+            if (auto proved = provePaired(PairedMemoKey(drawKey, packet))) {
+                if (!PairedVerifyEnabled()) {
+                    const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+                    const auto ticket = GuestMemory::Gen::Required();
+                    if (ArchB::Recorder::Enabled()) recorderWork.SetKey(proved->recorderKey);
+                    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [proved, epoch, ticket] { proved->commit(epoch, ticket); }, proved->writes, 0, {}, proved->reads, true, DrawPipeline::ItemKind::Draw);
+                    pairedCounters().taken.fetch_add(1, std::memory_order_relaxed);
+                    timing.Mark("paired_enqueued");
+                    return drawn();
+                }
+                pairedCounters().verifyChecks.fetch_add(1, std::memory_order_relaxed);
+                tail.pairedVerify = std::move(proved);
+            }
+        }
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && (drawDataHits() || tail.feedbackMask)) {
@@ -755,6 +1077,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
     phaseTiming.Phase(DrawRowKeyLookupValidate);
+    if (tail.pairedRefused >= 0 && entry != nullptr && entry->donor != nullptr) {
+        auto& counts = pairedCounters();
+        counts.refusedRelocated.fetch_add(1, std::memory_order_relaxed);
+        if (tail.pairedRefused == static_cast<int>(PairedRefusal::NoMemo)) counts.noMemoRelocated.fetch_add(1, std::memory_order_relaxed);
+        if (tail.pairedRefused == static_cast<int>(PairedRefusal::Differs)) counts.differsRelocated.fetch_add(1, std::memory_order_relaxed);
+    }
     if (hitCensus) {
         timing.Mark(drawParameters.indirect ? "j3_prepare_keys_indirect" : "j3_prepare_keys_nonindirect");
         ArchB::Recorder::Count(entry == nullptr ? "j3b_key_entry_absent" : entry->donor == nullptr ? "j3b_key_entry_direct" : "j3b_key_entry_relocated");
@@ -966,6 +1294,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
+    }
+    if (tail.pairedVerify != nullptr && (!drawHit || verifyHit)) {
+        pairedCounters().verifyOutcome.fetch_add(1, std::memory_order_relaxed);
+        ReportPairedMismatch("the validation outcome", drawKey);
+        tail.pairedVerify.reset();
     }
     if (hitCensus) ArchB::Recorder::Count(drawHit ? "j3_hit_prepare_material_ns" : "j3_miss_prepare_material_ns", hitPrepareNs);
     if (censusStage < programs.size()) {
@@ -1586,7 +1919,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
-
+        if (tail.pairedVerify != nullptr) {
+            pairedCounters().verifyOutcome.fetch_add(1, std::memory_order_relaxed);
+            ReportPairedMismatch("the indirect path", drawKey);
+            tail.pairedVerify.reset();
+        }
         const auto indirect = *drawParameters.indirect;
         results.reserve(programs.size() + 2u);
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -1844,8 +2181,49 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
         // and the commit hands `resolution` to its preparation.
         const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
+        std::shared_ptr<PairedDrawMemo> pairedMemo;
+        if (tail.paired) {
+            if (tail.pairedVerify != nullptr) VerifyPairedDraw(*tail.pairedVerify, drawKey, matched, stageData, stages, drawParameters, memory, writes, reads);
+            const auto why = !drawHit || drawKey == 0 ? PairedUnrecorded::Miss : verifyHit ? PairedUnrecorded::VerifyHit : indirectCpu ? PairedUnrecorded::CpuIndirect : resolveSplit ? PairedUnrecorded::ResolveSplit : tail.queue == nullptr || DrawFinisher::OnFinisherThread() ? PairedUnrecorded::Finisher : tail.pairedRefused == static_cast<int>(PairedRefusal::Volatile) ? PairedUnrecorded::Volatile : PairedUnrecorded::Count;
+            if (why != PairedUnrecorded::Count) {
+                pairedCounters().unrecorded[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                pairedMemo = std::make_shared<PairedDrawMemo>();
+                pairedMemo->packet.assign(tail.packet.begin(), tail.packet.end());
+                pairedMemo->parameters = tail.pairedParameters;
+                pairedMemo->finalParameters = drawParameters;
+                pairedMemo->device = localDevice.get();
+                pairedMemo->decode = decode;
+                pairedMemo->matched = matched;
+                pairedMemo->words.reserve(stageData.size());
+                for (const auto& hit : stageData) pairedMemo->words.push_back(hit.words);
+                pairedMemo->memory = memory;
+                pairedMemo->runs.reserve(memory.size());
+                pairedMemo->regionStage.assign(memory.size(), -1);
+                pairedMemo->regionWord.assign(memory.size(), 0);
+                for (std::size_t k = 0; k < memory.size(); ++k) {
+                    for (std::size_t i = 0; i < matchedRegions.size() && pairedMemo->regionStage[k] < 0; ++i) {
+                        if (matched[i] == nullptr) continue;
+                        const auto& words = stageData[i].words.empty() ? matched[i]->words : stageData[i].words;
+                        const auto* base = reinterpret_cast<const std::byte*>(words.data());
+                        const auto* at = memory[k].bytes.data();
+                        if (at < base || at >= base + words.size() * sizeof(std::uint32_t)) continue;
+                        pairedMemo->regionStage[k] = static_cast<std::int32_t>(i);
+                        pairedMemo->regionWord[k] = static_cast<std::uint32_t>((at - base) / sizeof(std::uint32_t));
+                    }
+                }
+                for (const auto& region : memory) {
+                    if (!region.bytes.empty()) pairedMemo->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                }
+                pairedMemo->stages = stages;
+                pairedMemo->frontCode = programs.front().binary.codeAddress;
+                pairedMemo->writes = writes;
+                pairedMemo->reads = reads;
+                pairedMemo->recorderKey = tail.recorderKey;
+            }
+        }
         if (hitCensus) timing.Mark("j3_enqueue_ranges");
-        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
+        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads, std::uint64_t epoch, std::uint64_t ticket, bool paired) mutable -> std::uint64_t {
             const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
             const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             if (resolving) {
@@ -1898,6 +2276,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             }
             const bool nostageCensus = nostageWhy >= 0 && Graphics::ArchcNostageCensus();
             if (nostageCensus) Graphics::ArchcNostageArm(nostageWhy);
+            const PairedCommitScope pairedScope(paired);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
             if (nostageCensus) Graphics::ArchcNostageArm(-1);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
@@ -1907,10 +2286,21 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::shared_ptr<DrawPipeline::ResolveSlot> resolveSlot;
         if (resolveSplit) {
             resolveSlot = std::make_shared<DrawPipeline::ResolveSlot>();
-            resolveSlot->run = [held](std::vector<DrawPipeline::Range>& resolveReads) { return (*held)(true, &resolveReads); };
+            resolveSlot->run = [held, epoch, ticket](std::vector<DrawPipeline::Range>& resolveReads) { return (*held)(true, &resolveReads, epoch, ticket, false); };
+        }
+        if (pairedMemo != nullptr) {
+            pairedMemo->commit = [held](std::uint64_t activeEpoch, std::uint64_t activeTicket) { (*held)(false, nullptr, activeEpoch, activeTicket, true); };
+            auto& slots = PairedMemos().At(PairedMemoKey(drawKey, tail.packet)).memos;
+            if (tail.pairedVerify != nullptr && slots[1] == tail.pairedVerify) slots[1] = std::move(pairedMemo);
+            else if (tail.pairedVerify != nullptr && slots[0] == tail.pairedVerify) slots[0] = std::move(pairedMemo);
+            else {
+                slots[1] = std::move(slots[0]);
+                slots[0] = std::move(pairedMemo);
+            }
+            pairedCounters().recorded.fetch_add(1, std::memory_order_relaxed);
         }
         if (hitCensus) timing.Mark("j3_enqueue_closure");
-        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held, epoch, ticket] { (*held)(false, nullptr, epoch, ticket, false); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -2083,6 +2473,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr ? identity : nullptr);
     if (nostageTimed) nostageAt[5] = nostageNow();
     const auto replayOutcome = slotProbe.Replay();
+    if (PairedCommitting()) CountPairedCommit(replayOutcome);
     CommitCensus::SetKind(replayOutcome == 0 ? CommitCensus::Kind::Replayed : CommitCensus::Kind::Legacy);
     if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind < archcSlotCensus::IndirectReplayed && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);

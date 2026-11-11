@@ -108,6 +108,7 @@ enum class Feature : std::uint8_t {
     FixHostSlabAlloc,
     FixCheapTimers,
     ReplayRecognize,
+    DrawPairedHit,
     FixStatePacketFast,
     FixDrawRelocNested,
     FixSampledArrayGpu,
