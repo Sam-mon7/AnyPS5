@@ -402,6 +402,8 @@ void SetGpuLockPriorityHook(bool (*queued)());
 std::chrono::nanoseconds GpuLockPriorityWindow();
 std::uint64_t GpuHoldSerial();
 std::uint64_t ThreadGpuHeldNs();
+std::uint64_t ThreadGpuMutexAcquireNs();
+bool SetGpuMutexCensusForThread(bool enabled);
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).

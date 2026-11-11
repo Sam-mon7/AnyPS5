@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -3192,9 +3193,12 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // Arch C label census (APS5_ARCHB_C_LABEL_CENSUS=1): the steps below per label (c9_wl_*), the outcome, and the
     // label's entry in the label-chain registry once other queues can see it (reasons 0, 1 and 5).
     ArchB::LabelCensus::Steps census;
+    std::optional<PerformanceTimer> itemCensus;
+    if (DriverDetail::CommitCensus::LabelActive()) itemCensus.emplace("J3.WriteLabel");
     const int reason = [&]() -> int {
         if (state->recorder != nullptr) state->recorder->EndComputeChain();
         census.Step("c9_wl_chain_ns");
+        if (itemCensus) itemCensus->Mark("chain");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         struct LabelTiming {
             std::chrono::steady_clock::time_point cursor = std::chrono::steady_clock::now();
@@ -3229,8 +3233,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label", state->device);
         if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
         census.Step("c9_wl_linear_ns");
+        if (itemCensus) itemCensus->Mark("linear");
         Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label", state->device);
         census.Step("c9_wl_srb_ns");
+        if (itemCensus) itemCensus->Mark("srb");
         if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
         if (profile) timing->Next();
         auto& recorder = *state->recorder;
@@ -3243,6 +3249,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
         if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
         census.Step("c9_wl_reap_ns");
+        if (itemCensus) itemCensus->Mark("reap");
         if (profile) timing->Next();
         if (recorder.Idle()) return 1;
         static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
@@ -3263,6 +3270,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         // stores of a run against each other and against the work before and after, the queued DCC
         // key stores included).
         const auto recordStore = [&] {
+            if (itemCensus) ArchB::Recorder::Count("j3c_label_recorded_stores");
             recorder.RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address);
             if (unregistered != nullptr) recorder.Keep(unregistered);
         };
@@ -3290,8 +3298,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
             if (listed) return 2;
         } else if (bytes.size() <= 8 ? (listed || storesPending) : (storesPending && recorder.CompletionLabelIn(address, bytes.size()))) {
             census.Step("c9_wl_check_ns");
+            if (itemCensus) itemCensus->Mark("check");
+            if (itemCensus) ArchB::Recorder::Count("j3c_label_deferred_cpu_stores");
             recorder.AfterCompletions(address, bytes, stamp, queue, false);
             census.Step("c9_wl_note_ns");
+            if (itemCensus) itemCensus->Mark("note");
             return 5;
         }
         // A larger store over a listed copied writer's range (as FillBuffer tests it) goes behind the
@@ -3312,22 +3323,29 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
             // a title misbehaves with this path.
             if (drain) return 2;
             census.Step("c9_wl_check_ns");
+            if (itemCensus) itemCensus->Mark("check");
             recordStore();
             census.Step("c9_wl_record_ns");
+            if (itemCensus) itemCensus->Mark("record");
             // Commands() opened the batch the store went into, so the completion is appended to that
             // batch and runs at its reap, after the write-backs of every batch before it.
+            if (itemCensus) ArchB::Recorder::Count("j3c_label_completion_restores");
             recorder.AfterCompletions(address, bytes, stamp, queue, true);
             GuestMemory::MarkWritten(address, bytes.size());
             census.Step("c9_wl_note_ns");
+            if (itemCensus) itemCensus->Mark("note");
             return 5;
         }
         census.Step("c9_wl_check_ns");
+        if (itemCensus) itemCensus->Mark("check");
         recordStore();
         census.Step("c9_wl_record_ns");
+        if (itemCensus) itemCensus->Mark("record");
         // The table entry and the label's own pending-write note (Recorder::NoteLabel).
         recorder.NoteLabel(address, bytes, stamp, queue);
         GuestMemory::MarkWritten(address, bytes.size());
         census.Step("c9_wl_note_ns");
+        if (itemCensus) itemCensus->Mark("note");
         // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
         // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
         // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
