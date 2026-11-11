@@ -295,10 +295,18 @@ public:
     std::vector<const DrawReferenceMasks::Words*> MovedIgnoredWords(std::span<const CompiledShader> shaders, std::span<const DrawReferenceMasks> masks, std::span<const MovedBuffer> moved) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
+    struct FailureDetail {
+        const char* check = "not-recorded";
+        const char* role = "unknown";
+        std::size_t binding = std::numeric_limits<std::size_t>::max();
+        std::size_t element = std::numeric_limits<std::size_t>::max();
+        std::optional<std::uint64_t> priorAddress, currentAddress, priorBytes, currentBytes, priorIdentity, currentIdentity;
+    };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
         std::size_t buffers = 0;
         std::size_t bytes = 0;
+        FailureDetail detail;
     };
     static const char* MoveRefusalName(MoveRefusal refusal);
     static bool RegisteredViewsCurrent(std::span<const ShaderRecompiler::RegisteredImageView> views);
@@ -455,6 +463,7 @@ public:
     // The ranges PrecollectSurfaces collects, appended as [begin, end) (Stage 4.1 resolve read set).
     void DescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     bool Reusable() const { return reusable; }
+    const char* ReuseBlockReason() const { return reuseBlockReason; }
     // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO: a serial unique to this object's insertion into the shared
     // resource cache while the cache holds it, 0 once it left (ResourceCache sets it under its mutex),
     // so a memo of a Find result stays exactly what Find would return while the serial holds.
@@ -485,6 +494,7 @@ public:
         bool stampReused = false;
         std::array<double, 6> stageMs{};
         std::array<double, 6> stageWaitMs{};
+        FailureDetail detail;
     };
     static const char* FastFailName(std::size_t reason);
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
@@ -537,6 +547,8 @@ public:
         double descriptorsMs = 0;
         double prepareMs = 0;
         double completeMs = 0;
+        double imagesMs = 0;
+        double bdaMs = 0;
     };
     const BuildTiming& Timing() const { return timing; }
     // The image surfaces (address, bytes) whose stage-B lookup reads guest memory on the CPU and so
@@ -895,6 +907,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    const char* reuseBlockReason = "uncompleted";
     mutable std::atomic<std::uint64_t> cacheMembership{0};
     bool provedOnce = false;
     std::vector<DirectRegion> directRegions;

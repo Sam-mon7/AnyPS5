@@ -1,6 +1,8 @@
+#include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -314,6 +316,33 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     return templates;
 }
 
+void RunBuildTraceBytes(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    Fill(guest.InputA(), 0xc000u);
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    context.hostImportAlignment = 0;
+    const auto bytes = std::as_bytes(std::span(guest.InputA(), Words));
+    const auto address = reinterpret_cast<std::uint64_t>(guest.InputA());
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::Graphics::GuestBufferMemory first(context);
+    first.AddSnapshot({address, bytes});
+    first.Upload(false);
+    const auto initial = first.Traffic();
+    const auto expected = AgcDriver::DispatchBuildTrace::Enabled() ? Bytes : 0u;
+    Require(initial.cpuBytes == expected, "build trace bytes: initial snapshot CPU traffic differs");
+    Require(initial.gpuBytes == 0 && initial.retainedCpuBytes == 0 && initial.retainedGpuBytes == 0, "build trace bytes: CPU snapshot counted GPU or retained traffic");
+    Require(first.CopiedBytes() == Bytes, "build trace bytes: initial copied footprint differs");
+    AgcDriver::Graphics::GuestBufferMemory second(context);
+    second.AddSnapshot({address, bytes});
+    second.Upload(false);
+    const auto reused = second.Traffic();
+    Require(reused.cpuBytes == 0 && reused.gpuBytes == 0 && reused.retainedCpuBytes == 0 && reused.retainedGpuBytes == 0, "build trace bytes: shared snapshot counted copy traffic");
+    Require(second.CopiedBytes() == Bytes, "build trace bytes: shared footprint differs");
+    std::uint32_t firstAdjustment = 0, secondAdjustment = 0;
+    const auto firstDescriptor = first.Descriptor(address, Bytes, firstAdjustment);
+    const auto secondDescriptor = second.Descriptor(address, Bytes, secondAdjustment);
+    Require(firstDescriptor.buffer == secondDescriptor.buffer && firstDescriptor.offset == secondDescriptor.offset && firstDescriptor.range == secondDescriptor.range && firstAdjustment == secondAdjustment, "build trace bytes: identical snapshots did not share their buffer");
+}
+
 bool RunCompletionRecipe(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Fill(guest.InputA(), 0xa000u);
     auto compiled = Compile(device, guest.InputA(), Bytes, guest.OutputO());
@@ -466,9 +495,96 @@ void RunPrivateRecording(AgcDriver::VulkanDevice& device, const GuestBlock& gues
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--build-trace-overflow") {
+            using Trace = AgcDriver::DispatchBuildTrace;
+            const Trace::Scope scope(0x28, 1, 2, 3, 4);
+            const auto emit = [](std::uint32_t number) {
+                const std::array<std::uint32_t, 1> key{number};
+                Trace::Event event;
+                event.program = number + 1;
+                event.reason = "overflow-test";
+                event.key = key;
+                event.completeNs = 7;
+                Trace::Emit(event);
+            };
+            for (std::uint32_t number = 0; number < 3072; ++number) {
+                if (number == 1024 || number == 3071) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                emit(number);
+            }
+            for (std::uint64_t readOnly = 0; readOnly < 2; ++readOnly) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                Trace::Event event;
+                event.program = 1;
+                event.reason = "category-test";
+                event.completeNs = 7;
+                event.addressTable = 1;
+                event.bdaReadOnly = readOnly;
+                event.spaceOnly = 1;
+                event.copiedWrites = 0;
+                event.holdsLease = 1;
+                Trace::Emit(event);
+            }
+            for (std::uint32_t queue = 0; queue < 513; ++queue) {
+                if (queue == 0 || queue == 509 || queue == 512) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                const Trace::Scope queued(queue, 1, 2, 3, 4);
+                Trace::Event event;
+                event.program = 1;
+                event.reason = "queue-overflow-test";
+                event.completeNs = 7;
+                Trace::Emit(event);
+            }
+            Require(Trace::Counts().failures == 0, "build trace: overflow logger failed");
+            std::puts("dispatch build overflow tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--build-trace-rate") {
+            using Trace = AgcDriver::DispatchBuildTrace;
+            const auto started = std::chrono::steady_clock::now();
+            {
+                const Trace::Scope scope(0x28, 1, 2, 3, 4);
+                const auto source = Trace::Current();
+                if (Trace::Enabled()) Require(source.known && source.packetOffset == 3 && source.submission == 4, "build trace: source context missing");
+                Trace::Event event;
+                event.event = "test";
+                event.reason = "sampling-test";
+                const std::array<std::uint32_t, 1> key{7};
+                event.key = key;
+                for (unsigned i = 0; i < 256; ++i) Trace::Emit(event);
+                const auto sampled = Trace::Counts();
+                if (Trace::Enabled()) Require(sampled.events == 256 && sampled.emitted == 9 && sampled.suppressed == 247, "build trace: power-of-two sampling counts differ");
+                else Require(sampled.events == 0 && sampled.emitted == 0, "build trace: disabled logger counted events");
+            }
+            if (Trace::Enabled()) Require(!Trace::Current().known, "build trace: context escaped its scope");
+            std::vector<std::jthread> workers;
+            for (unsigned worker = 0; worker < 4; ++worker) workers.emplace_back([worker] {
+                const Trace::Scope scope(worker, worker, worker, worker, worker);
+                for (unsigned i = 0; i < 1024; ++i) {
+                    Trace::Event event;
+                    event.program = 10000u * worker + i;
+                    event.event = "test";
+                    event.reason = "rate-test";
+                    Trace::Emit(event);
+                }
+            });
+            workers.clear();
+            const auto counts = Trace::Counts();
+            if (Trace::Enabled()) {
+                Require(counts.events == 4352 && counts.emitted + counts.suppressed == counts.events && counts.failures == 0, "build trace: concurrent counters differ");
+                Require(counts.bytes <= 4u * 1024u * 1024u && counts.suppressed > 4000, "build trace: output was not bounded");
+                const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                Require(counts.emitted <= static_cast<std::uint64_t>(128.0 + seconds * 8.0) + 1, "build trace: token rate exceeded");
+            }
+            std::puts("dispatch build trace sampling, concurrent rate limit and scope tests passed");
+            return 0;
+        }
         GuestBlock guest;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string(argv[1]) == "--build-trace-bytes") {
+            RunBuildTraceBytes(*device, guest);
+            std::puts("dispatch build upload byte tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--private-compute") {
             RunPrivateRecording(*device, guest);
             std::puts("private compute recording and fallback tests passed");
