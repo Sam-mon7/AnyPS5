@@ -537,6 +537,18 @@ bool LiveVerifyNext() {
     return period != 0 && ++draws % period == 0;
 }
 
+void MergeIgnoredWords(Graphics::DrawReferenceMasks::Words& into, std::span<const std::pair<std::uint32_t, std::uint32_t>> from) {
+    if (from.empty()) return;
+    into.insert(into.end(), from.begin(), from.end());
+    std::sort(into.begin(), into.end());
+    std::size_t kept = 0;
+    for (std::size_t index = 1; index < into.size(); ++index) {
+        if (into[index].first == into[kept].first) into[kept].second |= into[index].second;
+        else into[++kept] = into[index];
+    }
+    into.resize(kept + 1);
+}
+
 bool LiveViewsCurrent(GatherLiveEntry& entry) {
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (entry.allocationGeneration == generation) return true;
@@ -599,12 +611,13 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
     if (found == LiveIndex().entries.end()) { ArchB::Recorder::Count("draw_templates_live_q0_refused_no_template"); return {}; }
     const auto options = LiveOptions(tail);
     thread_local std::vector<DrawProgram> programs;
+    static const bool refuseFeedback = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_FEEDBACK") != nullptr;
     bool ready = false, feedback = false;
     for (const auto& entry : found->second) {
         if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) continue;
         ready = true;
         if (!LiveViewsCurrent(*entry) || !LivePacketMatches(entry->packet, tail.livePacket) || entry->options != options || !LiveStateMatches(*entry, queue) || !DecodeProgramsCurrent(*entry->decode, *submission.shaders)) continue;
-        if (options.feedback && std::any_of(entry->variants.begin(), entry->variants.end(), [](const auto& variant) {
+        if (refuseFeedback && options.feedback && std::any_of(entry->variants.begin(), entry->variants.end(), [](const auto& variant) {
             return !variant->feedback.memory.empty() || !variant->feedback.userData.empty();
         })) {
             feedback = true;
@@ -1489,7 +1502,24 @@ void Driver::enqueueGatherDraw(DrawTail& tail) {
             owner.variant = stage.variant;
             identity.stages.push_back(std::move(owner));
         }
+        std::vector<Graphics::DrawReferenceMasks> referenceMasks;
         if (reference != nullptr) {
+            referenceMasks.resize(link->stages.size());
+            for (std::size_t i = 0; i < referenceMasks.size(); ++i) {
+                const auto add = [&](const DispatchVariant* variant) {
+                    if (variant == nullptr) return;
+                    auto& masks = referenceMasks[i];
+                    if (masks.bindings.size() < variant->feedback.bindings.size()) masks.bindings.resize(variant->feedback.bindings.size());
+                    for (std::size_t binding = 0; binding < variant->feedback.bindings.size(); ++binding) MergeIgnoredWords(masks.bindings[binding], variant->feedback.bindings[binding]);
+                    MergeIgnoredWords(masks.push, variant->feedback.pushConstants);
+                };
+                if (i < live->entry->variants.size()) add(live->entry->variants[i].get());
+                if (i < reference->matched.size() && reference->matched[i] != nullptr) {
+                    add(reference->matched[i].get());
+                    add(reference->matched[i]->donor.get());
+                }
+            }
+            identity.referenceMasks = referenceMasks;
             identity.referenceStages = reference->stages;
             identity.referenceDraw = &reference->drawParameters;
             for (std::size_t i = 0; i < live->plan->stages.size() && i < reference->stages.size(); ++i) live->plan->stages[i].program = reference->stages[i].program;

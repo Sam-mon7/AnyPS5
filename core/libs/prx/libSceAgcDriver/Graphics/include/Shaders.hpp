@@ -4,9 +4,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -39,6 +44,28 @@ struct CompiledShader {
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
     const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews = nullptr;
+};
+
+struct DrawReferenceMasks {
+    using Words = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    std::vector<Words> bindings;
+    Words push;
+    static std::uint32_t Ignored(const Words& words, std::size_t position) {
+        const auto found = std::lower_bound(words.begin(), words.end(), position, [](const auto& mask, auto word) { return mask.first < word; });
+        return found != words.end() && found->first == position ? found->second : 0u;
+    }
+    static bool SameBytes(const std::byte* a, const std::byte* b, std::size_t bytes, const Words* words) {
+        if (words == nullptr || words->empty()) return std::memcmp(a, b, bytes) == 0;
+        for (std::size_t offset = 0; offset < bytes; ++offset) {
+            if (a[offset] == b[offset]) continue;
+            const auto ignored = (Ignored(*words, offset / 4u) >> (offset % 4u * 8u)) & 0xffu;
+            if ((std::to_integer<unsigned>(a[offset] ^ b[offset]) & ~ignored) != 0u) return false;
+        }
+        return true;
+    }
+    static bool SameWords(std::span<const std::uint32_t> a, std::span<const std::uint32_t> b, const Words* words) {
+        return a.size() == b.size() && SameBytes(reinterpret_cast<const std::byte*>(a.data()), reinterpret_cast<const std::byte*>(b.data()), a.size_bytes(), words);
+    }
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {

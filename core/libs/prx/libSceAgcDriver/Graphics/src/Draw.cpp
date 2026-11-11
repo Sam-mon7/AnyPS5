@@ -5974,6 +5974,7 @@ struct TemplatePlan {
         bool valid = false;
     };
     std::vector<Reference> reference;
+    std::vector<const DrawReferenceMasks::Words*> ignored;
 };
 
 TemplatePlan& templatePlan() {
@@ -6024,7 +6025,7 @@ void verifyTemplate(const Context& context, const ShaderResources& resources, co
             if (old.bytes.size() != info.range || std::memcmp(reinterpret_cast<const void*>(begin), old.bytes.data(), old.bytes.size()) != 0) mismatch(MismatchElementBytes, "the in-place bytes differ from what the old binding path binds");
         } else {
             if (info.buffer != sets.arena->Handle(flight % ParameterArena::Flights, chunk)) mismatch(MismatchElementRange, "a streamed descriptor points outside the flight");
-            if (old.bytes.size() != info.range || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, old.bytes.data(), old.bytes.size()) != 0) {
+            if (old.bytes.size() != info.range || !DrawReferenceMasks::SameBytes(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, old.bytes.data(), old.bytes.size(), i < templatePlan().ignored.size() ? templatePlan().ignored[i] : nullptr)) {
                 static unsigned reported = 0;
                 if (templatePlan().liveVerify && reported++ < 12) {
                     const auto* bytes = sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset;
@@ -6063,6 +6064,7 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
     plan.liveVerify = live != nullptr && !live->referenceStages.empty();
     plan.verify = plan.liveVerify || templateVerifyNow();
     plan.reference.clear();
+    plan.ignored.clear();
     const auto refuse = [&](TemplateRefusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
         if (live != nullptr) {
@@ -6118,6 +6120,7 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
         std::optional<std::vector<ShaderResources::MovedBuffer>> oldMoved;
         if (plan.liveVerify) oldMoved = resources.MovedReadOnlyBuffers(live->referenceStages, recorder, &live->gatherTemplate->state->color);
         if (plan.liveVerify && !oldMoved) liveMismatch(LiveElementSet, "the old path refused the gathered binding shape");
+        if (plan.liveVerify) plan.ignored = resources.MovedIgnoredWords(live->referenceStages, live->referenceMasks, moved);
         auto bound = resources.PrepareDrawBindings(recorder, plan.liveVerify && oldMoved ? std::span<const ShaderResources::MovedBuffer>(*oldMoved) : moved, false, nullptr, true);
         plan.reference.resize(moved.size());
         for (std::size_t i = 0; i < moved.size(); ++i) {
@@ -6654,7 +6657,23 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (identity.gather != nullptr && !identity.referenceStages.empty()) {
         auto oldPush = AssemblePushConstants(identity.referenceStages);
         resources->PatchPushConstants(oldPush);
-        if (oldPush != livePush || PushConstantStages(identity.referenceStages) != PushConstantStages(shaders)) liveMismatch(LivePush, "the old push block differs");
+        bool samePush = PushConstantStages(identity.referenceStages) == PushConstantStages(shaders);
+        if (samePush && oldPush != livePush) {
+            auto ignored = oldPush;
+            ignored.fill(std::byte{0});
+            for (std::size_t stage = 0; stage < identity.referenceStages.size() && stage < identity.referenceMasks.size(); ++stage) {
+                const auto& reference = identity.referenceStages[stage];
+                if (reference.program == nullptr) continue;
+                for (const auto& [word, bits] : identity.referenceMasks[stage].push) {
+                    for (std::size_t byte = 0; byte < 4; ++byte) {
+                        const auto offset = static_cast<std::size_t>(word) * 4u + byte;
+                        if (offset < reference.program->pushConstants.size() && reference.pushConstantOffset + offset < ignored.size()) ignored[reference.pushConstantOffset + offset] |= static_cast<std::byte>((bits >> (byte * 8u)) & 0xffu);
+                    }
+                }
+            }
+            for (std::size_t offset = 0; offset < oldPush.size() && samePush; ++offset) samePush = ((oldPush[offset] ^ livePush[offset]) & ~ignored[offset]) == std::byte{0};
+        }
+        if (!samePush) liveMismatch(LivePush, "the old push block differs");
     }
     pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, &livePush, identity.gather != nullptr ? PushConstantStages(shaders) : slot->pushStages, 0, false, inputs.meshLayerStride, reuse);
     ArchC::ProbeAt(ArchC::Probe::RcPush);
@@ -8031,7 +8050,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                     const auto& a = live.bindings[binding];
                     const auto& b = old.bindings[binding];
                     if (a.kind != b.kind || a.role != b.role || a.binding != b.binding || a.count != b.count || a.descriptorSet != b.descriptorSet) archcSlots::liveMismatch(archcSlots::LiveElementSet, "the fallback binding layout differs");
-                    if (a.guestDescriptor != b.guestDescriptor) {
+                    const auto* ignoredWords = i < identity->referenceMasks.size() && binding < identity->referenceMasks[i].bindings.size() ? &identity->referenceMasks[i].bindings[binding] : nullptr;
+                    if (!DrawReferenceMasks::SameWords(a.guestDescriptor, b.guestDescriptor, ignoredWords)) {
                         static unsigned reported = 0;
                         if (reported++ < 12) {
                             const auto common = std::min(a.guestDescriptor.size(), b.guestDescriptor.size());
@@ -8042,7 +8062,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                         archcSlots::liveMismatch(archcSlots::LiveElementBytes, "the fallback descriptor words differ");
                     }
                 }
-                if (live.pushConstants != old.pushConstants) archcSlots::liveMismatch(archcSlots::LivePush, "the fallback push input differs");
+                if (live.pushConstants.size() != old.pushConstants.size() || !DrawReferenceMasks::SameBytes(live.pushConstants.data(), old.pushConstants.data(), old.pushConstants.size(), i < identity->referenceMasks.size() ? &identity->referenceMasks[i].push : nullptr)) archcSlots::liveMismatch(archcSlots::LivePush, "the fallback push input differs");
                 if (!std::ranges::equal(live.spirv.Words(), old.spirv.Words())) archcSlots::liveMismatch(archcSlots::LivePipeline, "the fallback shader differs");
             }
             if (identity->referenceDraw == nullptr || !archcSlots::sameDraw(draw, *identity->referenceDraw) || draw.indirect->arguments != identity->referenceDraw->indirect->arguments) archcSlots::liveMismatch(archcSlots::LiveArguments, "the fallback packet differs");

@@ -46,6 +46,7 @@ struct DrawSlotIdentity {
     const DriverDetail::GatherDrawPlan* gather = nullptr;
     const DriverDetail::GatherDrawPlan* learning = nullptr;
     std::span<const CompiledShader> referenceStages;
+    std::span<const DrawReferenceMasks> referenceMasks;
     const Pm4::DrawParameters* referenceDraw = nullptr;
 };
 

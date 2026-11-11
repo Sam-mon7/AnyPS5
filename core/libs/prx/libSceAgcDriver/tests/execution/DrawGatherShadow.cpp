@@ -510,9 +510,11 @@ void GuardedReadsFallBackAndNeverFault() {
     Require(arena != nullptr, "cannot allocate an arena guard page");
     GuestArena::GuestArenaCommit_nid_postfix(arena, 65536, PAGE_READWRITE, 4096);
     Require(VirtualProtect(arena, 4096, PAGE_READWRITE | PAGE_GUARD, &previous) != 0, "cannot guard the arena page");
+    auto* recovery = AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* info) -> LONG { return GuestArena::GuestArenaRecoverRead_nid_no_patch(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH; });
     const auto guarded = AgcDriver::GuestMemory::CopyMappedGuarded(reinterpret_cast<std::uintptr_t>(arena), std::as_writable_bytes(std::span(copy)), owned);
     MEMORY_BASIC_INFORMATION info{};
     Require(VirtualQuery(arena, &info, sizeof(info)) == sizeof(info) && (info.Protect & PAGE_GUARD) != 0, "the guarded reader consumed PAGE_GUARD");
+    RemoveVectoredExceptionHandler(recovery);
     Require(guarded == AgcDriver::GuestMemory::Compare::Unmapped, "the guarded reader accepted PAGE_GUARD");
     VirtualProtect(arena, 4096, PAGE_READWRITE, &previous);
     GuestArena::GuestArenaReset_nid_postfix(arena, 65536);
@@ -567,13 +569,13 @@ void GenerationWindowIncludesPlanValidation() {
     Require(changed && plan != nullptr && !plan->complete && (plan->incomplete & GatherGenerationMoved) != 0, "a generation change during plan validation left a complete plan");
 }
 
-void ChangedFeedbackWaitsForACompleteStreamingMap() {
+void ChangedIgnoredFeedbackBitsStayTemplatable() {
     auto fixture = TableFixture();
     fixture.variant->feedback.memory = {{6, 0xff}};
     Table[6] = 7;
     ShadowDraw shadow(fixture, fixture.user);
     const auto plan = shadow.Run(EntryOutcome::Equal, {}, false, true);
-    Require(plan != nullptr && plan->matched && !plan->complete && (plan->incomplete & GatherNotTemplatable) != 0, "changed feedback without a streaming destination was admitted live");
+    Require(plan != nullptr && plan->matched && (plan->incomplete & GatherNotTemplatable) == 0, "a change confined to ignored feedback bits was refused live");
 }
 
 void StrictModeFailsOnAFalseDiffer() {
@@ -607,7 +609,7 @@ int main() {
         HashCollisionStillChecksStructure();
         BindingOwnerAndPendingRangeAreExact();
         GenerationWindowIncludesPlanValidation();
-        ChangedFeedbackWaitsForACompleteStreamingMap();
+        ChangedIgnoredFeedbackBitsStayTemplatable();
         StrictModeFailsOnAFalseDiffer();
         std::cout << "Gather templates classify base, value and structural words, detect structural changes, and carry moved and nested addresses in the plan\n";
         return 0;

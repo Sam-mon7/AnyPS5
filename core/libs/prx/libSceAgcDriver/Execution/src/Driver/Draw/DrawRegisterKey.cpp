@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -197,6 +198,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     }
     if (shape != nullptr) *shape = shapeKey;
     if (aliased && readable) *alias = other == 0 ? 1 : other;
+    if (alias != nullptr && relocation != nullptr) ArchB::Recorder::Count(!aliased ? "draw_reloc_alias_no_words" : readable ? "draw_reloc_alias_computed" : "draw_reloc_alias_unreadable");
     return key;
 }
 

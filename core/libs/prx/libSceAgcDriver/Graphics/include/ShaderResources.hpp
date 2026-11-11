@@ -292,6 +292,7 @@ public:
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool captureDescriptors = false) const;
     bool BoundElementBytes(const MovedBuffer& entry, const DrawBindings* bound, VkDescriptorBufferInfo& descriptor, std::vector<std::byte>& bytes) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
+    std::vector<const DrawReferenceMasks::Words*> MovedIgnoredWords(std::span<const CompiledShader> shaders, std::span<const DrawReferenceMasks> masks, std::span<const MovedBuffer> moved) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {

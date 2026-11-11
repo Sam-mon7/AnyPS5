@@ -8202,6 +8202,23 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+std::vector<const DrawReferenceMasks::Words*> ShaderResources::MovedIgnoredWords(std::span<const CompiledShader> shaders, std::span<const DrawReferenceMasks> masks, std::span<const MovedBuffer> moved) const {
+    std::vector<const DrawReferenceMasks::Words*> ignored(moved.size(), nullptr);
+    for (std::size_t stage = 0; stage < shaders.size() && stage < masks.size(); ++stage) {
+        if (shaders[stage].program == nullptr) continue;
+        const auto& programBindings = shaders[stage].program->bindings;
+        for (std::size_t index = 0; index < programBindings.size() && index < masks[stage].bindings.size(); ++index) {
+            if (!DataRole(programBindings[index].role) || masks[stage].bindings[index].empty()) continue;
+            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == programBindings[index].binding; });
+            if (kept == bindings.end() || kept->allocations.size() != 1) continue;
+            for (std::size_t element = 0; element < moved.size(); ++element) {
+                if (!moved[element].words.empty() && moved[element].allocation == kept->allocations.front()) ignored[element] = &masks[stage].bindings[index];
+            }
+        }
+    }
+    return ignored;
+}
+
 bool ShaderResources::MovedStillReadOnly(std::span<const MovedBuffer> moved, Recorder& recorder) const {
     for (const auto& entry : moved) {
         if (!entry.words.empty()) continue;

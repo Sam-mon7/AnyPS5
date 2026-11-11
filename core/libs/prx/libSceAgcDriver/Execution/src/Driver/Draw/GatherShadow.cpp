@@ -879,7 +879,6 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
             incomplete |= GatherGenerationMoved;
             ++generationRefused;
         }
-        if (draw.live && feedbackChanged) incomplete |= GatherNotTemplatable;
         plan->matched = allMatched && templatable;
         plan->incomplete = incomplete;
         plan->complete = allMatched && templatable && incomplete == GatherIncompleteNone;
