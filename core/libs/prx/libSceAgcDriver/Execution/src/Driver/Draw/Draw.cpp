@@ -674,7 +674,12 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         ArchB::Recorder::Count("draw_templates_live_q0_gathers");
         auto plan = RunGatherShadow(candidate);
         if (plan == nullptr || !plan->complete || entry->allocationGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+            if (plan == nullptr) ArchB::Recorder::Count("draw_templates_live_q0_refused_no_plan");
+            else if (plan->complete) ArchB::Recorder::Count("draw_templates_live_q0_refused_allocation_generation");
             if (plan != nullptr) {
+                if (plan->incomplete & GatherUnknownBindings) ArchB::Recorder::Count("draw_templates_live_q0_refused_unknown_bindings");
+                if ((plan->incomplete & GatherUnmatched) && plan->differ == GatherDiffer::None) ArchB::Recorder::Count("draw_templates_live_q0_refused_unmatched_unclassified");
+                if (plan->incomplete == GatherIncompleteNone && !plan->matched) ArchB::Recorder::Count("draw_templates_live_q0_refused_not_matched");
                 if (plan->incomplete & GatherPendingWords) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_words");
                 if (plan->incomplete & GatherPendingVsharp) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_vsharp");
                 if (plan->incomplete & GatherPendingIndirect) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_indirect");

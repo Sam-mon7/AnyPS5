@@ -978,7 +978,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     if (large) Recorder::Count("gather_shadow_draws_large");
     if (draw.indirect.present) Recorder::Count("gather_shadow_hits_indirect");
     if (plan->complete && !large && !feedbackChanged) Recorder::Count("gather_shadow_served");
-    if (!allMatched) return nullptr;
+    if (!allMatched) return draw.live ? plan : nullptr;
     static constexpr std::array<const char*, static_cast<std::size_t>(GatherElement::Count)> elementNames{"gather_shadow_elements_vsharp", "gather_shadow_elements_flat", "gather_shadow_elements_shaderdata", "gather_shadow_elements_push", "gather_shadow_elements_indirect"};
     static constexpr std::array<const char*, static_cast<std::size_t>(GatherElement::Count)> smallNames{"gather_shadow_bytes_vsharp_small", "gather_shadow_bytes_flat_small", "gather_shadow_bytes_shaderdata_small", "gather_shadow_bytes_push_small", "gather_shadow_bytes_indirect_small"};
     static constexpr std::array<const char*, static_cast<std::size_t>(GatherElement::Count)> largeNames{"gather_shadow_bytes_vsharp_large", "gather_shadow_bytes_flat_large", "gather_shadow_bytes_shaderdata_large", "gather_shadow_bytes_push_large", "gather_shadow_bytes_indirect_large"};
