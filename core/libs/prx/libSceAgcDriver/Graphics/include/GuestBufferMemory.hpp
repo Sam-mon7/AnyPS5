@@ -462,6 +462,7 @@ public:
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
     bool SpaceOnly() const;
+    bool RebindShadowAddresses();
     std::shared_ptr<const void> ReleaseSpace();
     bool RetakeSpace();
     bool SpaceHeld() const;

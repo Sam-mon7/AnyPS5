@@ -31,6 +31,8 @@ public:
     void CheckFault() const;
     void CheckUse(const BdaResources* record) const;
     void NoteUse(std::uint64_t serial);
+    void PinFaultSlot();
+    void UnpinFaultSlot();
     bool TakeFaultSlot(const Context& context);
     bool HoldsFaultSlot() const { return faultChunk != nullptr; }
     static void NoteFinished(VkDevice device, std::uint64_t serial);
@@ -88,6 +90,7 @@ private:
     VkDeviceSize faultOffset = 0;
     bool reportOnly = false;
     std::uint64_t lastUse = 0;
+    std::size_t faultPins = 0;
     std::size_t tableBytes = 0;
     std::uint64_t tableGuardSerial = 0;
     std::vector<ImageTableFaults> imageTables;

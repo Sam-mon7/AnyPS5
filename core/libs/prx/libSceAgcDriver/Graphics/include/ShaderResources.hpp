@@ -197,7 +197,7 @@ public:
     // then no other member may be used. `compute` and `snapshots` must outlive Complete(). An
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt, bool allowDispatchSpaceReuse = true);
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -401,8 +401,11 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool SpaceReuse() const { return spaceReuse; }
     static bool SpaceReuseDisabled();
+    static bool DispatchSpaceReuseEnabled();
+    const char* CompareDispatchSpace(const ShaderResources& fresh) const;
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
     bool RetakeSpace() { return guestMemory.RetakeSpace(); }
+    bool ShadowAddressesCurrent() { return guestMemory.RebindShadowAddresses(); }
     bool SpaceHeld() const { return guestMemory.SpaceHeld(); }
     SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const { return guestMemory.SnapshotsServedInPlace(snapshots); }
     std::shared_ptr<const void> ReleaseSpace() { return guestMemory.ReleaseSpace(); }
@@ -798,6 +801,15 @@ private:
     bool usesBda = false;
     bool bdaReadOnly = true;
     bool spaceReuse = false;
+    bool allowDispatchSpaceReuse = true;
+    struct DispatchUse {
+        std::shared_ptr<const void> space;
+        std::shared_ptr<const void> faultPin;
+        std::atomic<bool> completed{false};
+    };
+    std::weak_ptr<DispatchUse> dispatchUse;
+    std::atomic<bool> dispatchSpacePoisoned{false};
+    static std::shared_ptr<const void> pinDispatchFaultSlot(const std::shared_ptr<ShaderResources>& resources);
     bool faultReportOnly = true;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
