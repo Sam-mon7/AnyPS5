@@ -4894,6 +4894,7 @@ struct PreparedDraw {
     bool slotVerifyPatch = false;
     bool slotWordless = false;
     bool slotCapture = false;
+    bool slotLearnOnly = false;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -5820,6 +5821,11 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
             }
         }
     }
+    if (prepared.slotLearnOnly) {
+        publishGatherSlot(context, state, draw, identity, slot, *resources, prepared.resolved.moved);
+        AgcDriver::ArchB::Recorder::Count("draw_templates_live_first_sight_captures");
+        return;
+    }
     if (made.slots.size() >= TableLimit && !made.slots.contains(key)) {
         counters().evictions.fetch_add(made.slots.size(), std::memory_order_relaxed);
         made.slots.clear();
@@ -6339,9 +6345,16 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders));
         prepared.slotWordless = false;
         if (!prepared.slotCapture && wordlessIdentity(identity)) prepared.slotWordless = prepared.slotCapture = sightedBefore(keyOf(context.device, identity, draw, shaders, true));
+        static const bool learnFirst = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_FIRST_SIGHT") == nullptr;
+        prepared.slotLearnOnly = false;
+        if (learnFirst && !prepared.slotCapture && identity.gather == nullptr && identity.learning != nullptr && identity.gatherTemplate != nullptr && identity.gatherTemplate->valid.load(std::memory_order_acquire) && !identity.gatherTemplate->ready.load(std::memory_order_acquire)) {
+            prepared.slotCapture = true;
+            prepared.slotLearnOnly = true;
+        }
         return refuse(RefusedNew);
     }
     prepared.slotCapture = true;
+    prepared.slotLearnOnly = false;
     prepared.slotWordless = slot->wordless;
     slot->replayedLast = false;
     slot->lastUse = ++table().uses;

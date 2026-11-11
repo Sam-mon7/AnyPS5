@@ -1574,7 +1574,10 @@ void Driver::enqueueGatherDraw(DrawTail& tail) {
             for (std::size_t i = 0; i < live->plan->stages.size() && i < reference->stages.size(); ++i) live->plan->stages[i].program = reference->stages[i].program;
             CheckGatherDrawPlan(*live->plan, reference->stages, GatherTargetAddress(*link->state), GatherIndirectOf(reference->drawParameters));
         }
+        const auto commitStarted = std::chrono::steady_clock::now();
         commitDraw(localDevice, commitQueue, *link->state, live->parameters, live->stages, {}, nullptr, {}, 0, nullptr, {}, 0, pipelineStateReuse, memoVirtualQuery, nullptr, &identity);
+        ArchB::Recorder::Count("draw_commit_live_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
+        ArchB::Recorder::Count("draw_commit_live_n");
     };
     auto held = std::make_shared<decltype(commit)>(std::move(commit));
     DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw);
@@ -2323,7 +2326,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (gatherPlan != nullptr) CheckGatherDrawPlan(*gatherPlan, stages, GatherTargetAddress(decode->state), GatherIndirectOf(drawParameters));
             const bool nostageCensus = nostageWhy >= 0 && Graphics::ArchcNostageCensus();
             if (nostageCensus) Graphics::ArchcNostageArm(nostageWhy);
+            const auto commitStarted = std::chrono::steady_clock::now();
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
+            ArchB::Recorder::Count("draw_commit_old_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
+            ArchB::Recorder::Count("draw_commit_old_n");
             if (nostageCensus) Graphics::ArchcNostageArm(-1);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
             return 0;
