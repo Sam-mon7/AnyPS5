@@ -1,6 +1,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+#include <cstdlib>
+#include <functional>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -57,7 +67,7 @@ Fixture TableFixture() {
     FillTable(Table, BufferBase, 0x3f800000u);
     Fixture fixture;
     auto& variant = *fixture.variant;
-    fixture.user = {Low(Table.data()), High(Table.data()), static_cast<std::uint32_t>(ValueBase), 0x11111111u, 0x22222222u};
+    fixture.user = {Low(Table.data()), High(Table.data()), static_cast<std::uint32_t>(ValueBase), 0x11111111u, 0x22222222u, Records};
     auto compiled = std::make_shared<ShaderRecompiler::RecompileResult>();
     ShaderRecompiler::DescriptorBinding buffers{ShaderRecompiler::DescriptorKind::StorageBuffer, Role::GuestBuffers, 0, 0, 2, {}};
     buffers.guestDescriptor = {Table[0], Table[1], Table[2], Table[3], static_cast<std::uint32_t>(ValueBase), static_cast<std::uint32_t>(ValueBase >> 32u) | (Stride << 16u), Records, Format};
@@ -74,8 +84,8 @@ Fixture TableFixture() {
     variant.runParents.resize(1);
     variant.relocatableWords = 1u;
     variant.userWordsWalked = 1u | 2u;
-    variant.valueWords = 1u << 2u;
-    variant.valueSlots = {{2u, 0u, 4u}};
+    variant.valueWords = (1u << 2u) | (1u << 5u);
+    variant.valueSlots = {{2u, 0u, 4u}, {5u, 0u, 6u}};
     variant.dataPositions = {4};
     variant.dataSlots = {2};
     variant.flatBinding = 1;
@@ -95,6 +105,7 @@ void ClassifiesBaseValueAndStructureWords() {
     Require(shape->userClass[2] == GatherWord::ValueWord && shape->userMask[2] == 0xffffffffu, "the inline V# base is not a streamed value word");
     Require(shape->userClass[3] == GatherWord::PushWord && shape->userMask[3] == 0xffffffffu, "the forwarded user word is not a streamed push word");
     Require(shape->userClass[4] == GatherWord::Structure && shape->userMask[4] == 0, "an unused user word is not structure");
+    Require(shape->userClass[5] == GatherWord::ValueRecord && shape->userMask[5] == 0, "the inline V# record count tagged as a value word is not structure");
     Require(shape->wordClass[0] == GatherWord::BufferBase && shape->wordMask[0] == 0xfffffffcu, "the V# base low word is not a masked buffer base");
     Require(shape->wordClass[1] == GatherWord::BufferBase && shape->wordMask[1] == 0xffffu, "the V# base high word does not keep its stride as structure");
     Require(shape->wordClass[2] == GatherWord::Structure && shape->wordClass[3] == GatherWord::Structure, "the V# size and format words are not structure");
@@ -110,6 +121,37 @@ void ClassifiesBaseValueAndStructureWords() {
     program->bindings.push_back({ShaderRecompiler::DescriptorKind::StorageBuffer, Role::BdaPagetable, 0, 60, 1, {}});
     bda.variant->compiled = program;
     Require(std::string(BuildGatherTemplate(*bda.variant, bda.user, 0, AllOn)->refusal) == "bda", "a BDA program was not refused");
+}
+
+constexpr std::uint64_t ClampBase = 0x0000000010000000ull;
+
+std::uint64_t AllocationEnd(std::uint64_t) {
+    return ClampBase + 16384u;
+}
+
+std::uint64_t ShorterAllocationEnd(std::uint64_t) {
+    return ClampBase + 16380u;
+}
+
+void ExtentFollowsTheBindingRules() {
+    const auto address = ClampBase + 16004u;
+    const std::array<std::uint32_t, 4> words{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (12u << 16u), 32u, Format};
+    const GatherBufferLimits limits{1u << 27u, 64u, 0u, &AllocationEnd};
+    const auto extent = GatherBufferExtent(words, limits);
+    Require(extent.bytes == 380u && extent.adjustment == 4u, "a stride-12, 32-record buffer 16,004 bytes into a 16,384-byte allocation is not clamped to 380 bytes (got " + std::to_string(extent.bytes) + ")");
+    const GatherBufferLimits targeted{1u << 27u, 64u, address + 372u, &AllocationEnd};
+    Require(GatherBufferExtent(words, targeted).bytes == 372u, "a buffer ending inside the colour target by less than a stride is not clamped to the target");
+    GatherStagePlan plan;
+    plan.vsharps.push_back({0u, 0u, words, address, 384u, extent.bytes, extent.adjustment});
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding buffers{ShaderRecompiler::DescriptorKind::StorageBuffer, Role::GuestBuffers, 0, 0, 1, {words[0], words[1], words[2], words[3]}};
+    program.bindings = {buffers};
+    GatherCheck same;
+    CheckGatherStage(plan, program, same, limits);
+    Require(same.mismatched[static_cast<std::size_t>(GatherElement::Vsharp)] == 0, "the committer check rejects the bound extent it should accept");
+    GatherCheck moved;
+    CheckGatherStage(plan, program, moved, GatherBufferLimits{1u << 27u, 64u, 0u, &ShorterAllocationEnd});
+    Require(moved.vsharpExtent == 1 && moved.vsharpAddress == 0 && moved.vsharpSize == 0, "the committer check does not see a bound extent that differs from the plan's");
 }
 
 void StructuralChangeIsDetected() {
@@ -132,6 +174,10 @@ void StructuralChangeIsDetected() {
     user[4] = 0x33333333u;
     outcome = EvaluateGather(*shape, user, HostReader, live, nullptr, true);
     Require(!outcome.matched && outcome.differ == GatherDiffer::UserStructure, "a changed structural user word matched the template");
+    user = fixture.user;
+    user[5] = Records * 2u;
+    outcome = EvaluateGather(*shape, user, HostReader, live, nullptr, true);
+    Require(!outcome.matched && outcome.differ == GatherDiffer::RecordCount, "a changed INLINE V# record count matched the template");
     user = fixture.user;
     user[0] |= 1u;
     outcome = EvaluateGather(*shape, user, HostReader, live, nullptr, true);
@@ -257,12 +303,186 @@ void NestedPointersAreCarriedWithTheirReads() {
 
 }
 
-int main() {
+struct ShadowDraw {
+    std::vector<DrawProgram> programs;
+    DrawEntry entry;
+    std::vector<std::shared_ptr<DispatchVariant>> matched;
+    std::vector<std::uint64_t> reads;
+    GatherReader reader;
+    std::function<bool(std::uint64_t, std::size_t)> busyRange;
+    GatherShadowStats stats;
+
+    ShadowDraw(const Fixture& fixture, std::span<const std::uint32_t> liveUser) {
+        DrawProgram program{};
+        program.userData.assign(liveUser.begin(), liveUser.end());
+        programs.push_back(program);
+        auto decode = std::make_shared<DrawDecode>();
+        DrawProgram captured{};
+        captured.userData = fixture.user;
+        decode->programs.push_back(captured);
+        entry.decode = decode;
+        entry.stages = {{fixture.variant}};
+        matched = {fixture.variant};
+        reader = [this](std::uint64_t address, std::span<std::uint32_t> out) {
+            reads.push_back(address);
+            return HostReader(address, out);
+        };
+        busyRange = [](std::uint64_t, std::size_t) { return false; };
+    }
+
+    std::shared_ptr<GatherDrawPlan> Run(EntryOutcome outcome, const GatherIndirectPlan& indirect = {}, bool pendingAtValidation = false) {
+        ArmGatherValidationLog(true);
+        GatherValidationLog()->push_back({0u, matched.front(), outcome, false, pendingAtValidation});
+        GatherShadowDraw draw;
+        draw.programs = programs;
+        draw.entry = &entry;
+        draw.matched = matched;
+        draw.hit = outcome == EntryOutcome::Equal || outcome == EntryOutcome::EqualData;
+        draw.keyed = true;
+        draw.options = AllOn;
+        draw.indirect = indirect;
+        draw.read = &reader;
+        draw.busy = &busyRange;
+        draw.stats = &stats;
+        auto plan = RunGatherShadow(draw);
+        ArmGatherValidationLog(false);
+        return plan;
+    }
+};
+
+bool Throws(const std::function<void()>& body) {
     try {
+        body();
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+void ShadowRunsThroughTheCacheAndHandsThePlanToTheCommitter() {
+    const auto fixture = TableFixture();
+    FillTable(MovedTable, MovedBufferBase, 0x40000000u);
+    auto live = fixture.user;
+    live[0] = Low(MovedTable.data());
+    ShadowDraw shadow(fixture, live);
+    const auto plan = shadow.Run(EntryOutcome::EqualData);
+    Require(plan != nullptr && plan->complete && plan->incomplete == GatherIncompleteNone, "a moved table hit did not produce a complete plan");
+    Require(shadow.stats.built == 1 && shadow.stats.trueMatch == 1 && shadow.stats.falseDiffer == 0, "the first shadow run did not build one template and match it");
+    Require(plan->stages.size() == 1 && plan->stages[0].vsharps.size() == 2, "the shadow plan lacks the stage's V# elements");
+    const auto again = shadow.Run(EntryOutcome::Equal);
+    Require(again != nullptr && shadow.stats.built == 1 && shadow.stats.trueMatch == 2, "a second shadow run of the same variant rebuilt its template");
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*fixture.variant->compiled);
+    patched->bindings[0].guestDescriptor[0] = MovedTable[0];
+    patched->bindings[0].guestDescriptor[1] = MovedTable[1];
+    patched->bindings[1].guestDescriptor[0] = MovedTable[0];
+    patched->bindings[1].guestDescriptor[2] = MovedTable[4];
+    plan->stages[0].program = patched.get();
+    const std::vector<AgcDriver::Graphics::CompiledShader> stages{{ShaderRecompiler::ShaderStage::Vertex, patched.get(), 0u}};
+    const auto check = CheckGatherDrawPlan(*plan, stages, 0u, {});
+    std::uint64_t mismatched = 0;
+    for (const auto count : check.mismatched) mismatched += count;
+    Require(mismatched == 0 && check.stagesMissing == 0, "the committer check rejected the plan the shadow handed over");
+    const std::vector<AgcDriver::Graphics::CompiledShader> other{{ShaderRecompiler::ShaderStage::Vertex, fixture.variant->compiled.get(), 0u}};
+    Require(Throws([&] { CheckGatherDrawPlan(*plan, other, 0u, {}); }), "strict mode did not fail on a plan whose stage the committer does not bind");
+}
+
+void PendingSourcesRefuseOrLeaveThePlanIncomplete() {
+    auto nested = NestedFixture();
+    MovedChild = {0x10u, 0x99u, 0x30u, 0x40u};
+    Parent[0] = Low(MovedChild.data());
+    Parent[1] = High(MovedChild.data());
+    ShadowDraw parentPending(nested, nested.user);
+    const auto parent = reinterpret_cast<std::uintptr_t>(Parent.data());
+    parentPending.busyRange = [parent](std::uint64_t address, std::size_t bytes) { return address < parent + sizeof(Parent) && parent < address + bytes; };
+    const auto refused = parentPending.Run(EntryOutcome::Equal);
+    Require(refused == nullptr && parentPending.stats.pendingRefused == 1 && parentPending.stats.falseDiffer == 0, "a draw whose parent table is pending a GPU write was not refused");
+    const auto child = reinterpret_cast<std::uintptr_t>(MovedChild.data());
+    Require(std::none_of(parentPending.reads.begin(), parentPending.reads.end(), [&](std::uint64_t address) { return address == child; }), "the child table was read through a pointer from a pending parent");
+    ShadowDraw atValidation(nested, nested.user);
+    Require(atValidation.Run(EntryOutcome::Equal, {}, true) == nullptr && atValidation.stats.pendingRefused == 1 && atValidation.reads.empty(), "a validation over a pending range was evaluated");
+    const auto fixture = TableFixture();
+    ShadowDraw vsharpPending(fixture, fixture.user);
+    vsharpPending.busyRange = [](std::uint64_t address, std::size_t bytes) { return address < BufferBase + 1024u && BufferBase < address + bytes; };
+    const auto pendingPlan = vsharpPending.Run(EntryOutcome::Equal);
+    Require(pendingPlan != nullptr && !pendingPlan->complete && (pendingPlan->incomplete & GatherPendingVsharp) != 0, "a plan whose V# source is pending a GPU write is complete");
+}
+
+void IndirectArgumentsAreAPlanElement() {
+    const auto fixture = TableFixture();
+    const GatherIndirectPlan indirect{true, true, 0x0000777700000000ull, 0x0000777700001000ull, 4u, 20u, 80u};
+    ShadowDraw shadow(fixture, fixture.user);
+    const auto plan = shadow.Run(EntryOutcome::Equal, indirect);
+    Require(plan != nullptr && plan->complete && plan->indirect == indirect, "the plan does not carry the indirect arguments");
+    plan->stages[0].program = fixture.variant->compiled.get();
+    const std::vector<AgcDriver::Graphics::CompiledShader> stages{{ShaderRecompiler::ShaderStage::Vertex, fixture.variant->compiled.get(), 0u}};
+    const auto same = CheckGatherDrawPlan(*plan, stages, 0u, indirect);
+    Require(same.checked[static_cast<std::size_t>(GatherElement::Indirect)] == 1 && same.mismatched[static_cast<std::size_t>(GatherElement::Indirect)] == 0, "the committer check rejects the indirect arguments it commits");
+    auto moved = indirect;
+    moved.arguments += 0x100u;
+    Require(Throws([&] { CheckGatherDrawPlan(*plan, stages, 0u, moved); }), "the committer check does not see indirect arguments moved from the plan's");
+    ShadowDraw pending(fixture, fixture.user);
+    pending.busyRange = [&](std::uint64_t address, std::size_t) { return address == indirect.countAddress; };
+    const auto pendingPlan = pending.Run(EntryOutcome::Equal, indirect);
+    Require(pendingPlan != nullptr && !pendingPlan->complete && (pendingPlan->incomplete & GatherPendingIndirect) != 0, "a plan whose indirect count is pending a GPU write is complete");
+}
+
+void MovedNestedPointerOnADirectHitHasItsOwnClass() {
+    auto nested = NestedFixture();
+    MovedChild = {0x10u, 0x20u, 0x30u, 0x40u};
+    Parent[0] = Low(MovedChild.data());
+    Parent[1] = High(MovedChild.data());
+    ShadowDraw shadow(nested, nested.user);
+    Require(shadow.Run(EntryOutcome::Differing) == nullptr, "a direct miss produced a plan");
+    Require(shadow.stats.nestedDirect == 1 && shadow.stats.falseMatch == 0, "a moved nested pointer on a direct hit is not counted in its own class");
+    Parent[0] = Low(Child.data());
+    Parent[1] = High(Child.data());
+}
+
+void GuardedReadsFallBackAndNeverFault() {
+    FillTable(Table, BufferBase, 0x3f800000u);
+    std::array<std::uint32_t, 8> copy{};
+    bool owned = true;
+    const auto result = AgcDriver::GuestMemory::CopyMappedGuarded(reinterpret_cast<std::uintptr_t>(Table.data()), std::as_writable_bytes(std::span(copy)), owned);
+    Require(result == AgcDriver::GuestMemory::Compare::Equal && !owned && copy == Table, "a host table outside the guest arena was not read through the checked fallback");
+#ifdef _WIN32
+    auto* page = static_cast<std::byte*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(page != nullptr, "cannot allocate a host page");
+    DWORD previous = 0;
+    Require(VirtualProtect(page, 4096, PAGE_NOACCESS, &previous) != 0, "cannot protect the host page");
+    owned = true;
+    const auto denied = AgcDriver::GuestMemory::CopyMappedGuarded(reinterpret_cast<std::uintptr_t>(page), std::as_writable_bytes(std::span(copy)), owned);
+    Require(denied == AgcDriver::GuestMemory::Compare::Unmapped && !owned, "a no-access page was not refused by the guarded read");
+    VirtualFree(page, 0, MEM_RELEASE);
+#endif
+}
+
+void StrictModeFailsOnAFalseDiffer() {
+    const auto fixture = TableFixture();
+    auto live = fixture.user;
+    live[4] = 0x33333333u;
+    ShadowDraw shadow(fixture, live);
+    Require(Throws([&] { shadow.Run(EntryOutcome::Equal); }), "strict mode did not fail on a structural difference the old path accepted");
+    ArmGatherValidationLog(false);
+}
+
+int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_DRAW_GATHER_SHADOW_STRICT", "1");
+#else
+    setenv("APS5_DRAW_GATHER_SHADOW_STRICT", "1", 1);
+#endif
+    try {
+        ExtentFollowsTheBindingRules();
         ClassifiesBaseValueAndStructureWords();
         StructuralChangeIsDetected();
         MovedBaseMatchesAndYieldsTheNewAddress();
         NestedPointersAreCarriedWithTheirReads();
+        ShadowRunsThroughTheCacheAndHandsThePlanToTheCommitter();
+        PendingSourcesRefuseOrLeaveThePlanIncomplete();
+        IndirectArgumentsAreAPlanElement();
+        MovedNestedPointerOnADirectHitHasItsOwnClass();
+        GuardedReadsFallBackAndNeverFault();
+        StrictModeFailsOnAFalseDiffer();
         std::cout << "Gather templates classify base, value and structural words, detect structural changes, and carry moved and nested addresses in the plan\n";
         return 0;
     } catch (const std::exception& error) {
