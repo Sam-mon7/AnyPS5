@@ -454,7 +454,8 @@ bool PartialSnapshotVerifyEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ARCHB_FIX_PARTIAL_SNAPSHOT_VERIFY");
         const char* prewait = std::getenv("APS5_ARCHB_FIX_COMPUTE_SNAPSHOT_WAIT_VERIFY");
-        return (value != nullptr && std::string_view(value) == "1") || (prewait != nullptr && std::string_view(prewait) == "1");
+        const char* gpu = std::getenv("APS5_ARCHB_FIX_SAMPLED_ARRAY_GPU_VERIFY");
+        return (value != nullptr && std::string_view(value) == "1") || (prewait != nullptr && std::string_view(prewait) == "1") || (gpu != nullptr && std::string_view(gpu) == "1");
     }();
     return enabled;
 }
@@ -943,7 +944,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
     }
 }
 
-void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached) {
+void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached, bool gpu) {
     GuestMemory::AssertGpuLockHeld("Texture::UpdateSnapshotLayers");
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr && image != VK_NULL_HANDLE && owned != nullptr && storageSource == nullptr && source == nullptr && !srgbExpand && perUseCopy == PerUseCopy::None, "sampled snapshot cannot be updated in place");
@@ -953,9 +954,9 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
     Require(geometry.layerBytes <= std::numeric_limits<std::size_t>::max() / layers.size() && geometry.sliceLinearBytes <= std::numeric_limits<std::size_t>::max() / layers.size(), "partial sampled snapshot buffers overflow");
     const auto tiledBytes = static_cast<std::size_t>(geometry.layerBytes) * layers.size();
     const auto linearBytes = static_cast<std::size_t>(geometry.sliceLinearBytes) * layers.size();
-    auto staging = std::make_shared<Buffer>(context, tiledBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto staging = gpu ? nullptr : std::make_shared<Buffer>(context, tiledBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     Require(cached.empty() || cached.size() == geometry.guestBytes, "cached sampled snapshot size changed");
-    {
+    if (!gpu) {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
         for (std::size_t index = 0; index < layers.size(); ++index) {
             Require(layers[index] < geometry.layers && (index == 0 || layers[index - 1] < layers[index]), "partial sampled snapshot layers are invalid");
@@ -968,13 +969,25 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
     auto tiled = std::make_shared<DeviceBuffer>(context, tiledBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     auto linear = std::make_shared<DeviceBuffer>(context, linearBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     const auto commands = recorder->Commands();
-    recorder->Keep(staging, tiledBytes);
+    if (staging != nullptr) recorder->Keep(staging, tiledBytes);
     recorder->Keep(tiled, tiledBytes);
     recorder->Keep(linear, linearBytes);
     recorder->Keep(owned);
     detiler.BeginBatch();
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, tiledBytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | (gpu ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0u), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | (gpu ? VK_ACCESS_MEMORY_WRITE_BIT : 0u), VK_ACCESS_TRANSFER_READ_BIT);
+    if (gpu) {
+        Require(cached.empty(), "a GPU sampled snapshot cannot retain CPU texel bytes");
+        for (std::size_t index = 0; index < layers.size(); ++index) {
+            Require(layers[index] < geometry.layers && (index == 0 || layers[index - 1] < layers[index]), "GPU sampled snapshot layers are invalid");
+            const auto address = descriptor.baseAddress + geometry.GuestLayerOffset(layers[index]);
+            const auto* import = ExistingHostImportFor(context, address, static_cast<std::size_t>(geometry.layerBytes));
+            Require(import != nullptr, "GPU sampled snapshot lost its imported layer");
+            CopyBuffer(context, commands, import->buffer, HostImportOffset(*import, address), tiled->Handle(), index * geometry.layerBytes, static_cast<std::size_t>(geometry.layerBytes));
+            recorder->NotePendingRead(address, static_cast<std::size_t>(geometry.layerBytes), Recorder::ReadKind::StorageUpload);
+        }
+    } else {
+        CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, tiledBytes);
+    }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = ImageTypeFor(descriptor.dimension);
@@ -1057,7 +1070,7 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(toTransfer.size()), toTransfer.data());
 }
 
-void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor) const {
+void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor, const char* mismatchCounter) const {
     GuestMemory::AssertGpuLockHeld("Texture::VerifySnapshot");
     auto* recorder = Recorder::Active();
     Require(PartialSnapshotVerifyEnabled() && recorder != nullptr && image != VK_NULL_HANDLE && reference.image != VK_NULL_HANDLE && owned != nullptr && reference.owned != nullptr, "sampled snapshot verification is unavailable");
@@ -1127,7 +1140,7 @@ void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResourc
     }
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    recorder->OnComplete([actual, expected, ranges = std::move(ranges), actualOwner = owned, expectedOwner = reference.owned] {
+    recorder->OnComplete([actual, expected, ranges = std::move(ranges), actualOwner = owned, expectedOwner = reference.owned, mismatchCounter] {
         actual->Invalidate();
         expected->Invalidate();
         const auto actualBytes = actual->Bytes();
@@ -1135,8 +1148,8 @@ void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResourc
         std::uint64_t mismatches = 0;
         for (const auto& [offset, size] : ranges) mismatches += std::memcmp(actualBytes.data() + offset, expectedBytes.data() + offset, size) != 0;
         PartialSnapshotMismatches().fetch_add(mismatches, std::memory_order_relaxed);
-        AgcDriver::ArchB::Recorder::Count("fix_psnap_verify_mismatches", static_cast<double>(mismatches));
-    });
+        AgcDriver::ArchB::Recorder::Count(mismatchCounter, static_cast<double>(mismatches));
+    }, true);
 }
 
 std::uint64_t Texture::PartialSnapshotVerifyMismatches() {

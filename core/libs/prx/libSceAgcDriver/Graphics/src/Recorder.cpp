@@ -5310,6 +5310,17 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newest;
 }
 
+bool Recorder::PendingCpuWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto overlaps = [&](const Batch& batch) {
+        if (std::none_of(batch.writes.begin(), batch.writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) return false;
+        if (batch.completions.size() > batch.checkOnlyCompletions + batch.copiedWriterCompletions.size()) return true;
+        return std::any_of(batch.copiedWriterCompletions.begin(), batch.copiedWriterCompletions.end(), [&](const ShaderResources* resources) { return resources->CopiedWritesOverlap(address, bytes); });
+    };
+    if (open != nullptr && overlaps(*open)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return overlaps(*batch); });
+}
+
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
     std::vector<PendingWrite> found;
     if (bytes == 0) return found;
