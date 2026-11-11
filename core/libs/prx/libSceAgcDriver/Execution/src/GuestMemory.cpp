@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -6299,6 +6300,7 @@ static void lockSpinningTracked(Mutex& mutex) {
         std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         ~Acquisition() {
             if (!enabled) return;
+            DriverDetail::Replay::RegionCensus::GpuLock();
             const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
             HostThreadSlot<std::uint64_t, GpuMutexAcquireSlot>::Set(ThreadGpuMutexAcquireNs() + static_cast<std::uint64_t>(ns));
         }

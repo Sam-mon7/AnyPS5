@@ -585,6 +585,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     auto& traceIndirect = tail.traceIndirect;
     if (const auto verdict = precheckDraw(queue, submission, packetOffset, packet, drawParameters, rejected, traceIndirect)) {
+        Replay::RegionCensus::DrawArguments(drawParameters);
+        Replay::RegionCensus::Note(Replay::ResolvedField::Outcome, {static_cast<std::uint64_t>(*verdict)});
         TraceDrawAttemptFailure(traceToken, "precheck", "rejected", submission.serial, submission.queue, packetOffset, rejected);
         return *verdict;
     }
@@ -1464,6 +1466,20 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
     if (hitCensus) timing.Mark("j3_stage_bookkeeping");
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.feedbackMask, tail.bufferBases);
+    if (Replay::RegionCensus::Active()) {
+        using Field = Replay::ResolvedField;
+        Replay::RegionCensus::Note(Field::State, {Replay::RegionCensus::Identity(decode != nullptr && decode->stateOrigin != nullptr ? decode->stateOrigin.get() : decode.get())});
+        Replay::RegionCensus::Note(Field::Entry, {drawKey, Replay::RegionCensus::Identity(entry.get()), Replay::RegionCensus::Identity(dataEntry.get()), drawHit});
+        Replay::RegionCensus::DrawArguments(drawParameters);
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            Replay::RegionCensus::Note(Field::Programs, {static_cast<std::uint64_t>(programs[i].binary.stage), Replay::RegionCensus::Identity(programResults[i])});
+            Replay::RegionCensus::Note(Field::Variants, {Replay::RegionCensus::Identity(matched[i].get()), Replay::RegionCensus::Identity(fresh[i].get())});
+            const auto hidden = std::min<std::size_t>(programs[i].hiddenUserWords, programs[i].userData.size());
+            Replay::RegionCensus::UserData(static_cast<std::uint32_t>(programs[i].binary.stage), programs[i].userDataBase, std::span(programs[i].userData).subspan(hidden));
+            if (programs[i].merged && programs[i].userData.size() >= 2) Replay::RegionCensus::UserData(static_cast<std::uint32_t>(programs[i].binary.stage), programs[i].mergedPointer, std::span(programs[i].userData).first(2));
+        }
+        for (const auto& input : memory) Replay::RegionCensus::Input(input.guestAddress, input.bytes);
+    }
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -2074,6 +2090,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse) == RecipeOutcome::Recorded) {
             slotProbe.kind = archcSlotCensus::RecipeHit;
             CommitCensus::SetKind(CommitCensus::Kind::Recipe);
+            Replay::RegionCensus::Note(Replay::ResolvedField::Replay, {100});
             return;
         }
         slotProbe.kind = archcSlotCensus::RecipeMiss;
@@ -2083,6 +2100,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr ? identity : nullptr);
     if (nostageTimed) nostageAt[5] = nostageNow();
     const auto replayOutcome = slotProbe.Replay();
+    Replay::RegionCensus::Note(Replay::ResolvedField::Replay, {static_cast<std::uint64_t>(replayOutcome)});
     CommitCensus::SetKind(replayOutcome == 0 ? CommitCensus::Kind::Replayed : CommitCensus::Kind::Legacy);
     if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind < archcSlotCensus::IndirectReplayed && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);

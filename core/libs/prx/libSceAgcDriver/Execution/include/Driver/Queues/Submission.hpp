@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionProgress.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -31,6 +32,8 @@ struct Submission {
     std::map<std::size_t, std::shared_ptr<IRenderingWait>> renderingWaits;
     std::map<std::size_t, std::size_t> conditionalEnds;
     std::map<std::size_t, std::vector<std::uint32_t>> registerLists;
+    std::map<std::size_t, std::uint64_t> registerListClocks;
+    std::shared_ptr<Replay::RegionCensus::Region> censusRegion;
     bool suspend = false;
     bool waitFree = false;
     bool holdsFlip = false;

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -8354,6 +8355,7 @@ struct ShaderResources::MovedSetCache {
         DescriptorCache::SetAllocation allocation;
         DescriptorCache::SetAllocation fragmentAllocation;
         std::vector<std::shared_ptr<Buffer>> words;
+        std::vector<VkDescriptorBufferInfo> regionBuffers;
         ~Set() {
             if (cache == nullptr) return;
             if (allocation.set != VK_NULL_HANDLE) cache->Recycle(layout, allocation);
@@ -8507,6 +8509,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
             if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (write.pBufferInfo - descriptorBuffers.data());
         }
         if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        if (DriverDetail::Replay::RegionCensus::Enabled()) set->regionBuffers = buffers;
         if (cache.entries.size() >= MovedSetCache::Capacity) {
             const auto floor = cache.uses > MovedSetCache::Capacity ? cache.uses - MovedSetCache::Capacity : 0;
             std::erase_if(cache.entries, [&](const auto& entry) { return entry.second.lastUse < floor; });
@@ -9037,6 +9040,11 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     struct BuffersSlotStorage {};
     auto& buffers = AgcDriver::ThreadScratch<std::vector<VkDescriptorBufferInfo>, BuffersSlotStorage>();
     buffers = descriptorBuffers;
+    const struct RegionBuffers {
+        DrawBindings& result;
+        const std::vector<VkDescriptorBufferInfo>& buffers;
+        ~RegionBuffers() { if (DriverDetail::Replay::RegionCensus::Enabled()) result.regionBuffers = buffers; }
+    } regionBuffers{result, buffers};
     if (faultRecord != nullptr) {
         for (const auto& fault : faultDescriptors) buffers[fault.buffer] = faultRecord->Fault();
     }
@@ -9201,6 +9209,7 @@ void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout lay
         return;
     }
     requireGuestBuffers();
+    ObserveRegionBindings(use->bindings.get());
     const auto set = use->bindings->allocation.set;
     const auto fragmentSet = use->bindings->fragmentAllocation.set;
     if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
@@ -9241,8 +9250,34 @@ void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoi
     PerformanceTimer recorderTiming("Resources.Bind", AgcDriver::ArchB::Recorder::Phase::Bind);
     requireGuestBuffers();
     prepareFaultSlot();
+    ObserveRegionBindings();
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
+}
+
+void ShaderResources::ObserveRegionBindings(const DrawBindings* draw, const void* cachedSet) const {
+    namespace Probe = DriverDetail::Replay::RegionCensus;
+    using Field = DriverDetail::Replay::ResolvedField;
+    if (!Probe::Active()) return;
+    Probe::Note(Field::Layout, {Probe::Identity(_layout), Probe::Identity(fragment.layout), splitSets});
+    const auto* cached = static_cast<const MovedSetCache::Set*>(cachedSet != nullptr ? cachedSet : draw != nullptr ? draw->cachedSet.get() : nullptr);
+    Probe::Note(Field::Sets, {Probe::Identity(cached != nullptr ? cached->allocation.set : draw != nullptr ? draw->allocation.set : _set), Probe::Identity(cached != nullptr ? cached->fragmentAllocation.set : draw != nullptr ? draw->fragmentAllocation.set : fragment.set)});
+    const auto& buffers = cached != nullptr ? cached->regionBuffers : draw != nullptr ? draw->regionBuffers : descriptorBuffers;
+    if (buffers.empty() && !descriptorBuffers.empty()) Probe::UnobservedBindings();
+    for (std::size_t i = 0; i < buffers.size(); ++i) {
+        const auto& buffer = buffers[i];
+        Probe::Note(Field::Buffers, {i, Probe::Identity(buffer.buffer), buffer.offset, buffer.range});
+    }
+    for (std::size_t i = 0; i < descriptorImages.size(); ++i) {
+        const auto& image = descriptorImages[i];
+        Probe::Note(Field::Images, {i, Probe::Identity(image.sampler), Probe::Identity(image.imageView), static_cast<std::uint64_t>(image.imageLayout)});
+    }
+    if (draw == nullptr) return;
+    for (std::size_t i = 0; i < draw->snapshots.size(); ++i) {
+        const auto& snapshot = draw->snapshots[i];
+        Probe::Note(Field::Buffers, {i, snapshot.address, snapshot.buffer != nullptr ? Probe::Identity(snapshot.buffer->Handle()) : 0, snapshot.offset, snapshot.bytes});
+    }
+    for (const auto& range : draw->inPlaceReads) Probe::Note(Field::Buffers, {range.first, range.second});
 }
 
 namespace {

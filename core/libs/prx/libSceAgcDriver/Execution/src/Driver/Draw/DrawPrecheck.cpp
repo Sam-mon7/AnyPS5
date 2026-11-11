@@ -46,6 +46,15 @@ bool Driver::drawPrecheck() {
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
+        if (Replay::RegionCensus::Active()) {
+            Replay::RegionCensus::Note(Replay::ResolvedField::State, {static_cast<std::uint64_t>(pass->mode)});
+            const auto note = [](const Graphics::ColorTarget& target) {
+                Replay::RegionCensus::Note(Replay::ResolvedField::Targets, {target.address, target.bytes, static_cast<std::uint64_t>(target.format), target.extent.width, target.extent.height, target.dccAddress, target.cmaskAddress, target.cmaskBytes, target.fmaskAddress, target.arraySlice, target.layers, target.samples, target.mip});
+                Replay::RegionCensus::NoteWords(Replay::ResolvedField::Targets, target.clearWords);
+            };
+            for (const auto& target : pass->targets) note(target);
+            if (pass->source) note(*pass->source);
+        }
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
         if (DrawPipeline::Active() && DrawPipeline::MetadataPassesPipelined() && deferredLabels().labels.empty()) {
             auto writes = Graphics::PipelinedColorMetadataPassWrites(*pass);

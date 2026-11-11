@@ -984,6 +984,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseSnapshots);
 
     if (profile && cached && keepVariant != nullptr && !stampValidate() && keepVariant->recipe.load(std::memory_order_acquire) == nullptr) NoteMissingRecipe(submission.queue, indirectArguments != 0, keepVariant->recipeFailure.load(std::memory_order_relaxed));
+    if (Replay::RegionCensus::Active()) {
+        Replay::RegionCensus::Note(Replay::ResolvedField::ResourceKey, {key});
+        Replay::RegionCensus::Note(Replay::ResolvedField::Programs, {address, Replay::RegionCensus::Identity(compiledResult.get())});
+        Replay::RegionCensus::Note(Replay::ResolvedField::Variants, {Replay::RegionCensus::Identity(keepVariant.get()), dataHit, cached});
+        Replay::RegionCensus::Note(Replay::ResolvedField::Arguments, {groups[0], groups[1], groups[2], indirectArguments});
+        Replay::RegionCensus::UserData(static_cast<std::uint32_t>(ShaderRecompiler::ShaderStage::Compute), 0x240u, userData);
+        for (const auto& input : captured) Replay::RegionCensus::Input(input.guestAddress, input.bytes);
+    }
 
     if (pipelined) {
         runCaptureCheckHook();
@@ -1054,6 +1062,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
                         const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
+                        Replay::RegionCensus::Note(Replay::ResolvedField::Recipe, {static_cast<std::uint64_t>(recipeResult)});
                         if (recipeResult == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
                             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
@@ -1062,6 +1071,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             continue;
                         }
                     } else {
+                        Replay::RegionCensus::Note(Replay::ResolvedField::Recipe, {100});
                         localDevice->Dispatch(compiledCommit, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), htileClearCompletion.has_value() ? nullptr : &builtRecipe, htileClearCompletion, registeredViews, profile ? &recipeFailure : nullptr);
                     }
                     if (htileMask.bytes != 0u) localDevice->NoteHtileMask(htileMask);
@@ -1179,6 +1189,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (recipeHit != nullptr) {
                 VulkanDevice::IndirectOutcome outcome{0, 0};
                 const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup, std::move(privateDispatch));
+                Replay::RegionCensus::Note(Replay::ResolvedField::Recipe, {static_cast<std::uint64_t>(result)});
                 if (result == RecipeOutcome::Rebuild) {
 
                     recipeHit = nullptr;

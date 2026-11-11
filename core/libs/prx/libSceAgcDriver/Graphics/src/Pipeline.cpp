@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1141,6 +1142,7 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state) c
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes, PipelineStateReuse* reuse) const {
+    DriverDetail::Replay::RegionCensus::NoteBytes(DriverDetail::Replay::ResolvedField::Push, bytes);
     AgcDriver::ArchB::Recorder::Timer phases("H4.PushEmission");
     if (stages == 0) return;
     if (reuse == nullptr && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_untracked_writer");

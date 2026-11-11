@@ -193,6 +193,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    const Replay::RegionCensus::RegionScope censusRegion(submission.censusRegion);
     const GuestMemory::ReadSiteScope submissionSite(GuestMemory::ReadSite::Submission);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
@@ -351,6 +352,8 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        const auto censusClock = submission.registerListClocks.find(cursor);
+        const Replay::RegionCensus::PacketScope censusPacket(cursor, packet, censusClock == submission.registerListClocks.end() ? 0 : censusClock->second);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         if (Graphics::Recorder::ComputeChainsEnabled() && Graphics::Recorder::ComputeChainPacketBoundary(header)) {
             const bool syncPoint = opcode == 0x3c || opcode == 0x42 || opcode == 0x46 || opcode == 0x47 || opcode == 0x48 || opcode == 0x49 || opcode == 0x58 || opcode == 0x93;
@@ -509,7 +512,9 @@ void Driver::execute(const Submission& submission) {
         if (predicated) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
-            if (!Pm4::PredicationPasses(queue)) {
+            const bool passed = Pm4::PredicationPasses(queue);
+            Replay::RegionCensus::Note(Replay::ResolvedField::Outcome, {passed});
+            if (!passed) {
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
                 continue;
             }

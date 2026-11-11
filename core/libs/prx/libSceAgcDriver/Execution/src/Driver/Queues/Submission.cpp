@@ -287,10 +287,12 @@ ReferencedProgramScan ReferencedPrograms(std::span<const std::uint32_t> commands
 
 void Driver::readRegisterLists(Submission& submission) {
     submission.registerLists.clear();
+    submission.registerListClocks.clear();
     for (std::size_t cursor = 0; cursor < submission.commands.size(); cursor += Pm4::PacketWords(submission.commands[cursor])) {
         const auto header = submission.commands[cursor];
         if ((header >> 30u) != 3u || !Pm4::IndirectRegisterOpcode((header >> 8u) & 0xffu)) continue;
         try {
+            if (Replay::RegionCensus::Enabled()) submission.registerListClocks.emplace(cursor, GuestMemory::FaultClock());
             submission.registerLists.emplace(cursor, Pm4::ReadIndirectRegisters(std::span<const std::uint32_t>(submission.commands).subspan(cursor, Pm4::PacketWords(header))));
         } catch (const std::exception& error) {
             throw std::runtime_error("AGC driver: " + Pm4::Name(header) + " at DWORD " + std::to_string(cursor) + ": " + error.what());
@@ -544,8 +546,8 @@ void Driver::SubmitFlip(const FlipInfo& info) {
 
 namespace {
 
-void recognizeRegion(std::uint32_t queue, std::span<const std::uint32_t> commands, bool endsFrame) {
-    if (!ArchB::Switches::Enabled(ArchB::Feature::ReplayRecognize)) return;
+std::shared_ptr<Replay::RegionCensus::Region> recognizeRegion(std::uint32_t queue, std::span<const std::uint32_t> commands, bool endsFrame) {
+    if (!ArchB::Switches::Enabled(ArchB::Feature::ReplayRecognize) && !Replay::RegionCensus::Enabled()) return {};
     static auto* const recognizer = new Replay::RegionRecognizer;
     static auto* const guard = new std::mutex;
     static auto* const kindNames = new std::map<std::uint32_t, std::string>;
@@ -583,6 +585,7 @@ void recognizeRegion(std::uint32_t queue, std::span<const std::uint32_t> command
         }
     }
     if (endsFrame) recognizer->EndFrame();
+    return Replay::RegionCensus::Begin(queue, commands, report, endsFrame);
 }
 
 }
@@ -645,8 +648,9 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
         checkStopping();
         require(accepted != std::numeric_limits<std::uint64_t>::max(), "submission serial overflow");
         reserveOutputs(submission);
-        recognizeRegion(queue, submission.commands, !submission.flips.empty());
+        submission.censusRegion = recognizeRegion(queue, submission.commands, !submission.flips.empty());
         if (unorderedFlip && capture == nullptr && accepted != 0 && flipsAhead.load(std::memory_order_acquire) == 0) {
+            const Replay::RegionCensus::RegionScope censusFlip(submission.censusRegion);
             const auto now = FrameTiming::Clock::now();
             auto frame = std::make_shared<FrameTiming>(++frameSerial);
             frame->IncludeSubmission(accepted, now, now, now, true);

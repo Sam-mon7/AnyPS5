@@ -301,6 +301,8 @@ bool Driver::copyKernelRange(std::uint32_t queueId, std::uint64_t source, std::u
     countCopy(outcome.path, bytes, started, locked, &outcome);
     if (traceCopy() && bytes <= cpuMax && outcome.path != CopyCpu) traceCopyRefused(outcome, source, destination, bytes, localDevice);
     if (outcome.path == CopyNotImported || outcome.path == CopyOverGpuMax) return false;
+    Replay::RegionCensus::SetKind(Replay::ResolvedKind::Copy);
+    Replay::RegionCensus::Note(Replay::ResolvedField::Arguments, {source, destination, bytes});
 
     if (outcome.path == CopyCpu) noteForeignWriter(destination, destination + bytes, queueId);
     return true;

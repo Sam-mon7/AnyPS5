@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -3881,6 +3882,8 @@ void NoteGuestWorkIn(const Context& context, VkCommandBuffer commands) {
 }
 
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, const DrawTraceContext* trace, std::uint32_t& subdraw, std::optional<std::uint32_t> pieceFirstIndex = std::nullopt) {
+    DriverDetail::Replay::RegionCensus::DrawArguments(draw);
+    DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Arguments, {DriverDetail::Replay::RegionCensus::Identity(argumentBuffer), argumentOffset, pieceFirstIndex.value_or(0)});
     if (recordDrawCommandsImpl(context, commands, state, draw, inputs, indirect, argumentBuffer, argumentOffset, trace, subdraw, pieceFirstIndex)) NoteGuestWorkIn(context, commands);
 }
 
@@ -4437,6 +4440,16 @@ void markPhase(std::size_t drawPhase) {
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr, bool pipelineStateReuse = false) {
+    if (DriverDetail::Replay::RegionCensus::Active()) {
+        namespace Probe = DriverDetail::Replay::RegionCensus;
+        using Field = DriverDetail::Replay::ResolvedField;
+        Probe::Note(Field::Pipeline, {Probe::Identity(record.pipeline->Selected()), Probe::Identity(record.pipeline->Layout())});
+        for (const auto view : record.targetViews) Probe::Note(Field::Targets, {Probe::Identity(view)});
+        std::array<std::byte, 256> dynamic;
+        std::size_t used = 0;
+        record.pipeline->ContinueInputs(state, dynamic, used);
+        Probe::NoteBytes(Field::State, {dynamic.data(), used});
+    }
     using R = AgcDriver::ArchB::Recorder;
     // B0: a full draw's whole preparation (target lookups, template key and find or build,
     // pipeline) is "other" (reported apart by the recipe counters), a recipe hit's tail "other".
@@ -4673,6 +4686,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     recordPhase(RecordBegin);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
+        resources.ObserveRegionBindings(drawBindings.get());
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
         if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
         if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
@@ -5791,6 +5805,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     } probing;
     StepClock clock;
     const auto refuse = [&](Refusal why) {
+        DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Outcome, {static_cast<std::uint64_t>(why)});
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
         lastOutcome() = why == RefusedNew ? OutcomeNew : OutcomeRefused;
         scratch().inputs = DrawInputs{};
@@ -5799,6 +5814,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     };
     if (!usableIdentity(identity, state, shaders) || draw.indirect == std::nullopt || state.colors.size() > 64) return refuse(RefusedNew);
     auto* slot = lookup(context.device, state, draw, shaders, identity, pipelineStateReuse);
+    if (DriverDetail::Replay::RegionCensus::Active()) DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Slot, {slot != nullptr, keyOf(context.device, identity, draw, shaders, slot != nullptr && slot->wordless), slot != nullptr && slot->wordless});
     if (slot == nullptr) {
         if (stepTiming()) classifyMiss(identity, draw, shaders);
         if (archcNostage::enabled()) patchCensus(context.device, identity, draw, shaders, table().slots.contains(keyOf(context.device, identity, draw, shaders, true)));
@@ -5978,6 +5994,18 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     const VkDescriptorSet boundSet = slotSet != nullptr ? slot->bindVertex : drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE;
     const VkDescriptorSet boundFragmentSet = slotSet != nullptr ? slot->bindFragment : drawBindings != nullptr ? drawBindings->fragmentAllocation.set : VK_NULL_HANDLE;
+    DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Sets, {DriverDetail::Replay::RegionCensus::Identity(boundSet), DriverDetail::Replay::RegionCensus::Identity(boundFragmentSet)});
+    if (DriverDetail::Replay::RegionCensus::Active()) {
+        resources->ObserveRegionBindings(drawBindings.get(), slotSet.get());
+        DriverDetail::Replay::RegionCensus::NoteWords(DriverDetail::Replay::ResolvedField::ResourceKey, slot->contentKey);
+        std::array<std::byte, 256> dynamic;
+        std::size_t used = 0;
+        pipeline->ContinueInputs(state, dynamic, used);
+        DriverDetail::Replay::RegionCensus::NoteBytes(DriverDetail::Replay::ResolvedField::State, {dynamic.data(), used});
+        DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Pipeline, {DriverDetail::Replay::RegionCensus::Identity(pipeline->Selected()), DriverDetail::Replay::RegionCensus::Identity(pipeline->Layout())});
+        for (const auto& entry : moved) DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Buffers, {entry.allocation, entry.address, entry.size});
+        for (const auto view : slot->views) DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Targets, {DriverDetail::Replay::RegionCensus::Identity(view)});
+    }
     const bool setBound = slotSet != nullptr || drawBindings != nullptr;
     const auto* boundReads = slotSet != nullptr ? &slot->bindReads : drawBindings != nullptr ? &drawBindings->inPlaceReads : nullptr;
     ArchC::ProbeAt(ArchC::Probe::BdPrepare);
@@ -6626,6 +6654,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     const auto& reordered = prepared.reordered;
     const auto& reorderPass = prepared.reorderPass;
     const auto& depthLocations = prepared.depthLocations;
+    DriverDetail::Replay::RegionCensus::NoteWords(DriverDetail::Replay::ResolvedField::ResourceKey, contentKey);
     if (lean) {
         RecordedDraw record;
         record.recorder = recorder;
@@ -7735,6 +7764,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
     record.spaceKeep = &spaceKeep;
+    DriverDetail::Replay::RegionCensus::NoteWords(DriverDetail::Replay::ResolvedField::ResourceKey, recipe.key);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace, pipelineStateReuse);
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();

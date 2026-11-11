@@ -24,11 +24,15 @@
 //   cross-item conflicts within K=3 and K=8 windows. Lines: [stage4-m4], [stage4-m4-conflict].
 
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <utility>
 
 namespace AgcDriver::Stage4 {
+
+inline std::atomic<std::uint64_t (*)()> DiagnosticWaitBegin{nullptr};
+inline std::atomic<void (*)(std::uint64_t)> DiagnosticWaitEnd{nullptr};
 
 // "1" in the environment variable (read once per switch).
 bool EnvSwitch(const char* name);
@@ -79,10 +83,12 @@ inline constexpr const char* WaitEndNames[] = {"entry", "polled", "recorder", "f
 class WaitScope {
 public:
     WaitScope(Wait kind, bool spinsFirst) noexcept {
+        if (const auto observe = DiagnosticWaitBegin.load(std::memory_order_acquire)) censusStart = observe();
         if (Tracking()) begin(kind, spinsFirst);
     }
     ~WaitScope() {
         if (active) end();
+        if (censusStart != 0) DiagnosticWaitEnd.load(std::memory_order_acquire)(censusStart);
     }
     WaitScope(const WaitScope&) = delete;
     WaitScope& operator=(const WaitScope&) = delete;
@@ -100,6 +106,7 @@ public:
 
 private:
     void begin(Wait kind, bool spinsFirst) noexcept;
+    std::uint64_t censusStart = 0;
     void blocking() noexcept;
     void end() noexcept;
     bool active = false;

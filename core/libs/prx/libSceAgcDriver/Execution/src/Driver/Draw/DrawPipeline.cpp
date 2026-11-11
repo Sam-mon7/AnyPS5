@@ -275,6 +275,7 @@ bool DrawFinisher::Overlap() {
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (const auto& held : pending) {
         if (held.unknown) return true;
         for (const auto& [first, last] : held.writes) {
@@ -288,6 +289,7 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
     if (!Busy() || !finisherProducer()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
         if (held->unknown) return LabelLookup::Unknown;
         const bool overlaps = std::any_of(held->writes.begin(), held->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
@@ -303,6 +305,7 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
     if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (const auto& held : pending) {
         if (held.unknown) return true;
         for (const auto& [first, last] : held.writes) {
@@ -317,6 +320,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
     if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
 }
 
@@ -375,6 +379,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     const ClearOnExit<Job> clearReclaim{reclaim};
     std::unique_lock lock(mutex);
+    Replay::RegionCensus::PipeLock();
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth) {
@@ -403,6 +408,7 @@ void DrawFinisher::run() {
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
+            Replay::RegionCensus::PipeLock();
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
@@ -416,6 +422,7 @@ void DrawFinisher::run() {
             error = std::current_exception();
         }
         std::lock_guard lock(mutex);
+        Replay::RegionCensus::PipeLock();
         if (error != nullptr && failure == nullptr) failure = error;
         ran.push_back(std::move(jobs.front()));
         jobs.pop_front();
@@ -428,6 +435,7 @@ void DrawFinisher::run() {
 void DrawFinisher::waitEmpty(bool rethrow) {
     if (rethrow) SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
+    Replay::RegionCensus::PipeLock();
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
     if (rethrow && failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
@@ -455,6 +463,7 @@ void DrawFinisher::Drain() {
 void DrawFinisher::ReleaseRan() {
     std::vector<Job> done;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     std::swap(done, ran);
 }
 
@@ -627,6 +636,7 @@ std::uint64_t DrawPipeline::FullOvercommits() {
 std::size_t DrawPipeline::QueuedItems() {
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
+    Replay::RegionCensus::PipeLock();
     return pipeline.items.size();
 }
 
@@ -750,6 +760,7 @@ void DrawPipeline::runResolver() {
         std::shared_ptr<ResolveSlot> slot;
         {
             std::unique_lock lock(mutex);
+            Replay::RegionCensus::PipeLock();
             resolveWake.wait(lock, [&] { return closing || (slot = claimable()) != nullptr; });
             if (closing) break;
             std::uint8_t expected = 0;
@@ -761,6 +772,7 @@ void DrawPipeline::runResolver() {
         resolveCounters().poolNs.fetch_add(slot->ns, std::memory_order_relaxed);
         {
             std::lock_guard lock(mutex);
+            Replay::RegionCensus::PipeLock();
             slot->state.store(2, std::memory_order_release);
         }
         resolveDone.notify_all();
@@ -807,6 +819,7 @@ void DrawPipeline::resolveForApply(ResolveSlot& slot, std::uint64_t serial) {
             SpinUntil(HandoffSpinWindow(), [&] { return slot.state.load(std::memory_order_acquire) == 2; });
             if (slot.state.load(std::memory_order_acquire) != 2) {
                 std::unique_lock lock(mutex);
+                Replay::RegionCensus::PipeLock();
                 resolveDone.wait(lock, [&] { return slot.state.load(std::memory_order_acquire) == 2; });
             }
             counters.waits.fetch_add(1, std::memory_order_relaxed);
@@ -815,6 +828,7 @@ void DrawPipeline::resolveForApply(ResolveSlot& slot, std::uint64_t serial) {
         bool conflict = false;
         {
             std::lock_guard lock(mutex);
+            Replay::RegionCensus::PipeLock();
             conflict = appliedOverlap(slot, serial);
         }
         if (conflict) {
@@ -896,6 +910,7 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 }
 
 void DrawPipeline::enqueue(Item item) {
+    item.censusPacket = Replay::RegionCensus::CapturePipe();
     const bool recorder = ArchB::Recorder::Enabled();
     const auto enqueueStart = recorder ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
@@ -906,6 +921,7 @@ void DrawPipeline::enqueue(Item item) {
     const ClearOnExit<Item> clearReclaim{reclaim, census};
     const auto lockStart = profile || census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);
+    Replay::RegionCensus::PipeLock();
     const auto lockNs = profile || census ? elapsedNs(lockStart) : 0;
     if (!retired.empty()) std::swap(retired, reclaim);
     if (profile) lockWaitNs += elapsedNs(lockStart);
@@ -917,6 +933,7 @@ void DrawPipeline::enqueue(Item item) {
     rethrowFailure();
     if (closing) {
         lock.unlock();
+        const Replay::RegionCensus::CommitScope censusCommit(item.censusPacket);
         if (item.resolve != nullptr) runResolveSlot(*item.resolve);
         item.commit();
         return;
@@ -1128,6 +1145,7 @@ void DrawPipeline::run() {
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
         std::shared_ptr<ResolveSlot> resolveSlot;
+        std::shared_ptr<Replay::RegionCensus::Packet> censusPacket;
         std::uint64_t serial = 0;
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTop);
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
@@ -1139,6 +1157,7 @@ void DrawPipeline::run() {
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
+            Replay::RegionCensus::PipeLock();
             if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
@@ -1151,6 +1170,8 @@ void DrawPipeline::run() {
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
             resolveSlot = items.front().resolve;
+            censusPacket = items.front().censusPacket;
+            Replay::RegionCensus::PipeLock(censusPacket);
             serial = retiredItems.load(std::memory_order_relaxed);
             if (Stage4::ResolveCensus()) {
                 stage4Reads.assign(items.front().reads.begin(), items.front().reads.end());
@@ -1173,6 +1194,8 @@ void DrawPipeline::run() {
         if (collectCensus) GuestMemory::BeginCommitterCensusItem(static_cast<std::uint8_t>(kind));
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitBegin);
         std::optional<CommitCensus> commitCensus;
+        std::optional<Replay::RegionCensus::CommitScope> regionCommit;
+        regionCommit.emplace(censusPacket);
         const bool census = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
         try {
             if (commit != nullptr && resolveSlot != nullptr) {
@@ -1212,7 +1235,8 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
+        Replay::RegionCensus::PipeLock();
         countWrites(items.front().writes, false);
         if (!resolvers.empty()) noteApplied(items.front(), serial);
         const auto kindIndex = static_cast<std::size_t>(items.front().commitKind);
@@ -1230,6 +1254,8 @@ void DrawPipeline::run() {
         outstanding.fetch_sub(1, std::memory_order_release);
         if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemDone);
+        lock.unlock();
+        regionCommit.reset();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -1251,6 +1277,7 @@ void DrawPipeline::Stop() {
     std::vector<std::thread> stoppedResolvers;
     {
         std::lock_guard lock(mutex);
+        Replay::RegionCensus::PipeLock();
         closing = true;
         committer = std::move(thread);
         stoppedResolvers = std::move(resolvers);
@@ -1271,6 +1298,7 @@ void DrawPipeline::Stop() {
 void DrawPipeline::ReleaseRetired() {
     std::vector<Item> done;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     std::swap(done, retired);
 }
 
@@ -1297,6 +1325,7 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, Drain
     if (Stage4::Tracking()) stage4Wait.emplace(Stage4::Wait::PipeDrain, true);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
+    Replay::RegionCensus::PipeLock();
     if (stage4Wait && !items.empty()) stage4Wait->Blocking();
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
@@ -1325,6 +1354,7 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
+    Replay::RegionCensus::PipeLock();
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
     for (const auto& item : pipeline.items) {
         for (const auto& [begin, limit] : item.reads) {
@@ -1342,6 +1372,7 @@ std::uint64_t DrawPipeline::HeldReadQueries() {
 
 void DrawPipeline::ReleaseRunningReads() {
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     if (!items.empty()) items.front().reads.clear();
 }
 
@@ -1359,6 +1390,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     }
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const bool overlaps = std::any_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (!overlaps) continue;
@@ -1375,6 +1407,7 @@ DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
     auto answer = QueuedWrite::None;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         if (std::none_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;
         if (!item->store) return QueuedWrite::Unknown;
@@ -1405,6 +1438,7 @@ void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
 DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
     return watch;
@@ -1418,6 +1452,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     };
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     if (std::any_of(items.begin(), items.end(), [&](const Item& item) { return overlaps(item.writes); })) return true;
     const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
     if (retiredNow == watch.retired) return false;
@@ -1431,6 +1466,7 @@ bool DrawPipeline::Busy() const {
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return true;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (const auto& [range, count] : queuedWrites) {
         for (const auto& [address, end] : ranges) {
             if (address < range.second && range.first < end) return true;
@@ -1442,6 +1478,7 @@ bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uin
 std::optional<DrawPipeline::ItemKind> DrawPipeline::NewestWriter(std::uint64_t address, std::size_t bytes, Range* overlapped) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         const auto write = std::find_if(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; });
         if (write == item->writes.end()) continue;
@@ -1455,6 +1492,7 @@ bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return true;
     std::lock_guard lock(mutex);
+    Replay::RegionCensus::PipeLock();
     for (const auto& [range, count] : queuedWrites) {
         if (address < range.second && range.first < end) return true;
     }

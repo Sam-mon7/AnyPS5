@@ -259,6 +259,7 @@ public:
         std::vector<VkDeviceSize> slotOffsets;
         std::vector<std::size_t> slotSizes;
         std::uint64_t serial = 0;
+        std::vector<VkDescriptorBufferInfo> regionBuffers;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -279,6 +280,7 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
+    void ObserveRegionBindings(const DrawBindings* draw = nullptr, const void* cachedSet = nullptr) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);

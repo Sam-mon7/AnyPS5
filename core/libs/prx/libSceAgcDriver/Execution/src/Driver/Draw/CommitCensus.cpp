@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -26,7 +27,7 @@ constexpr std::array<Names, static_cast<std::size_t>(CommitCensus::Kind::Count)>
 }
 
 CommitCensus::CommitCensus(Kind kind) : kind(kind) {
-    enabled = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus) && ArchB::Recorder::Enabled();
+    enabled = (ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus) || Replay::RegionCensus::Enabled()) && ArchB::Recorder::Enabled();
     if (!enabled) return;
     exceptions = std::uncaught_exceptions();
     previous = CurrentCommit::Get();
@@ -44,6 +45,7 @@ void CommitCensus::Finish(bool failed) {
     const auto elapsed = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
     const auto mutex = GuestMemory::ThreadGpuMutexAcquireNs() - mutexNs;
     const auto gpu = std::max(0.0, Graphics::Recorder::ThreadWaitedMs() - gpuWaitMs) * 1000000.0;
+    Replay::RegionCensus::CommitTime(elapsed, mutex, gpu, failed);
     CurrentCommit::Set(previous);
     GuestMemory::SetGpuMutexCensusForThread(previousMutexCensus);
     enabled = false;

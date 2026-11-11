@@ -357,6 +357,9 @@ void Driver::noteFillWriter(std::uint32_t queue, std::uint64_t base, std::size_t
 }
 
 void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::size_t bytes, const std::array<std::uint32_t, 4>& pattern, const std::shared_ptr<VulkanDevice>& localDevice, bool memoryValueFill, bool noteMetadata) {
+    Replay::RegionCensus::SetKind(Replay::ResolvedKind::Fill);
+    Replay::RegionCensus::Note(Replay::ResolvedField::Arguments, {base, bytes, memoryValueFill});
+    Replay::RegionCensus::NoteWords(Replay::ResolvedField::Arguments, pattern);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<std::uint64_t> fills{0}, filledBytes{0}, cpuFills{0};
 

@@ -469,6 +469,8 @@ bool Driver::enqueueConstantRamDump(std::span<const std::uint32_t> packet, std::
 }
 
 void Driver::commitStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
+    Replay::RegionCensus::Note(Replay::ResolvedField::Arguments, {address, bytes.size()});
+    Replay::RegionCensus::NoteBytes(Replay::ResolvedField::Arguments, bytes);
     std::optional<PerformanceTimer> census;
     if (CommitCensus::LabelActive()) census.emplace("J3.LabelStore");
     constexpr std::size_t gpuStoreLimit = 65536;
@@ -565,6 +567,8 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 }
 
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt) {
+    Replay::RegionCensus::Note(Replay::ResolvedField::Arguments, {address, bytes.size(), interrupt.value_or(0)});
+    Replay::RegionCensus::NoteBytes(Replay::ResolvedField::Arguments, bytes);
     std::optional<PerformanceTimer> census;
     if (CommitCensus::LabelActive()) census.emplace("J3.LabelEop");
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);

@@ -17,6 +17,7 @@ struct RegionReport {
     std::uint32_t draws = 0;
     std::uint32_t dispatches = 0;
     std::uint32_t prefixPackets = 0;
+    std::uint32_t prefixWords = 0;
     std::uint32_t prefixDraws = 0;
     std::uint32_t prefixDispatches = 0;
     std::uint32_t patchWords = 0;

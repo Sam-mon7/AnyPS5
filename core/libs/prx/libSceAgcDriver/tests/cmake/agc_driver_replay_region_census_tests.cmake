@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    set_tests_properties(agc_driver_replay_region_census PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_ARCHB_RECORDER=1;APS5_ARCHB_DRAW_HIT_CENSUS=1;APS5_ARCHB_REPLAY_REGION_CENSUS=1;APS5_ARCHB_REPLAY_REGION_CENSUS_VERIFY=1")
+    add_test(NAME agc_replay_region_census_timing_witness COMMAND agc_driver_replay_region_census_tests)
+    set_tests_properties(agc_replay_region_census_timing_witness PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_ARCHB_RECORDER=1;APS5_ARCHB_DRAW_HIT_CENSUS=1;APS5_ARCHB_REPLAY_REGION_CENSUS=1;APS5_ARCHB_REPLAY_REGION_CENSUS_VERIFY=1;APS5_REPLAY_REGION_CENSUS_TIMING_ONLY=1")
+    if(WIN32)
+        set_property(TEST agc_replay_region_census_timing_witness APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

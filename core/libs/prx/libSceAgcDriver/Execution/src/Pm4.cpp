@@ -1,5 +1,6 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
@@ -130,6 +131,7 @@ Registers& registersFor(QueueState& queue, std::uint32_t opcode) {
 }
 
 void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
+    DriverDetail::Replay::RegionCensus::RegisterWrite(opcode, offset, value);
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
     registersFor(queue, opcode).insert_or_assign(offset, value);
@@ -600,6 +602,7 @@ bool IsTagMarker(std::span<const std::uint32_t> packet) {
 namespace {
 
 bool waitCompares(std::span<const std::uint32_t> packet, bool wide, std::uint64_t value) {
+    DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Outcome, {value});
     const std::uint64_t reference = wide ? address(packet[4], packet[5]) : packet[4];
     const std::uint64_t mask = wide ? address(packet[6], packet[7]) : packet[5];
     const auto masked = value & mask;
@@ -1000,6 +1003,7 @@ DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueSta
 }
 
 std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet) {
+    if (DriverDetail::Replay::RegionCensus::Active()) DriverDetail::Replay::RegionCensus::RegisterReadClock(GuestMemory::FaultClock());
     require(packet.size() == 5 && IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected indirect register packet");
     // Named for the [hooksync] attribution (the read goes through the flush hook).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
@@ -1039,6 +1043,7 @@ void ExecuteIndirectRegisters(std::span<const std::uint32_t> packet, std::span<c
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     require(packet.size() == 5 && IndirectRegisterOpcode(opcode), "expected indirect register packet");
     require(pairs.size() == static_cast<std::size_t>(packet[4]) * 2, "indirect register list does not match its packet");
+    DriverDetail::Replay::RegionCensus::Registers(packet, pairs);
     const auto usable = [&](std::uint32_t value) { return !skipInvalid || IndirectRegistersValid(std::span(&value, 1)); };
     for (std::size_t i = 0; i < pairs.size(); i += 2) {
         if (usable(pairs[i])) registerOffset(pairs[i]);

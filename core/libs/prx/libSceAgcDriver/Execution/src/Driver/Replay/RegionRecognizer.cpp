@@ -44,6 +44,7 @@ RegionReport RegionRecognizer::Observe(std::uint32_t queue, std::span<const std:
         }
         if (structure && (cursor + words > before->words.size() || before->words[cursor] != header)) structure = false;
         if (structure) {
+            report.prefixWords = static_cast<std::uint32_t>(cursor + words);
             ++report.prefixPackets;
             if ((kind >> 8u) == 3u && Pm4::DrawOpcode(kind & 0xffu)) ++report.prefixDraws;
             else if (kind == 0x315u || kind == 0x316u) ++report.prefixDispatches;

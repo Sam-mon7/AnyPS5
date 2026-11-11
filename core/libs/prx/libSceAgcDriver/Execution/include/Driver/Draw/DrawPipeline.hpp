@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
 #include <array>
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -203,6 +204,7 @@ private:
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
         std::shared_ptr<ResolveSlot> resolve;
+        std::shared_ptr<Replay::RegionCensus::Packet> censusPacket;
     };
     struct Applied {
         std::uint64_t serial = 0;

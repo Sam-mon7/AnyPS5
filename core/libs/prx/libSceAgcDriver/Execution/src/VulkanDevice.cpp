@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Replay/RegionCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
@@ -6250,12 +6251,15 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Pipeline, {DriverDetail::Replay::RegionCensus::Identity(record.objects->pipeline)});
     PerformanceTimer recorderTiming("Vulkan.RecordDispatch", ArchB::Recorder::Phase::Record);
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
     const auto& context = *record.context;
     auto& resources = *record.resources;
+    DriverDetail::Replay::RegionCensus::Note(DriverDetail::Replay::ResolvedField::Arguments, {record.x, record.y, record.z, record.arguments});
+    if (record.pushBytes != nullptr) DriverDetail::Replay::RegionCensus::NoteBytes(DriverDetail::Replay::ResolvedField::Push, *record.pushBytes);
     const auto arguments = record.arguments;
     const auto* argumentImport = record.argumentImport;
     const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
@@ -6452,6 +6456,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     if (!privateReady) {
         context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
+        if (record.bindings != nullptr) resources.ObserveRegionBindings(record.bindings.get());
         if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
         if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
         else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
@@ -6993,6 +6998,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         timer.phase(PhasePipeline);
     }
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText, std::move(privateDispatch)};
+    DriverDetail::Replay::RegionCensus::NoteWords(DriverDetail::Replay::ResolvedField::ResourceKey, contentKey);
     return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion, recipeFailure);
 }
 
@@ -7119,6 +7125,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     if (arguments != 0) std::snprintf(groupsText, sizeof(groupsText), "indirect");
     else std::snprintf(groupsText, sizeof(groupsText), "%ux%ux%u", x, y, z);
     const auto& recipe = *hit->recipe;
+    DriverDetail::Replay::RegionCensus::NoteWords(DriverDetail::Replay::ResolvedField::ResourceKey, recipe.key);
     auto& counters = Recipes().kinds[hit->indirect ? 1 : 0];
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
