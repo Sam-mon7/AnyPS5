@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -468,6 +469,117 @@ void NestedSpeculationRefusesProtectionChanges() {
     Require(copied == AgcDriver::GuestMemory::Compare::Unmapped && !readable, "nested speculation: a protected child was read through stale cached page permissions");
 }
 
+void NestedReplayPatchBases(const std::filesystem::path& control, bool verify) {
+    using D = AgcDriver::DriverDetail::Driver;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    using R = AgcDriver::ArchB::Recorder;
+    using AgcDriver::Graphics::ArchcReplayCounts;
+    alignas(256) static constexpr std::array<std::uint32_t, 16> code{
+        0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu,
+        0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u,
+        0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+    alignas(8) static Header header{};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, 20> descriptors{};
+    alignas(16) static std::array<std::array<std::uint64_t, 2>, 20> roots{};
+    static const TiledTarget target;
+    static const TiledTarget inputs;
+    auto* data = static_cast<float*>(const_cast<void*>(inputs.Data()));
+    const auto arguments = reinterpret_cast<std::uintptr_t>(inputs.Data()) + 32768;
+    const std::array<std::uint32_t, 4> record{3, 1, 0, 0};
+    std::memcpy(reinterpret_cast<void*>(arguments), record.data(), sizeof(record));
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code.data(), sizeof(code), 1);
+    for (std::size_t index = 0; index < roots.size(); ++index) {
+        const auto address = reinterpret_cast<std::uintptr_t>(data + index * 64);
+        data[index * 64] = index >= 12 ? 0.75f : 0.25f;
+        descriptors[index] = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 64u, 0x30016facu};
+        roots[index][0] = reinterpret_cast<std::uintptr_t>(descriptors[index].data());
+    }
+    Require(S::Enabled(F::ArchcDrawReplay) && S::Enabled(F::ArchcReplayPatchSlots) && S::Enabled(F::FixDrawRelocNested), "patch bases: replay prerequisites are not enabled");
+    R::Boundary(true, 0, R::Clock::now());
+    const auto draw = [&](std::size_t index, bool sync = true) {
+        auto commands = DrawFrom({roots[index].data()}, TriangleVertexCode.data(), code.data(), target.Data(), RenderTargetAttrib3);
+        commands.resize(commands.size() - 3);
+        Append(commands, 0x11, {1, static_cast<std::uint32_t>(arguments), static_cast<std::uint32_t>(arguments >> 32u)});
+        Append(commands, 0x24, {0, 0x280, 0x280, 2});
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "patch bases: indirect submission failed");
+        Require(D::Get().WaitIdleFor(std::chrono::seconds(10)), "patch bases: queue did not finish recording");
+        if (sync) {
+            AgcDriverWaitIdle_nid_postfix();
+            AgcDriver::GuestMemory::WtFaultFlip();
+        }
+        return D::Get().DrawCacheCounters();
+    };
+    const auto pixels = [&](std::uint8_t red) {
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(target.Data()), TiledTargetBytes);
+        std::vector<std::byte> image(TiledTargetBytes);
+        std::memcpy(image.data(), target.Data(), image.size());
+        std::size_t written = 0;
+        for (std::size_t offset = 0; offset < image.size(); offset += 4) {
+            if (image[offset] == std::byte{0} && image[offset + 1] == std::byte{0} && image[offset + 2] == std::byte{0} && image[offset + 3] == std::byte{0}) continue;
+            Require(image[offset] == static_cast<std::byte>(red) && image[offset + 1] == std::byte{0} && image[offset + 2] == std::byte{0} && image[offset + 3] == static_cast<std::byte>(red), "patch bases: the rendered buffer value was stale at pixel " + std::to_string(offset / 4));
+            ++written;
+        }
+        Require(written != 0, "patch bases: the draw wrote no pixels");
+        return image;
+    };
+    for (std::size_t index = 0; index < 12; ++index) draw(index);
+    for (std::size_t index = 0; index < 15; ++index) data[index * 64] = 0.0f;
+    draw(11, false);
+    static_cast<void>(R::Collect(R::Clock::now()));
+    const auto before = ArchcReplayCounts();
+    auto cached = D::Get().DrawCacheCounters();
+    for (std::size_t index = 12; index < 16; ++index) {
+        const auto previous = cached;
+        cached = draw(index, false);
+        Require(cached.hits == previous.hits + 1, "patch bases: changing both nested tables and the buffer base did not hit the draw cache");
+    }
+    const auto after = ArchcReplayCounts();
+    auto counts = R::Collect(R::Clock::now()).counters;
+    if ((verify && after.verifyChecks != before.verifyChecks + 4) || (!verify && after.hits != before.hits + 4)) {
+        for (const auto& [name, value] : counts) {
+            if ((name.starts_with("archc_replay_") || name.starts_with("archc_target_") || name.starts_with("fix_draw_reloc_") || name.starts_with("fix_buffer_base_")) && value != 0) std::cerr << name << '=' << value << '\n';
+        }
+    }
+    Require(counts["fix_draw_reloc_nested_hits"] == 4, "patch bases: the measured draws did not all take nested relocation");
+    Require(counts["fix_buffer_base_hits"] == 4, "patch bases: the measured draws did not all patch buffer bases");
+    if (verify) Require(after.verifyChecks == before.verifyChecks + 4 && after.verifyMismatches == 0, "patch bases: VERIFY did not check every changed base or reported a mismatch");
+    else Require(after.hits == before.hits + 4 && after.legacy == before.legacy, "patch bases: relocated buffer-base draws did not replay through the donor slot (hits " + std::to_string(after.hits - before.hits) + ", captures " + std::to_string(after.captures - before.captures) + ", legacy " + std::to_string(after.legacy - before.legacy) + ")");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto actual = pixels(191);
+    unsigned sequence = 0;
+    const auto enable = [&](bool enabled) {
+        {
+            std::ofstream stream(control, std::ios::trunc);
+            stream << ++sequence << " C_REPLAY_PATCH_BASES=" << enabled << '\n';
+            Require(stream.good(), "patch bases: cannot write reference switches");
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (S::Sequence() != sequence && std::chrono::steady_clock::now() < deadline) {
+            S::PollControl();
+            std::this_thread::yield();
+        }
+        Require(S::Sequence() == sequence && S::Enabled(F::CReplayPatchBases) == enabled, "patch bases: reference switch did not apply");
+    };
+    enable(false);
+    std::memset(const_cast<void*>(target.Data()), 0, TiledTargetBytes);
+    const auto referenceBefore = ArchcReplayCounts();
+    const auto referenceCached = draw(16);
+    Require(referenceCached.hits == cached.hits + 1, "patch bases: switch-off reference did not retain nested relocation");
+    Require(ArchcReplayCounts().hits == referenceBefore.hits, "patch bases: switch-off reference unexpectedly replayed");
+    Require(actual == pixels(191), "patch bases: replay image differs from the same nested-relocated draw with C_REPLAY_PATCH_BASES off");
+    enable(true);
+    descriptors[17][2] = 32;
+    data[17 * 64] = 1.0f;
+    const auto refusedBefore = ArchcReplayCounts();
+    const auto refused = draw(17);
+    Require(refused.hits == referenceCached.hits && ArchcReplayCounts().hits == refusedBefore.hits, "patch bases: a changed unmasked descriptor reused the old donor or replay slot");
+    static_cast<void>(pixels(255));
+    std::cout << "Nested buffer-base replay: " << after.hits - before.hits << " hits, " << after.verifyChecks - before.verifyChecks << " verification checks; " << counts["fix_buffer_base_hits"] << " nested buffer-base hits; " << actual.size() << " image bytes compared with switch off; stale donor buffers checked\n";
+}
+
 void NestedRelocationPath(const std::filesystem::path& control) {
     using D = AgcDriver::DriverDetail::Driver;
     using S = AgcDriver::ArchB::Switches;
@@ -564,7 +676,7 @@ int main(int argc, char** argv) {
             NestedSpeculationRefusesProtectionChanges();
             return 0;
         }
-        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels")) {
+        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels" || std::string(argv[1]) == "--replay-patch-bases" || std::string(argv[1]) == "--replay-patch-bases-verify")) {
             struct Control {
                 std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-nested-relocation-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
                 ~Control() { std::filesystem::remove(path); }
@@ -578,7 +690,8 @@ int main(int argc, char** argv) {
 #endif
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
-            NestedRelocationPath(control.path);
+            if (std::string(argv[1]).starts_with("--replay-patch-bases")) NestedReplayPatchBases(control.path, std::string(argv[1]) == "--replay-patch-bases-verify");
+            else NestedRelocationPath(control.path);
             AgcDriverShutdown_nid_postfix();
             std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";
             return 0;

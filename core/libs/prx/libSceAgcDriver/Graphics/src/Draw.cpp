@@ -4890,6 +4890,9 @@ struct PreparedDraw {
     const DrawSlotIdentity* identity = nullptr;
     bool slotVerify = false;
     bool slotVerifyPatch = false;
+    std::optional<std::array<std::byte, PipelinePushConstantBytes>> slotReplayPush;
+    std::optional<std::vector<ShaderResources::MovedBuffer>> slotReplayMoved;
+    std::vector<std::vector<std::uint32_t>> slotReplayMovedWords;
     bool slotWordless = false;
     bool slotCapture = false;
 };
@@ -5092,8 +5095,8 @@ namespace archcSlots {
 constexpr std::size_t MaxStages = 8;
 constexpr std::size_t TableLimit = 8192;
 
-enum Refusal : std::size_t { RefusedNew, RefusedSwitches, RefusedRecorder, RefusedInputs, RefusedTargets, RefusedDepth, RefusedTemplate, RefusedProof, RefusedMoved, RefusedArgs, RefusedObjects, RefusedTemplateGone, RefusedTemplateMembership, RefusalCount };
-constexpr std::array<const char*, RefusalCount> RefusalNames{"new", "switches", "recorder", "inputs", "targets", "depth", "template", "proof", "moved", "args", "objects", "template_gone", "template_membership"};
+enum Refusal : std::size_t { RefusedNew, RefusedSwitches, RefusedRecorder, RefusedInputs, RefusedTargets, RefusedDepth, RefusedTemplate, RefusedProof, RefusedMoved, RefusedArgs, RefusedObjects, RefusedTemplateGone, RefusedTemplateMembership, RefusedPatchBases, RefusalCount };
+constexpr std::array<const char*, RefusalCount> RefusalNames{"new", "switches", "recorder", "inputs", "targets", "depth", "template", "proof", "moved", "args", "objects", "template_gone", "template_membership", "patch_bases"};
 enum Ineligible : std::size_t { IneligiblePath, IneligibleRecord, IneligibleShape, IneligibleTargets, IneligibleInputs, IneligibleTemplate, IneligibleIdentity, IneligibleUnrecorded, IneligibleWaited, IneligibleListed, IneligibleCompletion, IneligibleMultisampled, IneligiblePass, IneligibleCopied, IneligibleLease, IneligibleAddress, IneligibleNotHit, IneligibleNotReusable, IneligibleMembership, IneligibleFaultChecks, IneligibleCount };
 constexpr std::array<const char*, IneligibleCount> IneligibleNames{"path", "record", "shape", "targets", "inputs", "template", "identity", "unrecorded", "waited", "listed", "completion", "multisampled", "pass", "copied", "lease", "address", "not_hit", "not_reusable", "membership", "fault_checks"};
 enum Step : std::size_t { StepChecks, StepInputs, StepTargets, StepDepth, StepProof, StepMoved, StepArgs, StepBindings, StepRecord, StepKeep, StepCount };
@@ -5290,6 +5293,7 @@ std::uint32_t currentSwitches() {
     bits |= Switches::Enabled(Feature::ZeroCopyMoved) ? 4u : 0u;
     bits |= Switches::Enabled(Feature::FixDrawSetPool) ? 8u : 0u;
     bits |= Switches::Enabled(Feature::PipeDrawReuse) ? 16u : 0u;
+    bits |= Switches::Enabled(Feature::CReplayPatchBases) ? 32u : 0u;
     return bits;
 }
 
@@ -5390,11 +5394,17 @@ bool sameDraw(const Pm4::DrawParameters& a, const Pm4::DrawParameters& b) {
     return !a.indirect.has_value() || sameIndirect(*a.indirect, *b.indirect);
 }
 
-// C_REPLAY_PATCH_SLOTS: an identity with a data-word patched stage whose words reach only its FlattenedSrt binding
-// (no buffer-base words), which the draw content key leaves out (movable buffers) and the moved list carries.
+bool wordlessStage(const DrawSlotStage& stage) {
+    return stage.patched && (!stage.bufferBases || cutEnabled(AgcDriver::ArchB::Feature::CReplayPatchBases));
+}
+
+bool refreshPatchedIdentity(const DrawSlotIdentity& identity) {
+    return cutEnabled(AgcDriver::ArchB::Feature::CReplayPatchBases) && std::ranges::any_of(identity.stages, [](const DrawSlotStage& stage) { return stage.patched; });
+}
+
 bool wordlessIdentity(const DrawSlotIdentity& identity) {
     if (!cutEnabled(AgcDriver::ArchB::Feature::ArchcReplayPatchSlots) || !MovableBuffers()) return false;
-    return std::ranges::any_of(identity.stages, [](const DrawSlotStage& stage) { return stage.patched && !stage.bufferBases; });
+    return std::ranges::any_of(identity.stages, wordlessStage);
 }
 
 std::uint64_t keyOf(VkDevice device, const DrawSlotIdentity& identity, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool wordless = false) {
@@ -5406,7 +5416,7 @@ std::uint64_t keyOf(VkDevice device, const DrawSlotIdentity& identity, const Pm4
         hash = mix(hash, reinterpret_cast<std::uintptr_t>(stage.variant.get()));
         hash = mix(hash, (static_cast<std::uint64_t>(shaders[i].stage) << 32u) | shaders[i].pushConstantOffset);
         hash = mix(hash, (stage.patched ? 1u : 0u) | (stage.bufferBases ? 2u : 0u));
-        if (wordless && stage.patched && !stage.bufferBases) continue;
+        if (wordless && wordlessStage(stage)) continue;
         for (const auto word : stage.words) hash = mix(hash, word);
     }
     hash = mix(hash, draw.indexAddress);
@@ -5431,7 +5441,7 @@ bool sameIdentity(const Slot& slot, VkDevice device, const State& state, const P
     if (slot.device != device || slot.stateOwner != identity.state.get() || slot.stageCount != shaders.size() || slot.pipelineStateReuse != pipelineStateReuse || slot.stateHeld.expired() || slot.wordless != wordless) return false;
     for (std::size_t i = 0; i < shaders.size(); ++i) {
         const auto& stage = identity.stages[i];
-        const bool words = !(wordless && stage.patched && !stage.bufferBases);
+        const bool words = !(wordless && wordlessStage(stage));
         if (slot.ownerRaw[i] != stage.owner.get() || slot.variantRaw[i] != stage.variant.get() || slot.patched[i] != ((stage.patched ? 1u : 0u) | (stage.bufferBases ? 2u : 0u)) || slot.stages[i].stage != shaders[i].stage || slot.stages[i].pushConstantOffset != shaders[i].pushConstantOffset || (words && slot.words[i] != stage.words) || slot.owners[i].expired() || (stage.patched && slot.variants[i].expired())) return false;
     }
     return sameDraw(slot.draw, draw);
@@ -5560,7 +5570,7 @@ std::uint64_t hashImages(std::uint64_t hash, std::span<const std::pair<VkImage, 
     return hash;
 }
 
-std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
+std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot, const std::array<std::byte, PipelinePushConstantBytes>* replayPush = nullptr) {
     std::array<std::uint64_t, ComponentCount> parts{};
     auto& targets = parts[ComponentTargets];
     for (const auto* raw : slot.targetRaw) targets = mix(targets, reinterpret_cast<std::uintptr_t>(raw));
@@ -5586,10 +5596,11 @@ std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
     pass = hashImages(pass, slot.pass.images);
     pass = hashImages(pass, slot.pass.attachments);
     auto& push = parts[ComponentPush];
+    const auto& bytes = replayPush != nullptr ? *replayPush : slot.push;
     push = mix(push, slot.pushStages);
-    for (std::size_t offset = 0; offset < slot.push.size(); offset += 8) {
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 8) {
         std::uint64_t word = 0;
-        std::memcpy(&word, slot.push.data() + offset, std::min<std::size_t>(8, slot.push.size() - offset));
+        std::memcpy(&word, bytes.data() + offset, std::min<std::size_t>(8, bytes.size() - offset));
         push = mix(push, word);
     }
     return parts;
@@ -5714,7 +5725,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     pass.passReads.resize(pass.passReads.size() - inputs.inPlaceReads.size());
     pass.linearReads.resize(pass.linearReads.size() - inputs.inPlaceReads.size());
     slot.fragmentOutputs = inputs.fragmentOutputs;
-    slot.movedStatic = !slot.wordless && std::ranges::all_of(prepared.resolved.moved, [](const ShaderResources::MovedBuffer& entry) { return !entry.words.empty(); });
+    slot.movedStatic = !slot.wordless && !refreshPatchedIdentity(identity) && std::ranges::all_of(prepared.resolved.moved, [](const ShaderResources::MovedBuffer& entry) { return !entry.words.empty(); });
     if (slot.movedStatic) {
         slot.movedWords.reserve(prepared.resolved.moved.size());
         for (const auto& entry : prepared.resolved.moved) slot.movedWords.emplace_back(entry.words.begin(), entry.words.end());
@@ -5739,7 +5750,9 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         slot.push = AssemblePushConstants(shaders);
         resources->PatchPushConstants(slot.push);
     }
-    if (predicted.has_value()) {
+    if (predicted.has_value() && prepared.slotReplayMoved.has_value() && !sameMoved(*prepared.slotReplayMoved, prepared.resolved.moved)) {
+        mismatch(ComponentTemplate);
+    } else if (predicted.has_value()) {
         const auto now = fingerprint(slot);
         for (std::size_t component = 0; component < ComponentCount; ++component) {
             if (now[component] != (*predicted)[component]) {
@@ -5812,6 +5825,8 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     slot->replayedLast = false;
     slot->lastUse = ++table().uses;
     if (slot->switches != currentSwitches() || diagnosticsBlock()) return refuse(RefusedSwitches);
+    const bool refreshPatched = refreshPatchedIdentity(identity);
+    if (refreshPatched && (slot->movedStatic || PushConstantStages(shaders) != slot->pushStages)) return refuse(RefusedPatchBases);
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || context.recorder != recorder) return refuse(RefusedRecorder);
     auto resources = slot->resources.lock();
@@ -5871,7 +5886,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     clock.Mark(StepProof);
     // C_REPLAY_SLOT_BINDINGS: a non-static list is the slot's last live list while its live conditions hold.
-    const bool slotBindings = cutEnabled(Feature::ArchcReplaySlotBindings);
+    const bool slotBindings = cutEnabled(Feature::ArchcReplaySlotBindings) && !refreshPatched;
     std::optional<std::vector<ShaderResources::MovedBuffer>> liveMoved;
     bool movedFromSlot = false;
     if (!slot->movedStatic) {
@@ -5899,11 +5914,34 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (resources->NeedsCompletion() != slot->completion || resources->HasCopiedWrites() || resources->HoldsLease() || resources->UsesAddressTable() || !resources->Reusable()) return refuse(RefusedTemplate);
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     clock.Mark(StepArgs);
+    if (refreshPatched) {
+        prepared.slotReplayPush = AssemblePushConstants(shaders);
+        resources->PatchPushConstants(*prepared.slotReplayPush);
+        if (verifyPeriod() != 0 && *prepared.slotReplayPush != slot->push) {
+            static std::uint64_t reports = 0;
+            if (reports++ < 8) {
+                for (std::size_t offset = 0; offset < slot->push.size(); offset += sizeof(std::uint32_t)) {
+                    std::uint32_t captured = 0, live = 0;
+                    std::memcpy(&captured, slot->push.data() + offset, sizeof(captured));
+                    std::memcpy(&live, prepared.slotReplayPush->data() + offset, sizeof(live));
+                    if (captured != live) std::fprintf(stderr, "[archc] replay patched push byte %zu: captured 0x%08x live 0x%08x\n", offset, captured, live);
+                }
+            }
+        }
+    }
     const bool patchVerify = slot->wordless && cutVerifyNow(CutPatchSlots);
     if (patchVerify || verifyNow()) {
         counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         prepared.slotVerify = true;
         prepared.slotVerifyPatch = patchVerify;
+        if (refreshPatched) {
+            prepared.slotReplayMoved.emplace(moved.begin(), moved.end());
+            prepared.slotReplayMovedWords.reserve(moved.size());
+            for (std::size_t i = 0; i < moved.size(); ++i) {
+                auto& words = prepared.slotReplayMovedWords.emplace_back(moved[i].words.begin(), moved[i].words.end());
+                (*prepared.slotReplayMoved)[i].words = words;
+            }
+        }
         lastOutcome() = OutcomeVerified;
         work.inputs = DrawInputs{};
         work.targets.clear();
@@ -6062,7 +6100,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         resources->BindDrawUse(commands, pipeline->Layout(), drawUse.get());
     }
     ArchC::ProbeAt(ArchC::Probe::RcBind);
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, &slot->push, slot->pushStages, 0, false, inputs.meshLayerStride, reuse);
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, prepared.slotReplayPush ? &*prepared.slotReplayPush : &slot->push, slot->pushStages, 0, false, inputs.meshLayerStride, reuse);
     ArchC::ProbeAt(ArchC::Probe::RcPush);
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
     auto eachDrawTiming = Recorder::NoTiming;
@@ -6669,7 +6707,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         const bool inputsInPlace = inputs.vertexBuffers.empty() && inputs.indices == nullptr;
         std::optional<std::array<std::uint64_t, archcSlots::ComponentCount>> predicted;
         if (slotCapture && prepared.slotVerify) {
-            if (auto* slot = archcSlots::lookup(context.device, state, draw, shaders, *prepared.identity, prepared.pipelineStateReuse)) predicted = archcSlots::fingerprint(*slot);
+            if (auto* slot = archcSlots::lookup(context.device, state, draw, shaders, *prepared.identity, prepared.pipelineStateReuse)) predicted = archcSlots::fingerprint(*slot, prepared.slotReplayPush ? &*prepared.slotReplayPush : nullptr);
         }
         record.slotCapture = slotCapture ? &passCapture : nullptr;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace, prepared.pipelineStateReuse);

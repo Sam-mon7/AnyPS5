@@ -16054,6 +16054,44 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
         return read;
     };
     const auto counts = [] { return ArchcReplayCounts(); };
+    if (scenario == "patch_bases_refused") {
+        using Census = AgcDriver::ArchB::Recorder;
+        Require(on && Switches::Enabled(Feature::CReplayPatchBases) && !verify, "patch-base refusal needs replay, patch bases and VERIFY off");
+        auto identity = wholeIdentity;
+        identity.stages[1].variant = pixel;
+        identity.stages[1].patched = true;
+        identity.stages[1].bufferBases = true;
+        identity.stages[1].words = {0};
+        for (int i = 0; i < 4; ++i) {
+            ++identity.stages[1].words[0];
+            draw(whole, identity);
+            settle();
+        }
+        ++identity.stages[1].words[0];
+        draw(whole, identity);
+        ++identity.stages[1].words[0];
+        draw(whole, identity);
+        const auto warmed = counts();
+        Require(warmed.hits != 0, "patch-base refusal did not first exercise a replay slot");
+        static_cast<void>(Census::Collect(Census::Clock::now()));
+        pixel->pushConstants.resize(4);
+        ++identity.stages[1].words[0];
+        bool invalidLayout = false;
+        try {
+            draw(whole, identity);
+        } catch (const std::runtime_error& error) {
+            invalidLayout = std::string_view(error.what()).find("recompiler push constant metadata disagrees with SPIR-V") != std::string_view::npos;
+            if (!invalidLayout) throw;
+        }
+        const auto after = counts();
+        auto counters = Census::Collect(Census::Clock::now()).counters;
+        Require(invalidLayout && after.hits == warmed.hits, "patch-base replay accepted malformed push-stage metadata instead of preserving full-path validation");
+        Require(counters["archc_replay_refused_patch_bases"] == 1, "patch-base replay did not count the unsupported push-stage layout refusal");
+        const auto image = texels(*whole);
+        Require(std::all_of(image.begin(), image.end(), [](std::byte value) { return value == std::byte{255}; }), "the refused patch-base draw damaged the previous valid pixels");
+        std::cout << "agc_archc_replay_patch_bases_refused: ok\n";
+        return 0;
+    }
     if (splitFaces) {
         using Census = AgcDriver::ArchB::Recorder;
         Require(on, "split-face cases require draw replay and its prerequisites");
