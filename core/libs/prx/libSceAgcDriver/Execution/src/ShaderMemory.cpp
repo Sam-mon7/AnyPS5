@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -10,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -226,6 +228,8 @@ bool sharedPagePools() {
     return enabled;
 }
 
+struct ReclaimPagePoolSlot {};
+
 template<typename TPage>
 struct SharedPagePool {
     std::mutex mutex;
@@ -244,6 +248,10 @@ void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
     waitedMsProvider.store(provider, std::memory_order_release);
 }
 
+void ShaderMemory::MarkReclaimThread() {
+    HostThreadSlot<bool, ReclaimPagePoolSlot>::Set(true);
+}
+
 ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regions, PendingWriteQuery pendingWrite, PendingWriteObserver observe, HookWaitCounter hookWaits, PendingWriteQuery pendingSpan, bool traceDescriptors) : pendingWrite(pendingWrite), observe(observe), hookWaits(hookWaits), pendingSpan(pendingSpan != nullptr ? pendingSpan : pendingWrite), spanQuery(pendingSpan != nullptr), traceDescriptors(traceDescriptors) {
     const ShaderRecompiler::RequestMemoryView validated(regions);
     initial.reserve(regions.size());
@@ -252,7 +260,7 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
 }
 
 ShaderMemory::~ShaderMemory() {
-    if (sharedPagePools() && !pages.empty()) {
+    if ((sharedPagePools() || HostThreadSlot<bool, ReclaimPagePoolSlot>::Get()) && !pages.empty()) {
         auto& shared = sharedPagePool<Page>();
         std::lock_guard lock(shared.mutex);
         for (const auto& [base, page] : pages) {
@@ -312,7 +320,7 @@ std::size_t ShaderMemory::pageAtOrAfter(std::uint64_t base) const {
 
 ShaderMemory::Page& ShaderMemory::addPage(std::size_t position, std::uint64_t base) {
     auto& pool = pagePool<Page>();
-    if (pool.empty() && sharedPagePools()) {
+    if (pool.empty() && (sharedPagePools() || ArchB::Switches::Enabled(ArchB::Feature::PipeAsyncReclaim))) {
         auto& shared = sharedPagePool<Page>();
         std::lock_guard lock(shared.mutex);
         for (std::size_t i = 0; i < 32 && !shared.pages.empty(); ++i) {

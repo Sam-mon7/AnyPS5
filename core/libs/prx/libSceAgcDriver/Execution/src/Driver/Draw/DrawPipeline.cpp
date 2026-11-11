@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
@@ -230,6 +231,11 @@ struct ClearOnExit {
         ArchB::Recorder::Count("j3b_enqueue_reclaimed_items", static_cast<double>(items.size()));
         items.clear();
     }
+};
+
+struct NotifyOnExit {
+    std::condition_variable* wake = nullptr;
+    ~NotifyOnExit() { if (wake != nullptr) wake->notify_one(); }
 };
 
 }
@@ -900,6 +906,12 @@ void DrawPipeline::enqueue(Item item) {
     const auto enqueueStart = recorder ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool asyncReclaim = ArchB::Switches::Enabled(ArchB::Feature::PipeAsyncReclaim);
+    if (asyncReclaim) std::call_once(reclaimStarted, [this] {
+        reclaimer = std::thread([this] { runReclaimer(); });
+    });
+    const bool canNotifyReclaim = asyncReclaim && !GuestMemory::GpuMutex().HeldByThisThread();
+    NotifyOnExit notifyReclaim;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
     const bool census = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
@@ -907,7 +919,11 @@ void DrawPipeline::enqueue(Item item) {
     const auto lockStart = profile || census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);
     const auto lockNs = profile || census ? elapsedNs(lockStart) : 0;
-    if (!retired.empty()) std::swap(retired, reclaim);
+    if (!asyncReclaim && !retired.empty()) std::swap(retired, reclaim);
+    if (canNotifyReclaim && retired.size() >= SwitchDepth && !reclaimPending) {
+        reclaimPending = true;
+        notifyReclaim.wake = &reclaimWake;
+    }
     if (profile) lockWaitNs += elapsedNs(lockStart);
     if (census) {
         ArchB::Recorder::Count("j3b_enqueue_mutex_wait_ns", static_cast<double>(lockNs));
@@ -1127,7 +1143,7 @@ void DrawPipeline::run() {
         CommitKind commitKind = CommitKind::Other;
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
-        std::shared_ptr<ResolveSlot> resolveSlot;
+        ResolveSlot* resolveSlot = nullptr;
         std::uint64_t serial = 0;
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTop);
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
@@ -1150,7 +1166,7 @@ void DrawPipeline::run() {
             commitKind = items.front().commitKind;
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
-            resolveSlot = items.front().resolve;
+            resolveSlot = items.front().resolve.get();
             serial = retiredItems.load(std::memory_order_relaxed);
             if (Stage4::ResolveCensus()) {
                 stage4Reads.assign(items.front().reads.begin(), items.front().reads.end());
@@ -1263,9 +1279,50 @@ void DrawPipeline::Stop() {
         if (resolver.get_id() == std::this_thread::get_id()) resolver.detach();
         else if (resolver.joinable()) resolver.join();
     }
-    if (!committer.joinable()) return;
-    if (committer.get_id() == std::this_thread::get_id()) committer.detach();
-    else committer.join();
+    if (committer.joinable()) {
+        if (committer.get_id() == std::this_thread::get_id()) committer.detach();
+        else committer.join();
+    }
+    {
+        std::lock_guard lock(mutex);
+        reclaimClosing = true;
+    }
+    reclaimWake.notify_all();
+    if (reclaimer.joinable()) reclaimer.join();
+}
+
+void DrawPipeline::runReclaimer() {
+    ShaderMemory::MarkReclaimThread();
+    PerformanceTrace::BindThread("draw reclaimer");
+    ArchB::Recorder::RegisterCounter("r12_reclaim_items", reclaimed);
+    ArchB::Recorder::RegisterCounter("r12_reclaim_batches", reclaimBatches);
+    ArchB::Recorder::RegisterCounter("r12_reclaim_verified", reclaimVerified);
+    ArchB::Recorder::RegisterCounter("r12_reclaim_verify_mismatches", reclaimMismatches);
+    const char* verifyValue = std::getenv("APS5_ARCHB_PIPE_ASYNC_RECLAIM_VERIFY");
+    const bool verify = verifyValue != nullptr && std::strcmp(verifyValue, "1") == 0;
+    std::vector<Item> done;
+    for (;;) {
+        bool closing;
+        {
+            std::unique_lock lock(mutex);
+            reclaimWake.wait_for(lock, std::chrono::milliseconds(1), [&] { return reclaimClosing || reclaimPending; });
+            closing = reclaimClosing;
+            if (closing || ArchB::Switches::Enabled(ArchB::Feature::PipeAsyncReclaim)) std::swap(done, retired);
+            reclaimPending = false;
+        }
+        if (!done.empty()) {
+            PerformanceTimer timing("DrawPipeline.Reclaim");
+            const auto count = done.size();
+            if (verify) {
+                reclaimVerified.fetch_add(count, std::memory_order_relaxed);
+                if (GuestMemory::GpuMutex().HeldByThisThread() || reclaimed.load(std::memory_order_relaxed) + count > retiredItems.load(std::memory_order_acquire)) reclaimMismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+            done.clear();
+            reclaimed.fetch_add(count, std::memory_order_relaxed);
+            reclaimBatches.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (closing) return;
+    }
 }
 
 void DrawPipeline::ReleaseRetired() {

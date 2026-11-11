@@ -211,6 +211,7 @@ private:
     DrawPipeline() = default;
     void enqueue(Item item);
     void run();
+    void runReclaimer();
     void runResolver();
     void startResolvers();
     void resolveForApply(ResolveSlot& slot, std::uint64_t serial);
@@ -240,6 +241,15 @@ private:
     std::uint64_t wakes = 0;
     std::uint64_t lockWaitNs = 0;
     std::thread thread;
+    std::once_flag reclaimStarted;
+    std::thread reclaimer;
+    std::condition_variable reclaimWake;
+    bool reclaimClosing = false;
+    bool reclaimPending = false;
+    std::atomic<std::uint64_t> reclaimed{0};
+    std::atomic<std::uint64_t> reclaimBatches{0};
+    std::atomic<std::uint64_t> reclaimVerified{0};
+    std::atomic<std::uint64_t> reclaimMismatches{0};
     std::vector<std::thread> resolvers;
     std::condition_variable resolveWake;
     std::condition_variable resolveDone;

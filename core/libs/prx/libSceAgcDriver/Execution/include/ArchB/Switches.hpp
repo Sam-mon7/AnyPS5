@@ -112,6 +112,8 @@ enum class Feature : std::uint8_t {
     FixDrawRelocNested,
     FixSampledArrayGpu,
     DrawHitCensus,
+    PipeAsyncReclaim,
+    DrawRawKeyFirst,
     Count
 };
 

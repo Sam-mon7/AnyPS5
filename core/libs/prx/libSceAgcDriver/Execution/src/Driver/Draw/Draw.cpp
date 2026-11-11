@@ -160,6 +160,7 @@ struct DrawTail {
     bool imageTableBitScanKeys = false;
     bool bufferBases = false;
     bool nestedRelocation = false;
+    bool rawKeyMiss = false;
     bool allocChurn = false;
     bool partialSnapshot = false;
     bool hostSlabAlloc = false;
@@ -645,105 +646,190 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t drawIdentity = 0, drawAlias = 0;
     std::vector<DrawUserPatch> userPatches;
     if (registerKey) {
-        const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool nestedRelocation = tail.nestedRelocation;
-        std::shared_ptr<const DrawRelocation> relocation;
-        bool aliasFirst = false;
-        if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
-            drawIdentity = packetKey(drawIdentityKey(queue, *submission.shaders));
-            std::lock_guard cacheLock(drawCacheMutex);
-            learnPendingRelocation();
-            const auto known = drawRelocations.find(drawIdentity);
-            if (known != drawRelocations.end()) {
-                auto& trial = drawRelocationTrials[drawIdentity];
-                if (trial.idle != 0 && !nestedRelocation) --trial.idle;
-                else relocation = known->second;
-                aliasFirst = relocation != nullptr && trial.productive && !nestedRelocation;
-            }
-        }
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
-        drawKey = packetKey(drawKey);
-        shapeKey = packetKey(shapeKey);
-        drawAlias = packetKey(drawAlias);
-        DrawPipeline::NoteDrawKey(drawKey, shapeKey);
-        if (DrawFinisher::Busy()) {
-            bool shapeMatters = false;
-            if (DrawFinisher::Overlap() && (drawDataHits() || tail.feedbackMask)) {
-                std::lock_guard peekLock(drawCacheMutex);
-                const auto shape = drawShapes.find(shapeKey);
-                shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
-            }
-            const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
-            if (drain) DrawFinisher::Get().Drain();
-            if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
-        }
-        std::unique_lock cacheLock(drawCacheMutex);
-        ++drawEntryCounters.lookups;
-        ++drawEntryCounters.registerKeyLookups;
-        if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
-        const auto found = drawCache.find(drawKey);
-        if (found != drawCache.end()) {
-            ArchB::Recorder::Count("draw_reloc_direct");
-            entry = found->second;
-            decode = entry->decode;
-        } else {
-            ++drawEntryCounters.absent;
-            static const bool nestedCensus = std::getenv("APS5_DRAW_RELOC_NESTED_CENSUS") != nullptr;
-            std::uint64_t censusAlias = 0;
-            if (nestedCensus) {
+        const bool rawFirst = tail.nestedRelocation && ArchB::Switches::Enabled(ArchB::Feature::DrawRawKeyFirst);
+        static const bool verifyRawFirst = [] {
+            const char* value = std::getenv("APS5_ARCHB_DRAW_RAW_KEY_FIRST_VERIFY");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        const auto selectKeys = [&](bool rawFirst, bool reference) {
+            const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool nestedRelocation = tail.nestedRelocation;
+            std::shared_ptr<const DrawRelocation> relocation;
+            bool aliasFirst = false;
+            const auto prepareRelocation = [&] {
+                if (!drawRelocationEnabled()) return;
+                if (!reference) ArchB::Recorder::Count("r12_keys_identity");
+                if (DrawFinisher::Busy()) {
+                    bool pending;
+                    {
+                        std::lock_guard cacheLock(drawCacheMutex);
+                        pending = drawRelocationPending.key != 0;
+                    }
+                    if (pending) DrawFinisher::Get().Drain();
+                }
+                drawIdentity = packetKey(drawIdentityKey(queue, *submission.shaders));
+                std::lock_guard cacheLock(drawCacheMutex);
+                learnPendingRelocation();
                 const auto known = drawRelocations.find(drawIdentity);
                 if (known != drawRelocations.end()) {
-                    drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, known->second.get(), &censusAlias, true);
-                    censusAlias = packetKey(censusAlias);
-                    if (censusAlias == 0) ArchB::Recorder::Count("draw_nested_census_alias_unreadable");
+                    if (!reference) ArchB::Recorder::Count("r12_keys_trial_probes");
+                    auto& trial = drawRelocationTrials[drawIdentity];
+                    if (trial.idle != 0 && !nestedRelocation) --trial.idle;
+                    else relocation = known->second;
+                    aliasFirst = relocation != nullptr && trial.productive && !nestedRelocation;
+                }
+            };
+            if (!rawFirst) prepareRelocation();
+            drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
+            drawKey = packetKey(drawKey);
+            shapeKey = packetKey(shapeKey);
+            drawAlias = packetKey(drawAlias);
+            DrawPipeline::NoteDrawKey(drawKey, shapeKey);
+            if (DrawFinisher::Busy()) {
+                bool shapeMatters = false;
+                if (DrawFinisher::Overlap() && (drawDataHits() || tail.feedbackMask)) {
+                    std::lock_guard peekLock(drawCacheMutex);
+                    const auto shape = drawShapes.find(shapeKey);
+                    shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
+                }
+                const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
+                if (drain) DrawFinisher::Get().Drain();
+                if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
+            }
+            std::unique_lock cacheLock(drawCacheMutex);
+            ++drawEntryCounters.lookups;
+            ++drawEntryCounters.registerKeyLookups;
+            if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
+            const auto found = drawCache.find(drawKey);
+            tail.rawKeyMiss = found == drawCache.end();
+            if (found != drawCache.end()) {
+                ArchB::Recorder::Count("draw_reloc_direct");
+                if (rawFirst && !reference) ArchB::Recorder::Count("r12_keys_raw_hits");
+                entry = found->second;
+                decode = entry->decode;
+            } else {
+                if (rawFirst) {
+                    cacheLock.unlock();
+                    prepareRelocation();
+                    cacheLock.lock();
+                    if (!reference) ArchB::Recorder::Count("r12_keys_fallback");
+                }
+                ++drawEntryCounters.absent;
+                static const bool nestedCensus = std::getenv("APS5_DRAW_RELOC_NESTED_CENSUS") != nullptr;
+                std::uint64_t censusAlias = 0;
+                if (nestedCensus) {
+                    const auto known = drawRelocations.find(drawIdentity);
+                    if (known != drawRelocations.end()) {
+                        drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, known->second.get(), &censusAlias, true);
+                        censusAlias = packetKey(censusAlias);
+                        if (censusAlias == 0) ArchB::Recorder::Count("draw_nested_census_alias_unreadable");
+                    }
+                }
+                ArchB::Recorder::Count(!drawRelocationEnabled() ? "draw_reloc_absent_off" : relocation != nullptr ? "draw_reloc_absent_shape" : drawRelocations.contains(drawIdentity) ? "draw_reloc_absent_idle" : "draw_reloc_absent_no_shape");
+                if (relocation != nullptr && !aliasFirst) {
+                    if (!reference) ArchB::Recorder::Count("r12_keys_alias");
+                    cacheLock.unlock();
+                    drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, nestedRelocation);
+                    drawAlias = packetKey(drawAlias);
+                    cacheLock.lock();
+                }
+                if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity, censusAlias, nestedRelocation};
+                if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches, nestedRelocation);
+                else if (relocation != nullptr) ArchB::Recorder::Count("draw_reloc_alias_zero");
+                ArchB::Recorder::Count(entry != nullptr ? "draw_reloc_entry" : "draw_reloc_none");
+                if (nestedCensus && drawRelocations.contains(drawIdentity)) {
+                    if (entry == nullptr) censusNestedDraw(queue, censusAlias);
+                    else ArchB::Recorder::Count("draw_nested_census_existing_entry");
+                }
+                if (relocation != nullptr) {
+                    auto& trial = drawRelocationTrials[drawIdentity];
+                    ++trial.lookups;
+                    if (trial.lookups >= DrawRelocationTrial::Window) {
+                        trial.productive = trial.hits * DrawRelocationTrial::MinimumHitShare >= trial.lookups;
+                        if (!trial.productive) trial.idle = DrawRelocationTrial::IdleDraws;
+                        trial.lookups = trial.hits = 0;
+                    }
+                }
+                if (traceDrawCache()) {
+                    auto& counters = drawEntryCounters;
+                    if (traceKeysEvicted.contains(drawKey)) ++counters.absentEvicted;
+                    else if (traceKeysSeen.contains(drawKey)) ++counters.absentNeverInserted;
+                    else if (traceShapes.contains(shapeKey)) ++counters.absentUserWords;
+                    else ++counters.absentNewRegisters;
+                }
+                if (decode == nullptr && (drawDataHits() || tail.feedbackMask) && !drawParameters.indirect) {
+                    if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
+                        const auto kept = drawCache.find(shape->second);
+                        if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
+                    }
+                    if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
                 }
             }
-            ArchB::Recorder::Count(!drawRelocationEnabled() ? "draw_reloc_absent_off" : relocation != nullptr ? "draw_reloc_absent_shape" : drawRelocations.contains(drawIdentity) ? "draw_reloc_absent_idle" : "draw_reloc_absent_no_shape");
-            if (relocation != nullptr && !aliasFirst) {
-                cacheLock.unlock();
-                drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias, nestedRelocation);
-                drawAlias = packetKey(drawAlias);
-                cacheLock.lock();
-            }
-            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity, censusAlias, nestedRelocation};
-            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches, nestedRelocation);
-            else if (relocation != nullptr) ArchB::Recorder::Count("draw_reloc_alias_zero");
-            ArchB::Recorder::Count(entry != nullptr ? "draw_reloc_entry" : "draw_reloc_none");
-            if (nestedCensus && drawRelocations.contains(drawIdentity)) {
-                if (entry == nullptr) censusNestedDraw(queue, censusAlias);
-                else ArchB::Recorder::Count("draw_nested_census_existing_entry");
-            }
-            if (relocation != nullptr) {
-                auto& trial = drawRelocationTrials[drawIdentity];
-                ++trial.lookups;
-                if (trial.lookups >= DrawRelocationTrial::Window) {
-                    trial.productive = trial.hits * DrawRelocationTrial::MinimumHitShare >= trial.lookups;
-                    if (!trial.productive) trial.idle = DrawRelocationTrial::IdleDraws;
-                    trial.lookups = trial.hits = 0;
-                }
-            }
+            if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, tail.rawKeyMiss);
             if (traceDrawCache()) {
-                auto& counters = drawEntryCounters;
-                if (traceKeysEvicted.contains(drawKey)) ++counters.absentEvicted;
-                else if (traceKeysSeen.contains(drawKey)) ++counters.absentNeverInserted;
-                else if (traceShapes.contains(shapeKey)) ++counters.absentUserWords;
-                else ++counters.absentNewRegisters;
+                traceInsert(traceKeysSeen, drawKey);
+                traceInsert(traceShapes, shapeKey);
             }
-            if (decode == nullptr && (drawDataHits() || tail.feedbackMask) && !drawParameters.indirect) {
-                if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
-                    const auto kept = drawCache.find(shape->second);
-                    if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
+            maybeReportDrawCache(profile);
+        };
+        std::shared_ptr<DrawEntry> expectedEntry;
+        std::shared_ptr<DrawEntry> expectedDataEntry;
+        std::vector<DrawUserPatch> expectedPatches;
+        std::uint64_t expectedKey = 0, expectedShape = 0, expectedAlias = 0;
+        if (rawFirst && verifyRawFirst) {
+            if (DrawFinisher::Busy()) DrawFinisher::Get().Drain();
+            std::unique_lock cacheLock(drawCacheMutex);
+            const auto relocations = drawRelocations;
+            const auto trials = drawRelocationTrials;
+            const auto aliases = drawAliases;
+            const auto nestedAliases = nestedDrawAliases;
+            const auto censusAliases = nestedCensusAliases;
+            const auto pending = drawRelocationPending;
+            const auto entryCounters = drawEntryCounters;
+            const auto relocationCounters = drawRelocationCounters;
+            cacheLock.unlock();
+            selectKeys(false, true);
+            expectedEntry = std::move(entry);
+            expectedDataEntry = std::move(dataEntry);
+            expectedPatches = std::move(userPatches);
+            expectedKey = drawKey;
+            expectedShape = shapeKey;
+            expectedAlias = drawAlias;
+            decode.reset();
+            drawIdentity = drawAlias = 0;
+            cacheLock.lock();
+            drawRelocations = relocations;
+            drawRelocationTrials = trials;
+            drawAliases = aliases;
+            nestedDrawAliases = nestedAliases;
+            nestedCensusAliases = censusAliases;
+            drawRelocationPending = pending;
+            drawEntryCounters = entryCounters;
+            drawRelocationCounters = relocationCounters;
+        }
+        selectKeys(rawFirst, false);
+        if (rawFirst && verifyRawFirst) {
+            const auto sameEntry = [](const auto& a, const auto& b) {
+                if (a == b) return true;
+                if (a == nullptr || b == nullptr || a->decode != b->decode || a->donor != b->donor || a->stages.size() != b->stages.size()) return false;
+                for (std::size_t i = 0; i < a->stages.size(); ++i) {
+                    if (a->stages[i].size() != b->stages[i].size()) return false;
+                    for (std::size_t j = 0; j < a->stages[i].size(); ++j) {
+                        const auto& x = a->stages[i][j];
+                        const auto& y = b->stages[i][j];
+                        if (x == y) continue;
+                        if (x == nullptr || y == nullptr || x->compiled != y->compiled || x->runs != y->runs || x->runBases != y->runBases || x->runParents != y->runParents || x->userData != y->userData || x->nestedRelocated != y->nestedRelocated || x->nestedPointerPatches != y->nestedPointerPatches || x->words != y->words || x->shaderDataPatches != y->shaderDataPatches || x->descriptorPatches != y->descriptorPatches) return false;
+                    }
                 }
-                if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
-            }
+                return true;
+            };
+            const bool sameChosen = expectedKey == drawKey && expectedShape == shapeKey && sameEntry(expectedEntry, entry) && expectedDataEntry == dataEntry;
+            const bool sameRelocation = expectedAlias == drawAlias && std::equal(expectedPatches.begin(), expectedPatches.end(), userPatches.begin(), userPatches.end(), [](const auto& a, const auto& b) { return a.program == b.program && a.index == b.index && a.value == b.value; });
+            ArchB::Recorder::Count("r12_keys_verified");
+            ArchB::Recorder::Count("r12_keys_entry_mismatches", sameChosen ? 0 : 1);
+            ArchB::Recorder::Count("r12_keys_relocation_mismatches", sameRelocation ? 0 : 1);
+            ArchB::Recorder::Count("r12_keys_verify_mismatches", sameChosen && sameRelocation ? 0 : 1);
         }
-        if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
-        if (traceDrawCache()) {
-            traceInsert(traceKeysSeen, drawKey);
-            traceInsert(traceShapes, shapeKey);
-        }
-        maybeReportDrawCache(profile);
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
@@ -1464,6 +1550,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
     if (hitCensus) timing.Mark("j3_stage_bookkeeping");
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.feedbackMask, tail.bufferBases);
+    if (tail.rawKeyMiss && registerKey && tail.nestedRelocation && ArchB::Switches::Enabled(ArchB::Feature::DrawRawKeyFirst)) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (drawRelocationPending.key == drawKey) learnPendingRelocation();
+    }
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -1768,7 +1858,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::IndirectDraw, [held] { (*held)(); }, std::move(writes), 0, {}, {}, false, DrawPipeline::ItemKind::Draw);
+                DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::IndirectDraw, [held = std::move(held)] { (*held)(); }, std::move(writes), 0, {}, {}, false, DrawPipeline::ItemKind::Draw);
                 phaseTiming.Phase(DrawRowLockWait);
                 countRecordWords();
                 timing.Mark("draw_enqueued");
@@ -1910,7 +2000,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             resolveSlot->run = [held](std::vector<DrawPipeline::Range>& resolveReads) { return (*held)(true, &resolveReads); };
         }
         if (hitCensus) timing.Mark("j3_enqueue_closure");
-        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held = std::move(held)] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();

@@ -223,6 +223,8 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixDrawRelocNested, "FIX_DRAW_RELOC_NESTED", false, true, {}},
     {Feature::FixSampledArrayGpu, "FIX_SAMPLED_ARRAY_GPU", false, true, {}},
     {Feature::DrawHitCensus, "DRAW_HIT_CENSUS", false, true, {}},
+    {Feature::PipeAsyncReclaim, "PIPE_ASYNC_RECLAIM", false, true, {}},
+    {Feature::DrawRawKeyFirst, "DRAW_RAW_KEY_FIRST", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

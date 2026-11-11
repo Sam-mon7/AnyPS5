@@ -62,6 +62,7 @@ public:
     static void SetWaitedMsProvider(WaitedMsProvider provider);
     explicit ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> initial, PendingWriteQuery pendingWrite = nullptr, PendingWriteObserver observe = nullptr, HookWaitCounter hookWaits = nullptr, PendingWriteQuery pendingSpan = nullptr, bool traceDescriptors = false);
     ~ShaderMemory();
+    static void MarkReclaimThread();
     ShaderMemory(const ShaderMemory&) = delete;
     ShaderMemory& operator=(const ShaderMemory&) = delete;
     // Returns what the capture resolved (plan, snapshot, specialization) for

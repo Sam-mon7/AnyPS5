@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
@@ -135,7 +136,7 @@ std::vector<std::uint32_t> DrawFrom(std::initializer_list<const void*> sources, 
     return commands;
 }
 
-void MovedDataHitsTheCache(bool libraries) {
+void MovedDataHitsTheCache(bool libraries, bool relocationOnly = false) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
     const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
@@ -153,10 +154,65 @@ void MovedDataHitsTheCache(bool libraries) {
     Require(counters.lookups == 4 && counters.hits == 0 && counters.inserts == 2, mode + ": the draws that teach the moved pointer and its contents made " + std::to_string(counters.hits) + " hits and " + std::to_string(counters.inserts) + " inserts, expected 0 and 2");
     for (std::size_t i = 4; i < same.size(); ++i) counters = draw({same[i].data()});
     Require(counters.lookups == 8 && counters.hits == 4 && counters.inserts == 2, mode + ": draws whose data moved again did not reuse the cached draw (" + std::to_string(counters.hits) + " hits in " + std::to_string(counters.lookups) + " lookups)");
+    if (relocationOnly) return;
     const auto other = draw({Other.data()});
     Require(other.lookups == 9 && other.hits == 4, mode + ": a draw whose moved data holds another value reused the cached draw");
     const auto again = draw({same[0].data()});
     Require(again.lookups == 10 && again.hits == 5, mode + ": a draw at an address seen before did not reuse the cached draw (" + std::to_string(again.hits) + " hits)");
+}
+
+void RawKeyHitSkipsRelocation() {
+    using R = AgcDriver::ArchB::Recorder;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    Require(S::Enabled(F::DrawRawKeyFirst) && S::Enabled(F::FixDrawRelocNested), "raw-first lookup switches are off");
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    alignas(16) static std::array<float, 4> data{1.0f, 0.0f, 0.0f, 0.0f};
+    const auto draw = [&] {
+        auto commands = DrawFrom({data.data()});
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "raw-first lookup submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+    };
+    const auto count = [](const auto& snapshot, const char* name) {
+        const auto found = snapshot.counters.find(name);
+        return found == snapshot.counters.end() ? 0.0 : found->second;
+    };
+    R::Boundary(true, 1, R::Clock::now());
+    draw();
+    const auto miss = R::Collect(R::Clock::now());
+    Require(count(miss, "r12_keys_fallback") == 1 && count(miss, "r12_keys_identity") == 1, "raw-key miss skipped the original identity and relocation path");
+    for (unsigned i = 0; i < 4; ++i) draw();
+    static_cast<void>(R::Collect(R::Clock::now()));
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    draw();
+    const auto hit = R::Collect(R::Clock::now());
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(after.hits == before.hits + 1, "raw-key lookup stopped validating and serving the cached draw");
+    Require(count(hit, "r12_keys_raw_hits") == 1, "raw-key hit did not take the fast lookup");
+    for (const char* name : {"r12_keys_fallback", "r12_keys_identity", "r12_keys_alias", "r12_keys_trial_probes"}) Require(count(hit, name) == 0, "raw-key hit performed identity, alias, relocation or trial work");
+    if (std::getenv("APS5_ARCHB_DRAW_RAW_KEY_FIRST_VERIFY") != nullptr) Require(count(hit, "r12_keys_verified") == 1 && count(hit, "r12_keys_verify_mismatches") == 0, "old key lookup disagreed with the raw-first hit");
+}
+
+void RawKeyFinisherOrdering() {
+    using R = AgcDriver::ArchB::Recorder;
+    Require(AgcDriver::DriverDetail::DrawFinisher::Enabled(), "raw-key ordering test needs the draw finisher");
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    alignas(16) static std::array<std::array<float, 4>, 8> data{};
+    for (auto& row : data) row = {1.0f, 0.0f, 0.0f, 0.0f};
+    auto commands = DrawFrom({data[0].data(), data[1].data(), data[2].data(), data[3].data(), data[4].data(), data[5].data(), data[6].data(), data[7].data(), data[0].data(), data[1].data(), data[2].data(), data[3].data(), data[4].data(), data[5].data(), data[6].data(), data[7].data()});
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    R::Boundary(true, 1, R::Clock::now());
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "raw-key pending relocation submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto counters = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(counters.lookups == 16 && counters.hits == 12 && counters.inserts == 2, "raw-key ordering changed cache admission or pending relocation learning beside the finisher");
+    const auto counts = R::Collect(R::Clock::now()).counters;
+    const auto raw = counts.find("r12_keys_raw_hits");
+    const auto slow = counts.find("r12_keys_fallback");
+    Require(raw != counts.end() && raw->second >= 2 && slow != counts.end() && slow->second > 0, "finisher ordering did not exercise both raw hits and relocated misses");
 }
 
 void EvictedEntriesServeNoRelocation(bool libraries) {
@@ -528,6 +584,11 @@ void NestedRelocationPath(const std::filesystem::path& control) {
     const auto counts = R::Collect(R::Clock::now()).counters;
     const auto hits = counts.find("fix_draw_reloc_nested_hits");
     Require(hits != counts.end() && hits->second > 0, "nested relocation: no nested-relocated hit was exercised");
+    if (S::Enabled(F::DrawRawKeyFirst) && std::getenv("APS5_ARCHB_DRAW_RAW_KEY_FIRST_VERIFY") != nullptr) {
+        const auto checked = counts.find("r12_keys_verified");
+        const auto mismatches = counts.find("r12_keys_verify_mismatches");
+        Require(checked != counts.end() && checked->second > 0 && (mismatches == counts.end() || mismatches->second == 0), "old key lookup disagreed with a nested relocation");
+    }
     if (std::getenv("APS5_ARCHB_FIX_DRAW_RELOC_NESTED_VERIFY") != nullptr) {
         const auto checked = counts.find("fix_draw_reloc_nested_verified");
         const auto mismatches = counts.find("fix_draw_reloc_nested_verify_mismatches");
@@ -581,6 +642,33 @@ int main(int argc, char** argv) {
             NestedRelocationPath(control.path);
             AgcDriverShutdown_nid_postfix();
             std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--raw-first") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            RawKeyHitSkipsRelocation();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--raw-pending") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            RawKeyFinisherOrdering();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--raw-relocated") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            using R = AgcDriver::ArchB::Recorder;
+            R::Boundary(true, 1, R::Clock::now());
+            MovedDataHitsTheCache(probe->GraphicsPipelineLibraries(), true);
+            const auto counts = R::Collect(R::Clock::now()).counters;
+            const auto count = [&](const char* name) { const auto found = counts.find(name); return found == counts.end() ? 0.0 : found->second; };
+            Require(count("r12_keys_fallback") == 8 && count("r12_keys_identity") == 8 && count("r12_keys_alias") > 0, "relocated draws skipped the slow key path");
+            Require(count("r12_keys_verified") == 8 && count("r12_keys_verify_mismatches") == 0, "old lookup disagreed with a relocated draw");
+            AgcDriverShutdown_nid_postfix();
             return 0;
         }
         const bool evicted = argc == 2 && std::string(argv[1]) == "--evicted";
