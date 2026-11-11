@@ -3505,6 +3505,44 @@ struct SrtWalkFixture {
     }
 };
 
+void verifyStrictSrtWalk(bool benchmark) {
+    SrtWalkFixture fixture(300u, true);
+    for (auto& source : fixture.plan.descriptorSources) source.dwords[3] = &fixture.Constant(0u);
+    const auto tape = ShaderRecompiler::Detail::SrtTape::CompileStrict(fixture.plan);
+    require(tape != nullptr && tape->Nodes() > 512u, "SRT strict walk: the complete large tape was refused or fits inline");
+    ShaderRecompiler::SrtRuntime runtime{fixture.userData};
+    runtime.readMemory = readDirect;
+    runtime.readSpecializationMemory = readDirect;
+    const auto referenceSources = fixture.plan.materializationSources;
+    const auto referenceClean = fixture.plan.cleanFlatSlots;
+    std::vector<ShaderRecompiler::DescriptorValue> expectedDescriptors;
+    std::vector<std::uint32_t> expectedFlat;
+    std::vector<std::uint8_t> expectedActive;
+    std::vector<ShaderRecompiler::DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    std::vector<std::uint32_t> structure;
+    const auto run = [&] { return tape->RunStrict(fixture.plan, runtime, descriptors, flat, active, &structure); };
+    const unsigned iterations = benchmark ? 2000u : 64u;
+    for (std::uint32_t branch = 0; branch < 3u; ++branch) {
+        fixture.userData[4] = branch * sizeof(std::uint32_t);
+        fixture.userData[5] = branch;
+        for (std::size_t word = 0; word < fixture.words.size(); ++word) fixture.words[word] = static_cast<std::uint32_t>(word * 0x9e3779b9u + branch);
+        require(ShaderRecompiler::Detail::EvaluateRuntimeSourcesImpl(fixture.plan, referenceSources, runtime, expectedDescriptors, expectedFlat, true, referenceClean, expectedActive), "SRT strict walk: the independent reference refused valid inputs");
+        for (unsigned warm = 0; warm < 3u; ++warm) require(run(), "SRT strict walk: warm-up failed");
+        require(descriptors == expectedDescriptors && flat == expectedFlat && active == expectedActive && !structure.empty(), "SRT strict walk: warm-up differs from the independent reference or omits structure");
+        const auto expectedStructure = structure;
+        const auto before = allocationCount;
+        for (unsigned iteration = 0; iteration < iterations; ++iteration) {
+            require(run(), "SRT strict walk: a warmed walk failed");
+            require(descriptors == expectedDescriptors && flat == expectedFlat && active == expectedActive && structure == expectedStructure, "SRT strict walk: warmed values or structure changed");
+        }
+        const auto allocations = allocationCount - before;
+        require(allocations == 0u, "SRT strict walk: a warmed large walk allocated scratch or output storage");
+        if (benchmark) std::cout << "SRT strict walk: nodes=" << tape->Nodes() << " branch=" << branch << " walks=" << iterations << " allocations/walk=" << allocations / iterations << '\n';
+    }
+}
+
 void verifyFastSrtWalk(bool benchmark) {
     using namespace ShaderRecompiler;
     struct Captured {
@@ -12782,9 +12820,15 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--srt-strict-walk") {
+            verifyStrictSrtWalk(false);
+            std::cout << "SRT strict walks preserve reference values and structure without warmed heap allocations\n";
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--srt-fast-walk" || std::string_view(argv[1]) == "--srt-walk-bench")) {
             verifySrtTape();
             verifyFastSrtWalk(std::string_view(argv[1]) == "--srt-walk-bench");
+            verifyStrictSrtWalk(std::string_view(argv[1]) == "--srt-walk-bench");
             std::cout << "SRT walks preserve captured words, descriptors, activity, flattened values and read origins\n";
             return 0;
         }
