@@ -142,6 +142,11 @@ struct GatherCommitTemplate {
     std::atomic<bool> valid{true};
 };
 
+struct GatherKnownRead {
+    std::uint64_t address = 0;
+    std::vector<std::uint32_t> words;
+};
+
 struct GatherStagePlan {
     const ShaderRecompiler::RecompileResult* program = nullptr;
     std::vector<GatherDescriptorWord> words;
@@ -150,6 +155,7 @@ struct GatherStagePlan {
     std::vector<GatherWordBuffer> buffers;
     std::vector<std::byte> push;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<GatherKnownRead> knownReads;
     bool ownerKnown = false;
     std::array<std::uint64_t, static_cast<std::size_t>(GatherElement::Count)> elements{};
     std::array<std::uint64_t, static_cast<std::size_t>(GatherElement::Count)> bytes{};

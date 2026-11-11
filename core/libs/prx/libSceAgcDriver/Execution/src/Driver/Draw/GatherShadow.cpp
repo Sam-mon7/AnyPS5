@@ -700,11 +700,25 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     };
     const GatherReader& baseRead = draw.read != nullptr ? *draw.read : checkedRead;
     bool blocked = false;
+    std::vector<std::uint64_t> knownServed;
     std::uint64_t reads = 0;
     const GatherReader read = [&](std::uint64_t address, std::span<std::uint32_t> out) {
         ++reads;
         if (busy(address, out.size_bytes())) {
-            if (draw.live && pendingWriteOnly) ArchB::Recorder::Count(Graphics::Recorder::LookupStoredBytes(address, std::as_writable_bytes(out)) ? "draw_templates_live_q0_busy_pending_known" : "draw_templates_live_q0_busy_pending_unknown");
+            static const bool knownWrites = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_KNOWN_WRITES") == nullptr;
+            if (draw.live && pendingWriteOnly && knownWrites) {
+                const auto policy = Driver::QueryPendingSpan(address, out.size_bytes(), std::as_writable_bytes(out));
+                if (policy == ShaderMemory::PendingWrite::KnownValue) {
+                    ArchB::Recorder::Count("draw_templates_live_q0_known_value_reads");
+                    knownServed.push_back(address);
+                    return true;
+                }
+                if (policy == ShaderMemory::PendingWrite::Raw) {
+                    ArchB::Recorder::Count("draw_templates_live_q0_raw_evidence_reads");
+                    return baseRead(address, out);
+                }
+                ArchB::Recorder::Count("draw_templates_live_q0_pending_sync");
+            }
             blocked = true;
             return false;
         }
@@ -754,6 +768,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
             }
             pending.Load();
             blocked = false;
+            knownServed.clear();
             outcome = EvaluateGather(*shape, liveUser, read, liveWords, &liveAddresses, false);
             if (blocked) {
                 refusedPending = true;
@@ -772,7 +787,12 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
             if (outcome.matched) {
                 const auto* binding = draw.commitTemplate != nullptr && draw.commitTemplate->ready.load(std::memory_order_acquire) && validation.stage < draw.commitTemplate->stages.size() ? &draw.commitTemplate->stages[validation.stage] : nullptr;
                 FillGatherPlan(*shape, liveUser, liveWords, stagePlan, draw.limits, binding);
-                for (std::size_t run = 0; run < liveAddresses.size(); ++run) stagePlan.reads.emplace_back(liveAddresses[run], liveAddresses[run] + shape->runs[run].count * sizeof(std::uint32_t));
+                for (std::size_t run = 0; run < liveAddresses.size(); ++run) {
+                    stagePlan.reads.emplace_back(liveAddresses[run], liveAddresses[run] + shape->runs[run].count * sizeof(std::uint32_t));
+                    if (std::find(knownServed.begin(), knownServed.end(), liveAddresses[run]) == knownServed.end()) continue;
+                    const auto first = liveWords.begin() + static_cast<std::ptrdiff_t>(shape->runs[run].first);
+                    stagePlan.knownReads.push_back({liveAddresses[run], std::vector<std::uint32_t>(first, first + static_cast<std::ptrdiff_t>(shape->runs[run].count))});
+                }
                 if (!stagePlan.vsharps.empty() && binding == nullptr) incomplete |= GatherUnknownBindings;
                 if (binding != nullptr) for (const auto& vsharp : stagePlan.vsharps) {
                     const auto known = std::find_if(binding->bindings.begin(), binding->bindings.end(), [&](const auto& item) { return item.binding == vsharp.binding && item.element == vsharp.element; });

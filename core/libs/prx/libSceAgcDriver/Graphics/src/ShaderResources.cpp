@@ -8778,6 +8778,12 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::Gather
     for (std::size_t stage = 0; stage < plan.stages.size(); ++stage) {
         const auto& source = plan.stages[stage];
         for (const auto& read : source.reads) {
+            const auto known = std::find_if(source.knownReads.begin(), source.knownReads.end(), [&](const auto& item) { return item.address == read.first; });
+            if (known != source.knownReads.end()) {
+                if (PendingStorageOverlaps(read.first, static_cast<std::size_t>(read.second - read.first), nullptr) || AnyShadowedOverlaps(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
+                AgcDriver::ArchB::Recorder::Count("draw_templates_live_commit_known_reads");
+                continue;
+            }
             if (recorder.PendingWriteOverlaps(read.first, static_cast<std::size_t>(read.second - read.first)) || PendingStorageOverlaps(read.first, static_cast<std::size_t>(read.second - read.first), nullptr) || AnyShadowedOverlaps(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
         }
         const auto& shape = plan.commitTemplate->stages[stage];

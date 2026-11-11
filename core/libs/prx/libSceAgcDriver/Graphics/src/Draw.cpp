@@ -6088,7 +6088,11 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
     };
     if (drawUse) return refuse(TemplateFaultRecord);
     if (!Recorder::ZeroCopyStorageActive()) return refuse(TemplateNoZeroCopy);
-    const auto limit = ShaderResources::DrawUploadLimit();
+    static const std::size_t storeStreamLimit = [] {
+        const char* value = std::getenv("APS5_DRAW_TEMPLATES_STORE_STREAM_MAX");
+        return value != nullptr ? static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) : std::size_t{65536};
+    }();
+    const auto limit = recorder.OpenGpuStores() != 0 ? std::max(ShaderResources::DrawUploadLimit(), storeStreamLimit) : ShaderResources::DrawUploadLimit();
     const auto alignment = static_cast<VkDeviceSize>(ParameterArena::Alignment(context));
     const auto storageAlignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     struct ShapeStorage {};
