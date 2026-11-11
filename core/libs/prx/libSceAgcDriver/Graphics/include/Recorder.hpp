@@ -302,6 +302,7 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    std::shared_ptr<void>& ParameterArenaHolder() { return parameterArena; }
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -1215,6 +1216,7 @@ private:
     void dropCarries(const ReadList& ranges, const char* source);
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    std::shared_ptr<void> parameterArena;
     std::unique_ptr<PipelineStateReuse> pipelineStateReuse;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;

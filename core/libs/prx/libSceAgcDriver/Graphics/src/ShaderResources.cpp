@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParameterArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -8136,24 +8137,32 @@ ShaderResources::DrawBindings::~DrawBindings() {
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData) const {
+    return MovedReadOnlyBuffers(shaders, recorder, target, patchedData, nullptr);
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData, MoveRefusal* refusal) const {
     std::vector<MovedBuffer> moved;
     std::size_t movedBytes = 0;
+    const auto refuse = [&](MoveRefusal why) {
+        if (refusal != nullptr) *refusal = why;
+        return std::optional<std::vector<MovedBuffer>>{};
+    };
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return moved;
     for (const auto& shader : shaders) {
-        if (shader.program == nullptr) return std::nullopt;
+        if (shader.program == nullptr) return refuse(MoveRefusal::Shape);
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-                if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
+                if (kept == bindings.end() || kept->allocations.size() != 1) return refuse(MoveRefusal::Shape);
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
-                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
+                if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return refuse(MoveRefusal::Shape);
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) {
                     if (patchedData != nullptr) *patchedData = true;
-                    return std::nullopt;
+                    return refuse(MoveRefusal::Bindings);
                 }
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, 0, item.size, binding.guestDescriptor});
@@ -8161,7 +8170,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
             const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
-            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
+            if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return refuse(MoveRefusal::Shape);
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
@@ -8173,15 +8182,16 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const bool empty = size == 0 || address == 0;
                 if (!item.guest) {
                     if (empty) continue;
-                    return std::nullopt;
+                    return refuse(MoveRefusal::NotGuest);
                 }
                 if (item.address == address && item.size == size) continue;
-                if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
+                if (written || empty || item.written) return refuse(MoveRefusal::Written);
+                if (size > context.limits.maxStorageBufferRange) return refuse(MoveRefusal::Limit);
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-                if (bytes > maxDrawSnapshotBytes - movedBytes) return std::nullopt;
-                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                if (bytes > maxDrawSnapshotBytes - movedBytes) return refuse(MoveRefusal::Limit);
+                if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return refuse(MoveRefusal::Inaccessible);
+                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return refuse(MoveRefusal::Overlap);
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
                 movedBytes += bytes;
@@ -8534,6 +8544,166 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
     for (const auto& [begin, end] : entry.reads) recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DispatchElement);
     recorder.Keep(result);
     return result;
+}
+
+ShaderResources::TemplateSets::~TemplateSets() {
+    if (cache == nullptr) return;
+    for (std::size_t flight = 0; flight < allocations.size(); ++flight) {
+        if (allocations[flight].set != VK_NULL_HANDLE) cache->Recycle(layout, allocations[flight]);
+        if (fragmentAllocations[flight].set != VK_NULL_HANDLE) cache->Recycle(fragmentLayout, fragmentAllocations[flight]);
+    }
+}
+
+std::shared_ptr<ShaderResources::TemplateSets> ShaderResources::MakeTemplateSets(std::span<const TemplateElement> elements, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const {
+    if (context.descriptorCache == nullptr || usesBda || flights.empty()) return {};
+    if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return {};
+    const auto proof = HostImportsIdentity(context);
+    if (proof == HostImportsProof{}) return {};
+    auto made = std::make_shared<TemplateSets>();
+    made->elements.assign(elements.begin(), elements.end());
+    for (const auto& element : elements) {
+        if (element.allocation >= allocations.size()) return {};
+        std::optional<std::size_t> slot;
+        for (const auto& binding : bindings) {
+            const auto position = std::find(binding.allocations.begin(), binding.allocations.end(), element.allocation);
+            if (position == binding.allocations.end()) continue;
+            const auto original = setOf(binding) == 0 ? _set : fragment.set;
+            const auto write = std::find_if(descriptorWrites.begin(), descriptorWrites.end(), [&](const VkWriteDescriptorSet& candidate) { return candidate.dstBinding == binding.layout.binding && candidate.dstSet == original && candidate.pBufferInfo != nullptr; });
+            if (write == descriptorWrites.end() || static_cast<std::uint32_t>(position - binding.allocations.begin()) >= write->descriptorCount) return {};
+            slot = static_cast<std::size_t>(write->pBufferInfo - descriptorBuffers.data()) + static_cast<std::size_t>(position - binding.allocations.begin());
+            break;
+        }
+        if (!slot.has_value() || *slot >= descriptorBuffers.size() || std::find(made->streamed.begin(), made->streamed.end(), *slot) != made->streamed.end()) return {};
+        made->streamed.push_back(*slot);
+    }
+    made->cache = context.descriptorCache;
+    made->layout = _layout;
+    made->fragmentLayout = fragment.layout;
+    made->images = descriptorImages;
+    made->proof = proof;
+    AddTemplateFlights(*made, flights);
+    return made;
+}
+
+void ShaderResources::AddTemplateFlights(TemplateSets& made, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const {
+    std::array<bool, 2> described{};
+    std::array<std::vector<VkDescriptorPoolSize>, 2> counts;
+    for (const auto& binding : bindings) {
+        const auto which = setOf(binding);
+        described[which] = true;
+        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+        if (count == 0) continue;
+        auto& sizes = counts[which];
+        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& size) { return size.type == binding.layout.descriptorType; });
+        if (held != sizes.end()) held->descriptorCount += count;
+        else sizes.push_back({binding.layout.descriptorType, count});
+    }
+    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    const auto variableOf = [&](std::size_t which) { return tableBindings[which] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[which]].imageAllocations.size()))) : std::nullopt; };
+    for (const auto& [buffer, base] : flights) {
+        auto& allocation = made.allocations.emplace_back();
+        auto& fragmentAllocation = made.fragmentAllocations.emplace_back();
+        if (described[0] || splitSets) {
+            allocation = made.cache->AllocateRewritten(_layout, counts[0], updateAfterBind, variableOf(0));
+            Require(allocation.set != VK_NULL_HANDLE, "template set allocation failed");
+            ++made.sets;
+        }
+        if (described[1] || splitSets) {
+            fragmentAllocation = made.cache->AllocateRewritten(fragment.layout, counts[1], updateAfterBind, variableOf(1));
+            Require(fragmentAllocation.set != VK_NULL_HANDLE, "template set allocation failed");
+            ++made.sets;
+        }
+        auto& buffers = made.buffers.emplace_back(descriptorBuffers);
+        for (std::size_t index = 0; index < made.elements.size(); ++index) buffers[made.streamed[index]] = {buffer, base + made.elements[index].offset, static_cast<VkDeviceSize>(made.elements[index].bytes)};
+        auto writes = descriptorWrites;
+        for (auto& write : writes) {
+            write.dstSet = write.dstSet == _set ? allocation.set : fragmentAllocation.set;
+            if (write.pBufferInfo != nullptr) write.pBufferInfo = buffers.data() + (write.pBufferInfo - descriptorBuffers.data());
+        }
+        if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        made.writes += writes.size();
+    }
+}
+
+void ShaderResources::KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const {
+    constexpr std::size_t Held = 256;
+    if (templateSetsHeld.size() >= Held) templateSetsHeld.erase(templateSetsHeld.begin(), templateSetsHeld.begin() + static_cast<std::ptrdiff_t>(Held / 2));
+    templateSetsHeld.push_back(std::move(sets));
+}
+
+std::size_t ShaderResources::RefreshTemplateFaults(TemplateSets& sets, std::size_t flight) const {
+    if (faultDescriptors.empty()) return 0;
+    prepareFaultSlot();
+    struct FaultWritesStorage {};
+    auto& writes = AgcDriver::ThreadScratch<std::vector<VkWriteDescriptorSet>, FaultWritesStorage>();
+    writes.clear();
+    for (const auto& fault : faultDescriptors) {
+        auto& held = sets.buffers[flight][fault.buffer];
+        const auto& current = descriptorBuffers[fault.buffer];
+        if (held.buffer == current.buffer && held.offset == current.offset && held.range == current.range) continue;
+        held = current;
+        auto write = descriptorWrites[fault.write];
+        write.dstSet = write.dstSet == _set ? sets.allocations[flight].set : sets.fragmentAllocations[flight].set;
+        write.dstArrayElement = fault.element;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &held;
+        writes.push_back(write);
+    }
+    if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    return writes.size();
+}
+
+void ShaderResources::DropTemplateSets(const TemplateSets* sets) const {
+    std::erase_if(templateSetsHeld, [&](const std::shared_ptr<TemplateSets>& held) { return held.get() == sets; });
+}
+
+std::size_t ShaderResources::StreamBytes(const MovedBuffer& entry) const {
+    if (!entry.words.empty()) return entry.size;
+    return static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, allocations[entry.allocation].adjustment));
+}
+
+void ShaderResources::StreamElement(const MovedBuffer& entry, std::byte* destination) const {
+    if (!entry.words.empty()) {
+        std::memcpy(destination, entry.words.data(), entry.size);
+        for (const auto& patch : dataPatches) {
+            if (patch.allocation == entry.allocation && patch.byte < entry.size) destination[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+        return;
+    }
+    std::memcpy(destination, reinterpret_cast<const void*>(entry.address - allocations[entry.allocation].adjustment), StreamBytes(entry));
+}
+
+bool ShaderResources::ExpectedElementBytes(const MovedBuffer& entry, std::vector<std::byte>& out) const {
+    if (entry.allocation >= allocations.size()) return false;
+    if (!entry.words.empty()) {
+        out.assign(entry.size, std::byte{0});
+        std::memcpy(out.data(), entry.words.data(), std::min(entry.size, entry.words.size_bytes()));
+        for (const auto& patch : dataPatches) {
+            if (patch.allocation == entry.allocation && patch.byte < out.size()) out[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+        return true;
+    }
+    const auto& item = allocations[entry.allocation];
+    const auto begin = entry.address - item.adjustment;
+    const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return false;
+    out.resize(bytes);
+    std::memcpy(out.data(), reinterpret_cast<const void*>(begin), bytes);
+    return true;
+}
+
+std::size_t ShaderResources::TemplateStaticMismatches(const TemplateSets& sets, std::size_t flight) const {
+    const auto& buffers = sets.buffers[flight];
+    if (buffers.size() != descriptorBuffers.size() || sets.images.size() != descriptorImages.size()) return 1;
+    std::size_t mismatches = 0;
+    for (std::size_t index = 0; index < buffers.size(); ++index) {
+        if (std::find(sets.streamed.begin(), sets.streamed.end(), index) != sets.streamed.end()) continue;
+        if (buffers[index].buffer != descriptorBuffers[index].buffer || buffers[index].offset != descriptorBuffers[index].offset || buffers[index].range != descriptorBuffers[index].range) ++mismatches;
+    }
+    for (std::size_t index = 0; index < descriptorImages.size(); ++index) {
+        if (sets.images[index].sampler != descriptorImages[index].sampler || sets.images[index].imageView != descriptorImages[index].imageView || sets.images[index].imageLayout != descriptorImages[index].imageLayout) ++mismatches;
+    }
+    return mismatches;
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {

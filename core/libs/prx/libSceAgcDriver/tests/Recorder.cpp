@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParameterArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -60,6 +61,8 @@
 #include "ReplaySplitFaces_vert_spv.h"
 #include "VertexRange_vert_spv.h"
 #include "VertexRangeProducer_frag_spv.h"
+#include "TemplateParams_vert_spv.h"
+#include "TemplateParams_frag_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "BdaAbi.hpp"
 #include "BdaShader.hpp"
@@ -18154,6 +18157,324 @@ void smallElementDetileTests(Device& device) {
     std::cout << "small element detile tests passed\n";
 }
 
+int parameterArenaTests(const Device& device) {
+    ParameterSlices slices(4096, 64);
+    const auto first = slices.Allocate(100);
+    Require(first.has_value() && first->chunk == 0 && first->offset == 0 && first->bytes == 256, "a small slice did not take the first 256 bytes of the first chunk");
+    const auto second = slices.Allocate(300);
+    Require(second.has_value() && second->chunk == 0 && second->offset == 256 && second->bytes == 512 && second->offset % 64 == 0, "a second slice did not follow the first at an aligned offset");
+    Require(!slices.Allocate(8192).has_value() && !slices.Allocate(0).has_value(), "a slice over the chunk size or of no bytes was handed out");
+    const auto whole = slices.Allocate(4096);
+    Require(whole.has_value() && whole->chunk == 1 && whole->offset == 0 && slices.Chunks() == 2, "a slice that does not fit grew no new chunk");
+    const auto after = slices.Allocate(200);
+    Require(after.has_value() && after->chunk == 2 && after->offset == 0 && slices.Chunks() == 3, "a slice after a full chunk did not open a new chunk");
+    auto slice = *first;
+    std::array<bool, ParameterSlices::Flights> taken{};
+    for (std::size_t use = 0; use < ParameterSlices::Flights; ++use) {
+        const auto flight = ParameterSlices::Pick(slice, 5, 4);
+        Require(flight.has_value() && !taken[*flight], "the open batch was handed a flight it already references");
+        taken[*flight] = true;
+    }
+    Require(!ParameterSlices::Pick(slice, 5, 4).has_value(), "a fourth use in the open batch reused a flight the batch references");
+    Require(!ParameterSlices::Pick(slice, 6, 4).has_value(), "a flight was reused while the submitted batch that read it is still pending");
+    const auto reused = ParameterSlices::Pick(slice, 6, 5);
+    Require(reused.has_value() && slice.serials[*reused] == 6, "a flight whose batch completed was not handed out");
+    slice.serials = {7, 5, 6};
+    const auto oldest = ParameterSlices::Pick(slice, 8, 6);
+    Require(oldest.has_value() && *oldest == 1, "flight selection did not take the least recently used completed flight");
+    auto held = *second;
+    held.serials = {9, 0, 0};
+    slices.Release(held);
+    const auto recycled = slices.Allocate(400);
+    Require(recycled.has_value() && recycled->chunk == second->chunk && recycled->offset == second->offset && recycled->serials[0] == 9, "a released slice was not reused with its flight serials");
+    auto recycledSlice = *recycled;
+    for (int use = 0; use < 4; ++use) {
+        const auto flight = ParameterSlices::Pick(recycledSlice, 10, 8);
+        if (flight.has_value()) Require(*flight != 0, "a reused slice handed out a flight a pending batch still reads");
+    }
+    auto context = device.GetContext();
+    auto arena = std::make_shared<ParameterArena>(context, 4096);
+    auto lease = ParameterArena::Allocate(arena, 100);
+    Require(lease != nullptr && arena->Chunks() == 1 && lease->slice.offset % ParameterArena::Alignment(context) == 0, "the arena did not make its first chunk");
+    std::array<VkBuffer, ParameterArena::Flights> handles{};
+    for (std::size_t flight = 0; flight < handles.size(); ++flight) {
+        handles[flight] = arena->Handle(flight, 0);
+        Require(handles[flight] != VK_NULL_HANDLE && arena->Bytes(flight, 0) != nullptr, "a flight has no mapped buffer");
+        for (std::size_t other = 0; other < flight; ++other) Require(handles[other] != handles[flight], "two flights share a buffer");
+        arena->Bytes(flight, 0)[lease->slice.offset] = static_cast<std::byte>(flight + 1);
+    }
+    auto grown = ParameterArena::Allocate(arena, 4096);
+    Require(grown != nullptr && grown->slice.chunk == 1 && arena->Chunks() == 2, "a full arena did not grow a chunk");
+    for (std::size_t flight = 0; flight < handles.size(); ++flight) Require(arena->Handle(flight, 0) == handles[flight] && arena->Bytes(flight, 0)[lease->slice.offset] == static_cast<std::byte>(flight + 1), "growth moved a slice already handed out");
+    const auto offset = lease->slice.offset;
+    lease.reset();
+    Require(arena->Freed() == 1, "a released lease did not return its slice");
+    auto again = ParameterArena::Allocate(arena, 64);
+    Require(again != nullptr && again->slice.chunk == 0 && again->slice.offset == offset && arena->Freed() == 0, "a released slice was not taken again");
+    std::cout << "parameter arena tests passed\n";
+    return 0;
+}
+
+int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    using Census = AgcDriver::ArchB::Recorder;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    Require(Switches::Enabled(Feature::ArchcDrawReplay) && Switches::Enabled(Feature::ArchcReplayPatchSlots) && Switches::Enabled(Feature::ZeroCopyStorage), "the template cases need draw replay, patch slots and zero-copy storage");
+    const bool on = Switches::Enabled(Feature::DrawTemplates);
+    const char* verifyText = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_VERIFY");
+    const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 3;
+    void* watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        ~Release() { ReleaseWatched(watched, bytes); }
+    } release{watched};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    DescriptorCache descriptors(context);
+    context.descriptorCache = &descriptors;
+    struct Reactivate {
+        Recorder& recorder;
+        ~Reactivate() { recorder.Activate(); }
+    } reactivate{mainRecorder};
+    Recorder recorder(context);
+    recorder.Activate();
+    context.recorder = &recorder;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            ClearDepthSurfaces(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    const auto arguments = address + unit;
+    const auto data = address + unit * 2;
+    const auto put = [&](std::uint64_t at, std::uint32_t value) { AgcDriver::GuestMemory::Write(at, std::as_bytes(std::span(&value, 1))); };
+    const std::array<std::uint32_t, 4> record{3, 1, 0, 0};
+    AgcDriver::GuestMemory::Write(arguments, std::as_bytes(std::span(record)));
+    AgcDriver::Pm4::DrawParameters indirect{0, 0, 0, 0, 0, false};
+    indirect.indirect.emplace();
+    indirect.indirect->arguments = arguments;
+    indirect.indirect->opcode = 0x24;
+    indirect.indirect->recordBytes = 16;
+    indirect.indirect->stride = 16;
+    indirect.indirect->count = 1;
+    indirect.indirect->countIndirect = false;
+    indirect.indirect->countAddress = 0;
+    indirect.indirect->vertexRule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule::InPlace;
+    indirect.indirect->instanceRule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule::InPlace;
+    const auto vsharp = [](std::uint64_t at, std::uint32_t size) { return std::vector<std::uint32_t>{static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, size, 0x31000000u}; };
+    auto vertex = std::make_shared<ShaderRecompiler::RecompileResult>();
+    vertex->spirv = std::vector<std::uint32_t>(std::begin(TEMPLATEPARAMS_VERT_SPV), std::end(TEMPLATEPARAMS_VERT_SPV));
+    vertex->variantId = 401;
+    vertex->shaderDataDwords = 4;
+    {
+        ShaderRecompiler::DescriptorBinding guest{};
+        guest.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        guest.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        guest.descriptorSet = 0;
+        guest.binding = 0;
+        guest.count = 1;
+        guest.guestDescriptor = vsharp(data + 4, 16);
+        auto flags = guest.Flags();
+        flags.bufferWritten = {false};
+        flags.bufferRead = {true};
+        flags.bufferAtomic = {false};
+        guest.SetFlags(std::move(flags));
+        vertex->bindings.push_back(guest);
+        ShaderRecompiler::DescriptorBinding srt{};
+        srt.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        srt.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        srt.descriptorSet = 0;
+        srt.binding = 1;
+        srt.count = 1;
+        srt.guestDescriptor = {0, 0, 0, 0};
+        vertex->bindings.push_back(srt);
+        ShaderRecompiler::DescriptorBinding shaderData{};
+        shaderData.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        shaderData.role = ShaderRecompiler::DescriptorRole::ShaderData;
+        shaderData.descriptorSet = 0;
+        shaderData.binding = 2;
+        shaderData.count = 1;
+        shaderData.guestDescriptor = {0, 0, 0, 0};
+        vertex->bindings.push_back(shaderData);
+    }
+    auto pixel = std::make_shared<ShaderRecompiler::RecompileResult>();
+    pixel->spirv = std::vector<std::uint32_t>(std::begin(TEMPLATEPARAMS_FRAG_SPV), std::end(TEMPLATEPARAMS_FRAG_SPV));
+    pixel->variantId = 402;
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> programs;
+    const auto stateFor = [](std::uint64_t base, bool additive) {
+        auto state = std::make_shared<State>();
+        state->stages.path = ShaderPath::Vertex;
+        state->color = {base, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+        state->colors = {state->color};
+        state->hasColorTarget = true;
+        state->renderExtent = {64, 64};
+        state->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state->viewport = {0, 64, 64, -64, 0, 1};
+        state->scissor = {{0, 0}, {64, 64}};
+        state->frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state->blend.colorWriteMask = 15;
+        if (additive) {
+            state->blend.blendEnable = VK_TRUE;
+            state->blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.colorBlendOp = VK_BLEND_OP_ADD;
+            state->blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        }
+        state->blends = {state->blend};
+        return state;
+    };
+    const auto target = stateFor(address, scenario == "flights");
+    const auto variant = std::make_shared<std::uint64_t>(vertex->variantId);
+    const auto draw = [&](std::uint64_t at, std::uint32_t size, std::uint32_t word) {
+        auto current = std::make_shared<ShaderRecompiler::RecompileResult>(*vertex);
+        current->bindings[0].guestDescriptor = vsharp(at, size);
+        current->bindings[1].guestDescriptor = {word, 0, 0, 0};
+        programs.push_back(current);
+        auto words = current->bindings[0].guestDescriptor;
+        words.insert(words.end(), current->bindings[1].guestDescriptor.begin(), current->bindings[1].guestDescriptor.end());
+        const DrawSlotIdentity identity{target, {{vertex, variant, std::move(words), true, false}, {pixel}}};
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, current.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        Draw(context, *target, indirect, shaders, {}, nullptr, nullptr, 0, nullptr, false, &identity);
+        WaitForOptimizedPipelines(context.device);
+    };
+    const auto settle = [&] {
+        StorageTexture::FlushAllPending("draw template test");
+        recorder.Sync();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    };
+    const auto expect = [&](std::uint32_t red, std::uint32_t green, std::uint32_t blue, const char* what) {
+        std::vector<std::byte> read(64 * 64 * 4);
+        recorder.Sync();
+        ReadColorTarget(target->color, read);
+        for (std::size_t i = 0; i < read.size(); i += 4) {
+            const std::array<std::uint32_t, 4> seen{std::to_integer<std::uint32_t>(read[i]), std::to_integer<std::uint32_t>(read[i + 1]), std::to_integer<std::uint32_t>(read[i + 2]), std::to_integer<std::uint32_t>(read[i + 3])};
+            if (seen != std::array<std::uint32_t, 4>{red, green, blue, 255}) {
+                throw std::runtime_error(std::string(what) + ": texel " + std::to_string(i / 4) + " is " + std::to_string(seen[0]) + "," + std::to_string(seen[1]) + "," + std::to_string(seen[2]) + "," + std::to_string(seen[3]) + ", expected " + std::to_string(red) + "," + std::to_string(green) + "," + std::to_string(blue) + ",255");
+            }
+        }
+    };
+    std::map<std::string, double> total;
+    const auto collect = [&] {
+        auto counters = Census::Collect(Census::Clock::now()).counters;
+        for (const auto& [name, value] : counters) total[name] += value;
+        return counters;
+    };
+    const auto base = data + 4;
+    put(base, 0x0101u);
+    for (int i = 0; i < 4; ++i) {
+        draw(base, 16, 1);
+        settle();
+    }
+    draw(base, 16, 1);
+    draw(base, 16, 1);
+    const auto prime = data + 0x800 + 4;
+    put(prime, 0x0101u);
+    draw(prime, 16, 1);
+    settle();
+    const auto warmed = ArchcReplayCounts();
+    if (warmed.captures == 0 || warmed.hits == 0) {
+        for (const auto& [name, value] : collect()) {
+            if (value != 0 && (name.starts_with("archc_replay_refused") || name.starts_with("archc_replay_ineligible") || name.starts_with("archc_replay_hits") || name.starts_with("archc_replay_captures") || name.starts_with("archc_replay_legacy") || name.starts_with("draw_templates"))) std::cout << name << " " << value << "\n";
+        }
+    }
+    Require(warmed.captures != 0 && warmed.hits != 0, "the repeated template draw was not replayed");
+    const std::uint32_t warmDraws = 7;
+    if (scenario == "stream") {
+        static_cast<void>(collect());
+        const auto moved = data + 0x100 + 4;
+        put(moved, 0x4231u);
+        const auto hitsBefore = ArchcReplayCounts().hits;
+        draw(moved, 16, 0x52);
+        expect(0x31, 0x42, 0x52, "a replay with a moved V# base and new FlattenedSrt words");
+        put(moved, 0x6655u);
+        draw(moved, 16, 0x77);
+        expect(0x55, 0x66, 0x77, "a replay after the CPU rewrote the moved element");
+        const auto unaligned = data + 0x200 + 12;
+        put(unaligned, 0x9988u);
+        draw(unaligned, 16, 0xaa);
+        expect(0x88, 0x99, 0xaa, "a replay whose moved base has another offset in the storage alignment");
+        auto counters = collect();
+        Require(ArchcReplayCounts().hits == hitsBefore + 3, "the draws with moved elements were not replayed");
+        if (on) Require(counters["draw_templates_replays"] == 3 && counters["draw_templates_candidates"] == 3 && counters["draw_templates_built_new"] == 1, "the replays with small moved elements did not take one template");
+        else Require(counters["draw_templates_replays"] == 0 && counters["draw_templates_candidates"] == 3, "the template path ran with its switch off");
+        const auto large = data + 0x1000 + 4;
+        put(large, 0xbbccu);
+        draw(large, 8192, 0xdd);
+        expect(0xcc, 0xbb, 0xdd, "a replay whose moved element is over the template limit");
+        counters = collect();
+        if (on) Require(counters["draw_templates_refused_large"] == 1 && counters["draw_templates_replays"] == 0, "a large moved element was not refused to the old path");
+        draw(moved, 16, 0x11);
+        expect(0x55, 0x66, 0x11, "a small replay after a large one");
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 1, "the template was not used again after a large refusal");
+        std::cout << "agc_draw_templates_stream" << (on ? "" : " (off)") << ": ok\n";
+    } else if (scenario == "flights") {
+        expect(warmDraws, warmDraws, warmDraws, "the additive warm-up draws");
+        static_cast<void>(collect());
+        std::uint32_t red = warmDraws;
+        std::uint32_t green = warmDraws;
+        std::uint32_t blue = warmDraws;
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            const auto at = data + 0x100 * (k + 1) + 4;
+            put(at, (k + 1) | ((2 * k + 1) << 8u));
+            red += k + 1;
+            green += 2 * k + 1;
+        }
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            draw(data + 0x100 * (k + 1) + 4, 16, k + 3);
+            blue += k + 3;
+        }
+        auto counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 5 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 2, "five uses of one template in one batch did not take five flights of two flight groups");
+        else Require(counters["draw_templates_replays"] == 0, "the template path ran with its switch off");
+        expect(red, green, blue, "five additive replays of one template in one batch");
+        draw(data + 0x100 + 4, 16, 2);
+        red += 1;
+        green += 1;
+        blue += 2;
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 0, "a flight was not free again after its batch completed");
+        expect(red, green, blue, "an additive replay after the batch completed");
+        std::cout << "agc_draw_templates_flights" << (on ? "" : " (off)") << ": ok\n";
+    } else {
+        throw std::runtime_error("unknown draw template scenario");
+    }
+    static_cast<void>(collect());
+    for (const char* kind : {"element_bytes", "element_range", "static_binding", "element_set", "push"}) Require(total[std::string("draw_templates_verify_mismatch_") + kind] == 0, "VERIFY counted a template mismatch");
+    if (verify && on) Require(total["draw_templates_verify_checks"] == total["draw_templates_replays"] && total["draw_templates_replays"] != 0, "VERIFY did not check every templated replay");
+    std::cout << "draw templates: replays " << total["draw_templates_replays"] << ", verify checks " << total["draw_templates_verify_checks"] << ", bytes " << total["draw_templates_bytes"] << ", sets " << total["draw_templates_sets_allocated"] << ", writes " << total["draw_templates_descriptor_writes"] << std::endl;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     struct SplitFacesControl {
         std::filesystem::path path;
@@ -18810,6 +19131,12 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-replay") {
             return archcReplayTests(device, recorder, argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--draw-templates") {
+            return drawTemplateTests(device, recorder, argv[2]);
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parameter-arena") {
+            return parameterArenaTests(device);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-template-token") {
             return archcTemplateTokenTests(device, recorder);
