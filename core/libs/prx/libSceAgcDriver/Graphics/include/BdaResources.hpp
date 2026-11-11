@@ -33,6 +33,7 @@ public:
     void NoteUse(std::uint64_t serial);
     bool TakeFaultSlot(const Context& context);
     bool HoldsFaultSlot() const { return faultChunk != nullptr; }
+    std::shared_ptr<void> KeepFaultSlot() const;
     static void NoteFinished(VkDevice device, std::uint64_t serial);
     struct FaultSlotCounts {
         std::uint64_t chunks = 0;
@@ -85,6 +86,7 @@ private:
     std::shared_ptr<Buffer> table;
     VkDevice faultDevice = VK_NULL_HANDLE;
     std::shared_ptr<BdaFaultChunk> faultChunk;
+    mutable std::weak_ptr<void> faultRetention;
     VkDeviceSize faultOffset = 0;
     bool reportOnly = false;
     std::uint64_t lastUse = 0;

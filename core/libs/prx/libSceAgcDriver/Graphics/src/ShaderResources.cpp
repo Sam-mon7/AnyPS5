@@ -3067,6 +3067,8 @@ struct ShaderResources::DrawSetPool {
         std::vector<VkDeviceSize> slotOffsets;
         std::vector<std::size_t> slotSizes;
         std::uint64_t serial = 0;
+        VkDescriptorBufferInfo fault{};
+        std::shared_ptr<void> faultKeep;
     };
     static constexpr std::size_t Capacity = 64;
     DescriptorCache* cache = nullptr;
@@ -6607,6 +6609,7 @@ std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words)
 }
 
 void ShaderResources::rehashDataWords() {
+    ++dataWordsVersion;
     dataWordsHash = FnvOffset;
     // Data buffers are the non-guest allocations with a buffer (an address-role allocation has
     // none), appended in binding order by buildPrepare: the order DataWordsHash(shader) hashes.
@@ -8125,7 +8128,7 @@ std::string ShaderResources::DrawSetPoolText() {
 
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
-    if (pool != nullptr && pool->Give(DrawSetPool::Entry{allocation, fragmentAllocation, std::move(overridden), std::move(held), std::move(slotBuffer), std::move(slotElements), std::move(slotOffsets), std::move(slotSizes), serial})) return;
+    if (pool != nullptr && pool->Give(DrawSetPool::Entry{allocation, fragmentAllocation, std::move(overridden), std::move(held), std::move(slotBuffer), std::move(slotElements), std::move(slotOffsets), std::move(slotSizes), serial, fault, std::move(faultKeep)})) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
         if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
@@ -8313,7 +8316,7 @@ namespace {
 // open batch: the guest may see that label and rewrite the range before this draw reads it), entries
 // dropped because the import table changed, and the _VERIFY checks and mismatches.
 struct MovedSetCounters {
-    std::atomic<std::uint64_t> hits{0}, built{0}, refusedImport{0}, refusedPending{0}, refusedStore{0}, stale{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> hits{0}, built{0}, refusedImport{0}, refusedPending{0}, refusedStore{0}, stale{0}, verified{0}, mismatches{0}, replayPools{0}, refusedReplayPool{0}, retainedPatches{0};
 };
 
 MovedSetCounters& movedSetCounters() {
@@ -8327,6 +8330,9 @@ MovedSetCounters& movedSetCounters() {
         AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_stale", counters->stale);
         AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_verified", counters->verified);
         AgcDriver::ArchB::Recorder::RegisterCounter("zc_moved_mismatches", counters->mismatches);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_retained_set_patches", counters->retainedPatches);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_retained_pool_created", counters->replayPools);
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_retained_refused_pool", counters->refusedReplayPool);
         return counters;
     }();
     return *made;
@@ -8354,6 +8360,7 @@ struct ShaderResources::MovedSetCache {
         DescriptorCache::SetAllocation allocation;
         DescriptorCache::SetAllocation fragmentAllocation;
         std::vector<std::shared_ptr<Buffer>> words;
+        std::shared_ptr<void> faultKeep;
         ~Set() {
             if (cache == nullptr) return;
             if (allocation.set != VK_NULL_HANDLE) cache->Recycle(layout, allocation);
@@ -8376,19 +8383,25 @@ struct ShaderResources::MovedSetCache {
     std::uint64_t uses = 0;
 };
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool retainFault) const {
     auto& counters = movedSetCounters();
-    if (context.descriptorCache == nullptr || !faultDescriptors.empty()) return {};
+    if (context.descriptorCache == nullptr) return {};
+    const bool fault = !faultDescriptors.empty();
+    if (fault && (!retainFault || !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained) || bda == nullptr || !bda->HoldsFaultSlot())) return {};
     // A GPU store already in the open batch may be a label the guest waits on: once the GPU stores it,
     // the guest may rewrite a moved range before this later draw reads it in place (the in-flight
     // rewrites the zero-copy census found were all of moved ranges). Such draws keep their snapshots.
-    if (recorder.OpenGpuStores() != 0) {
+    if (recorder.OpenGpuStores() != 0 && !(retainFault && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained) && std::ranges::all_of(moved, [](const MovedBuffer& entry) { return !entry.words.empty(); }))) {
         counters.refusedStore.fetch_add(1, std::memory_order_relaxed);
         return {};
     }
     struct ContentSlotStorage {};
     auto& content = AgcDriver::ThreadScratch<std::vector<std::uint64_t>, ContentSlotStorage>();
     content.clear();
+    if (fault) {
+        const auto descriptor = bda->Fault();
+        content.insert(content.end(), {~std::uint64_t{0}, std::bit_cast<std::uint64_t>(descriptor.buffer), descriptor.offset, descriptor.range});
+    }
     struct TargetsSlotStorage {};
     auto& targets = AgcDriver::ThreadScratch<std::vector<std::pair<VkBuffer, VkDeviceSize>>, TargetsSlotStorage>();
     targets.clear();
@@ -8446,6 +8459,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
         const auto proof = HostImportsIdentity(context);
         if (proof == HostImportsProof{}) return {};
         auto set = std::make_shared<MovedSetCache::Set>();
+        if (fault) set->faultKeep = bda->KeepFaultSlot();
         set->cache = context.descriptorCache;
         std::array<bool, 2> described{};
         std::array<std::vector<VkDescriptorPoolSize>, 2> counts;
@@ -8536,7 +8550,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::cachedMovedBindi
     return result;
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord, BindingReplay replay, std::uint64_t replaySlot) const {
+    const bool retained = replay != BindingReplay::None && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained);
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
     prepareFaultSlot();
@@ -8599,7 +8614,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // APS5_ARCHB_ZERO_COPY_MOVED (on top of ZERO_COPY_STORAGE, which leaves every other element as the
     // object's set binds it): a cached immutable set for this moved content; nothing when refused.
     if (!moved.empty() && Recorder::ZeroCopyStorageActive() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::ZeroCopyMoved)) {
-        if (auto cached = cachedMovedBindings(recorder, moved)) return cached;
+        if (auto cached = cachedMovedBindings(recorder, moved, replay == BindingReplay::Retained && faultRecord == nullptr)) return cached;
     }
     // APS5_DRAW_BINDINGS_DIAG: the call's time by snapshot path (diagnostic).
     const bool diag = Recorder::SnapshotDiagEnabled();
@@ -8618,6 +8633,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const bool candidates = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixSnapshotCandidates);
     const bool useCandidates = candidates && snapshotCandidatesKnown && snapshotCandidates.size() == allocations.size() && guestMemory.InPlaceReadsSettled();
     const bool verifyCandidates = useCandidates && snapshotCandidatesVerify();
+    bool retainedOnly = retained && Recorder::ZeroCopyStorageActive();
+    for (std::size_t i = 0; retainedOnly && i < moved.size(); ++i)
+        if (moved[i].allocation >= allocations.size() || (i != 0 && moved[i - 1].allocation >= moved[i].allocation)) retainedOnly = false;
     if (candidates) (useCandidates ? snapshotCandidateCounters().draws : snapshotCandidateCounters().fallbacks).fetch_add(1, std::memory_order_relaxed);
     std::uint64_t candidateSkips = 0;
     struct CandidateSkips {
@@ -8628,7 +8646,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     } candidateSkipsReport{candidateSkips};
     {
         const auto readsStart = diag ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (!useCandidates || verifyCandidates) guestMemory.InPlaceReads(reads);
+        if (!retainedOnly && (!useCandidates || verifyCandidates)) guestMemory.InPlaceReads(reads);
         else reads.clear();
         if (diag) bindingsDiag().readsNs.fetch_add(diagNs(readsStart), std::memory_order_relaxed);
     }
@@ -8652,7 +8670,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // holds (DrawBindings::held), so the pool's next draw writes only the elements whose buffer,
     // offset or range changed: matching slots, a shared snapshot unchanged or refreshed in place, and
     // a held moved word buffer need no write.
-    const bool slotted = drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawReuse) &&
+    const bool slotted = drawSetPool != nullptr && (AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeDrawReuse) || (retained && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained))) &&
         AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool) && GuestMemory::IsCommitterThread();
     struct SlotElementsSlotThreadStorage {};
     auto& slotElementsSlot = AgcDriver::ThreadScratch<std::vector<std::size_t>*, SlotElementsSlotThreadStorage>();
@@ -8671,7 +8689,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     // moved buffers (data words, or another address) still get a binding of their own.
     const bool zeroCopy = Recorder::ZeroCopyStorageActive();
     const bool zeroCopyChecks = Recorder::ZeroCopyChecks();
-    std::size_t zeroCopySkipped = 0;
+    std::size_t zeroCopySkipped = retainedOnly ? allocations.size() - moved.size() : 0;
     struct ZeroCopyReport {
         const bool& on;
         const std::size_t& skipped;
@@ -8679,10 +8697,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (on) Recorder::CountZeroCopyStorage(skipped);
         }
     } zeroCopyReport{zeroCopy, zeroCopySkipped};
-    for (std::size_t index = 0; index < allocations.size(); ++index) {
+    for (std::size_t position = 0; position < (retainedOnly ? moved.size() : allocations.size()); ++position) {
+        const auto index = retainedOnly ? moved[position].allocation : position;
         const auto& item = allocations[index];
         const auto checkStart = diag || movedCensusScope.counters != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto override = retainedOnly ? moved.begin() + static_cast<std::ptrdiff_t>(position) : std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
             struct MovedTime {
                 bool on;
@@ -8693,6 +8712,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     if (census != nullptr) census->wordsNs.fetch_add(diagNs(start), std::memory_order_relaxed);
                 }
             } movedTime{diag, movedCensusScope.counters, checkStart};
+            if (slotted && retained && override->size <= uploadLimit) {
+                slotElements.push_back(index);
+                slotSizes.push_back(override->size);
+                slotSnapshots.push_back(result->snapshots.size());
+                selected.push_back(index);
+                keep({0, nullptr, 0, override->size, override->words});
+                continue;
+            }
             constexpr std::size_t MovedWordBufferSlots = 8;
             const bool reportUploadWords = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixMovedWordUpload);
             const auto fill = [&](std::byte* bytes) {
@@ -8901,7 +8928,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     movedCensusScope.set = true;
-    writeDrawSets(*result, selected, faultRecord, &recorder, slotted, slotElements, slotSizes, slotSnapshots);
+    std::shared_ptr<DrawSetPool> retainedPool;
+    if (retained && replaySlot != 0 && drawSetPool != nullptr && GuestMemory::IsCommitterThread() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained)) {
+        auto poolSlot = replaySlot;
+        const auto mix = [&](std::uint64_t value) { poolSlot ^= value + 0x9e3779b97f4a7c15ull + (poolSlot << 6u) + (poolSlot >> 2u); };
+        mix(selected.size());
+        for (const auto element : selected) mix(element);
+        mix(slotElements.size());
+        for (std::size_t i = 0; i < slotElements.size(); ++i) {
+            mix(slotElements[i]);
+            mix(slotSizes[i]);
+        }
+        auto found = replayDrawSetPools.find(poolSlot);
+        if (found == replayDrawSetPools.end()) {
+            if (replayDrawSetPools.size() < MovedSetCache::Capacity) {
+                found = replayDrawSetPools.emplace(poolSlot, std::make_shared<DrawSetPool>(context.descriptorCache, _layout, fragment.layout)).first;
+                movedSetCounters().replayPools.fetch_add(1, std::memory_order_relaxed);
+            } else movedSetCounters().refusedReplayPool.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (found != replayDrawSetPools.end()) retainedPool = found->second;
+    }
+    writeDrawSets(*result, selected, faultRecord, &recorder, slotted, slotElements, slotSizes, slotSnapshots, retainedPool);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
@@ -8921,7 +8968,7 @@ bool ShaderResources::RecordPrivateDescriptors(VkDescriptorSet destination, cons
     }, proof);
 }
 
-void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, Recorder* recorder, bool slotted, std::span<const std::size_t> slotElements, std::span<const std::size_t> slotSizes, std::span<const std::size_t> slotSnapshots) const {
+void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, Recorder* recorder, bool slotted, std::span<const std::size_t> slotElements, std::span<const std::size_t> slotSizes, std::span<const std::size_t> slotSnapshots, const std::shared_ptr<DrawSetPool>& retainedPool) const {
     static const bool timeSets = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     struct SetTiming {
         std::chrono::steady_clock::time_point start;
@@ -8937,11 +8984,19 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     result.cache = context.descriptorCache;
     // APS5_ARCHB_FIX_DRAW_SET_POOL (sampled per call): a set back from an earlier draw of this object
     // keeps everything but the snapshot elements (see DrawSetPool).
-    const bool pooled = recorder != nullptr && drawSetPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
+    if (retainedPool != nullptr) {
+        const auto* record = faultRecord != nullptr ? faultRecord : bda.get();
+        if (record != nullptr) {
+            result.fault = record->Fault();
+            result.faultKeep = record->KeepFaultSlot();
+        }
+    }
+    const auto& selectedPool = retainedPool != nullptr ? retainedPool : drawSetPool;
+    const bool pooled = recorder != nullptr && selectedPool != nullptr && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixDrawSetPool);
     setTiming.mode = pooled ? 1 : 0;
     DrawSetPool::Entry reused;
     bool slotMatched = false;
-    const bool reuse = pooled && (slotted ? drawSetPool->TakeMatching(reused, slotElements, slotSizes, selected, result.snapshots, slotMatched) : drawSetPool->Take(reused));
+    const bool reuse = pooled && (slotted ? selectedPool->TakeMatching(reused, slotElements, slotSizes, selected, result.snapshots, slotMatched) : selectedPool->Take(reused));
     const bool verifyReuse = slotted && drawReuseVerify();
     if (slotted) {
         auto& counters = drawReuseCounters();
@@ -8977,11 +9032,19 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
             std::size_t copied = 0;
             for (std::size_t slot = 0; slot < slotSnapshots.size(); ++slot) {
                 auto& snapshot = result.snapshots[slotSnapshots[slot]];
-                std::memcpy(slotBuffer->Bytes().data() + slotOffsets[slot], reinterpret_cast<const void*>(snapshot.address), snapshot.bytes);
+                auto* bytes = slotBuffer->Bytes().data() + slotOffsets[slot];
+                if (snapshot.words.empty()) {
+                    std::memcpy(bytes, reinterpret_cast<const void*>(snapshot.address), snapshot.bytes);
+                    CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder->Submissions() + 1), static_cast<unsigned long long>(snapshot.address), snapshot.bytes);
+                } else {
+                    std::memcpy(bytes, snapshot.words.data(), snapshot.bytes);
+                    for (const auto& patch : dataPatches)
+                        if (patch.allocation == slotElements[slot] && patch.byte < snapshot.bytes) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                    snapshot.words = {};
+                }
                 snapshot.buffer = slotBuffer;
                 snapshot.offset = slotOffsets[slot];
                 copied += snapshot.bytes;
-                CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder->Submissions() + 1), static_cast<unsigned long long>(snapshot.address), snapshot.bytes);
             }
             counters.slotBytes.fetch_add(copied, std::memory_order_relaxed);
             result.slotBuffer = std::move(slotBuffer);
@@ -8998,7 +9061,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     const auto adopt = [&] {
         if (!pooled) return;
         result.overridden.assign(selected.begin(), selected.end());
-        result.pool = drawSetPool;
+        result.pool = selectedPool;
     };
     if (reuse) {
         result.allocation = reused.allocation;
@@ -9033,6 +9096,39 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         result.fragmentLayout = fragment.layout;
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    }
+    if (reuse && retainedPool != nullptr && slotted && !verifyReuse && std::ranges::equal(reused.overridden, selected) &&
+        std::ranges::equal(reused.held, result.snapshots, [](const DrawBindings::Held& held, const DrawBindings::Snapshot& snapshot) {
+            return !held.buffer.owner_before(snapshot.buffer) && !snapshot.buffer.owner_before(held.buffer) && !held.buffer.expired() && held.offset == snapshot.offset && held.range == snapshot.bytes;
+        })) {
+        struct RetainedWritesStorage {};
+        auto& writes = AgcDriver::ThreadScratch<std::vector<VkWriteDescriptorSet>, RetainedWritesStorage>();
+        writes.clear();
+        const bool sameFault = reused.faultKeep != nullptr && result.faultKeep != nullptr && reused.fault.buffer == result.fault.buffer && reused.fault.offset == result.fault.offset && reused.fault.range == result.fault.range;
+        if (!sameFault) {
+            for (const auto& fault : faultDescriptors) {
+                auto write = descriptorWrites[fault.write];
+                write.dstSet = write.dstSet == _set ? result.allocation.set : result.fragmentAllocation.set;
+                write.dstArrayElement = fault.element;
+                write.descriptorCount = 1;
+                write.pBufferInfo = &result.fault;
+                writes.push_back(write);
+            }
+        }
+        if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        auto& counters = drawSetPoolCounters();
+        counters.hits.fetch_add(1, std::memory_order_relaxed);
+        std::size_t full = 0;
+        for (const auto& write : descriptorWrites) full += write.descriptorCount;
+        counters.fullElements.fetch_add(full, std::memory_order_relaxed);
+        counters.writtenElements.fetch_add(writes.size(), std::memory_order_relaxed);
+        auto& reusedCounters = drawReuseCounters();
+        reusedCounters.skippedElements.fetch_add(selected.size(), std::memory_order_relaxed);
+        reusedCounters.writtenElements.fetch_add(writes.size(), std::memory_order_relaxed);
+        if (writes.empty()) reusedCounters.noWrite.fetch_add(1, std::memory_order_relaxed);
+        movedSetCounters().retainedPatches.fetch_add(1, std::memory_order_relaxed);
+        adopt();
+        return;
     }
     struct BuffersSlotStorage {};
     auto& buffers = AgcDriver::ThreadScratch<std::vector<VkDescriptorBufferInfo>, BuffersSlotStorage>();
@@ -9088,8 +9184,10 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
                 if (live == nullptr || live->Handle() != snapshot.buffer->Handle()) counters.mismatches.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        for (std::size_t index = 0; index < allocations.size(); ++index) {
-            if (allocations[index].role == ShaderRecompiler::DescriptorRole::FaultBuffer) marks[index] = 1;
+        const bool sameFault = retainedPool != nullptr && reused.faultKeep != nullptr && result.faultKeep != nullptr && reused.fault.buffer == result.fault.buffer && reused.fault.offset == result.fault.offset && reused.fault.range == result.fault.range;
+        if (!sameFault || verifyReuse) {
+            for (std::size_t index = 0; index < allocations.size(); ++index)
+                if (allocations[index].role == ShaderRecompiler::DescriptorRole::FaultBuffer) marks[index] = 1;
         }
         writes.clear();
         std::size_t full = 0;
@@ -9174,6 +9272,14 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
 
 ShaderResources::DrawUse::~DrawUse() {
     if (ownRecord != nullptr) ownRecord->store(false, std::memory_order_release);
+}
+
+std::optional<VkDescriptorBufferInfo> ShaderResources::RetainedDrawFault(const DrawUse* use) const {
+    if (use != nullptr && use->record != nullptr) return std::nullopt;
+    prepareFaultSlot();
+    if (faultDescriptors.empty()) return VkDescriptorBufferInfo{};
+    if (bda == nullptr || !bda->HoldsFaultSlot()) return std::nullopt;
+    return bda->Fault();
 }
 
 std::shared_ptr<ShaderResources::DrawUse> ShaderResources::BeginDrawUse(Recorder& recorder) const {

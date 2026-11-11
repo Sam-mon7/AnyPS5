@@ -1863,6 +1863,22 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         }
                         break;
                     }
+                    if (!entry.patched && ArchB::Switches::Enabled(ArchB::Feature::CReplayRetained)) {
+                        for (const auto& variant : matched) {
+                            if (variant == nullptr || variant->compiled.get() != stage.program || variant->donor == nullptr || variant->donor->compiled == nullptr) continue;
+                            entry.owner = variant->donor->compiled;
+                            entry.variant = variant->donor;
+                            entry.words = variant->words;
+                            entry.patched = true;
+                            static auto* count = [] {
+                                auto* made = new std::atomic<std::uint64_t>{0};
+                                ArchB::Recorder::RegisterCounter("archc_replay_retained_donor_stages", *made);
+                                return made;
+                            }();
+                            count->fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
                     if (!entry.patched) entry.owner = ownerOf(stage.program);
                     if (entry.owner == nullptr) identified = false;
                     slotIdentity.stages.push_back(std::move(entry));

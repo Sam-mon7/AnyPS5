@@ -469,7 +469,7 @@ void NestedSpeculationRefusesProtectionChanges() {
     Require(copied == AgcDriver::GuestMemory::Compare::Unmapped && !readable, "nested speculation: a protected child was read through stale cached page permissions");
 }
 
-void NestedReplayPatchBases(const std::filesystem::path& control, bool verify) {
+void NestedReplayPatchBases(const std::filesystem::path& control, bool verify, bool expectRetained, bool forwarded) {
     using D = AgcDriver::DriverDetail::Driver;
     using S = AgcDriver::ArchB::Switches;
     using F = AgcDriver::ArchB::Feature;
@@ -491,7 +491,7 @@ void NestedReplayPatchBases(const std::filesystem::path& control, bool verify) {
     Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(header, code.data(), sizeof(code), 1);
     for (std::size_t index = 0; index < roots.size(); ++index) {
-        const auto address = reinterpret_cast<std::uintptr_t>(data + index * 64);
+        const auto address = reinterpret_cast<std::uintptr_t>(data + (forwarded ? 15 : index) * 64);
         data[index * 64] = index >= 12 ? 0.75f : 0.25f;
         descriptors[index] = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 64u, 0x30016facu};
         roots[index][0] = reinterpret_cast<std::uintptr_t>(descriptors[index].data());
@@ -529,31 +529,41 @@ void NestedReplayPatchBases(const std::filesystem::path& control, bool verify) {
     for (std::size_t index = 0; index < 15; ++index) data[index * 64] = 0.0f;
     draw(11, false);
     static_cast<void>(R::Collect(R::Clock::now()));
+    const bool retained = expectRetained;
+    const auto measured = retained ? 9u : 4u;
     const auto before = ArchcReplayCounts();
     auto cached = D::Get().DrawCacheCounters();
-    for (std::size_t index = 12; index < 16; ++index) {
+    for (std::size_t iteration = 0; iteration < measured; ++iteration) {
+        const std::size_t index = iteration == 8 ? 15 : 12 + iteration % 4;
         const auto previous = cached;
         cached = draw(index, false);
         Require(cached.hits == previous.hits + 1, "patch bases: changing both nested tables and the buffer base did not hit the draw cache");
     }
     const auto after = ArchcReplayCounts();
     auto counts = R::Collect(R::Clock::now()).counters;
-    if ((verify && after.verifyChecks != before.verifyChecks + 4) || (!verify && after.hits != before.hits + 4)) {
+    if ((verify && after.verifyChecks != before.verifyChecks + measured) || (!verify && after.hits != before.hits + measured)) {
         for (const auto& [name, value] : counts) {
             if ((name.starts_with("archc_replay_") || name.starts_with("archc_target_") || name.starts_with("fix_draw_reloc_") || name.starts_with("fix_buffer_base_")) && value != 0) std::cerr << name << '=' << value << '\n';
         }
     }
-    Require(counts["fix_draw_reloc_nested_hits"] == 4, "patch bases: the measured draws did not all take nested relocation");
-    Require(counts["fix_buffer_base_hits"] == 4, "patch bases: the measured draws did not all patch buffer bases");
-    if (verify) Require(after.verifyChecks == before.verifyChecks + 4 && after.verifyMismatches == 0, "patch bases: VERIFY did not check every changed base or reported a mismatch");
-    else Require(after.hits == before.hits + 4 && after.legacy == before.legacy, "patch bases: relocated buffer-base draws did not replay through the donor slot (hits " + std::to_string(after.hits - before.hits) + ", captures " + std::to_string(after.captures - before.captures) + ", legacy " + std::to_string(after.legacy - before.legacy) + ")");
+    Require(counts["fix_draw_reloc_nested_hits"] == measured, "patch bases: the measured draws did not all take nested relocation");
+    Require(counts["fix_buffer_base_hits"] == (forwarded ? 0u : measured), "patch bases: the measured draws did not all patch buffer bases");
+    if (verify) Require(after.verifyChecks == before.verifyChecks + measured && after.verifyMismatches == 0, "patch bases: VERIFY did not check every changed base or reported a mismatch");
+    else Require(after.hits == before.hits + measured && after.legacy == before.legacy, "patch bases: relocated buffer-base draws did not replay through the donor slot (hits " + std::to_string(after.hits - before.hits) + ", captures " + std::to_string(after.captures - before.captures) + ", legacy " + std::to_string(after.legacy - before.legacy) + ")");
+    if (forwarded) Require(counts["archc_replay_retained_donor_stages"] >= measured, "retained forwarded replay: no already-patched donor identities were retained");
+    if (retained) Require(counts["archc_replay_retained_taken"] != 0, "retained replay: no exact moved-list proof was reused");
+    if (retained && !verify && counts["archc_replay_retained_bindings"] == 0) {
+        for (const auto& [name, value] : counts)
+            if (value != 0 && (name.starts_with("archc_replay_retained_") || name.starts_with("zc_moved_"))) std::cerr << name << '=' << value << '\n';
+    }
+    if (retained && !verify) Require(counts["archc_replay_retained_bindings"] != 0, "retained replay: no immutable descriptor set was retained");
     AgcDriverWaitIdle_nid_postfix();
     const auto actual = pixels(191);
     unsigned sequence = 0;
     const auto enable = [&](bool enabled) {
         {
             std::ofstream stream(control, std::ios::trunc);
-            stream << ++sequence << " C_REPLAY_PATCH_BASES=" << enabled << '\n';
+            stream << ++sequence << " C_REPLAY_PATCH_BASES=" << enabled << " C_REPLAY_RETAINED=" << (retained && enabled) << '\n';
             Require(stream.good(), "patch bases: cannot write reference switches");
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -572,7 +582,7 @@ void NestedReplayPatchBases(const std::filesystem::path& control, bool verify) {
     Require(actual == pixels(191), "patch bases: replay image differs from the same nested-relocated draw with C_REPLAY_PATCH_BASES off");
     enable(true);
     descriptors[17][2] = 32;
-    data[17 * 64] = 1.0f;
+    data[(forwarded ? 15 : 17) * 64] = 1.0f;
     const auto refusedBefore = ArchcReplayCounts();
     const auto refused = draw(17);
     Require(refused.hits == referenceCached.hits && ArchcReplayCounts().hits == refusedBefore.hits, "patch bases: a changed unmasked descriptor reused the old donor or replay slot");
@@ -676,7 +686,7 @@ int main(int argc, char** argv) {
             NestedSpeculationRefusesProtectionChanges();
             return 0;
         }
-        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels" || std::string(argv[1]) == "--replay-patch-bases" || std::string(argv[1]) == "--replay-patch-bases-verify")) {
+        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels" || std::string(argv[1]) == "--replay-patch-bases" || std::string(argv[1]) == "--replay-patch-bases-verify" || std::string(argv[1]) == "--replay-retained" || std::string(argv[1]) == "--replay-retained-verify" || std::string(argv[1]) == "--replay-retained-forwarded" || std::string(argv[1]) == "--replay-retained-forwarded-verify")) {
             struct Control {
                 std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-nested-relocation-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
                 ~Control() { std::filesystem::remove(path); }
@@ -690,7 +700,7 @@ int main(int argc, char** argv) {
 #endif
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
-            if (std::string(argv[1]).starts_with("--replay-patch-bases")) NestedReplayPatchBases(control.path, std::string(argv[1]) == "--replay-patch-bases-verify");
+            if (std::string(argv[1]).starts_with("--replay-")) NestedReplayPatchBases(control.path, std::string(argv[1]).ends_with("-verify"), std::string(argv[1]).starts_with("--replay-retained"), std::string(argv[1]).find("forwarded") != std::string::npos);
             else NestedRelocationPath(control.path);
             AgcDriverShutdown_nid_postfix();
             std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";

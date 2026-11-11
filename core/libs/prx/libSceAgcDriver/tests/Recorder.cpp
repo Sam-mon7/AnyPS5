@@ -6065,6 +6065,178 @@ private:
     static inline DescriptorUpdates* active = nullptr;
 };
 
+void retainedBindingGuardTests(const Device& device, Recorder& recorder) {
+    Require(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained), "retained binding guards require the retained switch");
+    constexpr std::size_t bytes = 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "retained binding guards require watched memory");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            static_cast<void>(HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes));
+        }
+    } unregister{context, block};
+    Require(HostImportFor(context, address, bytes) != nullptr, "retained binding guards require a host import");
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        AgcDriver::GuestMemory::MarkCommitterThread();
+        DescriptorUpdates updates(context);
+        ShaderRecompiler::RecompileResult program;
+        program.spirv = std::vector<std::uint32_t>(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+        program.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+        ShaderRecompiler::DescriptorBinding binding{};
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 64, 0x31000000u};
+        { auto flags = binding.Flags(); flags.bufferWritten = {false}; binding.SetFlags(std::move(flags)); }
+        program.bindings.push_back(binding);
+        binding = {};
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::FaultBuffer;
+        binding.binding = 1;
+        binding.count = 1;
+        program.bindings.push_back(binding);
+        binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        binding.binding = 2;
+        binding.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(binding);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        const ShaderResources::MovedBuffer moved{0, address + 4096, 64, {}};
+        const std::span movedList(&moved, 1);
+        const auto fault = resources.RetainedDrawFault(nullptr);
+        Require(fault.has_value() && fault->buffer != VK_NULL_HANDLE, "retained bindings lost the live fault descriptor");
+        const auto first = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Retained);
+        const auto updateCount = updates.calls.size();
+        const auto second = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Retained);
+        Require(first != nullptr && first->cachedSet != nullptr && second != nullptr && second->cachedSet == first->cachedSet && updates.calls.size() == updateCount, "retained bindings rebuilt an unchanged immutable set");
+        const auto descriptor = updates.calls.back().buffers.at({1, 0});
+        Require(descriptor.buffer == fault->buffer && descriptor.offset == fault->offset && descriptor.range == fault->range, "retained set names a stale fault descriptor");
+        ShaderResources::DrawUse separate;
+        separate.record = std::make_shared<BdaResources>(context);
+        Require(!resources.RetainedDrawFault(&separate).has_value(), "retained bindings accepted a separate per-draw fault record");
+        auto privateBindings = resources.PrepareDrawBindings(snapshots, movedList, false, separate.record.get(), ShaderResources::BindingReplay::Retained, 42);
+        Require(privateBindings == nullptr || privateBindings->cachedSet == nullptr, "a separate fault record reused the immutable set");
+        snapshots.Commands();
+        snapshots.NotePendingWrite(moved.address, moved.size);
+        Require(!resources.MovedStillReadOnly(movedList, snapshots), "retained moved proof ignored a pending write");
+        const auto pending = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Retained);
+        Require(pending == nullptr || pending->cachedSet == nullptr, "retained bindings ignored a pending write");
+        snapshots.Sync();
+        privateBindings.reset();
+        snapshots.FlushDeferredReleases();
+        const auto* imported = HostImportFor(context, address, bytes);
+        Require(imported != nullptr, "retained label import disappeared");
+        const std::uint32_t value = 1;
+        snapshots.RecordStore(imported->buffer, HostImportOffset(*imported, address + 32768), std::as_bytes(std::span(&value, 1)), address + 32768);
+        Require(snapshots.OpenGpuStores() != 0, "retained store refusal did not record a store");
+        Require(resources.MovedStillReadOnly(movedList, snapshots), "an unrelated GPU store invalidated the exact moved-list proof");
+        auto stored = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Retained, 42);
+        Require(stored != nullptr && stored->cachedSet == nullptr && stored->slotBuffer != nullptr, "retained bindings did not keep a private snapshot under an open GPU store");
+        const auto liveFault = resources.RetainedDrawFault(nullptr);
+        const auto reboundFault = updates.calls.back().buffers.at({1, 0});
+        Require(liveFault.has_value() && reboundFault.buffer == liveFault->buffer && reboundFault.offset == liveFault->offset && reboundFault.range == liveFault->range, "a retained pool did not replace its previous draw's fault binding");
+        const char* verifyReuse = std::getenv("APS5_ARCHB_PIPE_DRAW_REUSE_VERIFY");
+        if (verifyReuse != nullptr && std::string_view(verifyReuse) == "0") Require(updates.calls.back().written.size() == 1 && updates.calls.back().written.begin()->first.second == 1, "a retained set rewrote more than its changed fault binding");
+        auto inFlight = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Snapshot, 42);
+        auto otherSlot = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Snapshot, 43);
+        Require(inFlight != nullptr && inFlight->pool == stored->pool && inFlight->allocation.set != stored->allocation.set && inFlight->slotBuffer != stored->slotBuffer, "a retained pool overwrote an in-flight set or snapshot");
+        Require(otherSlot != nullptr && otherSlot->pool != stored->pool, "two replay slots shared their completed-set pools");
+        const auto completedPool = stored->pool;
+        const auto completedSet = stored->allocation.set;
+        const auto secondSet = inFlight->allocation.set;
+        const std::array<std::uint32_t, 4> copiedWords{5, 6, 7, 8};
+        const ShaderResources::MovedBuffer words{2, 0, sizeof(copiedWords), copiedWords};
+        const auto immutableWords = resources.PrepareDrawBindings(snapshots, std::span(&words, 1), false, nullptr, ShaderResources::BindingReplay::Retained);
+        Require(immutableWords != nullptr && immutableWords->cachedSet != nullptr && immutableWords->inPlaceReads.empty(), "immutable copied words were refused because an unrelated GPU store was open");
+        const std::array mixedMoves{moved, words};
+        const auto mixed = resources.PrepareDrawBindings(snapshots, mixedMoves, false, nullptr, ShaderResources::BindingReplay::Snapshot, 42);
+        Require(mixed != nullptr && mixed->snapshots.size() == 2 && mixed->pool != completedPool && mixed->slotBuffer != nullptr && mixed->snapshots[1].words.empty() && std::memcmp(mixed->snapshots[1].Bytes().data(), copiedWords.data(), sizeof(copiedWords)) == 0, "a retained word slot did not copy the live words or kept their source span");
+        snapshots.Sync();
+        stored.reset();
+        inFlight.reset();
+        otherSlot.reset();
+        snapshots.FlushDeferredReleases();
+        snapshots.RecordStore(imported->buffer, HostImportOffset(*imported, address + 32768), std::as_bytes(std::span(&value, 1)), address + 32768);
+        const auto writesBeforeReuse = updates.calls.size();
+        const auto reused = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Snapshot, 42);
+        Require(reused != nullptr && reused->pool == completedPool && (reused->allocation.set == completedSet || reused->allocation.set == secondSet), "a completed replay-slot set was not retained");
+        if (verifyReuse != nullptr && std::string_view(verifyReuse) == "0") Require(updates.calls.size() == writesBeforeReuse, "an unchanged retained set rewrote its fixed or fault descriptors");
+        snapshots.Sync();
+        const auto version = resources.DataWordsVersion();
+        auto changed = program;
+        ++changed.bindings[2].guestDescriptor[0];
+        resources.RefreshData(snapshots.Commands(), CompiledShader{ShaderRecompiler::ShaderStage::Compute, &changed, 0}, &snapshots);
+        Require(resources.DataWordsVersion() != version, "a template data refresh preserved the retained moved-list revision");
+        const std::array original{shader};
+        const auto refreshed = resources.MovedReadOnlyBuffers(original, snapshots, nullptr);
+        Require(refreshed.has_value() && refreshed->size() == 1 && refreshed->front().allocation == 2 && std::ranges::equal(refreshed->front().words, program.bindings[2].guestDescriptor), "the changed template data did not require a new moved override");
+        snapshots.Sync();
+        const auto proof = first->movedProof;
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+        static_cast<void>(HostImportFor(context, address, bytes));
+        Require(!HostImportsUnchanged(context, proof), "retained bindings kept a retired import proof");
+        const auto retired = resources.PrepareDrawBindings(snapshots, movedList, false, nullptr, ShaderResources::BindingReplay::Retained);
+        Require(retired == nullptr || retired->cachedSet == nullptr, "retained bindings reused a retired import");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, bytes, true, true, true);
+        }
+        Require(HostImportFor(context, address, bytes) != nullptr, "retained binding import could not be restored");
+        snapshots.Sync();
+    }
+    context.descriptorCache = nullptr;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        std::uint64_t serial = 1000000;
+        BdaResources retained(context);
+        retained.NoteUse(serial);
+        BdaResources::NoteFinished(context.device, serial);
+        const auto fault = retained.Fault();
+        auto lease = retained.KeepFaultSlot();
+        Require(lease != nullptr, "a retained fault slot has no lifetime lease");
+        std::vector<std::unique_ptr<BdaResources>> pressure;
+        const auto reclaimed = BdaResources::FaultSlots(context.device).reclaimed;
+        const auto allocate = [&] {
+            pressure.push_back(std::make_unique<BdaResources>(context));
+            pressure.back()->NoteUse(++serial);
+            BdaResources::NoteFinished(context.device, serial);
+        };
+        for (std::size_t i = 0; i < 256; ++i) allocate();
+        Require(BdaResources::FaultSlots(context.device).reclaimed > reclaimed && retained.HoldsFaultSlot() && retained.Fault().buffer == fault.buffer && retained.Fault().offset == fault.offset, "fault pressure moved a leased replay descriptor");
+        lease.reset();
+        for (std::size_t i = 0; i < 256 && retained.HoldsFaultSlot(); ++i) allocate();
+        Require(!retained.HoldsFaultSlot(), "a released replay fault lease prevented reclamation");
+        Require(retained.TakeFaultSlot(context), "a released replay fault slot could not be taken again");
+    }
+    recorder.Activate();
+    std::cout << "Retained bindings refused changed fault records, pending writes, GPU stores and retired imports\n";
+}
+
 void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     DescriptorUpdates updates(context);
@@ -16054,6 +16226,64 @@ int archcReplayTests(const Device& device, Recorder& recorder, std::string_view 
         return read;
     };
     const auto counts = [] { return ArchcReplayCounts(); };
+    if (scenario.starts_with("retained_")) {
+        using Census = AgcDriver::ArchB::Recorder;
+        Require(on && Switches::Enabled(Feature::CReplayRetained) && !verify, "retained refusal needs retained replay and VERIFY off");
+        auto identity = wholeIdentity;
+        identity.stages[1].variant = pixel;
+        identity.stages[1].patched = true;
+        identity.stages[1].bufferBases = true;
+        identity.stages[1].words = {0};
+        for (int i = 0; i < 4; ++i) {
+            ++identity.stages[1].words[0];
+            draw(whole, identity);
+            settle();
+        }
+        for (int i = 0; i < 3; ++i) {
+            ++identity.stages[1].words[0];
+            draw(whole, identity);
+        }
+        const auto warmed = counts();
+        auto warmCounters = Census::Collect(Census::Clock::now()).counters;
+        Require(warmed.hits != 0 && warmCounters["archc_replay_retained_taken"] != 0, "retained refusal did not first reuse an exact moved proof");
+        std::string counter;
+        if (scenario == "retained_push") {
+            pixel->pushConstants.resize(4);
+            counter = "archc_replay_retained_refused_push";
+        } else if (scenario == "retained_binding") {
+            ShaderRecompiler::DescriptorBinding binding{};
+            binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+            binding.binding = 2;
+            binding.count = 1;
+            binding.guestDescriptor = {1, 2, 3, 4};
+            pixel->bindings.push_back(std::move(binding));
+            counter = "archc_replay_retained_refused_shape";
+        } else if (scenario == "retained_owner") {
+            identity.stages[1].owner = std::make_shared<int>(1);
+            counter = "archc_replay_refused_new";
+        } else if (scenario == "retained_membership") {
+            SharedResourceCache().Clear();
+            counter = "archc_replay_refused_template_membership";
+        } else if (scenario == "retained_target") {
+            std::fill_n(block, unit, std::byte{0x40});
+            counter = "archc_replay_refused_targets";
+        } else throw std::runtime_error("unknown retained refusal scenario");
+        ++identity.stages[1].words[0];
+        bool invalidLayout = false;
+        try {
+            draw(whole, identity);
+        } catch (const std::runtime_error& error) {
+            invalidLayout = std::string_view(error.what()).find("recompiler push constant metadata disagrees with SPIR-V") != std::string_view::npos;
+            if (!invalidLayout && !(scenario == "retained_binding" && std::string_view(error.what()).find("recompiler binding metadata contains undeclared resources") != std::string_view::npos)) throw;
+        }
+        const auto after = counts();
+        auto rejected = Census::Collect(Census::Clock::now()).counters;
+        Require(after.hits == warmed.hits && rejected[counter] == 1, "retained replay did not refuse changed " + std::string(scenario) + " (" + counter + "=" + std::to_string(rejected[counter]) + ")");
+        Require(scenario != "retained_push" || invalidLayout, "retained replay weakened the full-path push layout check");
+        std::cout << "agc_archc_replay_" << scenario << ": ok (" << counter << "=1)\n";
+        return 0;
+    }
     if (scenario == "patch_bases_refused") {
         using Census = AgcDriver::ArchB::Recorder;
         Require(on && Switches::Enabled(Feature::CReplayPatchBases) && !verify, "patch-base refusal needs replay, patch bases and VERIFY off");
@@ -18799,6 +19029,10 @@ int main(int argc, char** argv) {
             multisampleGuestAccessTests(device, recorder);
             oneFragmentFmaskGuardTests(device);
             fmaskDecompressMsaaTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--retained-binding-guards") {
+            retainedBindingGuardTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {

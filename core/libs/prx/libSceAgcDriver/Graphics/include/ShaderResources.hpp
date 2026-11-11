@@ -220,6 +220,7 @@ public:
             std::shared_ptr<Buffer> buffer;
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
+            std::span<const std::uint32_t> words;
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
@@ -259,6 +260,8 @@ public:
         std::vector<VkDeviceSize> slotOffsets;
         std::vector<std::size_t> slotSizes;
         std::uint64_t serial = 0;
+        VkDescriptorBufferInfo fault{};
+        std::shared_ptr<void> faultKeep;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -279,7 +282,9 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
+    enum class BindingReplay { None, Snapshot, Retained };
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, BindingReplay replay = BindingReplay::None, std::uint64_t replaySlot = 0) const;
+    std::optional<VkDescriptorBufferInfo> RetainedDrawFault(const DrawUse* use) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
@@ -443,6 +448,7 @@ public:
     // as the recorded work will find them (maintained by addDataBuffer and RefreshData), and of a
     // compiled shader's descriptors. A recipe hit refreshes the template iff the two differ.
     std::uint64_t DataWordsHash() const { return dataWordsHash; }
+    std::uint64_t DataWordsVersion() const { return dataWordsVersion; }
     static std::uint64_t DataWordsHash(const CompiledShader& shader);
     void PatchPushConstants(std::span<std::byte, PipelinePushConstantBytes> bytes) const {
         for (const auto& [position, adjustment] : pushPatches) bytes[position] = static_cast<std::byte>(adjustment);
@@ -781,14 +787,15 @@ private:
     };
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
-    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, Recorder* recorder = nullptr, bool slotted = false, std::span<const std::size_t> slotElements = {}, std::span<const std::size_t> slotSizes = {}, std::span<const std::size_t> slotSnapshots = {}) const;
+    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, Recorder* recorder = nullptr, bool slotted = false, std::span<const std::size_t> slotElements = {}, std::span<const std::size_t> slotSizes = {}, std::span<const std::size_t> slotSnapshots = {}, const std::shared_ptr<DrawSetPool>& retainedPool = {}) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // APS5_ARCHB_FIX_DRAW_SET_POOL: made with the descriptor writes (buildComplete), never replaced.
     std::shared_ptr<DrawSetPool> drawSetPool;
+    mutable std::unordered_map<std::uint64_t, std::shared_ptr<DrawSetPool>> replayDrawSetPools;
     struct MovedSetCache;
     mutable std::shared_ptr<MovedSetCache> movedSetCache;
-    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
+    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool retainFault) const;
 
 public:
     // Arch C P3b (C_REPLAY_SLOT_BINDINGS): the conditions of MovedReadOnlyBuffers that do not depend only on the
@@ -954,6 +961,7 @@ private:
     bool importsReconcilable = false;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
+    std::uint64_t dataWordsVersion = 0;
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;

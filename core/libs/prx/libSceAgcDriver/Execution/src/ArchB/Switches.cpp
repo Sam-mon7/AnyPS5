@@ -63,6 +63,7 @@ constexpr Feature CWatchSplitPrerequisites[] = {Feature::WtFault};
 constexpr Feature CLazyStoreHookPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature CReplaySplitFacesPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CReplayPatchBasesPrerequisites[] = {Feature::ArchcDrawReplay, Feature::ArchcReplayPatchSlots};
+constexpr Feature CReplayRetainedPrerequisites[] = {Feature::CReplayPatchBases};
 constexpr Feature CGpuUploadCarryPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature CGpuBlockPublishPrerequisites[] = {Feature::CGpuStagingCarry, Feature::WtFault, Feature::WtFaultConsumers};
 constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
@@ -160,6 +161,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::CGpuUploadCarry, "C_GPU_UPLOAD_CARRY", false, true, CGpuUploadCarryPrerequisites},
     {Feature::CReplaySplitFaces, "C_REPLAY_SPLIT_FACES", false, true, CReplaySplitFacesPrerequisites},
     {Feature::CReplayPatchBases, "C_REPLAY_PATCH_BASES", false, true, CReplayPatchBasesPrerequisites},
+    {Feature::CReplayRetained, "C_REPLAY_RETAINED", false, true, CReplayRetainedPrerequisites},
     {Feature::ArchcImageEpochs, "C_IMAGE_EPOCHS", false, true, ArchcImageEpochsPrerequisites},
     {Feature::ArchcTargetFastpath, "C_TARGET_FASTPATH", false, true, ArchcTargetFastpathPrerequisites},
     {Feature::CLazyPublish, "C_LAZY_PUBLISH", false, true, CLazyPublishPrerequisites},

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -220,6 +222,23 @@ std::span<std::byte> BdaResources::faultBytes() const {
     return faultChunk->buffer->Bytes().subspan(static_cast<std::size_t>(faultOffset), static_cast<std::size_t>(faultChunk->slotBytes));
 }
 
+std::shared_ptr<void> BdaResources::KeepFaultSlot() const {
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained)) return faultChunk;
+    if (faultChunk == nullptr) return {};
+    if (auto kept = faultRetention.lock()) return kept;
+    auto kept = std::make_shared<std::shared_ptr<BdaFaultChunk>>(faultChunk);
+    faultRetention = kept;
+    static auto* count = [] {
+        auto* made = new std::atomic<std::uint64_t>{0};
+        AgcDriver::ArchB::Recorder::RegisterCounter("archc_replay_retained_fault_leases", *made);
+        return made;
+    }();
+    count->fetch_add(1, std::memory_order_relaxed);
+    return kept;
+}
+
 void BdaResources::NoteUse(std::uint64_t serial) {
     auto& arenas = faultArenas();
     std::lock_guard lock(arenas.mutex);
@@ -256,8 +275,9 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     bool reclaimed = false;
     if (shared && source == arena.chunks.rend() && GuestMemory::GpuMutex().HeldByThisThread()) {
         std::vector<BdaResources*> idle;
+        const bool retained = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained);
         for (auto* holder : arena.holders) {
-            if (holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
+            if ((!retained || holder->faultRetention.expired()) && holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
         }
         if (!idle.empty()) {
             const auto reclaim = (idle.size() + 1) / 2;
@@ -266,6 +286,7 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
                 auto& holder = *idle[index];
                 holder.faultChunk->free.push_back(holder.faultOffset);
                 holder.faultChunk.reset();
+                holder.faultRetention.reset();
                 arena.holders.erase(&holder);
                 --arena.counts.held;
                 ++arena.counts.reclaimed;

@@ -82,6 +82,7 @@ enum class Feature : std::uint8_t {
     CGpuUploadCarry,
     CReplaySplitFaces,
     CReplayPatchBases,
+    CReplayRetained,
     ArchcImageEpochs,
     ArchcTargetFastpath,
     CLazyPublish,

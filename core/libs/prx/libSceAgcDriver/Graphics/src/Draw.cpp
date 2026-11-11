@@ -4890,6 +4890,7 @@ struct PreparedDraw {
     const DrawSlotIdentity* identity = nullptr;
     bool slotVerify = false;
     bool slotVerifyPatch = false;
+    bool slotVerifyRetained = false;
     std::optional<std::array<std::byte, PipelinePushConstantBytes>> slotReplayPush;
     std::optional<std::vector<ShaderResources::MovedBuffer>> slotReplayMoved;
     std::vector<std::vector<std::uint32_t>> slotReplayMovedWords;
@@ -5294,10 +5295,42 @@ std::uint32_t currentSwitches() {
     bits |= Switches::Enabled(Feature::FixDrawSetPool) ? 8u : 0u;
     bits |= Switches::Enabled(Feature::PipeDrawReuse) ? 16u : 0u;
     bits |= Switches::Enabled(Feature::CReplayPatchBases) ? 32u : 0u;
+    bits |= Switches::Enabled(Feature::CReplayRetained) ? 64u : 0u;
     return bits;
 }
 
+enum RetainedReason : std::size_t { RetainedTaken, RetainedNew, RetainedShape, RetainedPush, RetainedData, RetainedHazard, RetainedStore, RetainedSet, RetainedImport, RetainedPending, RetainedMode, RetainedCold, RetainedFault, RetainedBindings, RetainedReplays, RetainedVerified, RetainedMismatched, RetainedNs, RetainedBaseReplays, RetainedBaseNs, RetainedRecordNs, RetainedCount };
+constexpr std::array<const char*, RetainedCount> RetainedNames{"taken", "refused_new", "refused_shape", "refused_push", "refused_data", "refused_hazard", "refused_store", "refused_set", "refused_import", "refused_pending", "refused_mode", "refused_cold", "refused_fault", "bindings", "replays", "verify_checks", "verify_mismatches", "ns", "base_replays", "base_ns", "record_ns"};
+
+void retainedCount(RetainedReason reason, std::uint64_t value = 1) {
+    struct Counts {
+        std::array<std::atomic<std::uint64_t>, RetainedCount> values{};
+        Counts() {
+            using AgcDriver::ArchB::Recorder;
+            for (std::size_t i = 0; i < RetainedCount; ++i) Recorder::RegisterCounter((new std::string(std::string("archc_replay_retained_") + RetainedNames[i]))->c_str(), values[i]);
+        }
+    };
+    static Counts counts;
+    counts.values[reason].fetch_add(value, std::memory_order_relaxed);
+}
+
+struct Retained {
+    std::vector<std::uint32_t> descriptors;
+    std::vector<ShaderResources::MovedBuffer> moved;
+    std::vector<std::vector<std::uint32_t>> words;
+    std::uint64_t dataVersion = 0;
+    std::weak_ptr<void> set;
+    VkDescriptorSet vertex = VK_NULL_HANDLE;
+    VkDescriptorSet fragment = VK_NULL_HANDLE;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    HostImportsProof proof{};
+    VkDescriptorBufferInfo fault{};
+};
+
 struct Slot {
+    std::array<std::vector<ShaderRecompiler::DescriptorBinding>, MaxStages> retainedLayout;
+    std::array<std::size_t, MaxStages> retainedPushSize{};
+    std::unordered_map<std::uint64_t, Retained> retained;
     std::uint64_t lastUse = 0;
     // C_REPLAY_PATCH_SLOTS: keyed without the patch words of its patched stages (no static moved list, no
     // kept moved list or cached moved set: the replay takes both live).
@@ -5353,7 +5386,65 @@ struct Slot {
     VkDescriptorSet bindFragment = VK_NULL_HANDLE;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> bindReads;
     HostImportsProof bindProof{};
+    std::uint64_t bindingSlot = 0;
 };
+
+bool retainedMovableBinding(ShaderRecompiler::DescriptorRole role) {
+    return role == ShaderRecompiler::DescriptorRole::GuestBuffers || role == ShaderRecompiler::DescriptorRole::ShaderData || role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
+}
+
+std::uint64_t retainedKey(std::span<const CompiledShader> shaders) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto& shader : shaders) {
+        for (const auto& binding : shader.program->bindings) {
+            if (!retainedMovableBinding(binding.role)) continue;
+            for (const auto word : binding.guestDescriptor) hash = (hash ^ word) * 0x100000001b3ull;
+        }
+    }
+    return hash;
+}
+
+bool retainedDescriptors(const Retained& entry, std::span<const CompiledShader> shaders) {
+    std::size_t offset = 0;
+    for (const auto& shader : shaders) {
+        for (const auto& binding : shader.program->bindings) {
+            if (!retainedMovableBinding(binding.role)) continue;
+            if (binding.guestDescriptor.size() > entry.descriptors.size() - offset || !std::equal(binding.guestDescriptor.begin(), binding.guestDescriptor.end(), entry.descriptors.begin() + static_cast<std::ptrdiff_t>(offset))) return false;
+            offset += binding.guestDescriptor.size();
+        }
+    }
+    return offset == entry.descriptors.size();
+}
+
+Retained& keepRetained(Slot& slot, std::uint64_t key, std::span<const CompiledShader> shaders, std::span<const ShaderResources::MovedBuffer> moved, const ShaderResources& resources) {
+    if (slot.retained.size() >= 64 && !slot.retained.contains(key)) slot.retained.clear();
+    auto& entry = slot.retained[key];
+    entry = Retained{};
+    entry.dataVersion = resources.DataWordsVersion();
+    for (const auto& shader : shaders)
+        for (const auto& binding : shader.program->bindings)
+            if (retainedMovableBinding(binding.role)) entry.descriptors.insert(entry.descriptors.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+    entry.words.reserve(moved.size());
+    for (const auto& item : moved) entry.words.emplace_back(item.words.begin(), item.words.end());
+    entry.moved.assign(moved.begin(), moved.end());
+    for (std::size_t i = 0; i < moved.size(); ++i) entry.moved[i].words = entry.words[i];
+    return entry;
+}
+
+RetainedReason retainedLayout(const Slot& slot, std::span<const CompiledShader> shaders) {
+    for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
+        const auto& program = *shaders[stage].program;
+        if (program.pushConstants.size() != slot.retainedPushSize[stage]) return RetainedPush;
+        const auto& kept = slot.retainedLayout[stage];
+        if (kept.size() != program.bindings.size()) return RetainedShape;
+        for (std::size_t i = 0; i < kept.size(); ++i) {
+            const auto& a = kept[i];
+            const auto& b = program.bindings[i];
+            if ((!retainedMovableBinding(a.role) && a.guestDescriptor != b.guestDescriptor) || a.kind != b.kind || a.role != b.role || a.descriptorSet != b.descriptorSet || a.binding != b.binding || a.count != b.count || a.readOnly != b.readOnly || a.guestDescriptor.size() != b.guestDescriptor.size() || a.imageShape != b.imageShape || a.imageShapes != b.imageShapes || a.imageSamplers != b.imageSamplers || a.bufferExtent != b.bufferExtent || (a.flags != b.flags && a.Flags() != b.Flags())) return RetainedShape;
+        }
+    }
+    return RetainedTaken;
+}
 
 void keepLiveMoved(Slot& slot, std::span<const ShaderResources::MovedBuffer> moved) {
     slot.liveWords.clear();
@@ -5511,6 +5602,15 @@ bool sightedBefore(std::uint64_t key) {
     return false;
 }
 
+bool retainedSeenBefore(std::uint64_t key) {
+    struct SeenStorage {};
+    auto& seen = AgcDriver::ThreadScratch<std::array<std::uint64_t, 16384>, SeenStorage>();
+    auto& entry = seen[static_cast<std::size_t>((key ^ (key >> 29u)) % seen.size())];
+    if (entry == key) return true;
+    entry = key;
+    return false;
+}
+
 // P3c census (APS5_ARCHB_C_NOSTAGE_CENSUS=1): a slot miss whose stages are data-word patched, and whether its
 // key without the patch words (patched stages without buffer-base words) was seen before.
 struct PatchCensus {
@@ -5621,9 +5721,12 @@ public:
         last = now;
         if (probeTiming()) probeLast = probeNow();
     }
-    void Finish() {
+    void Finish(bool retained = false, bool bases = false) {
         if (!on) return;
-        counters().replayNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        counters().replayNs.fetch_add(ns, std::memory_order_relaxed);
+        if (retained) retainedCount(RetainedNs, ns);
+        if (retained && bases) retainedCount(RetainedBaseNs, ns);
     }
 
 private:
@@ -5649,6 +5752,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         auto& counts = counters();
         counts.mismatched[component].fetch_add(1, std::memory_order_relaxed);
         if (prepared.slotVerifyPatch) cutMismatch(CutPatchSlots, component < ComponentCount ? ComponentNames[component] : "ineligible");
+        if (prepared.slotVerifyRetained) retainedCount(RetainedMismatched);
         if (counts.verifyMismatches.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: %s (indirect 0x%llx)\n", component < ComponentCount ? ComponentNames[component] : "ineligible", static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
     };
     const auto refuse = [&](Ineligible why) {
@@ -5685,6 +5789,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     if (resources->CacheMembership() == 0) return refuse(IneligibleMembership);
     Slot slot;
     slot.lastUse = ++made.uses;
+    slot.bindingSlot = key;
     slot.wordless = wordless;
     slot.device = context.device;
     slot.stateOwner = identity.state.get();
@@ -5698,7 +5803,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         slot.ownerRaw[i] = stage.owner.get();
         slot.variants[i] = stage.variant;
         slot.variantRaw[i] = stage.variant.get();
-        slot.words[i] = stage.words;
+        if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CReplayRetained) || !wordless || !wordlessStage(stage)) slot.words[i] = stage.words;
         slot.patched[i] = static_cast<std::uint8_t>((stage.patched ? 1u : 0u) | (stage.bufferBases ? 2u : 0u));
     }
     slot.draw = draw;
@@ -5745,6 +5850,13 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     pass.passReads.erase(readAt);
     pass.linearReads.erase(linearAt);
     slot.pass = std::move(pass);
+    if (cutEnabled(AgcDriver::ArchB::Feature::CReplayRetained) && refreshPatchedIdentity(identity)) {
+        for (std::size_t i = 0; i < shaders.size(); ++i) {
+            slot.retainedLayout[i] = shaders[i].program->bindings;
+            slot.retainedPushSize[i] = shaders[i].program->pushConstants.size();
+        }
+        keepRetained(slot, retainedKey(shaders), shaders, prepared.resolved.moved, *resources);
+    }
     slot.pushStages = PushConstantStages(shaders);
     if (slot.pushStages != 0) {
         slot.push = AssemblePushConstants(shaders);
@@ -5826,7 +5938,18 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     slot->lastUse = ++table().uses;
     if (slot->switches != currentSwitches() || diagnosticsBlock()) return refuse(RefusedSwitches);
     const bool refreshPatched = refreshPatchedIdentity(identity);
-    if (refreshPatched && (slot->movedStatic || PushConstantStages(shaders) != slot->pushStages)) return refuse(RefusedPatchBases);
+    const bool retain = refreshPatched && cutEnabled(AgcDriver::ArchB::Feature::CReplayRetained);
+    if (refreshPatched && (slot->movedStatic || PushConstantStages(shaders) != slot->pushStages)) {
+        if (cutEnabled(AgcDriver::ArchB::Feature::CReplayRetained)) retainedCount(RetainedPush);
+        return refuse(RefusedPatchBases);
+    }
+    if (retain) {
+        const auto layout = retainedLayout(*slot, shaders);
+        if (layout != RetainedTaken) {
+            retainedCount(layout);
+            return refuse(RefusedPatchBases);
+        }
+    }
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || context.recorder != recorder) return refuse(RefusedRecorder);
     auto resources = slot->resources.lock();
@@ -5886,12 +6009,27 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     clock.Mark(StepProof);
     // C_REPLAY_SLOT_BINDINGS: a non-static list is the slot's last live list while its live conditions hold.
-    const bool slotBindings = cutEnabled(Feature::ArchcReplaySlotBindings) && !refreshPatched;
+    Retained* retained = nullptr;
+    bool retainedMoved = false;
+    std::uint64_t retainedHash = 0;
+    if (retain) {
+        retainedHash = retainedKey(shaders);
+        const auto found = slot->retained.find(retainedHash);
+        if (found == slot->retained.end() || !retainedDescriptors(found->second, shaders)) retainedCount(RetainedNew);
+        else if (found->second.dataVersion != resources->DataWordsVersion()) retainedCount(RetainedData);
+        else if (!resources->MovedStillReadOnly(found->second.moved, *recorder)) retainedCount(RetainedHazard);
+        else {
+            retained = &found->second;
+            retainedMoved = true;
+            retainedCount(RetainedTaken);
+        }
+    }
+    const bool slotBindings = (cutEnabled(Feature::ArchcReplaySlotBindings) && !refreshPatched) || retain;
     std::optional<std::vector<ShaderResources::MovedBuffer>> liveMoved;
     bool movedFromSlot = false;
-    if (!slot->movedStatic) {
-        const bool verifyMoved = slotBindings && !slot->wordless && slot->liveKept && cutVerifyNow(CutSlotMoved);
-        const bool holds = slotBindings && !slot->wordless && slot->liveKept && resources->MovedStillReadOnly(slot->liveMoved, *recorder);
+    if (!slot->movedStatic && !retainedMoved) {
+        const bool verifyMoved = slotBindings && !refreshPatched && !slot->wordless && slot->liveKept && cutVerifyNow(CutSlotMoved);
+        const bool holds = slotBindings && !refreshPatched && !slot->wordless && slot->liveKept && resources->MovedStillReadOnly(slot->liveMoved, *recorder);
         if (holds && !verifyMoved) {
             movedFromSlot = true;
             cutHit(CutSlotMoved);
@@ -5900,10 +6038,15 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
             liveMoved = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
             if (verifyMoved && holds != (liveMoved.has_value() && sameMoved(*liveMoved, slot->liveMoved))) cutMismatch(CutSlotMoved, holds ? "the kept moved list held where the live list differs" : "the kept moved list was refused where the live list equals it");
             if (!liveMoved.has_value()) return refuse(RefusedMoved);
-            if (slotBindings && !slot->wordless && (!slot->liveKept || !sameMoved(*liveMoved, slot->liveMoved))) keepLiveMoved(*slot, *liveMoved);
+            if (slotBindings && !refreshPatched && !slot->wordless && (!slot->liveKept || !sameMoved(*liveMoved, slot->liveMoved))) keepLiveMoved(*slot, *liveMoved);
         }
     }
-    const std::span<const ShaderResources::MovedBuffer> moved = slot->movedStatic ? std::span<const ShaderResources::MovedBuffer>(slot->moved) : movedFromSlot ? std::span<const ShaderResources::MovedBuffer>(slot->liveMoved) : std::span<const ShaderResources::MovedBuffer>(*liveMoved);
+    const bool retainedWords = retain && (retained != nullptr ? std::ranges::all_of(retained->moved, [](const auto& entry) { return !entry.words.empty(); }) : liveMoved.has_value() && std::ranges::all_of(*liveMoved, [](const auto& entry) { return !entry.words.empty(); }));
+    if (retain && !retainedMoved && liveMoved.has_value()) {
+        if (!retainedSeenBefore(mix(retainedHash, reinterpret_cast<std::uintptr_t>(slot)))) retainedCount(RetainedCold);
+        else retained = &keepRetained(*slot, retainedHash, shaders, *liveMoved, *resources);
+    }
+    const std::span<const ShaderResources::MovedBuffer> moved = retained != nullptr ? std::span<const ShaderResources::MovedBuffer>(retained->moved) : slot->movedStatic ? std::span<const ShaderResources::MovedBuffer>(slot->moved) : movedFromSlot ? std::span<const ShaderResources::MovedBuffer>(slot->liveMoved) : std::span<const ShaderResources::MovedBuffer>(*liveMoved);
     if (const auto present = Recorder::Presents(); slot->touched != present) {
         SharedResourceCache().Touch(slot->contentKey);
         slot->touched = present;
@@ -5915,7 +6058,13 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     clock.Mark(StepArgs);
     if (refreshPatched) {
-        prepared.slotReplayPush = AssemblePushConstants(shaders);
+        if (retain) {
+            prepared.slotReplayPush = slot->push;
+            for (std::size_t i = 0; i < shaders.size(); ++i) {
+                const auto& bytes = shaders[i].program->pushConstants;
+                if (!bytes.empty()) std::memcpy(prepared.slotReplayPush->data() + shaders[i].pushConstantOffset, bytes.data(), bytes.size());
+            }
+        } else prepared.slotReplayPush = AssemblePushConstants(shaders);
         resources->PatchPushConstants(*prepared.slotReplayPush);
         if (verifyPeriod() != 0 && *prepared.slotReplayPush != slot->push) {
             static std::uint64_t reports = 0;
@@ -5934,6 +6083,8 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         prepared.slotVerify = true;
         prepared.slotVerifyPatch = patchVerify;
+        prepared.slotVerifyRetained = retain;
+        if (retain) retainedCount(RetainedVerified);
         if (refreshPatched) {
             prepared.slotReplayMoved.emplace(moved.begin(), moved.end());
             prepared.slotReplayMovedWords.reserve(moved.size());
@@ -5949,6 +6100,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     if (state.depth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     PerformanceTimer timing("Graphics.DrawReplay", AgcDriver::ArchB::Recorder::Phase::Record);
+    const auto retainedRecordStart = retain && stepTiming() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     struct ReuseGuard {
         Recorder* recorder;
         int exceptions = std::uncaught_exceptions();
@@ -5977,14 +6129,24 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     // with zero-copy storage and nothing moved it binds the template's set (no bindings); with a moved list it
     // hands back the cached moved set while the batch holds no GPU store, no moved range has a pending write
     // and the imports are those the set was built under. The set's read notes and its keep still run.
+    if (retained != nullptr) {
+        slot->bindSet = retained->set;
+        slot->bindVertex = retained->vertex;
+        slot->bindFragment = retained->fragment;
+        slot->bindReads = retained->reads;
+        slot->bindProof = retained->proof;
+    }
     const auto drawUse = resources->BeginDrawUse(*recorder);
+    const auto retainedFault = retained != nullptr && !moved.empty() ? resources->RetainedDrawFault(drawUse.get()) : std::nullopt;
+    const bool sameFault = retained == nullptr || (retainedFault.has_value() && retainedFault->buffer == retained->fault.buffer && retainedFault->offset == retained->fault.offset && retainedFault->range == retained->fault.range);
     std::shared_ptr<ShaderResources::DrawBindings> drawBindings;
     std::shared_ptr<void> slotSet;
     bool slotBound = false;
+    const bool keptBindings = retained != nullptr || (!refreshPatched && !slot->wordless);
     if (slotBindings) {
         if (moved.empty() && Recorder::ZeroCopyStorageActive()) {
             slotBound = true;
-        } else if (!slot->wordless && !moved.empty() && Recorder::ZeroCopyStorageActive() && cutEnabled(Feature::ZeroCopyMoved) && recorder->OpenGpuStores() == 0 && (slotSet = slot->bindSet.lock()) != nullptr) {
+        } else if (keptBindings && !moved.empty() && Recorder::ZeroCopyStorageActive() && cutEnabled(Feature::ZeroCopyMoved) && sameFault && (recorder->OpenGpuStores() == 0 || retainedWords) && (slotSet = slot->bindSet.lock()) != nullptr) {
             slotBound = std::none_of(slot->bindReads.begin(), slot->bindReads.end(), [&](const auto& read) { return recorder->PendingWriteOverlaps(read.first, static_cast<std::size_t>(read.second - read.first)); }) && HostImportsUnchanged(context, slot->bindProof);
             if (!slotBound) slotSet.reset();
         }
@@ -6000,19 +6162,35 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         }
     } else {
         if (slotBindings) cutLive(CutSlotBindings);
-        drawBindings = resources->PrepareDrawBindings(*recorder, moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+        drawBindings = resources->PrepareDrawBindings(*recorder, moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr, retained != nullptr ? ShaderResources::BindingReplay::Retained : retain ? ShaderResources::BindingReplay::Snapshot : ShaderResources::BindingReplay::None, slot->bindingSlot);
         if (verifyBindings) {
             const bool same = slotSet == nullptr ? drawBindings == nullptr : drawBindings != nullptr && drawBindings->cachedSet == slotSet && drawBindings->allocation.set == slot->bindVertex && drawBindings->fragmentAllocation.set == slot->bindFragment && drawBindings->inPlaceReads == slot->bindReads;
             if (!same) cutMismatch(CutSlotBindings, slotSet == nullptr ? "the slot answered no bindings" : "the slot's cached moved set differs from PrepareDrawBindings'");
         }
-        if (slotBindings && !slot->wordless && !moved.empty() && drawBindings != nullptr && drawBindings->cachedSet != nullptr) {
+        if (slotBindings && keptBindings && !moved.empty() && drawBindings != nullptr && drawBindings->cachedSet != nullptr) {
             slot->bindSet = drawBindings->cachedSet;
             slot->bindVertex = drawBindings->allocation.set;
             slot->bindFragment = drawBindings->fragmentAllocation.set;
             slot->bindReads = drawBindings->inPlaceReads;
             slot->bindProof = drawBindings->movedProof;
+            if (retained != nullptr && retainedFault.has_value()) retained->fault = *retainedFault;
         }
+        if (retained != nullptr && (drawBindings == nullptr || drawBindings->cachedSet == nullptr)) slot->bindSet.reset();
         slotSet.reset();
+    }
+    if (retained != nullptr) {
+        if (slotBound) retainedCount(RetainedBindings);
+        else if (!Recorder::ZeroCopyStorageActive() || !cutEnabled(Feature::ZeroCopyMoved)) retainedCount(RetainedMode);
+        else if (recorder->OpenGpuStores() != 0 && !retainedWords) retainedCount(RetainedStore);
+        else if (retained->set.expired()) retainedCount(RetainedSet);
+        else if (!sameFault) retainedCount(RetainedFault);
+        else if (!HostImportsUnchanged(context, retained->proof)) retainedCount(RetainedImport);
+        else retainedCount(RetainedPending);
+        retained->set = slot->bindSet;
+        retained->vertex = slot->bindVertex;
+        retained->fragment = slot->bindFragment;
+        retained->reads = slot->bindReads;
+        retained->proof = slot->bindProof;
     }
     const VkDescriptorSet boundSet = slotSet != nullptr ? slot->bindVertex : drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE;
     const VkDescriptorSet boundFragmentSet = slotSet != nullptr ? slot->bindFragment : drawBindings != nullptr ? drawBindings->fragmentAllocation.set : VK_NULL_HANDLE;
@@ -6130,8 +6308,12 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     work.targets.clear();
     work.inputs = DrawInputs{};
     clock.Mark(StepKeep);
-    clock.Finish();
+    const bool bases = retain && std::ranges::any_of(identity.stages, [](const DrawSlotStage& stage) { return stage.bufferBases; });
+    clock.Finish(retain, bases);
     slot->replayedLast = true;
+    if (retain) retainedCount(RetainedReplays);
+    if (bases) retainedCount(RetainedBaseReplays);
+    if (retainedRecordStart != std::chrono::steady_clock::time_point{}) retainedCount(RetainedRecordNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - retainedRecordStart).count()));
     if (slot->wordless) cutHit(CutPatchSlots);
     counts.hits.fetch_add(1, std::memory_order_relaxed);
     lastOutcome() = OutcomeReplayed;
