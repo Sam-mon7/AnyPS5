@@ -517,7 +517,10 @@ bool LiveStateMatches(const GatherLiveEntry& entry, const QueueState& queue) {
 
 struct GatherLiveIndex {
     std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<GatherLiveEntry>>> entries;
+    std::unordered_map<std::uint64_t, std::size_t> cursors;
 };
+
+constexpr std::size_t LiveWays = 8;
 
 GatherLiveIndex& LiveIndex() {
     thread_local GatherLiveIndex index;
@@ -570,7 +573,10 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
         donors.push_back(variant->donor != nullptr ? variant->donor : variant);
     }
     auto& index = LiveIndex().entries;
-    if (index.size() >= 4096 && !index.contains(tail.liveKey)) index.clear();
+    if (index.size() >= 4096 && !index.contains(tail.liveKey)) {
+        index.clear();
+        LiveIndex().cursors.clear();
+    }
     auto& bucket = index[tail.liveKey];
     const auto options = LiveOptions(tail);
     for (const auto& known : bucket) if (known->link->valid.load(std::memory_order_acquire) && known->variants == donors && known->options == options && LivePacketMatches(known->packet, tail.livePacket) && LiveViewsCurrent(*known) && LiveStateMatches(*known, queue)) return known;
@@ -599,7 +605,11 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
         const bool user = range.bank == Graphics::RegisterBank::Shader && std::any_of(entry->decode->programs.begin(), entry->decode->programs.end(), [&](const auto& program) { return offset >= program.userDataBase && offset - program.userDataBase < program.userData.size() - program.hiddenUserWords; });
         if (!user) entry->registers.push_back({range.bank, offset, LiveRegister(queue, range.bank, offset)});
     }
-    if (bucket.size() >= 8) bucket.erase(bucket.begin());
+    if (bucket.size() >= LiveWays) {
+        const auto stale = std::find_if(bucket.begin(), bucket.end(), [](const auto& known) { return !known->link->valid.load(std::memory_order_acquire); });
+        bucket.erase(stale != bucket.end() ? stale : bucket.begin());
+        ArchB::Recorder::Count("draw_templates_live_bucket_evictions");
+    }
     bucket.push_back(entry);
     ArchB::Recorder::Count("draw_templates_live_templates_learned");
     return entry;
@@ -613,7 +623,11 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
     thread_local std::vector<DrawProgram> programs;
     static const bool refuseFeedback = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_FEEDBACK") != nullptr;
     bool ready = false, feedback = false;
-    for (const auto& entry : found->second) {
+    auto& cursor = LiveIndex().cursors[tail.liveKey];
+    const auto ways = found->second.size();
+    for (std::size_t step = 0; step < ways; ++step) {
+        const auto way = (cursor + step) % ways;
+        const auto& entry = found->second[way];
         if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) continue;
         ready = true;
         if (!LiveViewsCurrent(*entry) || !LivePacketMatches(entry->packet, tail.livePacket) || entry->options != options || !LiveStateMatches(*entry, queue) || !DecodeProgramsCurrent(*entry->decode, *submission.shaders)) continue;
@@ -638,6 +652,7 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         candidate.limits = GatherLimitsOf(*tail.localDevice, *entry->link->state);
         candidate.live = true;
         candidate.commitTemplate = entry->link;
+        ArchB::Recorder::Count("draw_templates_live_q0_gathers");
         auto plan = RunGatherShadow(candidate);
         if (plan == nullptr || !plan->complete || entry->allocationGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
             if (plan != nullptr) {
@@ -679,6 +694,7 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
 
         for (const auto& stage : entry->link->stages) live->stages.push_back({stage.stage, stage.compiled.get(), stage.pushOffset, stage.registeredViews.get()});
         live->verify = tail.liveVerify;
+        cursor = (way + 1) % ways;
         ArchB::Recorder::Count("draw_templates_live_q0_taken");
         ArchB::Recorder::Count("draw_templates_live_q0_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
         return live;
