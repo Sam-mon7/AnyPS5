@@ -15,6 +15,13 @@ enum class Feature : std::uint8_t {
     TestDependent,
     TestRuntimeDependent,
 #endif
+    UbReplayRecordFree,
+    UbReplayProofFree,
+    UbReplayItemFree,
+    UbQ0HitFree,
+    UbLabelFree,
+    UbCommitterHold,
+    UbLegacyAsReplay,
     UbTrustProofs,
     UbNoLockInvalidation,
     UbPointerFreeDrawKeys,

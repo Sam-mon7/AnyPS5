@@ -3189,6 +3189,18 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    const auto opcode = GuestMemory::CurrentPacket().opcode;
+    if (ArchB::Switches::Enabled(ArchB::Feature::UbLabelFree) && GuestMemory::IsCommitterThread() && (opcode == 0x49 || opcode == 0x37) && state->recorder != nullptr && !bytes.empty() && bytes.size() <= 65536 && address % 4 == 0 && bytes.size() % 4 == 0) {
+        const auto context = graphicsContext();
+        if (const auto* import = Graphics::HostImportFor(context, address, bytes.size()); import != nullptr) {
+            state->recorder->RecordStore(import->buffer, Graphics::HostImportOffset(*import, address), bytes, address);
+            state->recorder->NoteLabel(address, bytes, stamp, queue);
+            ArchB::LabelWake::Recorded(address, bytes.size());
+            ArchB::Recorder::Count("ub_label_free_gpu_hits");
+            return 0;
+        }
+        ArchB::Recorder::Count("ub_label_free_gpu_fallbacks");
+    }
     // Arch C label census (APS5_ARCHB_C_LABEL_CENSUS=1): the steps below per label (c9_wl_*), the outcome, and the
     // label's entry in the label-chain registry once other queues can see it (reasons 0, 1 and 5).
     ArchB::LabelCensus::Steps census;

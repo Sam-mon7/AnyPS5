@@ -76,6 +76,13 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::TestDependent, "TEST_DEPENDENT", true, false, TestPrerequisites},
     {Feature::TestRuntimeDependent, "TEST_RUNTIME_DEPENDENT", false, true, TestRuntimePrerequisites},
 #endif
+    {Feature::UbReplayRecordFree, "UB_REPLAY_RECORD_FREE", false, true, {}},
+    {Feature::UbReplayProofFree, "UB_REPLAY_PROOF_FREE", false, true, {}},
+    {Feature::UbReplayItemFree, "UB_REPLAY_ITEM_FREE", false, true, {}},
+    {Feature::UbQ0HitFree, "UB_Q0_HIT_FREE", false, true, {}},
+    {Feature::UbLabelFree, "UB_LABEL_FREE", false, true, {}},
+    {Feature::UbCommitterHold, "UB_COMMITTER_HOLD", false, true, {}},
+    {Feature::UbLegacyAsReplay, "UB_LEGACY_AS_REPLAY", false, true, {}},
     {Feature::UbTrustProofs, "UB_TRUST_PROOFS", false, true, {}},
     {Feature::UbNoLockInvalidation, "UB_NO_LOCK_INVALIDATION", false, true, {}},
     {Feature::UbPointerFreeDrawKeys, "UB_POINTER_FREE_DRAW_KEYS", false, true, {}},

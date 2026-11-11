@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -547,23 +548,27 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    const bool ubLabel = ArchB::Switches::Enabled(ArchB::Feature::UbLabelFree);
+    if (!GuestMemory::GpuMutex().HeldByThisThread() || (!ubLabel && !ArchB::Switches::Enabled(ArchB::Feature::UbCommitterHold))) gpuLock.lock();
     const auto localDevice = device.Load();
-    recordDeferredLabels(localDevice.get(), queue);
+    if (!ubLabel) recordDeferredLabels(localDevice.get(), queue);
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
-        if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        if (!ubLabel && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
         }
         noteLabelStore(address, bytes, stamp, queue);
-        Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
-        countLabelOutcome(reason);
-        ++immediateLabels;
+        if (!ubLabel) {
+            Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+            countLabelOutcome(reason);
+            ++immediateLabels;
+        } else ArchB::Recorder::Count("ub_label_free_hits");
     } else {
         ++noOpLabels;
     }
@@ -577,7 +582,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         }
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
-    submitDueAfterCommit(localDevice.get());
+    if (!ubLabel) submitDueAfterCommit(localDevice.get());
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {

@@ -2701,6 +2701,13 @@ void Recorder::ensureOpen() {
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
+    const auto opcode = GuestMemory::CurrentPacket().opcode;
+    if (AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::UbLabelFree) && GuestMemory::IsCommitterThread() && (opcode == 0x49 || opcode == 0x37) && LabelRunsPerBatch()) {
+        ensureOpen();
+        ++open->gpuStores;
+        open->run.queued.push_back({buffer, offset, std::vector<std::byte>(bytes.begin(), bytes.end()), address});
+        return;
+    }
     EndComputeChain();
     ensureOpen();
     flushDeferredDispatch();
@@ -5521,7 +5528,8 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         const auto dword = address + offset;
         labels.insert_or_assign(dword, LabelEntry{value, queue, stamp, &batch, 0, false, behindCompletion});
         batch.labelDwords.push_back(dword);
-        LabelGroupDwords().emplace_back(dword, stamp);
+        const auto opcode = GuestMemory::CurrentPacket().opcode;
+        if (!(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::UbLabelFree) && GuestMemory::IsCommitterThread() && (opcode == 0x49 || opcode == 0x37))) LabelGroupDwords().emplace_back(dword, stamp);
     }
     recordedLabels.store(labels.size(), std::memory_order_relaxed);
 }

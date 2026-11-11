@@ -1106,6 +1106,8 @@ void DrawPipeline::run() {
     static std::atomic<std::uint64_t> recorderCommits{0};
     static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();
     static_cast<void>(registered);
+    std::unique_lock heldGpu(GuestMemory::GpuMutex(), std::defer_lock);
+    std::size_t heldItems = 0;
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -1115,6 +1117,11 @@ void DrawPipeline::run() {
         std::shared_ptr<ResolveSlot> resolveSlot;
         std::uint64_t serial = 0;
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTop);
+        const bool ubHold = ArchB::Switches::Enabled(ArchB::Feature::UbCommitterHold);
+        if (heldGpu.owns_lock() && (!ubHold || outstanding.load(std::memory_order_acquire) == 0)) {
+            heldGpu.unlock();
+            heldItems = 0;
+        }
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
         const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1158,6 +1165,12 @@ void DrawPipeline::run() {
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitBegin);
         try {
             if (commit != nullptr && resolveSlot != nullptr) resolveForApply(*resolveSlot, serial);
+            if (ubHold && !heldGpu.owns_lock()) {
+                heldGpu.lock();
+                if (ubHold) ArchB::Recorder::Count("ub_committer_hold_acquires");
+                heldItems = 0;
+            }
+            if (ubHold) ArchB::Recorder::Count("ub_committer_hold_items");
             if (commit != nullptr) (*commit)();
             GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitEnd);
             if (!isDraw) GuestMemory::BreakProofs();
@@ -1177,28 +1190,37 @@ void DrawPipeline::run() {
         }
         if (Stage4::ResolveCensus()) Stage4::EndItem(Graphics::StorageTexture::PendingSerial(), !isDraw);
         if (enqueuedNs != 0) countAheadWindow(enqueuedNs, enqueueClock, start);
+        if (fatal != nullptr && heldGpu.owns_lock()) heldGpu.unlock();
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
-        countWrites(items.front().writes, false);
-        if (!resolvers.empty()) noteApplied(items.front(), serial);
-        const auto kindIndex = static_cast<std::size_t>(items.front().commitKind);
-        kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
-        kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
-        retired.push_back(std::move(items.front()));
-        items.pop_front();
-        retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        recorderCommits.fetch_add(1, std::memory_order_relaxed);
-        pipeCounters().commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
-        commitNs += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
-        GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemDone);
+        bool releaseGpu = false;
+        {
+            std::lock_guard lock(mutex);
+            countWrites(items.front().writes, false);
+            if (!resolvers.empty()) noteApplied(items.front(), serial);
+            const auto kindIndex = static_cast<std::size_t>(items.front().commitKind);
+            kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
+            kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+            retired.push_back(std::move(items.front()));
+            items.pop_front();
+            retiredItems.fetch_add(1, std::memory_order_release);
+            ++commits;
+            recorderCommits.fetch_add(1, std::memory_order_relaxed);
+            pipeCounters().commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+            commitNs += spent;
+            if (failed) ++commitErrors;
+            if (fatal != nullptr && failure == nullptr) failure = fatal;
+            outstanding.fetch_sub(1, std::memory_order_release);
+            if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+            GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemDone);
+            releaseGpu = heldGpu.owns_lock() && (items.empty() || ++heldItems >= 64 || !ubHold);
+        }
+        if (releaseGpu) {
+            heldGpu.unlock();
+            heldItems = 0;
+        }
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
