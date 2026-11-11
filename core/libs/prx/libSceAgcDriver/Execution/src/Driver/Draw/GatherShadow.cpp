@@ -662,18 +662,32 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     const auto sourceGeneration = gatherGenerations();
     PendingView pending;
     pending.Load();
+    bool pendingWriteOnly = false;
     const auto busy = [&](std::uint64_t address, std::uint64_t bytes) -> bool {
+        pendingWriteOnly = false;
         if (bytes == 0) return false;
         if (draw.busy != nullptr) return (*draw.busy)(address, static_cast<std::size_t>(bytes));
-        if (pending.Overlaps(address, static_cast<std::size_t>(bytes))) return true;
+        const auto blockedBy = [&](const char* name) {
+            if (draw.live) ArchB::Recorder::Count(name);
+            return true;
+        };
+        if (pending.Overlaps(address, static_cast<std::size_t>(bytes))) {
+            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{address, address + bytes}}};
+            bool other = DrawPipeline::Active() && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(address, static_cast<std::size_t>(bytes));
+            other = other || Graphics::StorageTexture::AnyPendingOverlaps(span) || Graphics::AnyShadowedOverlaps(address, static_cast<std::size_t>(bytes));
+            for (const auto& label : deferredLabels().labels) other = other || (label.address < address + bytes && address < label.address + label.size);
+            pendingWriteOnly = !other;
+            return blockedBy("draw_templates_live_q0_busy_pending_write");
+        }
         if (DrawPipeline::Active()) {
             auto& pipeline = DrawPipeline::Queue0();
-            if (pipeline.Busy() && pipeline.Overlaps(address, static_cast<std::size_t>(bytes))) return true;
+            if (pipeline.Busy() && pipeline.Overlaps(address, static_cast<std::size_t>(bytes))) return blockedBy("draw_templates_live_q0_busy_queued_writer");
         }
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
-        if (Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(address, static_cast<std::size_t>(bytes))) return true;
+        if (Graphics::StorageTexture::AnyPendingOverlaps(range)) return blockedBy("draw_templates_live_q0_busy_storage_image");
+        if (Graphics::AnyShadowedOverlaps(address, static_cast<std::size_t>(bytes))) return blockedBy("draw_templates_live_q0_busy_unit_shadow");
         for (const auto& label : deferredLabels().labels) {
-            if (label.address < address + bytes && address < label.address + label.size) return true;
+            if (label.address < address + bytes && address < label.address + label.size) return blockedBy("draw_templates_live_q0_busy_deferred_label");
         }
         return false;
     };
@@ -690,6 +704,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     const GatherReader read = [&](std::uint64_t address, std::span<std::uint32_t> out) {
         ++reads;
         if (busy(address, out.size_bytes())) {
+            if (draw.live && pendingWriteOnly) ArchB::Recorder::Count(Graphics::Recorder::LookupStoredBytes(address, std::as_writable_bytes(out)) ? "draw_templates_live_q0_busy_pending_known" : "draw_templates_live_q0_busy_pending_unknown");
             blocked = true;
             return false;
         }
