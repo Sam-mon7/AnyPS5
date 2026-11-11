@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -9,6 +10,8 @@
 #include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -27,6 +30,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -36,8 +40,21 @@ struct DriverTestAccess {
     static void History(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
         Driver::Get().noteLabelStore(address, bytes, stamp, queue);
     }
-    static void Wait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
-        Driver::Get().waitMemory(packet, queue, PacketHistory{}, received, false);
+    static void Wait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, bool held = false) {
+        Driver::Get().waitMemory(packet, queue, PacketHistory{}, received, held);
+    }
+    static std::uint64_t LateCount() { return Driver::waitOutcomes().fromRecorderLate; }
+    static void Land(std::uint32_t queue) { Driver::Get().landPendingWaits(queue); }
+    static std::uint64_t PendingSource() {
+        const auto& waits = Driver::pendingWaits();
+        return waits.empty() ? 0 : waits.back().criticalGpuSource;
+    }
+    static std::pair<std::uint64_t, std::uint64_t> Sources(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
+        const auto bytes = Pm4::WaitAwaitedBytes(packet);
+        const auto address = (packet[2] & (bytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        std::pair<std::uint64_t, std::uint64_t> sources{};
+        Driver::Get().storedSince(packet, address, bytes, received, queue, nullptr, nullptr, &sources.first, &sources.second);
+        return sources;
     }
     static void Await(std::uint32_t queue, std::uint64_t address, std::uint64_t bytes) {
         auto& slot = Driver::Get().awaitedSlots[queue == 0 ? 0 : queue - 0x20 + 1];
@@ -76,34 +93,51 @@ constexpr std::size_t BlockBytes = 65536;
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(bool watched = false) : watched(watched) {
 #ifdef _WIN32
-        block = VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (watched) {
+            Require(AgcDriver::GuestMemory::WriteWatched(), "late fixture requires write watching");
+            block = GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, BlockBytes);
+            GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        } else {
+            block = VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
 #else
         block = std::aligned_alloc(BlockBytes, BlockBytes);
 #endif
         Require(block != nullptr, "cannot allocate label memory");
+#ifndef _WIN32
+        if (watched) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+#endif
         std::memset(block, 0, BlockBytes);
         GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
     }
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        VirtualFree(block, 0, MEM_RELEASE);
+        if (watched) {
+            GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        } else {
+            VirtualFree(block, 0, MEM_RELEASE);
+        }
 #else
+        if (watched) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
         std::free(block);
 #endif
     }
     std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(block); }
 private:
     void* block = nullptr;
+    bool watched = false;
 };
 
-bool Run(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t waiter, bool history, bool wide, bool atEntry, bool contended = false) {
+bool Run(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t waiter, bool history, bool wide, bool atEntry, bool contended = false, bool landing = false) {
     constexpr std::uint32_t writer = 0x20;
     const std::uint64_t value = atEntry ? 0 : wide ? 0x1234567800000001ull : 1;
     const auto bytes = std::as_bytes(std::span(&value, 1)).first(wide ? 8 : 4);
     const auto stamp = Access::Stamp();
+    std::uint64_t criticalSource = 0;
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         AgcDriver::GuestMemory::TagGpuLockThread(writer);
@@ -111,6 +145,15 @@ bool Run(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t w
         const std::array<std::uint32_t, 4> pattern{1, 2, 3, 4};
         if (!device.FillBuffer(address + 4096, 4096, pattern)) return false;
         Require(device.WriteLabelOnGpu(address, bytes, stamp, writer, false) == 0, "label was not recorded on the GPU");
+        if (CriticalPath::Capturing()) {
+            criticalSource = Recorder::CriticalLabelSource(address, bytes, stamp, writer);
+            Require(criticalSource != 0, "recorded label lost exact critical source");
+            Require(Recorder::CriticalLabelSource(address, bytes, stamp + 1, writer) == 0, "wrong stamp matched critical source");
+            Require(Recorder::CriticalLabelSource(address, bytes, stamp, writer + 8) == 0, "wrong queue matched critical source");
+            const auto wrong = value + 1;
+            Require(Recorder::CriticalLabelSource(address, std::as_bytes(std::span(&wrong, 1)).first(bytes.size()), stamp, writer) == 0, "wrong value matched critical source");
+            Require(Recorder::CriticalLabelObserved(criticalSource) == 0, "unsubmitted source has an observation");
+        }
         if (history) Access::History(address, bytes, stamp, writer);
         Require(device.OpenWriteOverlaps(address, bytes.size()), "label batch was submitted before the wait");
         if (std::getenv("APS5_PROFILE_DRAW")) {
@@ -133,22 +176,201 @@ bool Run(AgcDriver::VulkanDevice& device, std::uint64_t address, std::uint32_t w
         });
         ready.wait();
     }
+    if (history && CriticalPath::Capturing()) {
+        const auto sources = Access::Sources(std::span(packet).first(wide ? 9 : 7), waiter, stamp - 1);
+        Require(sources.first != 0 && sources.second == criticalSource, "history lost its recorded GPU source");
+    }
     Access::Wait(std::span(packet).first(wide ? 9 : 7), waiter, stamp - 1);
+    if (landing) Require(Access::PendingSource() == criticalSource, "deferred landing lost original record identity");
     if (holder.joinable()) { holder.request_stop(); holder.join(); }
+    if (landing) Access::Land(waiter);
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         const bool submitted = !atEntry && !contended && waiter != writer && !std::getenv("APS5_NO_WAIT_LABEL_SUBMIT");
-        Require(device.OpenWriteOverlaps(address, bytes.size()) != submitted, "awaited-label submission did not respect queue ownership or the opt-out");
+        Require(landing || device.OpenWriteOverlaps(address, bytes.size()) != submitted, "awaited-label submission did not respect queue ownership or the opt-out");
         if (std::getenv("APS5_PROFILE_DRAW") && submitted) {
             const auto seen = Recorder::ProfileWriter(address, bytes.size());
             Require(seen.stage == Recorder::WaitStage::Submitted || seen.stage == Recorder::WaitStage::GpuComplete, "submitted writer attribution is wrong");
         }
         device.WaitIdle();
+        if (criticalSource) Require(Recorder::CriticalLabelObserved(criticalSource) != 0, "completed source lacks observation");
         std::uint64_t actual = 0;
         std::memcpy(&actual, reinterpret_cast<const void*>(address), bytes.size());
         Require(actual == value, "the submitted label has the wrong value");
         if (std::getenv("APS5_PROFILE_DRAW")) Require(Recorder::ProfileWriter(address, bytes.size()).stage == Recorder::WaitStage::Retired, "completed writer was lost when its fence was recycled");
     }
+    Access::Land(waiter);
+    return true;
+}
+
+
+bool RunCriticalSettled(AgcDriver::VulkanDevice& device, std::uint64_t address) {
+    CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.settled", address);
+    constexpr std::uint32_t writer = 0x38;
+    const std::uint32_t value = 9, replacement = 0;
+    const auto bytes = std::as_bytes(std::span(&value, 1));
+    const auto stamp = Access::Stamp();
+    const std::array<std::uint32_t, 7> packet{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value, 0xffffffffu, 0x19u};
+    std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::TagGpuLockThread(writer);
+    const std::array<std::uint32_t, 4> pattern{1, 2, 3, 4};
+    if (!device.FillBuffer(address + 4096, 4096, pattern)) return false;
+    Require(device.WriteLabelOnGpu(address, bytes, stamp, writer, false) == 0, "settled fixture label was not recorded");
+    const auto source = Recorder::CriticalLabelSource(address, bytes, stamp, writer);
+    Require(source && !Recorder::CriticalLabelObserved(source), "settled fixture source was already observed");
+    std::promise<void> accepted, proceed;
+    auto acceptedFuture = accepted.get_future();
+    auto proceedFuture = proceed.get_future();
+    std::uint64_t done = 0;
+    auto waiter = std::async(std::launch::async, [&] {
+        CriticalPath::Name("settled label waiter");
+        Access::Wait(packet, 0x28, stamp - 1);
+        const auto pending = Access::PendingSource();
+        accepted.set_value();
+        proceedFuture.wait();
+        Require(pending == source, "settled fixture lost its original pending source");
+        Access::Land(0x28);
+        done = CriticalPath::Emit(CriticalPath::Kind::Release, "fixture.label.done", source);
+    });
+    const bool ready = acceptedFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    if (!ready) {
+        lock.unlock();
+        proceed.set_value();
+        waiter.get();
+        Require(false, "settled fixture did not accept its recorded source");
+    }
+    const auto before = Recorder::StoreCounts().replaced;
+    Require(device.WriteLabelOnGpu(address, std::as_bytes(std::span(&replacement, 1)), Access::Stamp(), writer, false) == 0, "settled fixture overwrite was not recorded");
+    const bool replaced = Recorder::StoreCounts().replaced == before + 1;
+    lock.unlock();
+    CriticalPath::Wait join("fixture.label.join", source);
+    proceed.set_value();
+    waiter.get();
+    join.End(done, "fixture.label.done");
+    Require(replaced, "settled fixture did not replace the unsubmitted store");
+    Require(Recorder::CriticalLabelObserved(source) != 0, "settled fixture lost the original batch observation");
+    Require(*reinterpret_cast<const volatile std::uint32_t*>(address) == replacement, "settled fixture unexpectedly satisfied the old memory predicate");
+    return true;
+}
+
+bool RunCriticalLate(AgcDriver::VulkanDevice& device, std::uint64_t address, bool wide, bool beforeEntry) {
+    Require(Recorder::LateTrust(), "late fixture requires APS5_LABEL_TRUST_LATE=1");
+    Require(AgcDriver::GuestMemory::Watched(address, wide ? 8 : 4), "late fixture label must be write watched");
+    CriticalPath::Emit(CriticalPath::Kind::Point, beforeEntry ? "fixture.label.late_ready" : "fixture.label.late_closing", address, wide ? 8 : 4);
+    GuestBlock workload;
+    constexpr std::uint32_t writer = 0x38;
+    const std::uint64_t value = wide ? 0x1234567800000009ull : 9;
+    const auto bytes = std::as_bytes(std::span(&value, 1)).first(wide ? 8 : 4);
+    const auto stamp = Access::Stamp();
+    const std::array<std::uint32_t, 9> packet{wide ? 0xc0079300u : 0xc0053c00u, 0x13u,
+        static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u),
+        static_cast<std::uint32_t>(value), wide ? static_cast<std::uint32_t>(value >> 32u) : 0xffffffffu,
+        wide ? 0xffffffffu : 0x19u, 0xffffffffu, 0x19u};
+    std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::TagGpuLockThread(writer);
+    const std::array<std::uint32_t, 4> pattern{1, 2, 3, 4};
+    if (!device.FillBuffer(workload.Address(), 4096, pattern)) return false;
+    Require(AgcDriver::GuestMemory::CollectWrites(address, bytes.size()) != 0, "late fixture could not collect watched label memory");
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "late fixture requires active recorder");
+    CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.late_table_only", address);
+    recorder->NoteLabel(address, bytes, stamp, writer);
+    const auto source = Recorder::CriticalLabelSource(address, bytes, stamp, writer);
+    Require(source && !Recorder::CriticalLabelObserved(source), "late fixture invented GPU completion");
+    Recorder::LabelRefusal refusal{};
+    Require(!Recorder::LookupLabel(address, bytes.size(), stamp, &refusal) && refusal == Recorder::LabelRefusal::Unclosed, "unclosed late record was accepted");
+    const auto close = [&] {
+        Recorder::CloseLabelGroup(AgcDriver::GuestMemory::TrackerGeneration());
+        const auto hit = Recorder::LookupLabel(address, bytes.size(), stamp);
+        Require(hit && hit->late && hit->criticalSource == source && hit->criticalClose, "closed late record lost exact readiness identity");
+        Require(!Recorder::CriticalLabelObserved(source), "CPU group close fabricated GPU completion");
+    };
+    if (beforeEntry) close();
+    std::atomic<bool> started{false};
+    auto waiter = std::async(std::launch::async, [&] {
+        CriticalPath::Name("late label waiter");
+        started.store(true, std::memory_order_release);
+        const auto before = Access::LateCount();
+        Access::Wait(std::span(packet).first(wide ? 9 : 7), 0x28, stamp);
+        return Access::LateCount() == before + 1;
+    });
+    while (!started.load(std::memory_order_acquire)) std::this_thread::yield();
+    if (!beforeEntry) {
+        const bool blocked = waiter.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+        try { close(); } catch (...) {
+            device.SubmitRecorded(false);
+            device.WaitIdle();
+            AgcDriver::GuestMemory::Write(address, bytes, 4);
+            lock.unlock();
+            waiter.wait();
+            throw;
+        }
+        if (!blocked) { lock.unlock(); waiter.get(); Require(false, "late wait returned before its group closed"); }
+    }
+    const bool accepted = waiter.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    if (!accepted) {
+        device.SubmitRecorded(false);
+        device.WaitIdle();
+        AgcDriver::GuestMemory::Write(address, bytes, 4);
+        lock.unlock();
+    }
+    const bool late = waiter.get();
+    Require(accepted && late, "late wait did not return from the closed unsubmitted table");
+    Require(!Recorder::CriticalLabelObserved(source), "late wait required GPU completion instead of CPU group close");
+    device.SubmitRecorded(false);
+    device.WaitIdle();
+    return true;
+}
+
+void RunCriticalMemory(std::uint64_t address) {
+    const std::array<std::uint32_t, 7> packet{0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 9, 0xffffffffu, 0x19u};
+    CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.held");
+    Access::Wait(packet, 0x28, ~0ull, true);
+    CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.unmatched_memory");
+    std::jthread producer([address] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const std::uint32_t value = 9;
+        AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(&value, 1)), 4);
+    });
+    Access::Wait(packet, 0x28, ~0ull);
+}
+
+bool RunCriticalIdentity(AgcDriver::VulkanDevice& device, std::uint64_t address) {
+    CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.identity");
+    constexpr std::uint32_t writer = 0x38;
+    const std::uint64_t value = 0x1234567800000007ull;
+    const auto bytes = std::as_bytes(std::span(&value, 1));
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::TagGpuLockThread(writer);
+    const std::array<std::uint32_t, 4> pattern{1, 2, 3, 4};
+    if (!device.FillBuffer(address + 4096, 4096, pattern)) return false;
+    const auto firstStamp = Access::Stamp();
+    Require(device.WriteLabelOnGpu(address, bytes, firstStamp, writer, false) == 0, "identity label was not recorded");
+    const auto first = Recorder::CriticalLabelSource(address, bytes, firstStamp, writer);
+    const auto secondStamp = Access::Stamp();
+    Require(device.WriteLabelOnGpu(address + 16, bytes, secondStamp, writer, false) == 0, "identity second label was not recorded");
+    const auto second = Recorder::CriticalLabelSource(address + 16, bytes, secondStamp, writer);
+    Require(first && second && first != second, "distinct writes share record identity");
+    device.SubmitRecorded(false);
+    device.WaitIdle();
+    const auto observation = Recorder::CriticalLabelObserved(first);
+    Require(observation && observation == Recorder::CriticalLabelObserved(second), "same-batch labels have different observations");
+    if (!device.FillBuffer(address + 4096, 4096, pattern)) return false;
+    const auto replacementStamp = Access::Stamp();
+    Require(device.WriteLabelOnGpu(address, bytes, replacementStamp, writer, false) == 0, "identity wide replacement was not recorded");
+    const auto thirdStamp = Access::Stamp();
+    Require(device.WriteLabelOnGpu(address, bytes.first(4), thirdStamp, writer, false) == 0, "identity replacement was not recorded");
+    const auto third = Recorder::CriticalLabelSource(address, bytes.first(4), thirdStamp, writer);
+    Require(third && third != first && !Recorder::CriticalLabelSource(address, bytes, firstStamp, writer), "reused address retained stale identity");
+    AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+    const auto mixed = Recorder::LookupLabel(address, 8, 0);
+    Require(mixed && mixed->value == value && !mixed->criticalSource, "mixed writes changed value or invented one source");
+    AgcDriver::GuestMemory::TagGpuLockThread(writer);
+    device.SubmitRecorded(false);
+    device.WaitIdle();
+    Require(Recorder::CriticalLabelObserved(first) == observation, "later batch overwrote original observation");
+    Require(Recorder::CriticalLabelObserved(third) && Recorder::CriticalLabelObserved(third) != observation, "new batch reused original observation");
+    Require(!Recorder::CriticalLabelObserved(0) && !Recorder::CriticalLabelObserved(~0ull), "unknown source fabricated an observation");
     return true;
 }
 
@@ -285,6 +507,7 @@ bool RunLabelWake(AgcDriver::VulkanDevice& device, std::uint64_t address, std::u
     std::exception_ptr failure;
     std::thread wait([&] {
         try {
+            if (CriticalPath::Enabled()) CriticalPath::Name("label waiter");
             AgcDriver::GuestMemory::TagGpuLockThread(waiter);
             Access::Wait(packet, waiter, stamp);
             back = std::chrono::steady_clock::now();
@@ -392,7 +615,8 @@ bool RunStateBatching(AgcDriver::VulkanDevice& device, std::uint64_t address, st
 
 int main(int argc, char** argv) {
     try {
-        GuestBlock labels;
+        const bool criticalLate = argc == 2 && std::string_view(argv[1]) == "--critical-label-late";
+        GuestBlock labels(criticalLate);
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Access::Device(device);
@@ -400,6 +624,44 @@ int main(int argc, char** argv) {
             ~Reset() { Access::Device(nullptr); }
         } reset;
         const auto base = labels.Address();
+        if (criticalLate) {
+            Require(CriticalPath::Enabled(), "critical late fixture requires tracing");
+            CriticalPath::Name("late label producer");
+            CriticalPath::Present(0);
+            for (const auto wide : {false, true}) {
+                const auto offset = wide ? 1024 : 0;
+                if (!RunCriticalLate(*device, base + offset, wide, true) || !RunCriticalLate(*device, base + offset + 256, wide, false)) return VulkanTestSkipped;
+            }
+            CriticalPath::Present(1);
+            CriticalPath::Shutdown();
+            std::puts("critical late label tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--critical-label-causes") {
+            Require(CriticalPath::Enabled(), "critical label fixture requires tracing");
+            CriticalPath::Name("label fixture");
+            CriticalPath::Present(0);
+            for (const auto wide : {false, true}) {
+                const auto offset = wide ? 2048 : 0;
+                CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.already_satisfied");
+                if (!Run(*device, base + offset, 0x28, false, wide, true)) return VulkanTestSkipped;
+                CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.table");
+                if (!Run(*device, base + offset + 256, 0x28, false, wide, false)) return VulkanTestSkipped;
+                CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.history_landing");
+                if (!Run(*device, base + offset + 512, 0x28, true, wide, false, true, true)) return VulkanTestSkipped;
+            }
+            RunCriticalMemory(base + 6144);
+            if (!RunCriticalIdentity(*device, base + 8192)) return VulkanTestSkipped;
+            CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.deferred_record");
+            if (!RunAwaitedEarly(*device, base + 16384, 0x38, 0x28, false)) return VulkanTestSkipped;
+            CriticalPath::Emit(CriticalPath::Kind::Point, "fixture.label.cross_thread");
+            if (!RunLabelWake(*device, base + 24576, 0x38, 0x28)) return VulkanTestSkipped;
+            if (!RunCriticalSettled(*device, base + 49152)) return VulkanTestSkipped;
+            CriticalPath::Present(1);
+            CriticalPath::Shutdown();
+            std::puts("critical label cause tests passed");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--state-batching") {
             for (const auto queue : {0u, 0x28u, 0x40u}) {
                 if (!RunStateBatching(*device, base, queue)) return VulkanTestSkipped;

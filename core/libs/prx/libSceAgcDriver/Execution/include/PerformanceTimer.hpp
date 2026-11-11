@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETIMER_HPP
 
@@ -287,6 +288,7 @@ public:
     }
 
     void Finish() {
+        critical.End();
         zone.End();
         if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
         const auto end = ArchB::CheapClock::Now(cheap);
@@ -309,6 +311,7 @@ public:
     }
 
     void Mark(const char* stage, std::uint64_t bytes = 0) {
+        critical.Mark(stage);
         if (frame == nullptr && trace == nullptr && !recorder.Active()) return;
         const auto now = ArchB::CheapClock::Now(cheap);
         if (recorder.Active()) AgcDriverRecorderScopeMark_nid_no_patch(&recorder, stage, now.time_since_epoch().count());
@@ -327,6 +330,7 @@ private:
     TraceThread* trace;
     ArchB::Recorder::Scope recorder;
     const char* scope;
+    CriticalPath::Scope critical{scope};
     [[no_unique_address]] TracyZone zone{scope};
     FrameTiming::Metric* total = nullptr;
     FrameTiming::Metric* tail = nullptr;

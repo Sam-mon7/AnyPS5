@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
@@ -6313,6 +6314,8 @@ DrawTimer& replayTimer() {
 }
 
 bool tryReplay(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, const DrawTraceContext* trace, bool pipelineStateReuse, PreparedDraw& prepared) {
+    std::optional<CriticalPath::Scope> liveTiming;
+    if (identity.gather != nullptr) liveTiming.emplace("draw_live_commit_template");
     auto& counts = counters();
     struct Probing {
         bool on = probeTiming();
@@ -8054,6 +8057,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         archcSlots::counters().legacy.fetch_add(1, std::memory_order_relaxed);
     }
     if (identity != nullptr && identity->gather != nullptr) {
+        CriticalPath::Scope fallbackTiming("draw_live_commit_fallback");
         AgcDriver::ArchB::Recorder::Count("draw_templates_live_commit_fallback");
         auto programs = DriverDetail::MaterializeGather(*identity->gather);
         if (!identity->referenceStages.empty()) {

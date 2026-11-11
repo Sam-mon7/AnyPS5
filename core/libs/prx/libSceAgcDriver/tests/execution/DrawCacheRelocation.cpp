@@ -4,6 +4,7 @@
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -694,9 +695,18 @@ int main(int argc, char** argv) {
 #endif
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
+            const bool traceLive = std::string(argv[1]) == "--live" && CriticalPath::Enabled();
+            if (traceLive) {
+                CriticalPath::Name("j11 live draw fixture");
+                CriticalPath::Present(0);
+            }
             if (std::string(argv[1]) == "--live") LiveNestedDraws(control.path);
             else NestedRelocationPath(control.path);
             AgcDriverShutdown_nid_postfix();
+            if (traceLive) {
+                CriticalPath::Present(1);
+                CriticalPath::Shutdown();
+            }
             std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";
             return 0;
         }

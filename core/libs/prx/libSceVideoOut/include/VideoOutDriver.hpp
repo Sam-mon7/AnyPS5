@@ -132,6 +132,12 @@ struct EventRegistration {
 struct VideoOutConfig {
     std::mutex mutex;
     std::condition_variable_any vblankCond;
+    struct CriticalRenderingWait {
+        std::uint32_t index;
+        std::uint64_t ticket;
+        std::weak_ptr<std::uint64_t> source;
+    };
+    std::vector<CriticalRenderingWait> criticalRenderingWaits;
 
     std::vector<EventRegistration> flipEvents;
     std::vector<EventRegistration> vblankEvents;
@@ -182,6 +188,8 @@ struct FlipQueue;
 
 struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this<FlipRequest> {
     std::uint64_t reuseTicket = 0;
+    std::uint64_t criticalQueued = 0;
+    std::uint64_t criticalGpuDone = 0;
     std::shared_ptr<VideoOutConfig> cfg;
     std::shared_ptr<FlipQueue> queue;
     uint64_t generation = 0;

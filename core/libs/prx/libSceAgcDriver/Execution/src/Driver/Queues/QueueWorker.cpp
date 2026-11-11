@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -212,14 +213,20 @@ void Driver::run(std::uint32_t id) noexcept {
                 const auto idleResultsPending = [&] {
                     return idleStore && id == 0 && Graphics::StorageTexture::AnyPending() && allQueuesIdle() && !completionsPending();
                 };
+                const auto criticalSource = [&] { return !failure && !stopping && !pending.empty() ? pending.front().criticalQueued : 0; };
                 const auto poll = [&](const auto& done) {
+                    CriticalPath::Wait criticalWait("queue.completion_poll", CriticalPath::Object(&worker));
 #ifdef _WIN32
                     lock.unlock();
                     PollSleep();
                     lock.lock();
-                    return done();
+                    const auto result = done();
+                    criticalWait.End();
+                    return result;
 #else
-                    return changed.wait_for(lock, std::chrono::milliseconds(1), done);
+                    const auto result = changed.wait_for(lock, std::chrono::milliseconds(1), done);
+                    criticalWait.End(criticalSource(), "submission_or_unknown");
+                    return result;
 #endif
                 };
 
@@ -231,9 +238,11 @@ void Driver::run(std::uint32_t id) noexcept {
                             queue0Dormant.store(true, std::memory_order_relaxed);
                             const auto quietUntil = std::chrono::steady_clock::now() + IdleResultsQuietPeriod;
                             const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
+                            CriticalPath::Wait criticalWait("queue.idle_quiet", CriticalPath::Object(&worker));
                             changed.wait_until(lock, quietUntil, [&] {
                                 return ready() || idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait;
                             });
+                            criticalWait.End(idleEpoch.load(std::memory_order_acquire) == idleEpochAtWait ? criticalSource() : 0, "submission_or_unknown");
                             queue0Dormant.store(false, std::memory_order_relaxed);
                             if (ready()) break;
                             if (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait) {
@@ -251,7 +260,9 @@ void Driver::run(std::uint32_t id) noexcept {
                             && ((idleStore && !storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
+                        CriticalPath::Wait criticalWait("queue.worker_idle", CriticalPath::Object(&worker));
                         changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
+                        criticalWait.End(id != 0 || (idleEpoch.load(std::memory_order_acquire) == idleEpochAtWait && !completionsPending()) ? criticalSource() : 0, "submission_or_unknown");
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         continue;
                     }

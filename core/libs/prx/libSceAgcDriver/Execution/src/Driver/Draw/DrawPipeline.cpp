@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -373,7 +374,10 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (jobs.size() >= depth) {
         // The finisher may need the GPU mutex to finish the job in front: waiting under it would never end.
         if (GuestMemory::GpuMutex().HeldByThisThread()) noteOvercommit("draw finisher", jobs.size());
-        else idle.wait(lock, [&] { return jobs.size() < depth; });
+        else {
+            CriticalPath::Wait criticalWait("finisher.full", CriticalPath::Object(this));
+            idle.wait(lock, [&] { return jobs.size() < depth; });
+        }
     }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
@@ -390,6 +394,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    CriticalPath::Name("draw finisher");
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
@@ -397,7 +402,13 @@ void DrawFinisher::run() {
         {
             std::unique_lock lock(mutex);
             sleeping = true;
-            wake.wait(lock, [&] { return !jobs.empty(); });
+            std::optional<CriticalPath::Wait> criticalWait;
+            wake.wait(lock, [&] {
+                if (!jobs.empty()) return true;
+                if (!criticalWait) criticalWait.emplace("finisher.idle.blocked", CriticalPath::Object(this));
+                return false;
+            });
+            criticalWait.reset();
             sleeping = false;
             job = &jobs.front();
             failed = failure != nullptr;
@@ -421,7 +432,10 @@ void DrawFinisher::run() {
 void DrawFinisher::waitEmpty(bool rethrow) {
     if (rethrow) SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) {
+        CriticalPath::Wait criticalWait("finisher.drain", CriticalPath::Object(this));
+        idle.wait(lock, [&] { return jobs.empty(); });
+    }
     if (rethrow && failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -721,6 +735,7 @@ void DrawPipeline::startResolvers() {
         resolvers.emplace_back([this, i] {
             resolverIndexThreadState() = i;
             PerformanceTrace::BindThread("draw resolver");
+            CriticalPath::Name("draw resolver");
             GuestMemory::MarkResolverThread();
             runResolver();
         });
@@ -743,7 +758,13 @@ void DrawPipeline::runResolver() {
         std::shared_ptr<ResolveSlot> slot;
         {
             std::unique_lock lock(mutex);
-            resolveWake.wait(lock, [&] { return closing || (slot = claimable()) != nullptr; });
+            std::optional<CriticalPath::Wait> criticalWait;
+            resolveWake.wait(lock, [&] {
+                if (closing || (slot = claimable()) != nullptr) return true;
+                if (!criticalWait) criticalWait.emplace("pipe.resolver.idle.blocked", CriticalPath::Object(this));
+                return false;
+            });
+            if (criticalWait) criticalWait->End(!closing && slot ? slot->criticalEnqueue : 0, "resolve_enqueue");
             if (closing) break;
             std::uint8_t expected = 0;
             if (!slot->state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) continue;
@@ -754,6 +775,7 @@ void DrawPipeline::runResolver() {
         resolveCounters().poolNs.fetch_add(slot->ns, std::memory_order_relaxed);
         {
             std::lock_guard lock(mutex);
+            slot->criticalDone = CriticalPath::Emit(CriticalPath::Kind::Release, "pipe.resolve.done", CriticalPath::Object(slot.get()));
             slot->state.store(2, std::memory_order_release);
         }
         resolveDone.notify_all();
@@ -800,7 +822,13 @@ void DrawPipeline::resolveForApply(ResolveSlot& slot, std::uint64_t serial) {
             SpinUntil(HandoffSpinWindow(), [&] { return slot.state.load(std::memory_order_acquire) == 2; });
             if (slot.state.load(std::memory_order_acquire) != 2) {
                 std::unique_lock lock(mutex);
-                resolveDone.wait(lock, [&] { return slot.state.load(std::memory_order_acquire) == 2; });
+                std::optional<CriticalPath::Wait> criticalWait;
+                resolveDone.wait(lock, [&] {
+                    if (slot.state.load(std::memory_order_acquire) == 2) return true;
+                    if (!criticalWait) criticalWait.emplace("pipe.resolve", CriticalPath::Object(&slot));
+                    return false;
+                });
+                if (criticalWait) criticalWait->End(slot.criticalDone, "resolve_done");
             }
             counters.waits.fetch_add(1, std::memory_order_relaxed);
             counters.waitNs.fetch_add(elapsedNs(waitStart), std::memory_order_relaxed);
@@ -889,6 +917,7 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 }
 
 void DrawPipeline::enqueue(Item item) {
+    const CriticalPath::Scope criticalEnqueue("pipe.enqueue", CriticalPath::Object(this));
     const bool recorder = ArchB::Recorder::Enabled();
     const auto enqueueStart = recorder ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
@@ -924,7 +953,24 @@ void DrawPipeline::enqueue(Item item) {
             ++idleWaiters;
             {
                 const Stage4::WaitScope stage4Wait(Stage4::Wait::PipeFull, false);
+                const auto targetResumeAt = resumeAt;
+                const auto targetRetired = retiredItems.load(std::memory_order_relaxed) + items.size() - resumeAt;
+                const auto& targetItem = items[items.size() - resumeAt - 1];
+                const auto targetEnqueue = targetItem.criticalEnqueue;
+                const auto targetKind = targetItem.kind;
+                std::shared_ptr<std::uint64_t> retirement;
+                if (CriticalPath::Capturing()) {
+                    auto& target = items[items.size() - resumeAt - 1].criticalRetirement;
+                    if (!target) target = std::make_shared<std::uint64_t>(0);
+                    retirement = target;
+                }
+                CriticalPath::Wait criticalWait("pipe.full", CriticalPath::Object(this));
+                if (criticalWait.Begin()) CriticalPath::Emit(CriticalPath::Kind::Point, "pipe.full.target", criticalWait.Begin(), static_cast<std::uint64_t>(targetKind), targetEnqueue);
                 idle.wait(lock, [&] { return items.size() <= resumeAt; });
+                const auto retiredNow = retiredItems.load(std::memory_order_relaxed);
+                if (criticalWait.Begin() && retirement && *retirement && retiredNow > targetRetired)
+                    CriticalPath::Emit(CriticalPath::Kind::Point, "pipe.full.observed_retire", criticalWait.Begin(), retiredNow - targetRetired, *retirement);
+                criticalWait.End(retirement && retiredNow == targetRetired && resumeAt == targetResumeAt ? *retirement : 0, "item_retired");
             }
             --idleWaiters;
             resumeAt = 0;
@@ -941,6 +987,9 @@ void DrawPipeline::enqueue(Item item) {
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
     countWrites(item.writes, true);
     const bool pooledResolve = item.resolve != nullptr && ResolvePoolActive();
+    item.criticalEnqueue = CriticalPath::Emit(CriticalPath::Kind::Release, "pipe.enqueue", CriticalPath::Object(this), enqueued);
+    if (item.criticalEnqueue) CriticalPath::Emit(CriticalPath::Kind::Point, "pipe.item.kind", item.criticalEnqueue, static_cast<std::uint64_t>(item.kind));
+    if (item.resolve) item.resolve->criticalEnqueue = item.criticalEnqueue;
     items.push_back(std::move(item));
     static const bool aheadCensus = GuestMemory::CollectAheadCensus();
     if (aheadCensus && items.back().kind == ItemKind::Draw) {
@@ -1095,6 +1144,7 @@ void countAheadWindow(std::uint64_t enqueuedNs, std::uint64_t enqueueClock, std:
 
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
+    CriticalPath::Name("draw committer");
     GuestMemory::MarkCommitterThread();
     Stage4::BindRole(Stage4::Role::Committer);
     GuestMemory::EnableHoldMarks();
@@ -1126,9 +1176,16 @@ void DrawPipeline::run() {
             std::unique_lock lock(mutex);
             if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
             committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty() || closing; });
+            std::optional<CriticalPath::Wait> criticalWait;
+            wake.wait(lock, [&] {
+                if (!items.empty() || closing) return true;
+                if (!criticalWait) criticalWait.emplace("pipe.committer.idle.blocked", CriticalPath::Object(this));
+                return false;
+            });
+            if (criticalWait) criticalWait->End(items.empty() ? 0 : items.front().criticalEnqueue, "item_enqueued");
             committerWaiting = false;
             if (items.empty()) break;
+            CriticalPath::Emit(CriticalPath::Kind::Handoff, "pipe.commit.begin", CriticalPath::Object(this), static_cast<std::uint64_t>(items.front().commitKind), items.front().criticalEnqueue);
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             kind = items.front().kind;
@@ -1187,6 +1244,8 @@ void DrawPipeline::run() {
         const auto kindIndex = static_cast<std::size_t>(items.front().commitKind);
         kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
         kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+        const auto criticalRetired = CriticalPath::Emit(CriticalPath::Kind::Release, "pipe.retire", CriticalPath::Object(this), serial, items.front().criticalEnqueue);
+        if (items.front().criticalRetirement) *items.front().criticalRetirement = criticalRetired;
         retired.push_back(std::move(items.front()));
         items.pop_front();
         retiredItems.fetch_add(1, std::memory_order_release);
@@ -1230,11 +1289,17 @@ void DrawPipeline::Stop() {
     resolveDone.notify_all();
     for (auto& resolver : stoppedResolvers) {
         if (resolver.get_id() == std::this_thread::get_id()) resolver.detach();
-        else if (resolver.joinable()) resolver.join();
+        else if (resolver.joinable()) {
+            CriticalPath::Wait criticalWait("pipe.resolver_join", CriticalPath::Object(&resolver));
+            resolver.join();
+        }
     }
     if (!committer.joinable()) return;
     if (committer.get_id() == std::this_thread::get_id()) committer.detach();
-    else committer.join();
+    else {
+        CriticalPath::Wait criticalWait("pipe.committer_join", CriticalPath::Object(this));
+        committer.join();
+    }
 }
 
 void DrawPipeline::ReleaseRetired() {
@@ -1268,7 +1333,20 @@ void DrawPipeline::drainUnlocked(DrainReason reason, std::uint32_t opcode, Drain
     std::unique_lock lock(mutex);
     if (stage4Wait && !items.empty()) stage4Wait->Blocking();
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    const auto targetRetired = retiredItems.load(std::memory_order_relaxed) + items.size();
+    std::shared_ptr<std::uint64_t> retirement;
+    if (CriticalPath::Capturing() && !items.empty()) {
+        auto& target = items.back().criticalRetirement;
+        if (!target) target = std::make_shared<std::uint64_t>(0);
+        retirement = target;
+    }
+    std::optional<CriticalPath::Wait> criticalWait;
+    idle.wait(lock, [&] {
+        if (items.empty()) return true;
+        if (!criticalWait) criticalWait.emplace("pipe.drain", CriticalPath::Object(this));
+        return false;
+    });
+    if (criticalWait) criticalWait->End(retirement && retiredItems.load(std::memory_order_relaxed) == targetRetired ? *retirement : 0, "item_retired");
     --idleWaiters;
     stage4Wait.reset();
     const auto index = static_cast<std::size_t>(reason);

@@ -416,6 +416,8 @@ void Driver::execute(const Submission& submission) {
             const auto value = DrawPipeline::Queue0().PendingLabel(awaited, awaitedBytes);
             heldLabelMismatch = value.has_value();
             if (value.has_value() && Pm4::WaitComparesValue(packet, *value)) {
+                CriticalPath::Wait critical("label.wait", awaited);
+                critical.End(0, "label.pipeline.pending.unknown");
                 if (profilePackets) {
                     Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
                     sample.end = Graphics::Recorder::WaitEnd::Recorder;
@@ -428,6 +430,8 @@ void Driver::execute(const Submission& submission) {
                 continue;
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
+                CriticalPath::Wait critical("label.wait", awaited);
+                critical.End(0, "label.already_satisfied");
                 if (profilePackets) {
                     Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
                     sample.end = Graphics::Recorder::WaitEnd::Entry;
@@ -449,7 +453,10 @@ void Driver::execute(const Submission& submission) {
             // changes nothing; skip it and the wait, as for a label still held in the pipeline above.
             if (!submission.heldAtSubmit.contains(cursor) && ArchB::Switches::Enabled(ArchB::Feature::PipeKeepOwnLabelWaits) && !DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes)) {
                 std::uint32_t writer = ~0u;
-                if (storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer) && writer == submission.queue) {
+                std::uint64_t criticalSource = 0;
+                if (storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer, nullptr, &criticalSource) && writer == submission.queue) {
+                    CriticalPath::Wait critical("label.wait", awaited);
+                    critical.End(criticalSource, "label.history");
                     if (profilePackets) {
                         Graphics::Recorder::WaitProfile sample(submission.queue, awaited, awaitedBytes);
                         sample.end = Graphics::Recorder::WaitEnd::History;

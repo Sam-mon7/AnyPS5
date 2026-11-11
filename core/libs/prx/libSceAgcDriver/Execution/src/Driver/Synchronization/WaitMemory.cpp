@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelWake.hpp"
@@ -14,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <exception>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -113,7 +115,7 @@ std::vector<Driver::PendingWait>& Driver::pendingWaits() {
     return HostThreadLocal<std::vector<PendingWait>, WaitsTag>();
 }
 
-void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
+void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, std::uint64_t criticalSource, std::uint64_t criticalGpuSource) {
     if (packet.size() > std::tuple_size_v<decltype(PendingWait::words)>) return;
     static const bool allQueues = std::getenv("APS5_LAND_WAITS_ALL_QUEUES") != nullptr;
     if (!allQueues && queue == 0) return;
@@ -126,6 +128,9 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
     std::copy(packet.begin(), packet.end(), wait.words.begin());
     wait.count = packet.size();
     wait.received = received;
+    wait.criticalSource = criticalSource;
+    wait.criticalGpuSource = criticalGpuSource;
+    if (CriticalPath::Enabled()) CriticalPath::Emit(CriticalPath::Kind::Point, "label.landing.deferred", criticalGpuSource, criticalSource);
     waits.push_back(wait);
 }
 
@@ -147,10 +152,13 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     for (const auto& wait : waits) {
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
         if (profile) ++stats->lands;
-        if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
+        if (Pm4::WaitSatisfiedUnchecked(packet)) {
+            if (CriticalPath::Enabled()) CriticalPath::Emit(CriticalPath::Kind::Point, "label.landing.already_satisfied", wait.criticalGpuSource, wait.criticalSource);
+            continue;
+        }
         const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto gpuBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
-        waitMemory(packet, queue, none, wait.received, false, true);
+        waitMemory(packet, queue, none, wait.received, false, true, false, wait.criticalGpuSource);
         if (profile) {
             const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             const auto gpuMs = Graphics::Recorder::ThreadWaitedMs() - gpuBefore;
@@ -169,7 +177,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     }
 }
 
-void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool epochCovered) {
+void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool epochCovered, std::uint64_t criticalGpuSource) {
     PerformanceTimer recorderTiming("Driver.LabelWait");
     recorderTiming.RecorderCounter("label_wait_ms");
     ArchB::Recorder::Count("label_waits");
@@ -184,6 +192,27 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto alignMask = awaitedBytes == 8 ? ~7ull : ~3ull;
     const std::uint64_t awaited = (packet[2] & static_cast<std::uint32_t>(alignMask)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
     Timeline::WaitScope timelineWait(packet, awaited, awaitedBytes);
+    CriticalPath::Wait critical(requireMemory ? "label.landing" : "label.wait", awaited);
+    if (CriticalPath::Enabled() && criticalGpuSource) CriticalPath::Emit(CriticalPath::Kind::Point, "label.landing.record", awaited, criticalGpuSource);
+    std::uint64_t criticalSource = 0;
+    const char* criticalCause = "label.memory.unknown";
+    struct CriticalFinish {
+        CriticalPath::Wait& wait;
+        std::uint64_t& source;
+        const char*& cause;
+        std::uint64_t& gpuSource;
+        bool landing;
+        bool enabled = CriticalPath::Enabled();
+        int exceptions = enabled ? std::uncaught_exceptions() : 0;
+        ~CriticalFinish() {
+            if (!enabled) return;
+            const bool cancelled = std::uncaught_exceptions() > exceptions;
+            if (!cancelled && landing && gpuSource) {
+                if (const auto observed = Graphics::Recorder::CriticalLabelObserved(gpuSource)) CriticalPath::Emit(CriticalPath::Kind::Point, "label.landing.observation", gpuSource, observed);
+            }
+            wait.End(cancelled ? 0 : source, cancelled ? "label.aborted" : cause);
+        }
+    } criticalFinish{critical, criticalSource, criticalCause, criticalGpuSource, requireMemory};
     // Arch C label census: which thread recorded the awaited label and when, against this wait's start and end.
     ArchB::LabelCensus::WaitScope labelCensus(awaited, requireMemory);
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
@@ -243,6 +272,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         stage4Wait.SetWriter(writer == queue ? (table ? W::OwnTable : W::OwnStore) : (table ? W::OtherTable : W::OtherStore), writer);
     };
     const auto finishProfile = [&](Graphics::Recorder::WaitEnd end) {
+        switch (end) {
+            case Graphics::Recorder::WaitEnd::Entry: criticalCause = "label.already_satisfied"; break;
+            case Graphics::Recorder::WaitEnd::Held: criticalCause = "label.held_at_submit"; break;
+            case Graphics::Recorder::WaitEnd::History: criticalCause = "label.history"; break;
+            case Graphics::Recorder::WaitEnd::Recorder: criticalCause = "label.table"; break;
+            default: criticalCause = "label.memory.unknown"; break;
+        }
         timelineWait.end = static_cast<std::uint32_t>(end);
         if (PipeDrainDiag()) ThreadWaitDiag().end = static_cast<int>(end);
         if (profile) waitProfile->end = end;
@@ -272,12 +308,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     }
     labelCensus.Blocked();
     std::optional<std::uint64_t> historyGeneration;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer, &historyGeneration)) {
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer, &historyGeneration, &criticalSource, &criticalGpuSource)) {
+        critical.End(criticalSource, "label.history");
         submitWriter(writer);
         if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
         stage4Writer(writer, false);
         if (writer != queue) {
-            notePendingWait(packet, queue, received);
+            notePendingWait(packet, queue, received, criticalSource, criticalGpuSource);
             epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
             noteInheritable(false, historyGeneration);
         } else {
@@ -328,6 +365,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             ++outcomes.fromRecorderLate;
             if (trace) traceLate("trusted", hit, refusal);
         }
+        criticalSource = hit->late ? hit->criticalClose : hit->criticalSource;
+        criticalGpuSource = hit->criticalSource;
+        if (hit->late && CriticalPath::Capturing()) CriticalPath::Emit(CriticalPath::Kind::Point, "label.table.late.record", awaited, criticalGpuSource);
+        critical.End(criticalSource, hit->late ? (criticalSource ? "label.table.late.closed" : "label.table.late.unknown") : "label.table");
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
         if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(hit->queue);
         stage4Writer(hit->queue, true);
@@ -339,7 +380,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 if (GuestMemory::Gen::Active()) GuestMemory::Gen::NoteTicket(GuestMemory::Gen::TicketReason::WaitOwn);
             }
         } else {
-            notePendingWait(packet, queue, received);
+            notePendingWait(packet, queue, received, criticalSource, criticalGpuSource);
             epochPoint.reason = GuestMemory::Gen::TicketReason::WaitGpuLabel;
             noteInheritable(!hit->late, hit->late ? std::optional<std::uint64_t>(hit->generation) : std::nullopt);
         }
@@ -514,11 +555,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint64_t producerToken = 0;
     auto lastProducerScan = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
     while (!memorySatisfied()) {
-        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer, &historyGeneration)) {
+        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer, &historyGeneration, &criticalSource, &criticalGpuSource)) {
+            critical.End(criticalSource, "label.history");
             submitWriter(writer);
             if (PipeDrainDiag()) ThreadWaitDiag().writer = static_cast<int>(writer);
             stage4Writer(writer, false);
-            if (writer != queue) notePendingWait(packet, queue, received);
+            if (writer != queue) notePendingWait(packet, queue, received, criticalSource, criticalGpuSource);
             else epochPoint.bump = false;
             finishProfile(Graphics::Recorder::WaitEnd::History);
             return;
@@ -551,6 +593,9 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (settleLock.owns_lock()) {
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
                     finishProfile(Graphics::Recorder::WaitEnd::Fence);
+                    criticalSource = CriticalPath::Enabled() ? Graphics::Recorder::CriticalLabelObserved(criticalGpuSource) : 0;
+                    if (criticalSource) criticalSource = CriticalPath::Emit(CriticalPath::Kind::Handoff, "label.landing.source", criticalGpuSource, 0, criticalSource);
+                    criticalCause = criticalSource ? "label.landing.settled" : "label.landing.unknown";
                     return;
                 }
             }
