@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -2751,7 +2752,7 @@ SnapshotCopies& SnapshotCopyCache() {
     return copies;
 }
 
-std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t address, std::span<const std::byte> bytes, VkBufferUsageFlags usage) {
+std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t address, std::span<const std::byte> bytes, VkBufferUsageFlags usage, std::uint64_t* copiedBytes) {
     auto& copies = SnapshotCopyCache();
     std::lock_guard lock(copies.mutex);
     if (copies.device != context.device) {
@@ -2770,6 +2771,7 @@ std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t addre
     }
     auto buffer = std::make_shared<Buffer>(context, bytes.size(), usage);
     std::memcpy(buffer->Bytes().data(), bytes.data(), bytes.size());
+    if (copiedBytes != nullptr) *copiedBytes += bytes.size();
     if (bytes.size() > SnapshotCopies::Budget) return buffer;
     while (!copies.recency.empty() && (copies.bytes + bytes.size() > SnapshotCopies::Budget || copies.entries.size() >= SnapshotCopies::MaxEntries)) {
         const auto oldest = copies.entries.find(copies.recency.front());
@@ -6788,6 +6790,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
 }
 
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
+    const bool trace = DispatchBuildTrace::Enabled();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto bytes = region.end - region.begin;
     const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
@@ -6810,7 +6813,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     const auto allocated = region.bufferEnd != 0 ? region.bufferEnd - region.begin : bytes;
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
     const bool shared = region.buffer == nullptr && !region.hostBacked && !region.writable && !region.sparse && region.bufferEnd == 0 && region.snapshot.size() == bytes;
-    if (shared) region.buffer = snapshotCopy(context, region.begin, region.snapshot, usage);
+    if (shared) region.buffer = snapshotCopy(context, region.begin, region.snapshot, usage, trace ? &uploadTraffic.cpuBytes : nullptr);
     else if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
     const auto readStart = std::chrono::steady_clock::now();
     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
@@ -6823,6 +6826,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         if (!region.sparse) {
             GuestMemory::Read(region.begin, region.buffer->Bytes());
             readBytes += region.buffer->Bytes().size();
+            if (trace) uploadTraffic.cpuBytes += region.buffer->Bytes().size();
             if (written) region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
         } else {
             // `uploaded` holds the backed pieces back to back.
@@ -6834,6 +6838,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
                 const auto piece = target.subspan(at, static_cast<std::size_t>(last - first));
                 GuestMemory::Read(first, piece);
                 readBytes += piece.size();
+                if (trace) uploadTraffic.cpuBytes += piece.size();
                 if (written) region.uploaded.insert(region.uploaded.end(), piece.begin(), piece.end());
                 cursor = at + piece.size();
             }
@@ -6841,7 +6846,10 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         }
     }
     else {
-        if (!shared) std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
+        if (!shared) {
+            std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
+            if (trace) uploadTraffic.cpuBytes += region.snapshot.size();
+        }
         readBytes += region.snapshot.size();
     }
     region.snapshot.clear();
@@ -6872,7 +6880,8 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
 }
 
-void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
+void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable, bool retained) {
+    const bool trace = DispatchBuildTrace::Enabled();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
@@ -6948,6 +6957,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (!pendingWriter && !writable) {
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+            if (trace) {
+                uploadTraffic.cpuBytes += bytes;
+                if (retained) uploadTraffic.retainedCpuBytes += bytes;
+            }
             copySource = inputSnapshot->Handle();
             copyOffset = 0;
             recorder->Keep(inputSnapshot, inputSnapshot->Bytes().size());
@@ -6961,6 +6974,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        if (trace) {
+            uploadTraffic.gpuBytes += bytes;
+            if (retained) uploadTraffic.retainedGpuBytes += bytes;
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -7989,7 +8006,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     }
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
-    recordGpuCopies(copies, false);
+    recordGpuCopies(copies, false, true);
 }
 
 GuestBufferMemory::StagingCarryCounts GuestBufferMemory::StagingCarry() {
