@@ -5289,7 +5289,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     const auto* refreshing = Refreshing::Get();
     const bool profile = LookupOutcomes::Profiled();
     const auto depthStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::optional<ShadowConsumerScope> consumer;
+    if (LazyShadowPublishEnabled()) consumer.emplace(reason, address, bytes, scope);
     const auto depthRanges = FlushDepthPlanes(address, bytes);
+    consumer.reset();
     if (profile) {
         LookupOutcomes::Add(LookupOutcomes::FlushDepth, depthStart);
         ++ThreadLookupOutcomes().work[LookupOutcomes::FlushCalls];
@@ -5515,6 +5518,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
+        const PublishSiteScope site(reason);
         const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
         if (units != 0) waitForIdlePublish(reason);
         if (published != nullptr) *published = units != 0;
@@ -5712,6 +5716,7 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason, bool waited) {
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    const PublishSiteScope site(reason);
     if (PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited) == 0) return false;
     waitForIdlePublish(reason);
     return true;

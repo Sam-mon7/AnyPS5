@@ -3687,9 +3687,15 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         // per store: a deferral left unresolved at its end is covered afterwards by the write-back's
         // own pending write, which is later than the writer.
         const Recorder::LazyFenceScope lazyFence(Recorder::LazyFenceScope::Kind::Depth);
-        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
+        const auto storeScope = PlaneStoreScope("depth plane store");
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store", storeScope);
+        SettlePlaneStore("depth plane store", entry.begin, entry.end, storeScope);
     }
-    for (auto& entry : storedStencils) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "stencil plane store");
+    for (auto& entry : storedStencils) {
+        const auto storeScope = PlaneStoreScope("stencil plane store");
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "stencil plane store", storeScope);
+        SettlePlaneStore("stencil plane store", entry.begin, entry.end, storeScope);
+    }
     const auto generation = GuestMemory::TrackerGeneration();
     std::lock_guard lock(surfacesMutex());
     for (const auto& entry : storedStencils) {

@@ -381,11 +381,10 @@ void BeforeLabelStores() {
     if (everOn.load(std::memory_order_relaxed) && Entries() != 0) PublishAll();
 }
 
-bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0 || !Active()) return false;
+namespace {
+
+bool enroll(std::uint64_t address, std::size_t bytes) {
     auto& c = counters();
-    if (!StorageTexture::PendingStoreInside(address, bytes) && !AnyShadowedOverlaps(address, bytes)) return false;
-    if (verify()) static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "readback before label"));
     const auto end = address + bytes;
     auto& s = state();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> orphans;
@@ -436,7 +435,21 @@ bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
         }
     }
     publishOrphans(orphans);
-    return deferred || verify();
+    return deferred;
+}
+
+}
+
+bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !Active()) return false;
+    if (!StorageTexture::PendingStoreInside(address, bytes) && !AnyShadowedOverlaps(address, bytes)) return false;
+    if (verify()) static_cast<void>(StorageTexture::FlushPending(address, bytes, nullptr, "readback before label"));
+    return enroll(address, bytes) || verify();
+}
+
+bool DeferShadowRange(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !Active()) return false;
+    return enroll(address, bytes);
 }
 
 LabelStoreOutcome PeekLabelStore(std::uint64_t address, std::size_t bytes) {

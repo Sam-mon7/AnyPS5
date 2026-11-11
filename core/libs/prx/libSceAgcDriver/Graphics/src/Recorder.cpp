@@ -1400,6 +1400,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             else recorder->SyncThrough(address, bytes, true);
         }
     }
+    if (LazyShadowVerifyEnabled() && LazyShadowPublishEnabled()) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        NoteLazyShadowRead(address, bytes, scope);
+    }
 }
 
 }

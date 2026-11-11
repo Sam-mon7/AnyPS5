@@ -15419,6 +15419,192 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
     return 0;
 }
 
+// LAZY_SHADOW_PUBLISH: a plane store made for a device-facing consumer (a storage upload, scope None) retiles
+// into the unit shadow and publishes nothing; the fresh units it leaves are enrolled with C_LAZY_PUBLISH's fault
+// watch. Scenarios: gpu (an upload reads the slab: no publication, the slab's bytes), cpu_read (a raw CPU read
+// faults and publishes once, exactly the slab's bytes), cpu_write (a raw CPU write into the range, then an upload:
+// the CPU's bytes where written, the slab's elsewhere), evict (APS5_UNIT_SHADOW_MIB=8: a unit retiled again while
+// unpublished, then the slab evicted for another: the CPU reads the newest bytes of both units). Without the switch
+// the store publishes at once and every scenario reads the same bytes.
+int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    using namespace AgcDriver::GuestMemory;
+    namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
+    const auto& context = device.GetContext();
+    if (!device.Graphics() || context.hostImportAlignment == 0 || !UnitShadowEnabled()) return 77;
+    const bool on = Switches::Enabled(Feature::LazyShadowPublish);
+    const bool verify = LazyShadowVerifyEnabled();
+    constexpr std::uint64_t unit = 65536;
+    const std::size_t bytes = scenario == "evict" ? (9u << 20u) : static_cast<std::size_t>(4 * unit);
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) return 77;
+    struct Release {
+        void* block;
+        std::size_t bytes;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block, bytes};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::size_t bytes;
+        ~Cleanup() {
+            Lazy::PublishAll();
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block, bytes};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    if (on) Require(LazyShadowPublishEnabled(), "LAZY_SHADOW_PUBLISH is on but inactive (C_LAZY_PUBLISH or the fault tracker is off)");
+    CollectWritesUncached(address, bytes);
+    GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    AgcDriver::GuestMemory::WtFaultFlip();
+    AgcDriver::GuestMemory::WtFaultFlip();
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value) {
+        auto destination = ShadowDestinationFor(context, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole unit has no slab destination");
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::size_t i = 0; i < unit; ++i) pattern->Bytes()[i] = static_cast<std::byte>(value + (i % 251));
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, destination->offset, unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    };
+    const auto expected = [&](std::uint8_t value) {
+        std::vector<std::uint8_t> bytesOf(static_cast<std::size_t>(unit));
+        for (std::size_t i = 0; i < unit; ++i) bytesOf[i] = static_cast<std::uint8_t>(value + (i % 251));
+        return bytesOf;
+    };
+    const auto store = [&](std::uint64_t begin, std::uint64_t end) {
+        const ShadowConsumerScope consumer("storage image creation", begin, static_cast<std::size_t>(end - begin), PublishScope::None);
+        const auto storeScope = PlaneStoreScope("depth plane store");
+        Require((storeScope == PublishScope::None) == on, "the plane store's publication scope does not follow the switch");
+        static_cast<void>(StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store", storeScope));
+        SettlePlaneStore("depth plane store", begin, end, storeScope);
+    };
+    const auto gpuRead = [&](std::uint64_t begin, std::uint64_t end) {
+        const std::pair<std::uint64_t, std::uint64_t> run{begin - address, end - address};
+        const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {});
+        auto host = std::make_shared<Buffer>(context, static_cast<std::size_t>(end - begin), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        recorder.Keep(host);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        bool slabOnly = true;
+        for (const auto& source : sources) {
+            const VkBufferCopy piece{source.offset, source.begin - run.first, source.end - source.begin};
+            copyBuffer(commands, source.buffer, host->Handle(), 1, &piece);
+            if (source.slab != nullptr) recorder.Keep(source.slab);
+            slabOnly = slabOnly && source.shadow;
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        host->Invalidate();
+        std::vector<std::uint8_t> seen(host->Bytes().size());
+        std::memcpy(seen.data(), host->Bytes().data(), seen.size());
+        return std::make_pair(seen, slabOnly);
+    };
+    const auto protection = [&](std::uint64_t at) {
+        MEMORY_BASIC_INFORMATION memory{};
+        VirtualQuery(reinterpret_cast<void*>(at), &memory, sizeof(memory));
+        return memory.Protect;
+    };
+    const auto rawRead = [&](std::uint64_t begin, std::uint64_t length) {
+        std::vector<std::uint8_t> seen(static_cast<std::size_t>(length));
+        const volatile std::uint8_t* from = reinterpret_cast<const volatile std::uint8_t*>(begin);
+        for (std::size_t i = 0; i < seen.size(); ++i) seen[i] = from[i];
+        return seen;
+    };
+    const auto first = address + unit;
+    const auto second = first + unit;
+    retile(first, 0x20);
+    retile(second, 0x60);
+    recorder.Sync();
+    const auto before = LazyShadowTotals();
+    const auto lazyBefore = Lazy::Totals();
+    store(first, second + unit);
+    const auto stored = LazyShadowTotals();
+    if (on) {
+        Require(stored.publishedUnits == before.publishedUnits, "the lazy plane store published");
+        Require(stored.lazyStores == before.lazyStores + 1 && stored.leftBytes == before.leftBytes + 2 * unit, "the lazy plane store left the wrong units");
+        if (!verify) {
+            Require(stored.enrolledBytes == before.enrolledBytes + 2 * unit && Lazy::Totals().deferred == lazyBefore.deferred + 1, "the left units were not enrolled with the fault watch");
+            Require(protection(first) == PAGE_NOACCESS && AnyShadowedOverlaps(first, 2 * unit), "the left units are not watched, or not shadowed");
+        } else {
+            Require(stored.verifyChecks == before.verifyChecks + 2 && stored.verifyMismatches == before.verifyMismatches, "VERIFY did not compare the forced publication with the eager copy, or they differ");
+        }
+    } else {
+        Require(stored.publishedUnits == before.publishedUnits + 2 && !AnyShadowedOverlaps(first, 2 * unit), "the eager plane store did not publish both units");
+    }
+    const auto unitOne = expected(0x20);
+    const auto unitTwo = expected(0x60);
+    if (scenario == "gpu") {
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        Require(slabOnly, "the upload did not read the slab");
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload read wrong bytes");
+        if (on && !verify) Require(LazyShadowTotals().publishedUnits == stored.publishedUnits && protection(first) == PAGE_NOACCESS, "a GPU-only read published");
+    } else if (scenario == "cpu_read") {
+        const auto seen = rawRead(first, 2 * unit);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the CPU read wrong bytes");
+        const auto read = LazyShadowTotals();
+        if (on && !verify) {
+            Require(read.publishedUnits == stored.publishedUnits + 2 && Lazy::Totals().services == lazyBefore.services + 1, "the CPU read did not force exactly one publication");
+            Require(protection(first) != PAGE_NOACCESS && !AnyShadowedOverlaps(first, 2 * unit), "the read range is still lazy");
+        }
+        const auto again = rawRead(first, 2 * unit);
+        Require(again == seen && LazyShadowTotals().publishedUnits == read.publishedUnits, "a second CPU read published again or read other bytes");
+    } else if (scenario == "cpu_write") {
+        {
+            volatile std::uint8_t* to = reinterpret_cast<volatile std::uint8_t*>(first + 8);
+            for (int i = 0; i < 16; ++i) to[i] = 0x77;
+        }
+        CollectWritesUncached(first, 2 * unit);
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        auto wanted = unitOne;
+        std::fill_n(wanted.begin() + 8, 16, std::uint8_t{0x77});
+        Require(!slabOnly, "the written unit is still read from the slab");
+        Require(std::equal(wanted.begin(), wanted.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload after the CPU write read wrong bytes");
+    } else if (scenario == "evict") {
+        retile(second, 0x90);
+        recorder.Sync();
+        const char* budgetText = std::getenv("APS5_UNIT_SHADOW_MIB");
+        Require(budgetText != nullptr && std::strtoull(budgetText, nullptr, 10) < 16, "the evict scenario needs APS5_UNIT_SHADOW_MIB=8");
+        const auto far = address + 128 * unit;
+        auto other = ShadowDestinationFor(context, *import, far, far + unit);
+        Require(other.has_value() && other->slab != nullptr, "the second slab was refused");
+        other.reset();
+        recorder.Sync();
+        Require(!AnyShadowedOverlaps(first, 2 * unit), "the evicted slab's units are still shadowed");
+        const auto seen = rawRead(first, 2 * unit);
+        const auto newer = expected(0x90);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(newer.begin(), newer.end(), seen.begin() + unit), "an evicted unpublished unit lost its bytes");
+    } else {
+        return 2;
+    }
+    if (on && verify) Require(LazyShadowTotals().staleReads == before.staleReads, "VERIFY saw a CPU read of unpublished lazy units");
+    std::cout << "agc_lazy_shadow_" << scenario << (on ? (verify ? " (verify)" : "") : " (off)") << ": ok\n";
+    return 0;
+}
+
 int archcLazyTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -18819,6 +19005,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy") {
             return archcLazyTests(device, recorder, argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--lazy-shadow") {
+            return lazyShadowTests(device, recorder, argv[2]);
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-label-prewait") {
             return archcLabelPrewaitTests(device, recorder, argv[2]);
