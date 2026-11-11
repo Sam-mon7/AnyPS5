@@ -601,9 +601,25 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
         bound.registeredViews = variant->registeredViews;
         entry->link->stages.push_back(std::move(bound));
     }
+    static const bool exactRegisters = std::getenv("APS5_DRAW_TEMPLATES_LIVE_EXACT_REGISTERS") != nullptr;
+    const auto keyedRuntime = [&](std::uint32_t offset, bool& runtime) {
+        runtime = true;
+        if (offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u) return true;
+        for (const auto& [base, limit] : {std::pair{0x00cu, 32u}, std::pair{0x04cu, 16u}, std::pair{0x08cu, 32u}, std::pair{0x10cu, 32u}}) {
+            if (offset - base >= limit) continue;
+            const auto resources = queue.shader.find(base - 1);
+            const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
+            return offset - base < std::min(count, limit);
+        }
+        runtime = false;
+        return false;
+    };
     for (const auto& range : Graphics::DrawKeyRegisters) for (std::uint32_t offset = range.first; offset < range.first + range.count; ++offset) {
         const bool user = range.bank == Graphics::RegisterBank::Shader && std::any_of(entry->decode->programs.begin(), entry->decode->programs.end(), [&](const auto& program) { return offset >= program.userDataBase && offset - program.userDataBase < program.userData.size() - program.hiddenUserWords; });
-        if (!user) entry->registers.push_back({range.bank, offset, LiveRegister(queue, range.bank, offset)});
+        if (user) continue;
+        bool runtime = false;
+        const bool keyed = range.bank == Graphics::RegisterBank::Shader && keyedRuntime(offset, runtime);
+        if (exactRegisters || keyed) entry->registers.push_back({range.bank, offset, LiveRegister(queue, range.bank, offset)});
     }
     if (bucket.size() >= LiveWays) {
         const auto stale = std::find_if(bucket.begin(), bucket.end(), [](const auto& known) { return !known->link->valid.load(std::memory_order_acquire); });
@@ -630,7 +646,10 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         const auto& entry = found->second[way];
         if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) continue;
         ready = true;
-        if (!LiveViewsCurrent(*entry) || !LivePacketMatches(entry->packet, tail.livePacket) || entry->options != options || !LiveStateMatches(*entry, queue) || !DecodeProgramsCurrent(*entry->decode, *submission.shaders)) continue;
+        if (const char* skipped = !LivePacketMatches(entry->packet, tail.livePacket) ? "draw_templates_live_q0_skip_packet" : entry->options != options ? "draw_templates_live_q0_skip_options" : !LiveStateMatches(*entry, queue) ? "draw_templates_live_q0_skip_state" : !LiveViewsCurrent(*entry) ? "draw_templates_live_q0_skip_views" : !DecodeProgramsCurrent(*entry->decode, *submission.shaders) ? "draw_templates_live_q0_skip_decode" : nullptr) {
+            ArchB::Recorder::Count(skipped);
+            continue;
+        }
         if (refuseFeedback && options.feedback && std::any_of(entry->variants.begin(), entry->variants.end(), [](const auto& variant) {
             return !variant->feedback.memory.empty() || !variant->feedback.userData.empty();
         })) {
@@ -662,6 +681,20 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
                 if (plan->incomplete & GatherGenerationMoved) ArchB::Recorder::Count("draw_templates_live_q0_refused_generation");
                 if (plan->incomplete & GatherBindingShape) ArchB::Recorder::Count("draw_templates_live_q0_refused_binding_shape");
                 if (plan->incomplete & GatherNotTemplatable) ArchB::Recorder::Count("draw_templates_live_q0_refused_feedback");
+                if (plan->differ != GatherDiffer::None) {
+                    static const auto names = [] {
+                        std::array<std::string, static_cast<std::size_t>(GatherDiffer::Count)> values;
+                        for (std::size_t kind = 0; kind < values.size(); ++kind) values[kind] = std::string("draw_templates_live_q0_differ_") + GatherDifferName(static_cast<GatherDiffer>(kind));
+                        return values;
+                    }();
+                    ArchB::Recorder::Count(names[static_cast<std::size_t>(plan->differ)].c_str());
+                    static const bool trace = std::getenv("APS5_DRAW_TEMPLATES_LIVE_TRACE_DIFFER") != nullptr;
+                    static std::atomic<unsigned> traced{0};
+                    if (trace && traced.fetch_add(1, std::memory_order_relaxed) % 37u == 0 && traced.load(std::memory_order_relaxed) < 37u * 120u) {
+                        const auto& differing = entry->decode->programs[std::min<std::size_t>(plan->differStage, entry->decode->programs.size() - 1)];
+                        std::fprintf(stderr, "[draw-templates-live] differ %s stage %u program 0x%llx index %u old %08x new %08x mask %08x ways %zu\n", GatherDifferName(plan->differ), plan->differStage, static_cast<unsigned long long>(differing.snapshot->CodeDigest()), plan->differIndex, plan->differOld, plan->differNew, plan->differMask, ways);
+                    }
+                }
             }
             continue;
         }

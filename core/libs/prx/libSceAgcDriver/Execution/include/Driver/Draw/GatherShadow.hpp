@@ -77,6 +77,10 @@ struct GatherOutcome {
     GatherDiffer differ = GatherDiffer::None;
     std::uint64_t signature = 0;
     std::uint32_t nestedRuns = 0;
+    std::uint32_t differIndex = 0;
+    std::uint32_t differOld = 0;
+    std::uint32_t differNew = 0;
+    std::uint32_t differMask = 0;
 };
 
 struct GatherDescriptorWord {
@@ -168,6 +172,12 @@ struct GatherDrawPlan {
     std::uint32_t incomplete = GatherIncompleteNone;
     bool complete = false;
     bool matched = false;
+    GatherDiffer differ = GatherDiffer::None;
+    std::uint32_t differStage = 0;
+    std::uint32_t differIndex = 0;
+    std::uint32_t differOld = 0;
+    std::uint32_t differNew = 0;
+    std::uint32_t differMask = 0;
     std::shared_ptr<GatherCommitTemplate> commitTemplate;
 };
 

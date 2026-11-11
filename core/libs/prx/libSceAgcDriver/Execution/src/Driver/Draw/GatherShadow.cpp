@@ -322,7 +322,13 @@ GatherOutcome EvaluateGather(const GatherTemplate& shape, std::span<const std::u
         const auto changed = live ^ shape.user[index];
         if (changed == 0) continue;
         outcome.wordsChanged = true;
-        if ((changed & ~shape.userMask[index]) != 0 && first == GatherDiffer::None) first = UserDiffer(shape.userClass[index]);
+        if ((changed & ~shape.userMask[index]) != 0 && first == GatherDiffer::None) {
+            first = UserDiffer(shape.userClass[index]);
+            outcome.differIndex = static_cast<std::uint32_t>(index);
+            outcome.differOld = shape.user[index];
+            outcome.differNew = live;
+            outcome.differMask = shape.userMask[index];
+        }
         if ((changed & shape.userMask[index]) != 0 && shape.userClass[index] == GatherWord::Feedback) outcome.feedbackChanged = true;
     }
     for (std::size_t word = 0; word < liveWords.size(); ++word) {
@@ -331,7 +337,13 @@ GatherOutcome EvaluateGather(const GatherTemplate& shape, std::span<const std::u
         const auto changed = live ^ shape.words[word];
         if (changed == 0) continue;
         outcome.wordsChanged = true;
-        if ((changed & ~shape.wordMask[word]) != 0 && first == GatherDiffer::None) first = shape.wordClass[word] == GatherWord::NestedPointer ? GatherDiffer::NestedPointer : GatherDiffer::RunStructure;
+        if ((changed & ~shape.wordMask[word]) != 0 && first == GatherDiffer::None) {
+            first = shape.wordClass[word] == GatherWord::NestedPointer ? GatherDiffer::NestedPointer : GatherDiffer::RunStructure;
+            outcome.differIndex = static_cast<std::uint32_t>(word);
+            outcome.differOld = shape.words[word];
+            outcome.differNew = live;
+            outcome.differMask = shape.wordMask[word];
+        }
         if ((changed & shape.wordMask[word]) != 0 && shape.wordClass[word] == GatherWord::Feedback) outcome.feedbackChanged = true;
     }
     outcome.signature = hash;
@@ -757,6 +769,14 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
             }
             hitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - timed).count());
             allMatched &= outcome.matched;
+            if (!outcome.matched && plan->differ == GatherDiffer::None) {
+                plan->differ = outcome.differ;
+                plan->differStage = validation.stage;
+                plan->differIndex = outcome.differIndex;
+                plan->differOld = outcome.differOld;
+                plan->differNew = outcome.differNew;
+                plan->differMask = outcome.differMask;
+            }
             wordsChanged |= outcome.wordsChanged;
             feedbackChanged |= outcome.feedbackChanged;
             if (refusedPending) incomplete |= GatherPendingWords;
