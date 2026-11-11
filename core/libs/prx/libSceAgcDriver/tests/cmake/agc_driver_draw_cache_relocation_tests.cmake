@@ -1,6 +1,16 @@
 target_include_directories(agc_driver_draw_cache_relocation_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 if(BUILD_TESTING)
+    set(replayPatchBasesEnvironment "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1;APS5_ARCHB_WT_FAULT=1;APS5_ARCHB_WT_FAULT_CONSUMERS=1;APS5_ARCHB_PIPE_RESOLVE_PROOFS=1;APS5_ARCHB_PIPE_Q0_COMMITTER=1;APS5_ARCHB_C_IMAGE_EPOCHS=1;APS5_ARCHB_C_TARGET_FASTPATH=1;APS5_ARCHB_C_TEMPLATE_TOKEN=1;APS5_ARCHB_C_DRAW_REPLAY=1;APS5_ARCHB_C_TARGET_FASTPATH_VERIFY=0;APS5_ARCHB_C_REPLAY_PATCH_SLOTS=1;APS5_ARCHB_C_REPLAY_PATCH_BASES=1;APS5_ARCHB_FIX_DRAW_RELOC_NESTED=1;APS5_ARCHB_FIX_BUFFER_BASE_REFRESH=1")
+    add_test(NAME agc_archc_replay_patch_bases_pixels COMMAND agc_driver_draw_cache_relocation_tests --replay-patch-bases)
+    add_test(NAME agc_archc_replay_patch_bases_verify COMMAND agc_driver_draw_cache_relocation_tests --replay-patch-bases-verify)
+    set_tests_properties(agc_archc_replay_patch_bases_pixels agc_archc_replay_patch_bases_verify PROPERTIES
+        ENVIRONMENT "${replayPatchBasesEnvironment}" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" FAIL_REGULAR_EXPRESSION "VERIFY mismatch")
+    set_property(TEST agc_archc_replay_patch_bases_pixels APPEND PROPERTY ENVIRONMENT "APS5_ARCHB_C_DRAW_REPLAY_VERIFY=0")
+    set_property(TEST agc_archc_replay_patch_bases_verify APPEND PROPERTY ENVIRONMENT "APS5_ARCHB_C_DRAW_REPLAY_VERIFY=1")
+    if(WIN32)
+        set_tests_properties(agc_archc_replay_patch_bases_pixels agc_archc_replay_patch_bases_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_draw_cache_nested_relocation COMMAND agc_driver_draw_cache_relocation_tests --nested)
     add_test(NAME agc_driver_draw_cache_nested_relocation_verify COMMAND agc_driver_draw_cache_relocation_tests --nested)
     add_test(NAME agc_driver_draw_cache_nested_pixels COMMAND agc_driver_draw_cache_relocation_tests --nested-pixels)

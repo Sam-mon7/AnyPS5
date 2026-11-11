@@ -1857,6 +1857,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         entry.words = stageData[i].words;
                         entry.patched = true;
                         entry.bufferBases = stageData[i].bufferBaseHit;
+                        if (ArchB::Switches::Enabled(ArchB::Feature::CReplayPatchBases) && matched[i]->donor != nullptr && matched[i]->donor->compiled != nullptr) {
+                            entry.owner = matched[i]->donor->compiled;
+                            entry.variant = matched[i]->donor;
+                        }
                         break;
                     }
                     if (!entry.patched) entry.owner = ownerOf(stage.program);
