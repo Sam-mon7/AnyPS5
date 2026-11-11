@@ -37,6 +37,8 @@ public:
         if (state.exchange(Unlocked, std::memory_order_release) == Contended) WakeOne(state);
     }
 
+    bool IsContended() const noexcept { return state.load(std::memory_order_relaxed) == Contended; }
+
 private:
     static constexpr std::uint32_t Unlocked = 0;
     static constexpr std::uint32_t Locked = 1;

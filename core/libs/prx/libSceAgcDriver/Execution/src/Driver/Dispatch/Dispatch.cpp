@@ -1042,6 +1042,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     Stage4::Mark(Stage4::Bucket::DispatchPrepare);
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    DrawPipeline::LabelHandoffTail labelHandoffTail;
                     const DispatchCensusScope dispatchCensus;
                     Graphics::Recorder::ComputeSyncScope computeSyncScope(computeSync);
                     recordLabelsForPacket(localDevice.get(), queueId);
@@ -1066,6 +1067,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     }
                     if (htileMask.bytes != 0u) localDevice->NoteHtileMask(htileMask);
                     Stage4::Mark(Stage4::Bucket::DispatchDevice);
+                    labelHandoffTail.armed = true;
                     break;
                 }
                 if (Stage4::ResolveCensus()) Stage4::NoteTemplate(keepVariant.get(), recipeHit == nullptr);

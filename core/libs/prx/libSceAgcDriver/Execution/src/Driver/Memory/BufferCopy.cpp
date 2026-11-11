@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -371,6 +372,7 @@ bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::sp
     const auto ticket = GuestMemory::Gen::Required();
     NoteCopyItem(CopyItemEnqueued);
     DrawPipeline::Queue0().Enqueue([this, localDevice, source, destination, bytes, programAddress, queueId, record, recordWords, epoch, ticket] {
+        CommitCensus::SetKind(CommitCensus::Kind::Copy);
         PerformanceTimer recorderTiming("Driver.CopyCommit");
         DrawPipeline::FollowEpoch(epoch, ticket);
         GuestMemory::SetCurrentPacket(0x15, queueId);
@@ -379,6 +381,7 @@ bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::sp
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            DrawPipeline::LabelHandoffTail labelHandoffTail;
             const auto locked = std::chrono::steady_clock::now();
             recordLabelsForPacket(localDevice.get(), queueId);
             localDevice->ReapRecorded();
@@ -391,6 +394,7 @@ bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::sp
                 if (now != recordWords) NoteCopyItem(CopyItemVerifyMismatch);
             }
             copied = copyKernelRange(queueId, source, destination, bytes, localDevice, programAddress, started, locked);
+            labelHandoffTail.armed = copied;
         }
         if (copied) {
             NoteCopyItem(CopyItemCopied);
