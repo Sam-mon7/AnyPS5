@@ -67,11 +67,6 @@ struct PublishSiteScope {
     const char* previous;
 };
 
-// LAZY_SHADOW_PUBLISH: a depth or stencil plane stored for a consumer (a FlushPending, which then
-// publishes its own range at its own scope) retiles into the unit shadows and publishes nothing itself.
-// The units it leaves fresh outside the consumer's published range are enrolled with C_LAZY_PUBLISH's
-// fault watch (a raw CPU access publishes them first); a range that cannot be watched is published
-// at once. A store without a consumer publishes as before.
 bool LazyShadowPublishEnabled();
 bool LazyShadowVerifyEnabled();
 struct ShadowConsumerScope {
@@ -88,8 +83,6 @@ struct ShadowConsumerScope {
 };
 PublishScope PlaneStoreScope(const char* store);
 void SettlePlaneStore(const char* store, std::uint64_t begin, std::uint64_t end, PublishScope used);
-// _VERIFY: fresh units a lazy plane store left that are still unpublished at their store generation
-// over [address, address + bytes) (a CPU reader after the flush hook must find none).
 std::size_t LazyLeftUnpublished(std::uint64_t address, std::size_t bytes);
 struct LazyShadowCounts {
     std::uint64_t lazyStores = 0;

@@ -7359,7 +7359,7 @@ void GuestBufferMemory::bindShadowAddresses() {
     Require(recorder != nullptr, "shadow address binding requires a recorder");
     recorder->FlushKeyStores();
     recorder->FlushStores();
-    StorageTexture::StoreDrawnLinear("address-based heaps");
+    StorageTexture::StoreDrawnLinear("address-based heaps", LazyShadowPublishEnabled() ? PublishScope::None : PublishScope::Whole);
     for (const auto& [begin, end] : descriptorRanges) {
         StorageTexture::PublishShadowsOnly(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, "imported buffer region");
     }

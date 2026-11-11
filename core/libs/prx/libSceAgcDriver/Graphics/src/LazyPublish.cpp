@@ -40,6 +40,8 @@ constexpr std::uint64_t PageBytes = 4096;
 
 struct Counters {
     std::atomic<std::uint64_t> deferred{0}, renewed{0}, services{0}, serviceNs{0}, lockedServices{0}, lockedWrites{0}, storeHooks{0}, storeHookBytes{0}, storeHookOrphans{0}, storeHookNested{0}, pageServices{0}, partial{0}, eager{0}, eagerKeys{0}, dropped{0}, drained{0}, verified{0}, newer{0}, overlaps{0}, full{0};
+    std::atomic<std::uint64_t> renewalFallbacks{0};
+    std::array<std::atomic<std::uint64_t>, GuestArena::WtWatchSkipCauses> watchSkips{};
     Counters() {
         const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter(name, counter); };
         add("c_lazy_publish_deferred", deferred);
@@ -62,6 +64,9 @@ struct Counters {
         add("c_lazy_publish_verify_newer", newer);
         add("c_lazy_publish_overlaps", overlaps);
         add("c_lazy_publish_full", full);
+        add("n5a_watch_renewal_fallbacks", renewalFallbacks);
+        constexpr std::array<const char*, GuestArena::WtWatchSkipCauses> names{"n5a_watch_skip_noleaf", "n5a_watch_skip_untracked", "n5a_watch_skip_excluded", "n5a_watch_skip_unchecked", "n5a_watch_skip_exec", "n5a_watch_skip_held", "n5a_watch_skip_busy", "n5a_watch_skip_watched", "n5a_watch_skip_protect"};
+        for (std::size_t i = 0; i < names.size(); ++i) add(names[i], watchSkips[i]);
     }
 };
 
@@ -134,6 +139,8 @@ std::map<std::uint64_t, Entry>::iterator containing(State& s, std::uint64_t addr
 
 void publish(std::uint64_t begin, std::uint64_t end) {
     const Recorder::FenceReasonScope fenceReason(Recorder::FenceReason::LazyPublish);
+    const auto current = GuestMemory::CurrentReadSite();
+    const GuestMemory::ReadSiteScope readSite(GuestArena::GuestWtFaultLazyPreservationEnabled_nid_no_patch() && current == GuestMemory::ReadSite::Store ? GuestMemory::ReadSite::Unknown : current);
     GuestMemory::FlushGpuWrites(begin, static_cast<std::size_t>(end - begin));
     GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
 }
@@ -159,13 +166,10 @@ void drainLocked(State& s, std::vector<std::pair<std::uint64_t, std::uint64_t>>&
 
 void publishOrphans(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& orphans) {
     if (orphans.empty()) return;
-    // C_LAZY_STORE_HOOK: an explicit publication (FlushForAccess reads the range raw: a fault there only
-    // opens its page, it does not run the service again).
-    const bool explicitScope = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook);
-    const bool entered = explicitScope && GuestArena::GuestWtFaultEnterLazyService_nid_no_patch();
-    if (explicitScope) publishing(publishing() + 1);
+    const bool entered = GuestArena::GuestWtFaultEnterLazyService_nid_no_patch();
+    publishing(publishing() + 1);
     for (const auto& [begin, end] : orphans) publish(begin, end);
-    if (explicitScope) publishing(publishing() - 1);
+    publishing(publishing() - 1);
     if (entered) GuestArena::GuestWtFaultLeaveLazyService_nid_no_patch();
 }
 
@@ -220,6 +224,13 @@ void traceLockedService(std::uintptr_t page, bool write) {
 }
 
 void service(std::uintptr_t page, bool write) {
+    const auto cause = GuestArena::GuestWtFaultLazyServiceCause_nid_no_patch();
+    const auto* name = write ? "lazy CPU write" : "lazy CPU read";
+    if (cause == GuestArena::WtLazyCause::Range) name = "host write preservation";
+    if (cause == GuestArena::WtLazyCause::Hold) name = "host hold";
+    if (cause == GuestArena::WtLazyCause::Open) name = "driver page open";
+    if (cause == GuestArena::WtLazyCause::Unwatch) name = "watch removal";
+    const PublishSiteScope site(name);
     struct ReadObservation {
         std::uintptr_t page;
         bool write;
@@ -383,12 +394,13 @@ void BeforeLabelStores() {
 
 namespace {
 
-bool enroll(std::uint64_t address, std::size_t bytes) {
+bool enroll(std::uint64_t address, std::size_t bytes, bool shadow = false) {
     auto& c = counters();
     const auto end = address + bytes;
     auto& s = state();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> orphans;
     bool deferred = false;
+    bool unwatch = false;
     {
         std::lock_guard lock(s.mutex);
         drainLocked(s, orphans);
@@ -396,8 +408,16 @@ bool enroll(std::uint64_t address, std::size_t bytes) {
             c.eager.fetch_add(1, std::memory_order_relaxed);
         } else if (const auto it = containing(s, address); it != s.live.end() && end <= it->second.end) {
             if (!it->second.serving) {
-                c.renewed.fetch_add(1, std::memory_order_relaxed);
-                deferred = true;
+                const auto pages = ((end + PageBytes - 1) / PageBytes) - (address / PageBytes);
+                if (GuestArena::GuestWtFaultLazyPages_nid_no_patch(address, bytes) == pages) {
+                    c.renewed.fetch_add(1, std::memory_order_relaxed);
+                    deferred = true;
+                } else {
+                    c.renewalFallbacks.fetch_add(1, std::memory_order_relaxed);
+                    s.live.erase(it);
+                    syncCount(s);
+                    c.dropped.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         } else {
             auto next = s.live.lower_bound(address);
@@ -408,9 +428,11 @@ bool enroll(std::uint64_t address, std::size_t bytes) {
             } else {
                 const auto pages = ((end + PageBytes - 1) / PageBytes) - (address / PageBytes);
                 GuestArena::GuestWtFaultSetWatchSplit_nid_no_patch(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CWatchSplit));
-                const auto watched = GuestArena::GuestWtFaultWatchLazy_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+                std::array<std::uint64_t, GuestArena::WtWatchSkipCauses> causes{};
+                const auto watched = GuestArena::GuestWtFaultWatchLazyCauses_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, causes.data());
+                if (shadow) for (std::size_t i = 0; i < causes.size(); ++i) c.watchSkips[i].fetch_add(causes[i], std::memory_order_relaxed);
                 if (watched != pages) {
-                    GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+                    unwatch = watched != 0;
                     c.partial.fetch_add(1, std::memory_order_relaxed);
                     static std::atomic<int> traces{[] {
                         const char* text = std::getenv("APS5_ARCHB_C_LAZY_PUBLISH_TRACE");
@@ -420,9 +442,6 @@ bool enroll(std::uint64_t address, std::size_t bytes) {
                         std::uintptr_t arenaBase = 0;
                         std::size_t arenaBytes = 0;
                         GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
-                        std::array<std::uint64_t, GuestArena::WtWatchSkipCauses> causes{};
-                        GuestArena::GuestWtFaultWatchCauses_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, causes.data());
-                        GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
                         std::fprintf(stderr, "[lazy-publish] not protectable 0x%llx+0x%zx: %llu of %llu pages watchable (untracked %llu excluded %llu unchecked %llu held %llu busy %llu noleaf %llu watched %llu protect %llu, word 0x%llx); arena 0x%llx-0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(watched), static_cast<unsigned long long>(pages), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipUntracked]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipExcluded]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipUnchecked]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipHeld]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipBusy]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipNoLeaf]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipWatched]), static_cast<unsigned long long>(causes[GuestArena::WtWatchSkipProtect]), static_cast<unsigned long long>(GuestArena::GuestWtFaultWord_nid_no_patch(static_cast<std::uintptr_t>(address))), static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(arenaBase + arenaBytes));
                     }
                 } else {
@@ -433,6 +452,10 @@ bool enroll(std::uint64_t address, std::size_t bytes) {
                 }
             }
         }
+    }
+    if (unwatch) {
+        const PublishSiteScope site("watch fallback");
+        publishOrphans({{address, end}});
     }
     publishOrphans(orphans);
     return deferred;
@@ -449,7 +472,7 @@ bool DeferLabelStore(std::uint64_t address, std::size_t bytes) {
 
 bool DeferShadowRange(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || !Active()) return false;
-    return enroll(address, bytes);
+    return enroll(address, bytes, true);
 }
 
 LabelStoreOutcome PeekLabelStore(std::uint64_t address, std::size_t bytes) {

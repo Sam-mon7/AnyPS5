@@ -6045,7 +6045,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     for (const auto& [address, bytes] : occasional) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device));
 }
 
-std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
+std::size_t StorageTexture::StoreDrawnLinear(const char* reason, PublishScope scope) {
     auto& pending = Pending();
     if (pending.drawnCount.load(std::memory_order_acquire) == 0 || Recorder::InCompletion()) return 0;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -6060,7 +6060,8 @@ std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
     }
     std::size_t stored = 0;
     for (const auto& [address, bytes] : ranges) {
-        if (FlushPending(address, bytes, nullptr, reason)) ++stored;
+        if (FlushPending(address, bytes, nullptr, reason, scope)) ++stored;
+        if (scope == PublishScope::None && LazyShadowPublishEnabled()) SettlePlaneStore(reason, address, address + bytes, scope);
     }
     return stored;
 }

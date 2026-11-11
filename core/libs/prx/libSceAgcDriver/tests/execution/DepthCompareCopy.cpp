@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -306,7 +308,7 @@ void GpuArrayCase(AgcDriver::VulkanDevice& device, std::string_view mode) {
     namespace Graphics = AgcDriver::Graphics;
     namespace Memory = AgcDriver::GuestMemory;
     using Counters = AgcDriver::ArchB::Recorder;
-    Require(mode == "on" || mode == "off" || mode == "cpu" || mode == "queued", "unknown GPU sampled array mode");
+    Require(mode == "on" || mode == "off" || mode == "cpu" || mode == "queued" || mode == "shadow", "unknown GPU sampled array mode");
     const Shape shape{Format32Float, 512, 512, 8, 1, true, 0x18};
     Graphics::SetHostImportWindow(1u << 20u);
     Graphics::SetHostImportRangeWindow(1u << 20u);
@@ -319,6 +321,14 @@ void GpuArrayCase(AgcDriver::VulkanDevice& device, std::string_view mode) {
     const AgcDriver::ArchB::PartialSnapshotScope partial(true);
     std::lock_guard gpu(Memory::GpuMutex());
     const auto context = device.graphicsContext();
+    const auto watch = Graphics::PrepareImportWatch(context);
+    struct RestoreWatch {
+        const Graphics::Context& context;
+        Graphics::ImportWatch watch;
+        bool active;
+        ~RestoreWatch() { if (active) Graphics::SetImportWatch(context, watch); }
+    } restoreWatch{context, watch, mode == "shadow"};
+    if (mode == "shadow") Graphics::SetImportWatch(context, Graphics::ImportWatch::Watch);
     auto* recorder = Graphics::Recorder::Active();
     Require(recorder != nullptr && recorder->Device() == device.Device(), "GPU sampled array recorder is unavailable");
     std::array<ShaderRecompiler::RecompileResult, 4> programs;
@@ -341,6 +351,26 @@ void GpuArrayCase(AgcDriver::VulkanDevice& device, std::string_view mode) {
     Counters::Boundary(true, 1, Counters::Clock::now());
     Counters::Collect(Counters::Clock::now());
     const auto fill = [&](std::uint32_t layer, float value) {
+        if (mode == "shadow") {
+            const auto begin = address + geometry.GuestLayerOffset(layer);
+            const auto end = begin + geometry.layerBytes;
+            const auto* import = Graphics::HostImportFor(context, begin, static_cast<std::size_t>(geometry.layerBytes));
+            Require(import != nullptr && Memory::Watched(begin, geometry.layerBytes), "the lazy sampled array layer is not imported and watched");
+            Memory::CollectWritesUncached(begin, geometry.layerBytes);
+            GuestArena::GuestWtFaultTrack_nid_no_patch(begin, geometry.layerBytes);
+            const auto destination = Graphics::ShadowDestinationFor(context, *import, begin, end);
+            Require(destination.has_value() && destination->seedUnits.empty(), "the lazy sampled array layer has no slab");
+            const auto commands = recorder->Commands();
+            recorder->Keep(destination->slab);
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, destination->buffer, destination->offset, geometry.layerBytes, Bits(value));
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+            const Graphics::ShadowedRange range{begin, end, destination->slab};
+            Graphics::MarkShadowed(*import, std::span(&range, 1), Memory::TrackerGeneration());
+            Graphics::SettlePlaneStore("depth plane store", begin, end, Graphics::PublishScope::None);
+            Require(Graphics::AnyShadowedOverlaps(begin, geometry.layerBytes), "the lazy sampled array published before sampling");
+            return;
+        }
         const std::array<std::uint32_t, 4> pattern{Bits(value), Bits(value), Bits(value), Bits(value)};
         const auto source = address + geometry.guestBytes + geometry.GuestLayerOffset(layer);
         Require(device.FillBuffer(source, static_cast<std::size_t>(geometry.layerBytes), pattern), "GPU sampled array source fill was refused");
@@ -365,7 +395,7 @@ void GpuArrayCase(AgcDriver::VulkanDevice& device, std::string_view mode) {
         recorder->RecordStore(import->buffer, Graphics::HostImportOffset(*import, destination), std::as_bytes(std::span(values)), destination);
         Require(recorder->QueuedStoreOverlaps(destination, static_cast<std::size_t>(geometry.layerBytes)), "GPU sampled array did not queue its label store");
     }
-    Require(recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(geometry.guestBytes)), "GPU sampled array writer completed before the lookup");
+    Require(mode == "shadow" ? Graphics::AnyShadowedOverlaps(address, geometry.guestBytes) : recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(geometry.guestBytes)), "GPU sampled array writer completed before the lookup");
     const auto mismatches = Graphics::Texture::PartialSnapshotVerifyMismatches();
     sample(1, mode == "cpu" || mode == "queued" ? 0.375f : 0.75f);
     sample(3, 0.125f);
@@ -373,7 +403,8 @@ void GpuArrayCase(AgcDriver::VulkanDevice& device, std::string_view mode) {
     auto counts = Counters::Collect(Counters::Clock::now());
     for (const auto& [name, value] : counts.counters) if (name.starts_with("fix_sampled_array_gpu")) std::printf("%s %.0f\n", name.c_str(), value);
     std::printf("GPU sampled array %s: taken %.0f, refused CPU %.0f, verified %.0f, mismatches %.0f\n", std::string(mode).c_str(), counts.counters["fix_sampled_array_gpu_taken"], counts.counters["fix_sampled_array_gpu_refused_cpu_store"], counts.counters["fix_sampled_array_gpu_verified"], counts.counters["fix_sampled_array_gpu_verify_mismatches"]);
-    Require((counts.counters["fix_sampled_array_gpu_taken"] == 1.0) == (mode == "on"), "GPU sampled array did not take its selected path");
+    Require((counts.counters["fix_sampled_array_gpu_taken"] == 1.0) == (mode == "on" || mode == "shadow"), "GPU sampled array did not take its selected path");
+    if (mode == "shadow") Require(counts.counters["n5a_force_sampled_array_import_bytes"] == 2.0 * geometry.layerBytes, "the GPU array consumer did not materialize its shadow inputs exactly once");
     if (mode == "cpu") Require(landed && counts.counters["fix_sampled_array_gpu_refused_cpu_store"] >= 1.0, "GPU sampled array accepted a pending CPU completion store");
     if (mode == "queued") Require(counts.counters["fix_sampled_array_gpu_refused_queued_store"] >= 1.0, "GPU sampled array accepted an unrecorded label store");
     Require(Graphics::Texture::PartialSnapshotVerifyMismatches() == mismatches, "GPU sampled array bytes differ from the old snapshot");

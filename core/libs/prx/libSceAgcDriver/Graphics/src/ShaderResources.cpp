@@ -979,7 +979,10 @@ std::shared_ptr<Texture> gpuSampledArray(const Context& context, std::span<const
     if (recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes)) return refuse("fix_sampled_array_gpu_refused_queued_store");
     if (recorder->PendingCpuWritesOverlap(address, bytes) || recorder->CompletionLabelIn(address, bytes)) return refuse("fix_sampled_array_gpu_refused_cpu_store");
     if (recorder->PendingLeaseSerial(address, bytes) != 0) return refuse("fix_sampled_array_gpu_refused_lease");
-    if (AnyShadowedOverlaps(address, bytes)) return refuse("fix_sampled_array_gpu_refused_shadow");
+    if (AnyShadowedOverlaps(address, bytes)) {
+        if (!LazyShadowPublishEnabled()) return refuse("fix_sampled_array_gpu_refused_shadow");
+        StorageTexture::PublishShadowsOnly(address, bytes, PublishScope::Whole, "sampled array import");
+    }
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (StorageTexture::AnyPendingOverlaps(range)) return refuse("fix_sampled_array_gpu_refused_storage");
     const auto pending = recorder->PendingWritesOver(address, bytes);
@@ -1147,7 +1150,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto bytes = static_cast<std::size_t>(guestBytes);
     if (profile) StorageTexture::ProfilePendingAccess(resource, guestBytes, StorageTexture::PendingAccess::Read);
     static_cast<void>(FlushDepthPlanes(address, bytes));
-    if (snapshotWait && ArchB::Switches::Enabled(ArchB::Feature::FixSampledArrayGpu) && depthCompare && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+    if (snapshotWait && ArchB::Switches::Enabled(ArchB::Feature::FixSampledArrayGpu) && depthCompare && (Recorder::SnapshotWriteOverlaps(address, bytes) || (LazyShadowPublishEnabled() && AnyShadowedOverlaps(address, bytes)))) {
         if (auto texture = gpuSampledArray(context, words, resource, components, guestBytes, depthCompare, layerRows)) return texture;
     }
     if (snapshotWait && ArchB::PartialSnapshotActive() && Recorder::ComputeSyncEnabled() && ArchB::Switches::Enabled(ArchB::Feature::FixComputeSnapshotWait) && sampledCacheHeldThreadState() == 0 && storageCacheHeldThreadState() == 0 && !ImportsHeldByThisThread() && (depthCompare || !SampledFromStorageEligible(context, resource, guestBytes)) && Recorder::SnapshotWriteOverlaps(address, bytes)) {

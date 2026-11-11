@@ -104,7 +104,8 @@ struct UnitShadow {
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
     std::vector<std::uint8_t> addressed;
-    std::vector<std::uint64_t> lazyGeneration;
+    std::vector<std::uint64_t> lazyTicket;
+    std::vector<std::uint8_t> lazySettled;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -134,6 +135,8 @@ struct Shadows {
     std::uint32_t liveSlabs = 0;
     // Counted for the [storage] segment: shadows retired and the slab bytes they returned.
     std::uint64_t retired = 0;
+    std::uint64_t lazySerial = 0;
+    std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> publishing;
 };
 
 Shadows& Registry() {
@@ -196,7 +199,8 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
-    shadow->lazyGeneration.assign(static_cast<std::size_t>(units), 0);
+    shadow->lazyTicket.assign(static_cast<std::size_t>(units), 0);
+    shadow->lazySettled.assign(static_cast<std::size_t>(units), 0);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (ShadowAddressEnabled() && profile) shadow->addressed.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
@@ -270,6 +274,7 @@ bool& publishOnCpu() {
 
 struct LazyCounters {
     std::atomic<std::uint64_t> lazyStores{0}, eagerStores{0}, leftBytes{0}, enrolled{0}, enrolledBytes{0}, unwatchable{0}, unwatchableBytes{0}, verifyChecks{0}, verifyMismatches{0}, verifySkipped{0}, staleReads{0}, staleChecks{0}, publishedUnits{0};
+    std::atomic<std::uint64_t> avoided{0}, avoidedBytes{0};
     LazyCounters() {
         const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter(name, counter); };
         add("n5a_lazy_stores", lazyStores);
@@ -277,6 +282,8 @@ struct LazyCounters {
         add("n5a_left_bytes", leftBytes);
         add("n5a_enrolled", enrolled);
         add("n5a_enrolled_bytes", enrolledBytes);
+        add("n5a_publications_avoided", avoided);
+        add("n5a_publication_bytes_avoided", avoidedBytes);
         add("n5a_unwatchable", unwatchable);
         add("n5a_unwatchable_bytes", unwatchableBytes);
         add("n5a_verify_checks", verifyChecks);
@@ -285,6 +292,9 @@ struct LazyCounters {
         add("n5a_verify_stale_reads", staleReads);
         add("n5a_verify_read_checks", staleChecks);
         add("n5a_published_units", publishedUnits);
+        add("n5a_lost_on_retire", Stats().lostOnRetire);
+        add("n5a_slab_lost", Stats().slabLost);
+        add("n5a_retired_discarded_units", Stats().droppedOnRetire);
     }
 };
 
@@ -471,6 +481,8 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t bytes = 0;
+    std::uint64_t forcedBytes = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> forced;
     std::size_t units = 0;
     const auto checked = GuestMemory::TrackerGeneration();
     {
@@ -502,6 +514,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             if (changed[k] == GuestMemory::BlockWritten) {
                 // Newer bytes reached the import since the retile: the slab's are dead.
                 shadow->generation[unit] = 0;
+                shadow->lazyTicket[unit] = 0;
                 ++ended;
                 (cpu[k] != 0 ? Stats().staleDroppedCpu : Stats().staleDroppedDriver).fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -510,6 +523,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             const auto& slab = shadow->slabs[slabIndex];
             if (slab == nullptr) {
                 shadow->generation[unit] = 0;
+                shadow->lazyTicket[unit] = 0;
                 ++ended;
                 continue;
             }
@@ -525,6 +539,10 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 ranges.emplace_back(begin, end);
             }
             shadow->published[unit] = 1;
+            if (shadow->lazyTicket[unit] != 0) {
+                forcedBytes += end - begin;
+                forced.emplace_back(unit, shadow->lazyTicket[unit]);
+            }
             ++ended;
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
@@ -535,6 +553,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     }
     if (units == 0) return 0;
     countSite("n5a_pub_", siteOf(reason).c_str(), bytes);
+    if (forcedBytes != 0) countSite("n5a_force_", siteOf(reason).c_str(), forcedBytes);
     lazyCounters().publishedUnits.fetch_add(units, std::memory_order_relaxed);
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
@@ -553,6 +572,23 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const ArchC::LazyCensus::UseScope censusScope;
         for (const auto& [begin, end] : ranges) ArchC::LazyCensus::Published(begin, end, ArchC::LazyCensus::Kind::ShadowPublish, static_cast<std::uint8_t>(reason));
         if (!publishOnCpu() || !recordCopiesOnCpu(*shadow, copies, ranges, bytes, checked)) recordCopies(*shadow, copies, ranges, bytes);
+    }
+    if (!forced.empty()) {
+        std::uint64_t publication = 0;
+        {
+            std::lock_guard lock(Registry().mutex);
+            publication = ++Registry().lazySerial;
+            Registry().publishing.emplace(publication, ranges);
+        }
+        auto completed = [shadow, forced = std::move(forced), publication] {
+            std::lock_guard lock(Registry().mutex);
+            Registry().publishing.erase(publication);
+            for (const auto& [unit, ticket] : forced) {
+                if (shadow->lazyTicket[unit] == ticket) shadow->lazyTicket[unit] = 0;
+            }
+        };
+        if (auto* recorder = Recorder::Active()) recorder->OnComplete(std::move(completed));
+        else completed();
     }
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
@@ -697,7 +733,9 @@ PublishOnCpuScope::~PublishOnCpuScope() {
     publishOnCpu() = previous;
 }
 
-PublishSiteScope::PublishSiteScope(const char* site) : previous(std::exchange(publishSite(), site)) {}
+PublishSiteScope::PublishSiteScope(const char* site) : previous(publishSite()) {
+    if (previous == nullptr) publishSite() = site;
+}
 
 PublishSiteScope::~PublishSiteScope() {
     publishSite() = previous;
@@ -1065,6 +1103,8 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 if (!shadow->Live(unit)) ++shadow->liveUnits;
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
+                shadow->lazyTicket[unit] = shadow->lazyTicket[unit] != 0 ? ++registry.lazySerial : 0;
+                shadow->lazySettled[unit] = 0;
                 if (!shadow->addressed.empty()) shadow->addressed[unit] = 0;
                 current->lastUse = present;
             }
@@ -1237,13 +1277,15 @@ void verifyLeft(const LeftUnits& left) {
         batch.SubmitAndWait();
         scratch.back()->Invalidate();
     }
-    publishUnits(shadow, left.first, left.last, left.selected, PublishReason::Validate);
+    const PublishSiteScope site("verify");
+    GuestMemory::FlushGpuWrites(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
     if (recorder != nullptr) {
         Recorder::CountSync(4);
         recorder->Sync();
     }
     for (std::size_t i = 0; i < regions.size(); ++i) {
         const auto& region = regions[i];
+        GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(region.address), static_cast<std::size_t>(region.size));
         counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         if (GuestArena::GuestWtFaultWatchedPages_nid_no_patch(static_cast<std::uintptr_t>(region.address), static_cast<std::size_t>(region.size)) != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(region.address), static_cast<std::size_t>(region.size))) {
             counters.verifySkipped.fetch_add(1, std::memory_order_relaxed);
@@ -1253,7 +1295,33 @@ void verifyLeft(const LeftUnits& left) {
         counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[lazy-shadow] VERIFY mismatch: the forced publication of 0x%llx+0x%llx differs from the eager copy\n", static_cast<unsigned long long>(region.address), static_cast<unsigned long long>(region.size));
+        throw std::runtime_error("lazy shadow forced publication differs from eager bytes");
     }
+}
+
+}
+
+namespace {
+
+bool needsLazyPreservation(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0) return false;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    if (anyOverlapping(registry, address, end, [&](const auto& shadow) {
+        const auto begin = std::max<std::uint64_t>(address, shadow->importBase);
+        const auto stop = std::min(end, shadow->ImportEnd());
+        for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(stop - 1); ++unit) {
+            if (shadow->lazyTicket[unit] != 0) return true;
+        }
+        return false;
+    })) return true;
+    for (const auto& [ticket, ranges] : registry.publishing) {
+        for (const auto& [begin, stop] : ranges) {
+            if (begin < end && address < stop) return true;
+        }
+    }
+    return false;
 }
 
 }
@@ -1263,7 +1331,12 @@ bool LazyShadowVerifyEnabled() {
 }
 
 bool LazyShadowPublishEnabled() {
-    return UnitShadowEnabled() && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::LazyShadowPublish) && ArchC::LazyPublish::Active();
+    if (!UnitShadowEnabled() || !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::LazyShadowPublish) || !ArchC::LazyPublish::Active()) return false;
+    static const bool installed = [] {
+        GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(&needsLazyPreservation);
+        return true;
+    }();
+    return installed;
 }
 
 ShadowConsumerScope::ShadowConsumerScope(const char* reason, std::uint64_t address, std::size_t bytes, PublishScope scope) : previous(consumerState()) {
@@ -1277,13 +1350,8 @@ ShadowConsumerScope::~ShadowConsumerScope() {
 PublishScope PlaneStoreScope(const char* store) {
     if (!LazyShadowPublishEnabled()) return PublishScope::Whole;
     const auto& consumer = consumerState();
-    if (!consumer.set) {
-        lazyCounters().eagerStores.fetch_add(1, std::memory_order_relaxed);
-        countSite("n5a_eager_", store, 0);
-        return PublishScope::Whole;
-    }
     lazyCounters().lazyStores.fetch_add(1, std::memory_order_relaxed);
-    countSite("n5a_store_", consumer.reason != nullptr ? consumer.reason : "unnamed", 0);
+    countSite("n5a_store_", consumer.reason != nullptr ? consumer.reason : store, 0);
     return PublishScope::None;
 }
 
@@ -1292,9 +1360,8 @@ void SettlePlaneStore(const char* store, std::uint64_t begin, std::uint64_t end,
     auto& counters = lazyCounters();
     const auto consumer = consumerState();
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    static std::atomic<std::uint64_t> settled{0};
     const auto every = lazyVerifyEvery();
-    const bool verify = every != 0 && (settled.fetch_add(1, std::memory_order_relaxed) + 1) % every == 0;
+    const bool verify = every != 0 && Recorder::Presents() % every == 0;
     std::vector<LeftUnits> lefts;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t leftBytes = 0;
@@ -1310,36 +1377,41 @@ void SettlePlaneStore(const char* store, std::uint64_t begin, std::uint64_t end,
             left.selected.assign(static_cast<std::size_t>(left.last - left.first + 1), 0);
             bool any = false;
             for (auto unit = left.first; unit <= left.last; ++unit) {
-                if (!shadow->Live(unit)) continue;
+                if (!shadow->Live(unit) || shadow->lazySettled[unit] != 0) continue;
                 const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
                 if (unitEnd <= unitBegin || consumerPublishes(consumer, unitBegin, unitEnd)) continue;
-                shadow->lazyGeneration[unit] = shadow->generation[unit];
+                if (shadow->lazyTicket[unit] == 0) shadow->lazyTicket[unit] = ++registry.lazySerial;
+                shadow->lazySettled[unit] = 1;
                 left.selected[static_cast<std::size_t>(unit - left.first)] = 1;
                 any = true;
                 leftBytes += unitEnd - unitBegin;
-                if (!ranges.empty() && ranges.back().second == unitBegin) ranges.back().second = unitEnd;
-                else ranges.emplace_back(unitBegin, unitEnd);
+                ranges.emplace_back(unitBegin, unitEnd);
             }
             if (any) lefts.push_back(std::move(left));
         }
     }
     counters.leftBytes.fetch_add(leftBytes, std::memory_order_relaxed);
     if (lefts.empty()) return;
-    if (verify) {
-        for (const auto& left : lefts) verifyLeft(left);
-        return;
-    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fallback;
     for (const auto& [rangeBegin, rangeEnd] : ranges) {
         const auto bytes = static_cast<std::size_t>(rangeEnd - rangeBegin);
         if (ArchC::LazyPublish::DeferShadowRange(rangeBegin, bytes)) {
             counters.enrolled.fetch_add(1, std::memory_order_relaxed);
             counters.enrolledBytes.fetch_add(bytes, std::memory_order_relaxed);
+            if (store != nullptr && (std::strcmp(store, "depth plane store") == 0 || std::strcmp(store, "stencil plane store") == 0 || std::strcmp(store, "address-based heaps") == 0)) {
+                counters.avoided.fetch_add(1, std::memory_order_relaxed);
+                counters.avoidedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
             continue;
         }
         counters.unwatchable.fetch_add(1, std::memory_order_relaxed);
         counters.unwatchableBytes.fetch_add(bytes, std::memory_order_relaxed);
-        static_cast<void>(StorageTexture::PublishShadowsOnly(rangeBegin, bytes, PublishScope::Whole, store));
+        counters.eagerStores.fetch_add(1, std::memory_order_relaxed);
+        if (!fallback.empty() && fallback.back().second == rangeBegin) fallback.back().second = rangeEnd;
+        else fallback.emplace_back(rangeBegin, rangeEnd);
     }
+    for (const auto& [from, to] : fallback) static_cast<void>(StorageTexture::PublishShadowsOnly(from, static_cast<std::size_t>(to - from), PublishScope::Whole, store));
+    if (verify) for (const auto& left : lefts) verifyLeft(left);
 }
 
 std::size_t LazyLeftUnpublished(std::uint64_t address, std::size_t bytes) {
@@ -1354,7 +1426,7 @@ std::size_t LazyLeftUnpublished(std::uint64_t address, std::size_t bytes) {
         const auto to = std::min(end, shadow->ImportEnd());
         if (to <= from) continue;
         for (auto unit = shadow->UnitOf(from); unit <= shadow->UnitOf(to - 1); ++unit) {
-            if (shadow->Live(unit) && shadow->lazyGeneration[unit] != 0 && shadow->lazyGeneration[unit] == shadow->generation[unit]) ++units;
+            if (shadow->Live(unit)) ++units;
         }
     }
     return units;
@@ -1369,6 +1441,7 @@ void NoteLazyShadowRead(std::uint64_t address, std::size_t bytes, PublishScope s
     counters.staleReads.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<int> reports{0};
     if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[lazy-shadow] VERIFY: a CPU read of 0x%llx+0x%zx found %zu unpublished units a lazy plane store left (read site %s)\n", static_cast<unsigned long long>(address), bytes, units, GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()));
+    throw std::runtime_error("lazy shadow CPU reader found unpublished bytes");
 }
 
 LazyShadowCounts LazyShadowTotals() {

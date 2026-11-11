@@ -359,7 +359,7 @@ public:
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason, VkDevice device = VK_NULL_HANDLE);
     static void PrepareReadbackBeforeLabel(bool computeSync = false);
-    static std::size_t StoreDrawnLinear(const char* reason);
+    static std::size_t StoreDrawnLinear(const char* reason, PublishScope scope = PublishScope::Whole);
     static void NoteFlip();
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();

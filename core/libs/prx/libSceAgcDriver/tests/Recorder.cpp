@@ -15419,13 +15419,6 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
     return 0;
 }
 
-// LAZY_SHADOW_PUBLISH: a plane store made for a device-facing consumer (a storage upload, scope None) retiles
-// into the unit shadow and publishes nothing; the fresh units it leaves are enrolled with C_LAZY_PUBLISH's fault
-// watch. Scenarios: gpu (an upload reads the slab: no publication, the slab's bytes), cpu_read (a raw CPU read
-// faults and publishes once, exactly the slab's bytes), cpu_write (a raw CPU write into the range, then an upload:
-// the CPU's bytes where written, the slab's elsewhere), evict (APS5_UNIT_SHADOW_MIB=8: a unit retiled again while
-// unpublished, then the slab evicted for another: the CPU reads the newest bytes of both units). Without the switch
-// the store publishes at once and every scenario reads the same bytes.
 int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -15433,10 +15426,17 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
     const auto& context = device.GetContext();
     if (!device.Graphics() || context.hostImportAlignment == 0 || !UnitShadowEnabled()) return 77;
+    const auto decided = PrepareImportWatch(context);
+    SetImportWatch(context, ImportWatch::Watch);
+    struct RestoreWatch {
+        const Context& context;
+        ImportWatch decided;
+        ~RestoreWatch() { SetImportWatch(context, decided); }
+    } restoreWatch{context, decided};
     const bool on = Switches::Enabled(Feature::LazyShadowPublish);
     const bool verify = LazyShadowVerifyEnabled();
     constexpr std::uint64_t unit = 65536;
-    const std::size_t bytes = scenario == "evict" ? (9u << 20u) : static_cast<std::size_t>(4 * unit);
+    const std::size_t bytes = scenario == "evict" ? (9u << 20u) : scenario == "image" ? (4u << 20u) : static_cast<std::size_t>(4 * unit);
     void* block = AllocateWatched(bytes, unit);
     if (block == nullptr) return 77;
     struct Release {
@@ -15524,9 +15524,7 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         return std::make_pair(seen, slabOnly);
     };
     const auto protection = [&](std::uint64_t at) {
-        MEMORY_BASIC_INFORMATION memory{};
-        VirtualQuery(reinterpret_cast<void*>(at), &memory, sizeof(memory));
-        return memory.Protect;
+        return GuestArena::GuestWtFaultWatchedPages_nid_no_patch(at, 1) != 0;
     };
     const auto rawRead = [&](std::uint64_t begin, std::uint64_t length) {
         std::vector<std::uint8_t> seen(static_cast<std::size_t>(length));
@@ -15534,6 +15532,57 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         for (std::size_t i = 0; i < seen.size(); ++i) seen[i] = from[i];
         return seen;
     };
+    if (scenario == "image") {
+        TextureDetiler detiler(context);
+        auto imageContext = context;
+        imageContext.detiler = &detiler;
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = 1024;
+        resource.height = 1024;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        Require(DescribeSurface(resource).guestBytes == 64 * unit, "the lazy image test must fill 64 units");
+        auto source = StorageTexture::Create(imageContext, detiler, resource, 0);
+        const auto commands = recorder.Commands();
+        recorder.Keep(source);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        source->MarkDrawn(0, 1, {{0, 0}, {1024, 1024}});
+        const auto before = LazyShadowTotals();
+        Require(StorageTexture::StoreDrawnLinear("address-based heaps", on ? PublishScope::None : PublishScope::Whole) == 1, "the GPU image was not stored");
+        recorder.Sync();
+        const auto stored = LazyShadowTotals();
+        Require(stored.publishedUnits == before.publishedUnits + (on && !verify ? 0 : 64), "the GPU image publication did not follow the switch");
+        source.reset();
+        auto consumer = StorageTexture::Create(imageContext, detiler, resource, 0);
+        Buffer pixels(context, 64 * unit, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto readCommands = recorder.Commands();
+        recorder.Keep(consumer);
+        RecordMemoryBarrier(context, readCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {1024, 1024, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(readCommands, consumer->Image(), VK_IMAGE_LAYOUT_GENERAL, pixels.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, readCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        pixels.Invalidate();
+        constexpr std::array<std::byte, 4> wanted{std::byte{255}, std::byte{0}, std::byte{0}, std::byte{255}};
+        for (std::size_t i = 0; i < 64 * unit; ++i) Require(pixels.Bytes()[i] == wanted[i % 4], "the slab upload produced wrong pixels");
+        Require(LazyShadowTotals().publishedUnits == stored.publishedUnits, "the GPU image consumer published");
+        if (on && !verify) Require(protection(address) && AnyShadowedOverlaps(address, 64 * unit), "the GPU-only image lost its lazy authority");
+        std::cout << "agc_lazy_shadow_image: ok\n";
+        return 0;
+    }
     const auto first = address + unit;
     const auto second = first + unit;
     retile(first, 0x20);
@@ -15542,13 +15591,14 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     const auto before = LazyShadowTotals();
     const auto lazyBefore = Lazy::Totals();
     store(first, second + unit);
+    recorder.Sync();
     const auto stored = LazyShadowTotals();
     if (on) {
-        Require(stored.publishedUnits == before.publishedUnits, "the lazy plane store published");
+        Require(stored.publishedUnits == before.publishedUnits + (verify ? 2 : 0), "the lazy plane store published unexpectedly");
         Require(stored.lazyStores == before.lazyStores + 1 && stored.leftBytes == before.leftBytes + 2 * unit, "the lazy plane store left the wrong units");
         if (!verify) {
-            Require(stored.enrolledBytes == before.enrolledBytes + 2 * unit && Lazy::Totals().deferred == lazyBefore.deferred + 1, "the left units were not enrolled with the fault watch");
-            Require(protection(first) == PAGE_NOACCESS && AnyShadowedOverlaps(first, 2 * unit), "the left units are not watched, or not shadowed");
+            Require(stored.enrolledBytes == before.enrolledBytes + 2 * unit && Lazy::Totals().deferred == lazyBefore.deferred + 2, "the left units were not enrolled with the fault watch");
+            Require(protection(first) && AnyShadowedOverlaps(first, 2 * unit), "the left units are not watched, or not shadowed");
         } else {
             Require(stored.verifyChecks == before.verifyChecks + 2 && stored.verifyMismatches == before.verifyMismatches, "VERIFY did not compare the forced publication with the eager copy, or they differ");
         }
@@ -15557,25 +15607,67 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     }
     const auto unitOne = expected(0x20);
     const auto unitTwo = expected(0x60);
+    if (scenario == "observer_renewal") {
+        StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "observer test");
+        recorder.Sync();
+        GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 2 * unit);
+        Require(GuestArena::GuestWtFaultWatch_nid_no_patch(first, 2 * unit) == 32, "the observational watch did not cover both units");
+        retile(first, 0x31);
+        retile(second, 0x73);
+        const auto renewed = LazyShadowTotals();
+        store(first, second + unit);
+        recorder.Sync();
+        Require(LazyShadowTotals().publishedUnits == renewed.publishedUnits + 2, "an observational watch was accepted as a lazy service watch");
+        const auto seen = rawRead(first, 2 * unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require(std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "renewing an observational watch lost GPU bytes");
+        std::cout << "agc_lazy_shadow_observer_renewal: ok\n";
+        return 0;
+    }
     if (scenario == "gpu") {
         const auto [seen, slabOnly] = gpuRead(first, second + unit);
         Require(slabOnly, "the upload did not read the slab");
         Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload read wrong bytes");
-        if (on && !verify) Require(LazyShadowTotals().publishedUnits == stored.publishedUnits && protection(first) == PAGE_NOACCESS, "a GPU-only read published");
-    } else if (scenario == "cpu_read") {
-        const auto seen = rawRead(first, 2 * unit);
-        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the CPU read wrong bytes");
+        if (on && !verify) Require(LazyShadowTotals().publishedUnits == stored.publishedUnits && protection(first), "a GPU-only read published");
+    } else if (scenario == "cpu_read" || scenario == "hold" || scenario == "open" || scenario == "unwatch" || scenario == "protect" || scenario == "driver_read") {
+        if (scenario == "hold") GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+        if (scenario == "open") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
+        if (scenario == "unwatch") GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
+        if (scenario == "protect") {
+#ifdef _WIN32
+            GuestArena::GuestArenaSetProtection_nid_postfix(first, 4096, PAGE_READWRITE);
+#else
+            return 77;
+#endif
+        }
+        if (scenario == "driver_read") {
+            std::array<std::byte, 1> seen{};
+            Read(first, seen);
+        }
+        const auto readBytes = scenario == "cpu_read" ? unit : 2 * unit;
+        const auto seen = rawRead(first, readBytes);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && (readBytes == unit || std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit)), "the CPU read wrong bytes");
         const auto read = LazyShadowTotals();
         if (on && !verify) {
-            Require(read.publishedUnits == stored.publishedUnits + 2 && Lazy::Totals().services == lazyBefore.services + 1, "the CPU read did not force exactly one publication");
-            Require(protection(first) != PAGE_NOACCESS && !AnyShadowedOverlaps(first, 2 * unit), "the read range is still lazy");
+            Require(read.publishedUnits == stored.publishedUnits + readBytes / unit, "the CPU read did not force each requested unit once");
+            if (scenario == "cpu_read") Require(Lazy::Totals().services == lazyBefore.services + 1, "the CPU fault did not run exactly one service");
+            Require(!protection(first) && !AnyShadowedOverlaps(first, readBytes), "the read range is still lazy");
         }
-        const auto again = rawRead(first, 2 * unit);
+        const auto again = rawRead(first, readBytes);
         Require(again == seen && LazyShadowTotals().publishedUnits == read.publishedUnits, "a second CPU read published again or read other bytes");
-    } else if (scenario == "cpu_write") {
-        {
+        if (scenario == "hold") GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+    } else if (scenario == "cpu_write" || scenario == "host_write") {
+        const auto write = [&] {
             volatile std::uint8_t* to = reinterpret_cast<volatile std::uint8_t*>(first + 8);
             for (int i = 0; i < 16; ++i) to[i] = 0x77;
+        };
+        if (scenario == "host_write") {
+            const ReadSiteScope site(ReadSite::Store);
+            const GuestArena::HostWrite hold(reinterpret_cast<void*>(first + 8), 16);
+            write();
+        } else {
+            write();
         }
         CollectWritesUncached(first, 2 * unit);
         const auto [seen, slabOnly] = gpuRead(first, second + unit);
@@ -15588,10 +15680,17 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         recorder.Sync();
         const char* budgetText = std::getenv("APS5_UNIT_SHADOW_MIB");
         Require(budgetText != nullptr && std::strtoull(budgetText, nullptr, 10) < 16, "the evict scenario needs APS5_UNIT_SHADOW_MIB=8");
-        const auto far = address + 128 * unit;
-        auto other = ShadowDestinationFor(context, *import, far, far + unit);
+        const auto distant = address + 128 * unit;
+        auto other = ShadowDestinationFor(context, *import, distant, distant + unit);
         Require(other.has_value() && other->slab != nullptr, "the second slab was refused");
         other.reset();
+        if (on && !verify) {
+            GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+            const auto during = rawRead(first, 2 * unit);
+            const auto newest = expected(0x90);
+            Require(std::equal(unitOne.begin(), unitOne.end(), during.begin()) && std::equal(newest.begin(), newest.end(), during.begin() + unit), "opening an evicted publication exposed unfinished GPU bytes");
+            GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+        }
         recorder.Sync();
         Require(!AnyShadowedOverlaps(first, 2 * unit), "the evicted slab's units are still shadowed");
         const auto seen = rawRead(first, 2 * unit);
