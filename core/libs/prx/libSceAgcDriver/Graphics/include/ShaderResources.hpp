@@ -299,6 +299,7 @@ public:
         std::size_t bytes = 0;
         VkDeviceSize offset = 0;
         bool words = false;
+        bool inPlace = false;
     };
     struct TemplateSets {
         TemplateSets() = default;
@@ -321,6 +322,7 @@ public:
         std::shared_ptr<ParameterArena> arena;
         std::vector<std::shared_ptr<ParameterLease>> leases;
         std::array<std::byte, PipelinePushConstantBytes> push{};
+        std::shared_ptr<void> accounting;
     };
     std::shared_ptr<TemplateSets> MakeTemplateSets(std::span<const TemplateElement> elements, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const;
     void AddTemplateFlights(TemplateSets& sets, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const;
@@ -329,7 +331,10 @@ public:
     bool ExpectedElementBytes(const MovedBuffer& entry, std::vector<std::byte>& out) const;
     std::size_t TemplateStaticMismatches(const TemplateSets& sets, std::size_t flight) const;
     void KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const;
-    std::size_t RefreshTemplateFaults(TemplateSets& sets, std::size_t flight) const;
+    std::pair<std::size_t, std::size_t> UpdateTemplateFlight(TemplateSets& sets, std::size_t flight, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace) const;
+    std::pair<std::uint64_t, std::size_t> MovedView(const MovedBuffer& entry) const;
+    VkDescriptorBufferInfo TemplateDescriptor(VkDescriptorBufferInfo info) const { return wholeDwordRange(info); }
+    void RequireGuestBuffers(std::span<const MovedBuffer> moved) const { requireGuestBuffers(moved); }
     void DropTemplateSets(const TemplateSets* sets) const;
     static std::size_t MaxDrawSnapshotBytes();
     // APS5_ARCHB_PIPE_DRAW_REUSE: a "[draw-reuse]" summary of the slot counters.

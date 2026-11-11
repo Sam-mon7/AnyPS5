@@ -5350,8 +5350,9 @@ struct Slot {
     VkDescriptorSet bindFragment = VK_NULL_HANDLE;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> bindReads;
     HostImportsProof bindProof{};
-    std::weak_ptr<ShaderResources::TemplateSets> templateSets;
-    const ShaderResources::TemplateSets* templateRaw = nullptr;
+    std::array<std::weak_ptr<ShaderResources::TemplateSets>, 4> templates{};
+    std::array<const ShaderResources::TemplateSets*, 4> templateRaw{};
+    std::array<std::uint64_t, 4> templateUse{};
 };
 
 void keepLiveMoved(Slot& slot, std::span<const ShaderResources::MovedBuffer> moved) {
@@ -5761,15 +5762,16 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
 
 static_assert(ParameterArena::Flights == ShaderResources::TemplateFlights);
 
-enum TemplateRefusal : std::size_t { TemplateLarge, TemplateWritten, TemplatePending, TemplateMovedOther, TemplateFlightBusy, TemplateFaultRecord, TemplateNoZeroCopy, TemplateSetsRefused, TemplateRefusalCount };
-constexpr std::array<const char*, TemplateRefusalCount> TemplateRefusalNames{"large", "gpu_written", "pending_write", "moved_other", "flight_busy", "fault_record", "no_zero_copy", "sets_refused"};
-enum TemplateBuild : std::size_t { BuildNew, BuildShape, BuildImports, BuildGone, BuildCount };
-constexpr std::array<const char*, BuildCount> TemplateBuildNames{"new", "shape", "imports", "gone"};
+enum TemplateRefusal : std::size_t { TemplateLarge, TemplateWritten, TemplatePending, TemplateMovedOther, TemplateFlightBusy, TemplateFaultRecord, TemplateNoZeroCopy, TemplateSetsRefused, TemplateBudget, TemplateInPlaceImport, TemplateInPlaceAlignment, TemplateInPlaceStore, TemplateInPlacePending, TemplateRefusalCount };
+constexpr std::array<const char*, TemplateRefusalCount> TemplateRefusalNames{"large", "gpu_written", "pending_write", "moved_other", "flight_busy", "fault_record", "no_zero_copy", "sets_refused", "budget", "in_place_import", "in_place_alignment", "in_place_store", "in_place_pending"};
+enum TemplateBuild : std::size_t { BuildNew, BuildShape, BuildImports, BuildCount };
+constexpr std::array<const char*, BuildCount> TemplateBuildNames{"new", "shape", "imports"};
 enum TemplateMismatch : std::size_t { MismatchElementBytes, MismatchElementRange, MismatchStatic, MismatchElementSet, MismatchPush, MismatchCount };
 constexpr std::array<const char*, MismatchCount> TemplateMismatchNames{"element_bytes", "element_range", "static_binding", "element_set", "push"};
 
 struct TemplateCounters {
     std::atomic<std::uint64_t> replays{0}, bytes{0}, candidates{0}, nothingMoved{0}, sets{0}, writes{0}, verifyChecks{0}, largeBytes{0}, groups{0};
+    std::atomic<std::uint64_t> inPlaceDraws{0}, inPlaceElements{0}, inPlaceWrites{0}, inPlaceBytes{0}, batchMoved{0}, liveSets{0}, liveBytes{0}, keptBytes{0};
     std::array<std::atomic<std::uint64_t>, TemplateRefusalCount> refused{};
     std::array<std::atomic<std::uint64_t>, BuildCount> built{};
     std::array<std::atomic<std::uint64_t>, MismatchCount> mismatches{};
@@ -5784,6 +5786,12 @@ struct TemplateCounters {
         Recorder::RegisterCounter("draw_templates_verify_checks", verifyChecks);
         Recorder::RegisterCounter("draw_templates_large_bytes", largeBytes);
         Recorder::RegisterCounter("draw_templates_flight_groups", groups);
+        Recorder::RegisterCounter("draw_templates_in_place_draws", inPlaceDraws);
+        Recorder::RegisterCounter("draw_templates_in_place_elements", inPlaceElements);
+        Recorder::RegisterCounter("draw_templates_in_place_writes", inPlaceWrites);
+        Recorder::RegisterCounter("draw_templates_in_place_bytes", inPlaceBytes);
+        Recorder::RegisterCounter("draw_templates_batch_moved", batchMoved);
+        Recorder::RegisterCounter("draw_templates_kept_bytes", keptBytes);
         for (std::size_t i = 0; i < TemplateRefusalCount; ++i) Recorder::RegisterCounter((new std::string(std::string("draw_templates_refused_") + TemplateRefusalNames[i]))->c_str(), refused[i]);
         for (std::size_t i = 0; i < BuildCount; ++i) Recorder::RegisterCounter((new std::string(std::string("draw_templates_built_") + TemplateBuildNames[i]))->c_str(), built[i]);
         for (std::size_t i = 0; i < MismatchCount; ++i) Recorder::RegisterCounter((new std::string(std::string("draw_templates_verify_mismatch_") + TemplateMismatchNames[i]))->c_str(), mismatches[i]);
@@ -5811,6 +5819,41 @@ bool templateVerifyNow() {
     return ++uses % period == 0;
 }
 
+std::uint64_t templateBudget(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    return value == nullptr ? fallback : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+}
+
+std::uint64_t templateSetBudget() {
+    static const std::uint64_t budget = templateBudget("APS5_ARCHB_DRAW_TEMPLATES_BUDGET_SETS", 16384);
+    return budget;
+}
+
+std::uint64_t templateByteBudget() {
+    static const std::uint64_t budget = templateBudget("APS5_ARCHB_DRAW_TEMPLATES_BUDGET_BYTES", std::uint64_t{64} << 20u);
+    return budget;
+}
+
+struct TemplateAccounting {
+    std::uint64_t sets = 0;
+    std::uint64_t bytes = 0;
+    void Add(std::uint64_t moreSets, std::uint64_t moreBytes) {
+        sets += moreSets;
+        bytes += moreBytes;
+        templateCounters().liveSets.fetch_add(moreSets, std::memory_order_relaxed);
+        templateCounters().liveBytes.fetch_add(moreBytes, std::memory_order_relaxed);
+    }
+    ~TemplateAccounting() {
+        templateCounters().liveSets.fetch_sub(sets, std::memory_order_relaxed);
+        templateCounters().liveBytes.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+};
+
+bool templateBudgetHolds(std::uint64_t moreSets, std::uint64_t moreBytes) {
+    const auto& counts = templateCounters();
+    return counts.liveSets.load(std::memory_order_relaxed) + moreSets <= templateSetBudget() && counts.liveBytes.load(std::memory_order_relaxed) + moreBytes <= templateByteBudget();
+}
+
 std::shared_ptr<ParameterArena> parameterArena(const Context& context, Recorder& recorder) {
     auto& holder = recorder.ParameterArenaHolder();
     if (holder == nullptr) holder = std::make_shared<ParameterArena>(context);
@@ -5828,9 +5871,23 @@ std::array<std::pair<VkBuffer, VkDeviceSize>, ParameterArena::Flights> groupFlig
 bool sameShape(std::span<const ShaderResources::TemplateElement> a, std::span<const ShaderResources::TemplateElement> b) {
     if (a.size() != b.size()) return false;
     for (std::size_t i = 0; i < a.size(); ++i) {
-        if (a[i].allocation != b[i].allocation || a[i].bytes != b[i].bytes || a[i].offset != b[i].offset || a[i].words != b[i].words) return false;
+        if (a[i].allocation != b[i].allocation || a[i].bytes != b[i].bytes || a[i].offset != b[i].offset || a[i].words != b[i].words || a[i].inPlace != b[i].inPlace) return false;
     }
     return true;
+}
+
+struct TemplatePlan {
+    std::shared_ptr<ShaderResources::TemplateSets> sets;
+    std::vector<std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::size_t flight = 0;
+    std::uint64_t serial = 0;
+    bool committed = false;
+};
+
+TemplatePlan& templatePlan() {
+    struct PlanStorage {};
+    return AgcDriver::ThreadScratch<TemplatePlan, PlanStorage>();
 }
 
 void verifyTemplate(const Context& context, const ShaderResources& resources, const ShaderResources::TemplateSets& sets, std::size_t flight, std::span<const ShaderResources::MovedBuffer> moved, const Slot& slot) {
@@ -5852,97 +5909,219 @@ void verifyTemplate(const Context& context, const ShaderResources& resources, co
         const auto& element = sets.elements[i];
         if (element.allocation != moved[i].allocation || element.words != !moved[i].words.empty()) mismatch(MismatchElementSet, "a streamed element is not the moved element at its position");
         const auto& info = sets.buffers[flight][sets.streamed[i]];
-        if (info.buffer != sets.arena->Handle(flight % ParameterArena::Flights, chunk) || info.offset % alignment != 0 || info.range != resources.StreamBytes(moved[i])) mismatch(MismatchElementRange, "a streamed descriptor's buffer, alignment or range differs from the old path's");
-        if (!resources.ExpectedElementBytes(moved[i], expected) || expected.size() != info.range || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, expected.data(), expected.size()) != 0) mismatch(MismatchElementBytes, "the bytes behind a streamed descriptor differ from the bytes behind the old path's descriptor");
+        if (element.inPlace) {
+            const auto [begin, bytes] = resources.MovedView(moved[i]);
+            const auto* import = ExistingHostImportFor(context, begin, bytes);
+            const auto old = import == nullptr ? VkDescriptorBufferInfo{} : resources.TemplateDescriptor({import->buffer, HostImportOffset(*import, begin), static_cast<VkDeviceSize>(bytes)});
+            if (import == nullptr || info.buffer != old.buffer || info.offset != old.offset || info.range != old.range) mismatch(MismatchElementRange, "an in-place descriptor differs from the import descriptor the old path binds");
+            if (import != nullptr && std::memcmp(reinterpret_cast<const void*>(import->base + (old.offset - import->lead)), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(old.range)) != 0) mismatch(MismatchElementBytes, "the bytes behind an in-place descriptor are not the moved range");
+            continue;
+        }
+        const auto copied = resources.StreamBytes(moved[i]);
+        const auto old = resources.TemplateDescriptor({info.buffer, info.offset, static_cast<VkDeviceSize>(copied)});
+        if (info.buffer != sets.arena->Handle(flight % ParameterArena::Flights, chunk) || info.offset % alignment != 0 || info.range != old.range) mismatch(MismatchElementRange, "a streamed descriptor's buffer, alignment or range differs from the old path's");
+        if (!resources.ExpectedElementBytes(moved[i], expected) || expected.size() != copied || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, expected.data(), expected.size()) != 0) mismatch(MismatchElementBytes, "the bytes behind a streamed descriptor differ from the bytes behind the old path's descriptor");
     }
     if (resources.TemplateStaticMismatches(sets, flight) != 0) mismatch(MismatchStatic, "a static binding of the template set differs from the template's own");
     if (sets.push != slot.push) mismatch(MismatchPush, "the slot's push block changed under its template");
 }
 
-std::shared_ptr<ShaderResources::TemplateSets> useTemplate(const Context& context, Recorder& recorder, Slot& slot, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, bool drawUse, std::size_t& flight) {
+std::optional<std::size_t> freeFlight(const ShaderResources::TemplateSets& sets, const Recorder& recorder) {
+    for (std::size_t group = 0; group < sets.leases.size(); ++group) {
+        auto slice = sets.leases[group]->slice;
+        if (const auto flight = ParameterSlices::Pick(slice, recorder.OpenSerial(), recorder.CompletedThrough())) return group * ParameterArena::Flights + *flight;
+    }
+    return std::nullopt;
+}
+
+void keepTemplate(Recorder& recorder, const std::shared_ptr<ShaderResources::TemplateSets>& sets, std::uint64_t bytes) {
+    recorder.Keep(sets, static_cast<std::size_t>(bytes));
+    if (bytes != 0) templateCounters().keptBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, bool drawUse) {
     auto& counts = templateCounters();
+    auto& plan = templatePlan();
+    plan.sets.reset();
+    plan.inPlace.clear();
+    plan.reads.clear();
+    plan.committed = false;
     const auto refuse = [&](TemplateRefusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
-        return std::shared_ptr<ShaderResources::TemplateSets>{};
+        plan.sets.reset();
+        plan.inPlace.clear();
+        plan.reads.clear();
+        return false;
     };
     if (drawUse) return refuse(TemplateFaultRecord);
     if (!Recorder::ZeroCopyStorageActive()) return refuse(TemplateNoZeroCopy);
     const auto limit = ShaderResources::DrawUploadLimit();
     const auto alignment = static_cast<VkDeviceSize>(ParameterArena::Alignment(context));
+    const auto storageAlignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     struct ShapeStorage {};
     auto& shape = AgcDriver::ThreadScratch<std::vector<ShaderResources::TemplateElement>, ShapeStorage>();
     shape.clear();
     VkDeviceSize total = 0;
-    for (const auto& entry : moved) {
+    for (std::size_t index = 0; index < moved.size(); ++index) {
+        const auto& entry = moved[index];
         const bool words = !entry.words.empty();
         const auto bytes = resources.StreamBytes(entry);
-        if (bytes == 0 || (!words && bytes > limit)) {
+        if (bytes == 0) return refuse(TemplateLarge);
+        if (!words && bytes > limit) {
             counts.largeBytes.fetch_add(bytes, std::memory_order_relaxed);
-            return refuse(TemplateLarge);
+            shape.push_back({entry.allocation, bytes, 0, false, true});
+            continue;
         }
         total = (total + alignment - 1) / alignment * alignment;
-        shape.push_back({entry.allocation, bytes, total, words});
+        shape.push_back({entry.allocation, bytes, total, words, false});
         total += bytes;
     }
-    auto sets = slot.templateSets.lock();
+    resources.RequireGuestBuffers(moved);
+    for (std::size_t index = 0; index < moved.size(); ++index) {
+        if (!shape[index].inPlace) continue;
+        if (recorder.OpenGpuStores() != 0) return refuse(TemplateInPlaceStore);
+        const auto [begin, bytes] = resources.MovedView(moved[index]);
+        if (recorder.PendingWriteOverlaps(begin, bytes)) return refuse(TemplateInPlacePending);
+        const auto* import = ExistingHostImportFor(context, begin, bytes);
+        if (import == nullptr) return refuse(TemplateInPlaceImport);
+        const auto offset = HostImportOffset(*import, begin);
+        if (offset % storageAlignment != 0) return refuse(TemplateInPlaceAlignment);
+        plan.inPlace.emplace_back(index, resources.TemplateDescriptor({import->buffer, offset, static_cast<VkDeviceSize>(bytes)}));
+        plan.reads.emplace_back(begin, begin + bytes);
+    }
+    std::shared_ptr<ShaderResources::TemplateSets> sets;
+    std::size_t held = slot.templates.size();
+    bool other = false;
+    for (std::size_t index = 0; index < slot.templates.size(); ++index) {
+        auto candidate = slot.templates[index].lock();
+        if (candidate == nullptr || candidate.get() != slot.templateRaw[index]) {
+            slot.templates[index].reset();
+            slot.templateRaw[index] = nullptr;
+            continue;
+        }
+        if (candidate->recorder == &recorder && sameShape(candidate->elements, shape)) {
+            sets = std::move(candidate);
+            held = index;
+            break;
+        }
+        other = true;
+    }
     std::optional<TemplateBuild> build;
-    if (sets == nullptr || sets.get() != slot.templateRaw) build = slot.templateRaw == nullptr ? BuildNew : BuildGone;
-    else if (sets->recorder != &recorder || !sameShape(sets->elements, shape)) build = BuildShape;
+    if (sets == nullptr) build = other ? BuildShape : BuildNew;
     else if (!HostImportsUnchanged(context, sets->proof)) build = BuildImports;
+    const auto groupBytes = static_cast<std::uint64_t>(ParameterSlices::ClassBytes(static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)), static_cast<std::size_t>(alignment))) * ParameterArena::Flights;
+    const auto groupSets = static_cast<std::uint64_t>(ParameterArena::Flights) * 2u;
     if (build.has_value()) {
-        if (sets != nullptr) resources.DropTemplateSets(sets.get());
-        sets.reset();
-        slot.templateSets.reset();
-        slot.templateRaw = nullptr;
+        if (sets != nullptr) {
+            resources.DropTemplateSets(sets.get());
+            slot.templates[held].reset();
+            slot.templateRaw[held] = nullptr;
+            sets.reset();
+        }
+        if (!templateBudgetHolds(groupSets, groupBytes)) return refuse(TemplateBudget);
         auto arena = parameterArena(context, recorder);
-        auto lease = ParameterArena::Allocate(arena, static_cast<std::size_t>(total));
+        auto lease = ParameterArena::Allocate(arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)));
         if (lease == nullptr) return refuse(TemplateLarge);
         const auto flights = groupFlights(*arena, *lease);
         sets = resources.MakeTemplateSets(shape, flights);
         if (sets == nullptr) return refuse(TemplateSetsRefused);
+        auto accounting = std::make_shared<TemplateAccounting>();
+        accounting->Add(sets->sets, groupBytes);
+        sets->accounting = accounting;
         sets->recorder = &recorder;
         sets->arena = std::move(arena);
         sets->leases.push_back(std::move(lease));
         sets->push = slot.push;
         counts.groups.fetch_add(1, std::memory_order_relaxed);
         resources.KeepTemplateSets(sets);
-        slot.templateSets = sets;
-        slot.templateRaw = sets.get();
+        std::size_t place = 0;
+        for (std::size_t index = 0; index < slot.templates.size(); ++index) {
+            if (slot.templateRaw[index] == nullptr) {
+                place = index;
+                break;
+            }
+            if (slot.templateUse[index] < slot.templateUse[place]) place = index;
+        }
+        if (slot.templateRaw[place] != nullptr) {
+            if (auto evicted = slot.templates[place].lock()) resources.DropTemplateSets(evicted.get());
+        }
+        slot.templates[place] = sets;
+        slot.templateRaw[place] = sets.get();
+        held = place;
         counts.built[*build].fetch_add(1, std::memory_order_relaxed);
         counts.sets.fetch_add(sets->sets, std::memory_order_relaxed);
         counts.writes.fetch_add(sets->writes, std::memory_order_relaxed);
+        keepTemplate(recorder, sets, groupBytes);
     }
-    std::optional<std::size_t> picked;
-    std::size_t group = 0;
-    for (; group < sets->leases.size() && !picked.has_value(); ++group) picked = ParameterSlices::Pick(sets->leases[group]->slice, recorder.OpenSerial(), recorder.CompletedThrough());
-    if (!picked.has_value()) {
+    slot.templateUse[held] = table().uses;
+    if (!freeFlight(*sets, recorder).has_value()) {
         if (sets->leases.size() >= TemplateGroupLimit) return refuse(TemplateFlightBusy);
-        auto lease = ParameterArena::Allocate(sets->arena, static_cast<std::size_t>(total));
+        if (!templateBudgetHolds(groupSets, groupBytes)) return refuse(TemplateBudget);
+        auto lease = ParameterArena::Allocate(sets->arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)));
         if (lease == nullptr) return refuse(TemplateLarge);
         const auto before = std::pair{sets->sets, sets->writes};
         resources.AddTemplateFlights(*sets, groupFlights(*sets->arena, *lease));
         sets->leases.push_back(std::move(lease));
+        std::static_pointer_cast<TemplateAccounting>(sets->accounting)->Add(sets->sets - before.first, groupBytes);
         counts.groups.fetch_add(1, std::memory_order_relaxed);
         counts.sets.fetch_add(sets->sets - before.first, std::memory_order_relaxed);
         counts.writes.fetch_add(sets->writes - before.second, std::memory_order_relaxed);
-        group = sets->leases.size();
-        picked = ParameterSlices::Pick(sets->leases.back()->slice, recorder.OpenSerial(), recorder.CompletedThrough());
-        if (!picked.has_value()) return refuse(TemplateFlightBusy);
+        keepTemplate(recorder, sets, groupBytes);
     }
-    const auto& slice = sets->leases[group - 1]->slice;
-    flight = (group - 1) * ParameterArena::Flights + *picked;
-    if (const auto faults = resources.RefreshTemplateFaults(*sets, flight); faults != 0) counts.writes.fetch_add(faults, std::memory_order_relaxed);
-    auto* base = sets->arena->Bytes(*picked, slice.chunk) + slice.offset;
+    plan.sets = std::move(sets);
+    return true;
+}
+
+std::size_t commitTemplate(const Context& context, Recorder& recorder, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const Slot& slot) {
+    auto& counts = templateCounters();
+    auto& plan = templatePlan();
+    auto& sets = *plan.sets;
+    std::optional<std::size_t> picked;
+    std::size_t group = 0;
+    for (; group < sets.leases.size() && !picked.has_value(); ++group) picked = ParameterSlices::Pick(sets.leases[group]->slice, recorder.OpenSerial(), recorder.CompletedThrough());
+    Require(picked.has_value(), "a template lost the free flight its preparation found");
+    const auto& slice = sets.leases[group - 1]->slice;
+    const auto flight = (group - 1) * ParameterArena::Flights + *picked;
+    const auto [placed, faults] = resources.UpdateTemplateFlight(sets, flight, plan.inPlace);
+    if (placed + faults != 0) counts.writes.fetch_add(placed + faults, std::memory_order_relaxed);
+    if (placed != 0) counts.inPlaceWrites.fetch_add(placed, std::memory_order_relaxed);
+    auto* base = sets.arena->Bytes(*picked, slice.chunk) + slice.offset;
     std::size_t copied = 0;
     for (std::size_t index = 0; index < moved.size(); ++index) {
-        resources.StreamElement(moved[index], base + sets->elements[index].offset);
-        copied += sets->elements[index].bytes;
+        if (sets.elements[index].inPlace) continue;
+        resources.StreamElement(moved[index], base + sets.elements[index].offset);
+        copied += sets.elements[index].bytes;
+    }
+    static const bool noNotes = std::getenv("APS5_ZC_MOVED_NO_READNOTES") != nullptr;
+    if (!noNotes)
+        for (const auto& [begin, end] : plan.reads) recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DispatchElement);
+    if (!plan.inPlace.empty()) {
+        counts.inPlaceDraws.fetch_add(1, std::memory_order_relaxed);
+        counts.inPlaceElements.fetch_add(plan.inPlace.size(), std::memory_order_relaxed);
+        for (const auto& [begin, end] : plan.reads) counts.inPlaceBytes.fetch_add(end - begin, std::memory_order_relaxed);
     }
     counts.bytes.fetch_add(copied, std::memory_order_relaxed);
     counts.replays.fetch_add(1, std::memory_order_relaxed);
-    if (templateVerifyNow()) verifyTemplate(context, resources, *sets, flight, moved, slot);
-    recorder.Keep(sets);
-    return sets;
+    if (templateVerifyNow()) verifyTemplate(context, resources, sets, flight, moved, slot);
+    plan.flight = flight;
+    plan.serial = recorder.OpenSerial();
+    plan.committed = true;
+    return flight;
+}
+
+void finishTemplate(Recorder& recorder) {
+    auto& plan = templatePlan();
+    if (!plan.committed || plan.sets == nullptr) return;
+    const auto open = recorder.OpenSerial();
+    if (open != plan.serial) {
+        templateCounters().batchMoved.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& [begin, end] : plan.reads) recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::DispatchElement);
+    }
+    auto& serial = plan.sets->leases[plan.flight / ParameterArena::Flights]->slice.serials[plan.flight % ParameterArena::Flights];
+    serial = std::max(serial, open);
+    keepTemplate(recorder, plan.sets, 0);
+    plan.sets.reset();
+    plan.committed = false;
 }
 
 struct ReplayScratch {
@@ -6136,13 +6315,19 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     std::shared_ptr<ShaderResources::DrawBindings> drawBindings;
     std::shared_ptr<void> slotSet;
     bool slotBound = false;
+    struct PlanReset {
+        ~PlanReset() {
+            auto& plan = templatePlan();
+            plan.sets.reset();
+            plan.committed = false;
+        }
+    } planReset;
     std::shared_ptr<ShaderResources::TemplateSets> templateSets;
-    std::size_t templateFlight = 0;
     if (moved.empty()) {
         templateCounters().nothingMoved.fetch_add(1, std::memory_order_relaxed);
     } else {
         templateCounters().candidates.fetch_add(1, std::memory_order_relaxed);
-        if (cutEnabled(Feature::DrawTemplates)) templateSets = useTemplate(context, *recorder, *slot, *resources, moved, drawUse != nullptr, templateFlight);
+        if (cutEnabled(Feature::DrawTemplates) && prepareTemplate(context, *recorder, *slot, *resources, moved, drawUse != nullptr)) templateSets = templatePlan().sets;
     }
     if (templateSets == nullptr && slotBindings) {
         if (moved.empty() && Recorder::ZeroCopyStorageActive()) {
@@ -6177,10 +6362,10 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         }
         slotSet.reset();
     }
-    const VkDescriptorSet boundSet = templateSets != nullptr ? templateSets->allocations[templateFlight].set : slotSet != nullptr ? slot->bindVertex : drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE;
-    const VkDescriptorSet boundFragmentSet = templateSets != nullptr ? templateSets->fragmentAllocations[templateFlight].set : slotSet != nullptr ? slot->bindFragment : drawBindings != nullptr ? drawBindings->fragmentAllocation.set : VK_NULL_HANDLE;
+    const VkDescriptorSet boundSet = slotSet != nullptr ? slot->bindVertex : drawBindings != nullptr ? drawBindings->allocation.set : VK_NULL_HANDLE;
+    const VkDescriptorSet boundFragmentSet = slotSet != nullptr ? slot->bindFragment : drawBindings != nullptr ? drawBindings->fragmentAllocation.set : VK_NULL_HANDLE;
     const bool setBound = templateSets != nullptr || slotSet != nullptr || drawBindings != nullptr;
-    const auto* boundReads = templateSets != nullptr ? nullptr : slotSet != nullptr ? &slot->bindReads : drawBindings != nullptr ? &drawBindings->inPlaceReads : nullptr;
+    const auto* boundReads = templateSets != nullptr ? &templatePlan().reads : slotSet != nullptr ? &slot->bindReads : drawBindings != nullptr ? &drawBindings->inPlaceReads : nullptr;
     ArchC::ProbeAt(ArchC::Probe::BdPrepare);
     static const bool zcNoPassReads = std::getenv("APS5_ZC_MOVED_NO_PASSREADS") != nullptr;
     auto& passReads = work.passReads;
@@ -6255,8 +6440,9 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     ArchC::ProbeAt(continued ? ArchC::Probe::RcBegin : ArchC::Probe::RcBeginNew);
     if (setBound) {
-        const auto set = boundSet;
-        const auto fragmentSet = boundFragmentSet;
+        const auto templateFlight = templateSets != nullptr ? commitTemplate(context, *recorder, *resources, moved, *slot) : 0;
+        const auto set = templateSets != nullptr ? templateSets->allocations[templateFlight].set : boundSet;
+        const auto fragmentSet = templateSets != nullptr ? templateSets->fragmentAllocations[templateFlight].set : boundFragmentSet;
         if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), 0, 1, &set, 0, nullptr);
         if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
     } else {
@@ -6288,6 +6474,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     ArchC::ProbeAt(ArchC::Probe::RcDraw);
     recorder->LeaveRenderPassOpen(slot->pass.passKey, drawTiming, slot->pass.fenced, passAccess, {});
     ArchC::ProbeAt(ArchC::Probe::RcLeave);
+    if (templateSets != nullptr) finishTemplate(*recorder);
     clock.Mark(StepRecord);
     keepRecordedDraw(*recorder, resources, std::move(pipeline), std::move(framebuffer), inputs, std::move(work.targets), slot->slices, state.scissor, std::move(argumentScratch), {}, false, slot->completion, replayOutcome(), drawUse, nullptr);
     work.targets.clear();
