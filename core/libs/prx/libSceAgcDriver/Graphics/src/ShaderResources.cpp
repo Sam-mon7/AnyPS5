@@ -3718,6 +3718,7 @@ RevalidateProfile& Revalidations() {
 void countFastFail(FastFail reason) {
     constexpr const char* names[] = {"proof_fast_fail_no_record", "proof_fast_fail_collect", "proof_fast_fail_pending", "proof_fast_fail_evicted", "proof_fast_fail_changed", "proof_fast_fail_keys", "proof_fast_fail_cleared_view", "proof_fast_fail_storage_keys", "proof_fast_fail_depth", "proof_fast_fail_replaced", "proof_fast_fail_audit"};
     AgcDriver::ArchB::Recorder::Count(names[static_cast<std::size_t>(reason)]);
+    if (!GuestMemory::IsCommitterThread()) AgcDriver::ArchB::Recorder::Count(reason == FastFail::Depth ? "proof_other_fast_fail_depth" : reason == FastFail::Pending ? "proof_other_fast_fail_pending" : "proof_other_fast_fail_rest");
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -4602,7 +4603,11 @@ bool ShaderResources::revalidateCensused(std::span<const CompiledShader> shaders
         provedEpoch = 0;
         return false;
     }
-    const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs);
+    static const int trustScope = [] {
+        const char* value = std::getenv("APS5_UB_TRUST_PROOFS_SCOPE");
+        return value == nullptr ? 0 : std::strcmp(value, "committer") == 0 ? 1 : std::strcmp(value, "other") == 0 ? 2 : 0;
+    }();
+    const bool trustProofs = ArchB::Switches::Enabled(ArchB::Feature::UbTrustProofs) && (trustScope == 0 || (trustScope == 1) == GuestMemory::IsCommitterThread());
     if (trustProofs && provedOnce && HasSurfaceTracking(validatedTextures, storageTextures)) {
         ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbTrustProofs);
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
@@ -5324,10 +5329,16 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     bool stampReused = false;
+    const auto otherStarted = std::chrono::steady_clock::now();
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
         if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : stampReused ? "proof_fast_pass_stamp_memo" : "proof_fast_pass_stamps") : "proof_full_pass");
         if (!ok) setStampValid(false);
         if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
+        if (!GuestMemory::IsCommitterThread()) {
+            AgcDriver::ArchB::Recorder::Count(!ok ? "proof_other_failed" : !fast ? "proof_other_full_pass" : epochReused ? "proof_other_pass_epoch" : stampReused ? "proof_other_pass_stamp_memo" : "proof_other_pass_stamps");
+            AgcDriver::ArchB::Recorder::Count(drawBuild ? "proof_other_draw_resources" : "proof_other_dispatch_resources");
+            AgcDriver::ArchB::Recorder::Count("proof_other_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - otherStarted).count()));
+        }
         if (ok) provedOnce = true;
         if (epochProofs && !ok) resourceEpochProof = {};
         if (report != nullptr) report->epochReused = epochReused && ok;
