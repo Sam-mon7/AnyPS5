@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchGatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -2641,6 +2642,7 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
+    dispatchGatherShadow = !drawBuild && DriverDetail::DispatchShadow::Enabled();
     registeredImageViews.clear();
     for (const auto& shader : shaders) if (shader.registeredImageViews != nullptr) registeredImageViews.insert(registeredImageViews.end(), shader.registeredImageViews->begin(), shader.registeredImageViews->end());
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource capture");
@@ -3321,6 +3323,13 @@ void ShaderResources::buildComplete() {
             Require(data.buffer != nullptr && allocation.dataByte < data.size, "guest buffer offset lies outside the shader's data buffer");
             data.buffer->Bytes()[allocation.dataByte] = static_cast<std::byte>(allocation.adjustment);
             dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
+        }
+        if (dispatchGatherShadow && DriverDetail::DispatchShadow::Enabled()) {
+            for (const auto& allocation : allocations) {
+                if (allocation.guest || allocation.buffer == nullptr || allocation.size % sizeof(std::uint32_t) != 0) continue;
+                allocation.dispatchGatherUploadedWords.resize(allocation.size / sizeof(std::uint32_t));
+                std::memcpy(allocation.dispatchGatherUploadedWords.data(), allocation.buffer->Bytes().data(), allocation.size);
+            }
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         computeSnapshotCandidates();
@@ -6637,6 +6646,89 @@ bool ShaderResources::DataWordsDiffer(const CompiledShader& shader) const {
     return false;
 }
 
+ShaderResources::DispatchGatherCommitDifference ShaderResources::CompareDispatchGather(const DriverDetail::DispatchGatherUse& use, std::span<const std::byte> pushBytes, bool pushes) const {
+    using Difference = DispatchGatherCommitDifference;
+    if (!completed || drawBuild || !use.gathered) return Difference::Unsupported;
+    if (!dispatchGatherShadow) return Difference::UnobservedUpload;
+    if (usesBda) return Difference::AddressTable;
+    if (use.bindings.size() != bindings.size()) return Difference::Binding;
+    for (const auto& expected : use.bindings) {
+        if (expected.kind != ShaderRecompiler::DescriptorKind::StorageBuffer) return Difference::BindingRole;
+        const auto held = std::ranges::find_if(bindings, [&](const Binding& binding) { return binding.layout.binding == expected.binding && setOf(binding) == 0; });
+        if (held == bindings.end() || held->layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || held->allocations.size() != expected.count) return Difference::Binding;
+        const auto write = std::ranges::find_if(descriptorWrites, [&](const VkWriteDescriptorSet& candidate) { return candidate.dstSet == _set && candidate.dstBinding == expected.binding && candidate.dstArrayElement == 0 && candidate.pBufferInfo != nullptr; });
+        if (write == descriptorWrites.end() || write->descriptorCount != expected.count) return Difference::Binding;
+        if (expected.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            if (expected.guestDescriptor.size() != static_cast<std::size_t>(expected.count) * 4u) return Difference::Binding;
+            for (std::size_t element = 0; element < expected.count; ++element) {
+                const auto& allocation = allocations[held->allocations[element]];
+                const auto words = std::span<const std::uint32_t>(expected.guestDescriptor).subspan(element * 4u, 4u);
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1] & ~0x40000000u, words[2], words[3]}};
+                const auto address = descriptor.Base48();
+                const auto bytes = guestBufferBytes(words);
+                const auto& actual = write->pBufferInfo[element];
+                if (address == 0 || bytes == 0) {
+                    if (allocation.guest || allocation.address != 0) return Difference::Address;
+                    const bool oversized = address != 0 && descriptor.GetSize() != 0;
+                    const auto placeholder = oversized ? context.oversizedBuffer : context.emptyBuffer;
+                    if (actual.buffer != placeholder || actual.offset != 0) return Difference::Address;
+                    if (allocation.size != EmptyBufferBytes || actual.range != EmptyBufferBytes) return Difference::Extent;
+                    continue;
+                }
+                if (!allocation.guest || allocation.address != address) return Difference::Address;
+                if (bytes != allocation.size || bytes > std::numeric_limits<std::size_t>::max()) return Difference::Extent;
+                std::uint32_t adjustment = 0;
+                VkDescriptorBufferInfo resolved{};
+                try {
+                    resolved = wholeDwordRange(guestMemory.Descriptor(address, static_cast<std::size_t>(bytes), adjustment));
+                } catch (...) {
+                    return Difference::Extent;
+                }
+                if (actual.buffer != resolved.buffer || actual.offset != resolved.offset || allocation.adjustment != adjustment) return Difference::Address;
+                if (actual.range != resolved.range) return Difference::Extent;
+            }
+        } else if (expected.role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
+            if (expected.count != 1 || !expected.guestDescriptor.empty() || bda == nullptr) return Difference::FaultBuffer;
+            const auto& allocation = allocations[held->allocations.front()];
+            if (allocation.guest || allocation.role != ShaderRecompiler::DescriptorRole::FaultBuffer) return Difference::Binding;
+            const auto resolved = bda->Fault();
+            const auto& actual = write->pBufferInfo[0];
+            if (actual.buffer != resolved.buffer || actual.offset != resolved.offset) return Difference::Address;
+            if (actual.range != resolved.range) return Difference::Extent;
+        } else if (DataRole(expected.role)) {
+            if (held->allocations.size() != 1) return Difference::Binding;
+            const auto index = held->allocations.front();
+            const auto& allocation = allocations[index];
+            const auto expectedBytes = std::as_bytes(std::span(expected.guestDescriptor));
+            const auto actualBytes = std::as_bytes(std::span(allocation.dispatchGatherUploadedWords));
+            if (actualBytes.size() != allocation.size) return Difference::UnobservedUpload;
+            if (allocation.guest || allocation.buffer == nullptr || actualBytes.size() != expectedBytes.size()) return Difference::Data;
+            const auto& actual = write->pBufferInfo[0];
+            if (actual.buffer != allocation.buffer->Handle() || actual.offset != 0) return Difference::Address;
+            if (actual.range != expectedBytes.size() || allocation.size != expectedBytes.size()) return Difference::Extent;
+            for (std::size_t byte = 0; byte < expectedBytes.size(); ++byte) {
+                auto value = expectedBytes[byte];
+                for (const auto& patch : dataPatches) if (patch.allocation == index && patch.byte == byte) value = static_cast<std::byte>(patch.adjustment);
+                if (value != actualBytes[byte]) return Difference::Data;
+            }
+        } else {
+            return Difference::BindingRole;
+        }
+    }
+    if (pushes != !use.pushConstants.empty()) return Difference::Push;
+    if (pushes) {
+        if (use.pushConstants.size() > ComputePushConstantBytes || pushBytes.size() < ComputePushConstantBytes) return Difference::Push;
+        std::array<std::byte, ComputePushConstantBytes> expected{};
+        std::copy(use.pushConstants.begin(), use.pushConstants.end(), expected.begin());
+        for (const auto& [position, adjustment] : pushPatches) {
+            if (position >= expected.size()) return Difference::Push;
+            expected[position] = static_cast<std::byte>(adjustment);
+        }
+        if (!std::equal(expected.begin(), expected.end(), pushBytes.begin())) return Difference::Push;
+    }
+    return Difference::None;
+}
+
 bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder) {
     Require(shader.program != nullptr, "missing compiled shader");
     Require(!refreshResourceKey.empty() && MatchesContentKey(shader, refreshResourceKey), "runtime data refresh cannot replace bound resources");
@@ -6693,6 +6785,7 @@ VkBuffer ShaderResources::shaderDataBuffer(const CompiledShader& shader) const {
 void ShaderResources::forgetShaderDataWords(const CompiledShader& shader) {
     if (const auto allocation = shaderDataAllocation(shader)) {
         allocations[*allocation].dataWords.clear();
+        allocations[*allocation].dispatchGatherUploadedWords.clear();
         rehashDataWords();
     }
 }
@@ -6700,7 +6793,10 @@ void ShaderResources::forgetShaderDataWords(const CompiledShader& shader) {
 void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const {
     const auto& buffer = *allocations[allocation].buffer;
     const auto size = words.size() * sizeof(std::uint32_t);
+    const bool observe = dispatchGatherShadow && DriverDetail::DispatchShadow::Enabled();
+    if (!observe) allocations[allocation].dispatchGatherUploadedWords.clear();
     if (std::none_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == allocation; })) {
+        if (observe) allocations[allocation].dispatchGatherUploadedWords.assign(words.begin(), words.end());
         context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, words.data());
         return;
     }
@@ -6709,6 +6805,7 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
     for (const auto& patch : dataPatches) {
         if (patch.allocation == allocation && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
     }
+    if (observe) allocations[allocation].dispatchGatherUploadedWords.assign(patched.begin(), patched.end());
     context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
 }
 
