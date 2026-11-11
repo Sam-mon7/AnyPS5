@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -222,7 +223,13 @@ void runResolveSlot(DrawPipeline::ResolveSlot& slot) {
 template<typename TItem>
 struct ClearOnExit {
     std::vector<TItem>& items;
-    ~ClearOnExit() { items.clear(); }
+    bool census = false;
+    ~ClearOnExit() {
+        if (!census) { items.clear(); return; }
+        PerformanceTimer timing("J3.EnqueueReclaim");
+        ArchB::Recorder::Count("j3b_enqueue_reclaimed_items", static_cast<double>(items.size()));
+        items.clear();
+    }
 };
 
 }
@@ -895,11 +902,18 @@ void DrawPipeline::enqueue(Item item) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
-    const ClearOnExit<Item> clearReclaim{reclaim};
-    const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool census = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
+    const ClearOnExit<Item> clearReclaim{reclaim, census};
+    const auto lockStart = profile || census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);
+    const auto lockNs = profile || census ? elapsedNs(lockStart) : 0;
     if (!retired.empty()) std::swap(retired, reclaim);
     if (profile) lockWaitNs += elapsedNs(lockStart);
+    if (census) {
+        ArchB::Recorder::Count("j3b_enqueue_mutex_wait_ns", static_cast<double>(lockNs));
+        ArchB::Recorder::Count("j3b_enqueue_calls");
+        if (item.kind == ItemKind::Draw) ArchB::Recorder::Count("j3b_enqueue_draw_calls");
+    }
     rethrowFailure();
     if (closing) {
         lock.unlock();
@@ -1110,6 +1124,7 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         bool isDraw = false;
         ItemKind kind = ItemKind::Other;
+        CommitKind commitKind = CommitKind::Other;
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
         std::shared_ptr<ResolveSlot> resolveSlot;
@@ -1132,6 +1147,7 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             kind = items.front().kind;
+            commitKind = items.front().commitKind;
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
             resolveSlot = items.front().resolve;
@@ -1156,9 +1172,23 @@ void DrawPipeline::run() {
         static const bool collectCensus = GuestMemory::CommitterCollectCensus();
         if (collectCensus) GuestMemory::BeginCommitterCensusItem(static_cast<std::uint8_t>(kind));
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitBegin);
+        std::optional<CommitCensus> commitCensus;
+        const bool census = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
         try {
-            if (commit != nullptr && resolveSlot != nullptr) resolveForApply(*resolveSlot, serial);
-            if (commit != nullptr) (*commit)();
+            if (commit != nullptr && resolveSlot != nullptr) {
+                std::optional<PerformanceTimer> resolveTiming;
+                if (census) resolveTiming.emplace("J3.CommitResolve");
+                resolveForApply(*resolveSlot, serial);
+            }
+            if (commit != nullptr) {
+                using Kind = CommitCensus::Kind;
+                const auto classified = kind == ItemKind::Draw ? Kind::Legacy : kind == ItemKind::Label ? Kind::Label : commitKind == CommitKind::DmaCopy ? Kind::Copy : (commitKind == CommitKind::DmaFill || commitKind == CommitKind::DmaWrite || commitKind == CommitKind::BufferFill) ? Kind::Fill : kind == ItemKind::Dispatch ? Kind::Dispatch : Kind::Other;
+                commitCensus.emplace(classified);
+                if (census && kind == ItemKind::Label) ArchB::Recorder::Count(commitKind == CommitKind::Store ? "j3c_label_store_items" : "j3c_label_eop_items");
+                if (census && commitKind == CommitKind::DmaWrite) ArchB::Recorder::Count("j3c_inline_dma_writes");
+                (*commit)();
+                commitCensus->Finish();
+            } else if (census) ArchB::Recorder::Count("j3c_stopped_items");
             GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitEnd);
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
@@ -1170,6 +1200,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
+        if (commitCensus) commitCensus->Finish(fatal != nullptr);
         const auto spent = elapsedNs(start);
         if (resolveSlot != nullptr) {
             resolveCounters().applyNs.fetch_add(spent, std::memory_order_relaxed);

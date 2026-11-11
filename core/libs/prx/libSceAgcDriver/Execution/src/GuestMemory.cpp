@@ -6282,7 +6282,27 @@ std::chrono::nanoseconds GpuLockPriorityWindow() {
 }
 
 // LockSpinning with the Stage 4 wait scope (M1/M4) around a contended acquisition.
+struct GpuMutexCensusSlot {};
+struct GpuMutexAcquireSlot {};
+
+std::uint64_t ThreadGpuMutexAcquireNs() { return HostThreadSlot<std::uint64_t, GpuMutexAcquireSlot>::Get(); }
+
+bool SetGpuMutexCensusForThread(bool enabled) {
+    const bool previous = HostThreadSlot<bool, GpuMutexCensusSlot>::Get();
+    HostThreadSlot<bool, GpuMutexCensusSlot>::Set(enabled);
+    return previous;
+}
+
 static void lockSpinningTracked(Mutex& mutex) {
+    struct Acquisition {
+        bool enabled = HostThreadSlot<bool, GpuMutexCensusSlot>::Get();
+        std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~Acquisition() {
+            if (!enabled) return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+            HostThreadSlot<std::uint64_t, GpuMutexAcquireSlot>::Set(ThreadGpuMutexAcquireNs() + static_cast<std::uint64_t>(ns));
+        }
+    } acquisition;
     if (!Stage4::Tracking()) {
         LockSpinning(mutex, HandoffSpinWindow());
         return;

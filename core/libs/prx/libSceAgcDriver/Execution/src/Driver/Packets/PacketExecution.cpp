@@ -400,11 +400,21 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         if (submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) noteRingPacket(submission.queue, submission.serial, opcode, header);
         PerformanceTimer timing("Driver.Packet");
+        const bool hitCensus = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
+        const char* queuedKind = nullptr;
+        const auto queued = [&](bool accepted, const char* kind) {
+            if (accepted && hitCensus) queuedKind = kind;
+            return accepted;
+        };
         if (!predicated) noteLabelIssue(packet, submission.queue);
-        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
+        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (queued(enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)), "j3_queued_label") || queued(enqueueDmaPacket(packet, opcode, submission.queue, queue), "j3_queued_dma") || queued(enqueueConstantRamDump(packet, opcode, submission.queue, queue), "j3_queued_constant") || queued(enqueueSampleDumpPacket(packet, opcode, submission.queue), "j3_queued_sample"))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
+            if (hitCensus) {
+                timing.Mark(queuedKind);
+                ArchB::Recorder::Count("j3b_packet_queued");
+            }
             continue;
         }
         bool heldLabelMismatch = false;
@@ -425,6 +435,7 @@ void Driver::execute(const Submission& submission) {
                 noteLabelPass(packet, submission.queue);
                 recent.Record(cursor);
                 cursor = nextCursor;
+                if (hitCensus) { timing.Mark("j3_satisfied_pending"); ArchB::Recorder::Count("j3b_packet_satisfied_pending"); }
                 continue;
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
@@ -438,6 +449,7 @@ void Driver::execute(const Submission& submission) {
                 noteLabelPass(packet, submission.queue);
                 recent.Record(cursor);
                 cursor = nextCursor;
+                if (hitCensus) { timing.Mark("j3_satisfied_current"); ArchB::Recorder::Count("j3b_packet_satisfied_current"); }
                 continue;
             }
             // APS5_ARCHB_PIPE_KEEP_OWN_LABEL_WAITS: the compare fails on memory, no queued item writes the
@@ -460,6 +472,7 @@ void Driver::execute(const Submission& submission) {
                     noteLabelPass(packet, submission.queue);
                     recent.Record(cursor);
                     cursor = nextCursor;
+                    if (hitCensus) { timing.Mark("j3_satisfied_history"); ArchB::Recorder::Count("j3b_packet_satisfied_history"); }
                     continue;
                 }
             }

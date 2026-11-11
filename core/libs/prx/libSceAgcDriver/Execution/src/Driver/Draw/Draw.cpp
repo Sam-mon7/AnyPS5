@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/CheapClock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
@@ -7,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawHitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -129,6 +131,7 @@ struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     ArchB::Recorder::Key recorderKey;
     bool profile = false;
+    bool hitCensus = false;
     DrawCacheOutcome cacheOutcome = CacheNotLookedUp;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -476,6 +479,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
+    const bool hitCensus = tail.hitCensus = DrawHitCensusEnabled();
     tail.feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     tail.pipelineStateReuse = ArchB::Switches::Enabled(ArchB::Feature::FixPipelineStateReuse);
     tail.memoVirtualQuery = ArchB::Switches::Enabled(ArchB::Feature::FixVqMemo);
@@ -585,6 +589,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return *verdict;
     }
     phaseTiming.Phase(DrawRowPrecheck);
+    if (hitCensus) {
+        timing.Mark("j3_prologue_precheck");
+        ArchB::Recorder::Count(drawParameters.indirect ? "j3b_draw_indirect" : "j3b_draw_nonindirect");
+    }
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
 
@@ -747,6 +755,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
     phaseTiming.Phase(DrawRowKeyLookupValidate);
+    if (hitCensus) {
+        timing.Mark(drawParameters.indirect ? "j3_prepare_keys_indirect" : "j3_prepare_keys_nonindirect");
+        ArchB::Recorder::Count(entry == nullptr ? "j3b_key_entry_absent" : entry->donor == nullptr ? "j3b_key_entry_direct" : "j3b_key_entry_relocated");
+    }
 
     if (dataEntry != nullptr) {
         auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
@@ -791,6 +803,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         tail.recorderKey = RecorderProgramKey(programs);
         recorderWork.SetKey(tail.recorderKey);
     }
+    if (hitCensus) timing.Mark("j3_prepare_decode_programs");
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     static const bool fromBase = std::getenv("APS5_NO_INDIRECT_BUILTIN_OFFSETS") == nullptr;
     const bool emptyIndirectSkip = !tail.ubSkipCpuIndirect && EmptyIndirectSkip() && !(fromBase && drawParameters.indexed);
@@ -865,6 +878,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     auto& memory = tail.memory;
     auto& linked = tail.linked;
+    if (hitCensus) timing.Mark(drawParameters.indirect ? "j3_prepare_indirect_setup" : "j3_prepare_direct_setup");
+    const auto hitPrepareStarted = hitCensus ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     memory.reserve(2 * programs.size() + 32);
     AppendProgramMemory(memory, programs);
     linked.reserve(programs.size());
@@ -897,6 +912,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, tail.feedbackMask || tail.bufferBases || tail.nestedRelocation);
     shaderMemory->SetImageTableSnapshotReuse(tail.imageTableSnapshotReuse);
     shaderMemory->SetImageTableBitScanKeys(tail.imageTableBitScanKeys);
+    const auto hitPrepareNs = hitCensus ? std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - hitPrepareStarted).count() : 0.0;
     auto& results = tail.results;
     auto& compiledStages = tail.compiledStages;
     compiledStages.reserve(programs.size());
@@ -944,12 +960,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         missesBefore = drawEntryCounters.misses;
         censusMisses = drawEntryCounters.misses;
     }
+    if (hitCensus) timing.Mark("j3_setup_before_lookup");
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, shapeKey, drawParameters, tail.ubPointerFree, tail.feedbackMask, tail.bufferBases);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, shapeKey, drawParameters, tail.ubPointerFree, tail.feedbackMask, tail.bufferBases, packet);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
     }
+    if (hitCensus) ArchB::Recorder::Count(drawHit ? "j3_hit_prepare_material_ns" : "j3_miss_prepare_material_ns", hitPrepareNs);
     if (censusStage < programs.size()) {
         const char* reason = drawHit ? "hit" : verifyHit ? "verify" : entry == nullptr ? "absent" : "miss-other";
         {
@@ -1147,6 +1165,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     const bool profile = tail.profile;
+    const bool hitCensus = tail.hitCensus;
     const auto traceToken = tail.traceToken;
     const auto& trace = tail.trace;
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
@@ -1294,6 +1313,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a stage data hit differs from its full build in its %s (%zu data positions refreshed)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.dataPositions.size());
         throw std::runtime_error(message);
     };
+    if (hitCensus) {
+        timing.Mark("j3_postlookup_stage_setup");
+        ArchB::Recorder::Count(tail.drawHit ? "j3b_finish_hit" : "j3b_finish_miss");
+    }
     bool partialFeedbackHit = false;
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     std::size_t completedSubdraws = 0;
@@ -1331,7 +1354,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         break;
                     }
                 }
-                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                if (hitCensus) ArchB::Recorder::Count(verifyHit ? "j3b_materialize_verify" : "j3b_materialize_primary");
+                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, verifyHit ? "Shader.J3VerifyStage" : "Shader.J3PrimaryStage"));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate);
@@ -1362,6 +1386,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
 
+    if (hitCensus) timing.Mark(drawHit ? (drawParameters.indirect ? "j3_stage_assembly_hit_indirect" : "j3_stage_assembly_hit_nonindirect") : "j3_stage_assembly_miss");
     if (partialFeedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
     if (verifyHit && std::any_of(matched.begin(), matched.end(), [](const auto& variant) { return variant != nullptr && variant->nestedRelocated; })) {
         const auto flattened = [](const auto& runs, const auto& words) {
@@ -1437,6 +1462,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
+    if (hitCensus) timing.Mark("j3_stage_bookkeeping");
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.feedbackMask, tail.bufferBases);
     timing.Mark("shader_compile_and_link");
 
@@ -1497,7 +1523,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (programResults[0]->meshBarycentrics != meshBarycentrics) {
             const auto pushBytes = programResults[0]->pushConstants.size();
             const auto exports = programResults[0]->parameterExports;
-            compiledStages.push_back(materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, traceToken, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+            if (hitCensus) ArchB::Recorder::Count("j3b_materialize_mesh");
+            compiledStages.push_back(materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, traceToken, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, "Shader.J3MeshRecapture"));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[0] = compiledStages.back().get();
             stages[0].program = programResults[0];
@@ -1687,7 +1714,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 if (pushWord && forwardRecordWords(programIndex, result, previousInfo)) {
                     wordsForwarded += static_cast<std::uint64_t>(std::count_if(recordWords.begin(), recordWords.end(), [&](const RecordWord& word) { return word.program == programIndex; }));
                     if (!verifyPushWord) continue;
-                    const auto fresh = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
+                    if (hitCensus) ArchB::Recorder::Count("j3b_materialize_indirect_verify");
+                    const auto fresh = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, "Shader.J3IndirectVerify");
                     for (auto& stage : stages) if (stage.program == &result) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
                     if (!rejected.empty()) return DrawVerdict::Rejected;
                     verifyForwardedWords(programIndex, result, *fresh);
@@ -1696,7 +1724,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 if (pushWord) wordsRefused += static_cast<std::uint64_t>(std::count_if(recordWords.begin(), recordWords.end(), [&](const RecordWord& word) { return word.program == programIndex; }));
                 const auto* capture = !graphics.stages.mesh && !graphics.stages.tessellation && sameInfo(previousInfo, vertexInfos[programIndex]) ? stageCaptures[programIndex].capture.get() : nullptr;
                 const bool pushPatched = RefreshIndirectStage(result, capture, programs[programIndex], vertexInfos[programIndex], [&] {
-                    return materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
+                    if (hitCensus) ArchB::Recorder::Count("j3b_materialize_indirect");
+                    return materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, "Shader.J3IndirectRecapture");
                 });
                 for (auto& stage : stages) if (stage.program == &result) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
                 if (!rejected.empty()) return DrawVerdict::Rejected;
@@ -1796,12 +1825,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
+        if (hitCensus) timing.Mark("j3_recipe_and_prequeue");
         runCaptureCheckHook();
         if (tail.queue != nullptr && capturedMemoryChanged(memory)) {
             const RecaptureScope recapture;
             return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
         }
         phaseTiming.Phase(DrawRowVectors);
+        if (hitCensus) timing.Mark("j3_enqueue_capture_gate");
         auto writes = queuedDrawWrites(tail, graphics, stages);
         if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
         const auto commitQueue = submission.queue;
@@ -1813,6 +1844,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
         // and the commit hands `resolution` to its preparation.
         const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
+        if (hitCensus) timing.Mark("j3_enqueue_ranges");
         auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
             const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
             const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
@@ -1877,6 +1909,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             resolveSlot = std::make_shared<DrawPipeline::ResolveSlot>();
             resolveSlot->run = [held](std::vector<DrawPipeline::Range>& resolveReads) { return (*held)(true, &resolveReads); };
         }
+        if (hitCensus) timing.Mark("j3_enqueue_closure");
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(false, nullptr); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw, std::move(resolveSlot));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
@@ -1963,10 +1996,10 @@ struct Probe {
     void Locked() {
         if (on) locked = now();
     }
-    void Replay() {
+    int Replay() {
         const auto outcome = Graphics::ArchcTakeReplayOutcome();
-        if (!on || kind != Indirect || outcome < 0) return;
-        kind = static_cast<Kind>(IndirectReplayed + static_cast<std::size_t>(outcome));
+        if (on && kind == Indirect && outcome >= 0) kind = static_cast<Kind>(IndirectReplayed + static_cast<std::size_t>(outcome));
+        return outcome;
     }
     void Built() {
         if (!on) return;
@@ -2040,6 +2073,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse) == RecipeOutcome::Recorded) {
             slotProbe.kind = archcSlotCensus::RecipeHit;
+            CommitCensus::SetKind(CommitCensus::Kind::Recipe);
             return;
         }
         slotProbe.kind = archcSlotCensus::RecipeMiss;
@@ -2048,7 +2082,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr ? identity : nullptr);
     if (nostageTimed) nostageAt[5] = nostageNow();
-    slotProbe.Replay();
+    const auto replayOutcome = slotProbe.Replay();
+    CommitCensus::SetKind(replayOutcome == 0 ? CommitCensus::Kind::Replayed : CommitCensus::Kind::Legacy);
     if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind < archcSlotCensus::IndirectReplayed && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
 }
