@@ -18430,12 +18430,32 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         put(large, 0xbbccu);
         draw(large, 8192, 0xdd);
         expect(0xcc, 0xbb, 0xdd, "a replay whose moved element is over the template limit");
+        put(large, 0xbecfu);
+        draw(large, 8192, 0xde);
+        expect(0xcf, 0xbe, 0xde, "a second in-place replay after the CPU rewrote the large element");
         counters = collect();
-        if (on) Require(counters["draw_templates_refused_large"] == 1 && counters["draw_templates_replays"] == 0, "a large moved element was not refused to the old path");
+        if (on) Require(counters["draw_templates_replays"] == 2 && counters["draw_templates_in_place_draws"] == 2 && counters["draw_templates_refused_large"] == 0, "a large moved element was not bound in place through its import");
+        const auto misplaced = data + 0x2000 + 12;
+        put(misplaced, 0xa1b2u);
+        draw(misplaced, 8192, 0xc3);
+        expect(0xb2, 0xa1, 0xc3, "a large moved element whose import offset is off the storage alignment");
+        counters = collect();
+        if (on) Require(counters["draw_templates_refused_in_place_alignment"] == 1 && counters["draw_templates_replays"] == 0, "a large element off the storage alignment was not refused to the old path");
         draw(moved, 16, 0x11);
         expect(0x55, 0x66, 0x11, "a small replay after a large one");
         counters = collect();
-        if (on) Require(counters["draw_templates_replays"] == 1, "the template was not used again after a large refusal");
+        if (on) Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_built_new"] == 0 && counters["draw_templates_built_shape"] == 0, "the small template was not kept beside the large one");
+        put(moved, 0x00776655u);
+        draw(moved, 5, 0x13);
+        expect(0x55, 0x66, 0x13, "a replay whose moved element is five bytes at adjustment four");
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 1, "the five-byte element was not templated");
+        for (int round = 0; round < 6; ++round) {
+            draw(moved, 16, round % 2 == 0 ? 1u : 0x21u);
+            expect(0x55, 0x66, round % 2 == 0 ? 1u : 0x21u, "a replay alternating its FlattenedSrt words between the template's and changed ones");
+        }
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 6 && counters["draw_templates_built_new"] + counters["draw_templates_built_shape"] <= 1, "alternating between two element shapes rebuilt a template on each use");
         std::cout << "agc_draw_templates_stream" << (on ? "" : " (off)") << ": ok\n";
     } else if (scenario == "flights") {
         expect(warmDraws, warmDraws, warmDraws, "the additive warm-up draws");
@@ -18464,7 +18484,60 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
         counters = collect();
         if (on) Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 0, "a flight was not free again after its batch completed");
         expect(red, green, blue, "an additive replay after the batch completed");
+        struct Gate {
+            const Context& context;
+            Recorder& recorder;
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            void Release() {
+                if (semaphore == VK_NULL_HANDLE) return;
+                std::uint64_t value = 0;
+                Check(context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, semaphore, &value), "template hold counter");
+                if (value != 0) return;
+                const VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, semaphore, 1};
+                Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "template hold release");
+            }
+            ~Gate() {
+                try {
+                    Release();
+                    recorder.Sync();
+                } catch (...) {
+                }
+                if (semaphore != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+            }
+        } gate{context, recorder};
+        const VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR, nullptr, VK_SEMAPHORE_TYPE_TIMELINE_KHR, 0};
+        const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &gate.semaphore), "template hold semaphore");
+        for (std::uint32_t k = 0; k < 8; ++k) put(data + 0x100 * (k + 7) + 4, (k + 2) | ((k + 1) << 8u));
+        static_cast<void>(collect());
+        recorder.HoldNextSubmit(gate.semaphore, 1);
+        draw(data + 0x100 * 7 + 4, 16, 4);
+        const auto held = recorder.OpenSerial();
+        recorder.Submit();
+        Require(recorder.CompletedThrough() < held, "the held batch completed before its gate opened");
+        for (std::uint32_t k = 1; k < 8; ++k) draw(data + 0x100 * (k + 7) + 4, 16, k + 4);
+        Require(recorder.CompletedThrough() < held, "the held batch completed while later draws were recorded");
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            red += k + 2;
+            green += k + 1;
+            blue += k + 4;
+        }
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 8 && counters["draw_templates_refused_flight_busy"] == 0, "the draws around a held submission were not templated");
+        gate.Release();
+        expect(red, green, blue, "additive replays recorded while an earlier batch that read a flight was held on the GPU");
         std::cout << "agc_draw_templates_flights" << (on ? "" : " (off)") << ": ok\n";
+    } else if (scenario == "budget") {
+        static_cast<void>(collect());
+        const auto moved = data + 0x100 + 4;
+        put(moved, 0x4231u);
+        for (int round = 0; round < 4; ++round) {
+            draw(moved, 16, round % 2 == 0 ? 1u : 0x21u);
+            expect(0x31, 0x42, round % 2 == 0 ? 1u : 0x21u, "a replay under a template budget of one flight group");
+        }
+        auto counters = collect();
+        Require(counters["draw_templates_refused_budget"] == 2 && counters["draw_templates_replays"] == 2 && counters["draw_templates_built_new"] == 1, "a second template generation was built over the budget");
+        std::cout << "agc_draw_templates_budget: ok\n";
     } else {
         throw std::runtime_error("unknown draw template scenario");
     }

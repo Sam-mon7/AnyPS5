@@ -8586,6 +8586,7 @@ std::shared_ptr<ShaderResources::TemplateSets> ShaderResources::MakeTemplateSets
 }
 
 void ShaderResources::AddTemplateFlights(TemplateSets& made, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const {
+    prepareFaultSlot();
     std::array<bool, 2> described{};
     std::array<std::vector<VkDescriptorPoolSize>, 2> counts;
     for (const auto& binding : bindings) {
@@ -8614,7 +8615,9 @@ void ShaderResources::AddTemplateFlights(TemplateSets& made, std::span<const std
             ++made.sets;
         }
         auto& buffers = made.buffers.emplace_back(descriptorBuffers);
-        for (std::size_t index = 0; index < made.elements.size(); ++index) buffers[made.streamed[index]] = {buffer, base + made.elements[index].offset, static_cast<VkDeviceSize>(made.elements[index].bytes)};
+        for (std::size_t index = 0; index < made.elements.size(); ++index) {
+            if (!made.elements[index].inPlace) buffers[made.streamed[index]] = wholeDwordRange({buffer, base + made.elements[index].offset, static_cast<VkDeviceSize>(made.elements[index].bytes)});
+        }
         auto writes = descriptorWrites;
         for (auto& write : writes) {
             write.dstSet = write.dstSet == _set ? allocation.set : fragmentAllocation.set;
@@ -8631,12 +8634,32 @@ void ShaderResources::KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const
     templateSetsHeld.push_back(std::move(sets));
 }
 
-std::size_t ShaderResources::RefreshTemplateFaults(TemplateSets& sets, std::size_t flight) const {
-    if (faultDescriptors.empty()) return 0;
+std::pair<std::uint64_t, std::size_t> ShaderResources::MovedView(const MovedBuffer& entry) const {
+    const auto adjustment = allocations[entry.allocation].adjustment;
+    return {entry.address - adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, adjustment))};
+}
+
+std::pair<std::size_t, std::size_t> ShaderResources::UpdateTemplateFlight(TemplateSets& sets, std::size_t flight, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace) const {
+    if (faultDescriptors.empty() && inPlace.empty()) return {0, 0};
     prepareFaultSlot();
     struct FaultWritesStorage {};
     auto& writes = AgcDriver::ThreadScratch<std::vector<VkWriteDescriptorSet>, FaultWritesStorage>();
     writes.clear();
+    for (const auto& [index, info] : inPlace) {
+        const auto slot = sets.streamed[index];
+        auto& held = sets.buffers[flight][slot];
+        if (held.buffer == info.buffer && held.offset == info.offset && held.range == info.range) continue;
+        held = info;
+        const auto write = std::find_if(descriptorWrites.begin(), descriptorWrites.end(), [&](const VkWriteDescriptorSet& candidate) { return candidate.pBufferInfo != nullptr && slot >= static_cast<std::size_t>(candidate.pBufferInfo - descriptorBuffers.data()) && slot < static_cast<std::size_t>(candidate.pBufferInfo - descriptorBuffers.data()) + candidate.descriptorCount; });
+        Require(write != descriptorWrites.end(), "an in-place template element has no buffer descriptor write");
+        auto made = *write;
+        made.dstSet = made.dstSet == _set ? sets.allocations[flight].set : sets.fragmentAllocations[flight].set;
+        made.dstArrayElement = write->dstArrayElement + static_cast<std::uint32_t>(slot - static_cast<std::size_t>(write->pBufferInfo - descriptorBuffers.data()));
+        made.descriptorCount = 1;
+        made.pBufferInfo = &held;
+        writes.push_back(made);
+    }
+    const auto placed = writes.size();
     for (const auto& fault : faultDescriptors) {
         auto& held = sets.buffers[flight][fault.buffer];
         const auto& current = descriptorBuffers[fault.buffer];
@@ -8650,7 +8673,7 @@ std::size_t ShaderResources::RefreshTemplateFaults(TemplateSets& sets, std::size
         writes.push_back(write);
     }
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    return writes.size();
+    return {placed, writes.size() - placed};
 }
 
 void ShaderResources::DropTemplateSets(const TemplateSets* sets) const {
