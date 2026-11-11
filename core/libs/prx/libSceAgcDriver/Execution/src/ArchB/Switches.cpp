@@ -68,6 +68,7 @@ constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
+constexpr Feature DrawTemplatesLivePrerequisites[] = {Feature::DrawTemplates, Feature::DrawGatherShadow};
 constexpr Feature DrawTemplatesPrerequisites[] = {Feature::ArchcDrawReplay, Feature::ZeroCopyStorage};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
@@ -225,6 +226,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::FixSampledArrayGpu, "FIX_SAMPLED_ARRAY_GPU", false, true, {}},
     {Feature::DrawGatherShadow, "DRAW_GATHER_SHADOW", false, true, {}},
     {Feature::DrawTemplates, "DRAW_TEMPLATES", false, true, DrawTemplatesPrerequisites},
+    {Feature::DrawTemplatesLive, "DRAW_TEMPLATES_LIVE", false, true, DrawTemplatesLivePrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

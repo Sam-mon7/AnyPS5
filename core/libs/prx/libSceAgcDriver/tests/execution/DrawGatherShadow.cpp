@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #ifdef _WIN32
@@ -190,6 +192,23 @@ void StructuralChangeIsDetected() {
     Require(!outcome.matched && outcome.differ == GatherDiffer::Layout, "a draw with fewer user words matched the template");
 }
 
+void ImageDescriptorsRemainStructural() {
+    auto fixture = TableFixture();
+    alignas(64) std::array<std::uint32_t, 8> image{1, 2, 3, 4, 5, 6, 7, 8};
+    auto compiled = std::make_shared<ShaderRecompiler::RecompileResult>(*fixture.variant->compiled);
+    compiled->bindings.push_back({ShaderRecompiler::DescriptorKind::SampledImage, Role::GuestImages, 0, 10, 1, std::vector<std::uint32_t>(image.begin(), image.end())});
+    fixture.variant->compiled = compiled;
+    const auto address = reinterpret_cast<std::uintptr_t>(image.data());
+    fixture.variant->runs.emplace_back(address, address + sizeof(image));
+    fixture.variant->words.insert(fixture.variant->words.end(), image.begin(), image.end());
+    fixture.variant->runBases.push_back(-1);
+    fixture.variant->runParents.emplace_back();
+    const auto shape = BuildGatherTemplate(*fixture.variant, fixture.user, 0, AllOn);
+    image[0] ^= 0x100;
+    std::vector<std::uint32_t> words;
+    Require(!EvaluateGather(*shape, fixture.user, HostReader, words, nullptr, true).matched, "a changed image descriptor matched a live template");
+}
+
 void MovedBaseMatchesAndYieldsTheNewAddress() {
     const auto fixture = TableFixture();
     const auto shape = BuildGatherTemplate(*fixture.variant, fixture.user, 0, AllOn);
@@ -311,6 +330,7 @@ struct ShadowDraw {
     GatherReader reader;
     std::function<bool(std::uint64_t, std::size_t)> busyRange;
     GatherShadowStats stats;
+    std::shared_ptr<GatherCommitTemplate> binding = std::make_shared<GatherCommitTemplate>();
 
     ShadowDraw(const Fixture& fixture, std::span<const std::uint32_t> liveUser) {
         DrawProgram program{};
@@ -323,6 +343,21 @@ struct ShadowDraw {
         entry.decode = decode;
         entry.stages = {{fixture.variant}};
         matched = {fixture.variant};
+        GatherCommitStage bound;
+        bound.compiled = fixture.variant->compiled;
+        if (bound.compiled != nullptr) for (std::size_t index = 0; index < bound.compiled->bindings.size(); ++index) {
+            const auto& descriptor = bound.compiled->bindings[index];
+            if (descriptor.role != Role::GuestBuffers) continue;
+            for (std::uint32_t element = 0; element < descriptor.count; ++element) {
+                std::array<std::uint32_t, 4> words;
+                std::copy_n(descriptor.guestDescriptor.begin() + element * 4u, 4u, words.begin());
+                const auto extent = GatherBufferExtent(words, {});
+                bound.bindings.push_back({static_cast<std::uint32_t>(index), element, element, extent.bytes, extent.adjustment, extent.bytes + extent.adjustment});
+            }
+        }
+        binding->stages.push_back(std::move(bound));
+        binding->ready.store(true);
+
         reader = [this](std::uint64_t address, std::span<std::uint32_t> out) {
             reads.push_back(address);
             return HostReader(address, out);
@@ -330,7 +365,7 @@ struct ShadowDraw {
         busyRange = [](std::uint64_t, std::size_t) { return false; };
     }
 
-    std::shared_ptr<GatherDrawPlan> Run(EntryOutcome outcome, const GatherIndirectPlan& indirect = {}, bool pendingAtValidation = false) {
+    std::shared_ptr<GatherDrawPlan> Run(EntryOutcome outcome, const GatherIndirectPlan& indirect = {}, bool pendingAtValidation = false, bool live = false) {
         ArmGatherValidationLog(true);
         GatherValidationLog()->push_back({0u, matched.front(), outcome, false, pendingAtValidation});
         GatherShadowDraw draw;
@@ -344,6 +379,8 @@ struct ShadowDraw {
         draw.read = &reader;
         draw.busy = &busyRange;
         draw.stats = &stats;
+        draw.commitTemplate = binding;
+        draw.live = live;
         auto plan = RunGatherShadow(draw);
         ArmGatherValidationLog(false);
         return plan;
@@ -438,6 +475,22 @@ void MovedNestedPointerOnADirectHitHasItsOwnClass() {
     Parent[1] = High(Child.data());
 }
 
+void FailedNestedDiagnosisDoesNotExemptAMatch() {
+    auto fixture = NestedFixture();
+    MovedChild = {0x10u, 0x20u, 0x30u, 0x40u};
+    Parent[0] = Low(MovedChild.data());
+    Parent[1] = High(MovedChild.data());
+    ShadowDraw shadow(fixture, fixture.user);
+    unsigned parents = 0;
+    shadow.reader = [&](std::uint64_t address, std::span<std::uint32_t> out) {
+        if (address == reinterpret_cast<std::uintptr_t>(Parent.data()) && ++parents > 1) return false;
+        return HostReader(address, out);
+    };
+    Require(shadow.Run(EntryOutcome::Differing) == nullptr && shadow.stats.nestedDirect == 0 && shadow.stats.pendingRefused == 1, "a failed parent diagnosis was exempted as a nested pointer move");
+    Parent[0] = Low(Child.data());
+    Parent[1] = High(Child.data());
+}
+
 void GuardedReadsFallBackAndNeverFault() {
     FillTable(Table, BufferBase, 0x3f800000u);
     std::array<std::uint32_t, 8> copy{};
@@ -453,7 +506,74 @@ void GuardedReadsFallBackAndNeverFault() {
     const auto denied = AgcDriver::GuestMemory::CopyMappedGuarded(reinterpret_cast<std::uintptr_t>(page), std::as_writable_bytes(std::span(copy)), owned);
     Require(denied == AgcDriver::GuestMemory::Compare::Unmapped && !owned, "a no-access page was not refused by the guarded read");
     VirtualFree(page, 0, MEM_RELEASE);
+    auto* arena = GuestArena::GuestArenaAllocate_nid_postfix(65536, 65536);
+    Require(arena != nullptr, "cannot allocate an arena guard page");
+    GuestArena::GuestArenaCommit_nid_postfix(arena, 65536, PAGE_READWRITE, 4096);
+    Require(VirtualProtect(arena, 4096, PAGE_READWRITE | PAGE_GUARD, &previous) != 0, "cannot guard the arena page");
+    const auto guarded = AgcDriver::GuestMemory::CopyMappedGuarded(reinterpret_cast<std::uintptr_t>(arena), std::as_writable_bytes(std::span(copy)), owned);
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(arena, &info, sizeof(info)) == sizeof(info) && (info.Protect & PAGE_GUARD) != 0, "the guarded reader consumed PAGE_GUARD");
+    Require(guarded == AgcDriver::GuestMemory::Compare::Unmapped, "the guarded reader accepted PAGE_GUARD");
+    VirtualProtect(arena, 4096, PAGE_READWRITE, &previous);
+    GuestArena::GuestArenaReset_nid_postfix(arena, 65536);
+    GuestArena::GuestArenaRelease_nid_postfix(arena, 65536);
+
 #endif
+}
+
+void HashCollisionStillChecksStructure() {
+    const auto fixture = TableFixture();
+    const auto shape = BuildGatherTemplate(*fixture.variant, fixture.user, 0, AllOn);
+    auto changed = fixture.user;
+    ++changed[4];
+    std::vector<std::uint32_t> words;
+    const auto different = EvaluateGather(*shape, changed, HostReader, words, nullptr, true);
+    auto collision = *shape;
+    collision.signature = different.signature;
+    const auto checked = EvaluateGather(collision, changed, HostReader, words, nullptr, true);
+    Require(!checked.matched && checked.differ != GatherDiffer::None, "a signature collision bypassed exact structural comparison");
+}
+
+void BindingOwnerAndPendingRangeAreExact() {
+    const auto fixture = TableFixture();
+    ShadowDraw shadow(fixture, fixture.user);
+    auto& owner = shadow.binding->stages[0].bindings[0];
+    owner.adjustment = 8;
+    owner.viewBytes = owner.extent + 8;
+    const auto plan = shadow.Run(EntryOutcome::Equal);
+    Require(plan != nullptr && plan->complete && std::any_of(plan->stages[0].vsharps.begin(), plan->stages[0].vsharps.end(), [](const auto& value) { return value.element == 0 && value.adjustment == 8; }), "the published owner's adjustment was replaced by absolute address alignment");
+    shadow.busyRange = [](std::uint64_t address, std::size_t bytes) { return address == BufferBase - 8 && bytes == Records * Stride + 8; };
+    const auto pending = shadow.Run(EntryOutcome::Equal);
+    Require(pending != nullptr && (pending->incomplete & GatherPendingVsharp) != 0, "pending checking omitted the owner's adjusted range");
+    owner.adjustment = 3;
+    owner.viewBytes = (owner.extent + 6) & ~std::uint64_t{3};
+    shadow.busyRange = [](std::uint64_t address, std::size_t bytes) { return address == BufferBase - 3 && bytes == Records * Stride + 4; };
+    const auto rounded = shadow.Run(EntryOutcome::Equal);
+    Require(rounded != nullptr && (rounded->incomplete & GatherPendingVsharp) != 0, "pending checking omitted the DWORD-rounded tail");
+}
+
+void GenerationWindowIncludesPlanValidation() {
+    const auto fixture = TableFixture();
+    ShadowDraw shadow(fixture, fixture.user);
+    bool changed = false;
+    shadow.busyRange = [&](std::uint64_t address, std::size_t) {
+        if (address == BufferBase && !changed) {
+            changed = true;
+            GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(Table.data()), sizeof(Table));
+        }
+        return false;
+    };
+    const auto plan = shadow.Run(EntryOutcome::Equal);
+    Require(changed && plan != nullptr && !plan->complete && (plan->incomplete & GatherGenerationMoved) != 0, "a generation change during plan validation left a complete plan");
+}
+
+void ChangedFeedbackWaitsForACompleteStreamingMap() {
+    auto fixture = TableFixture();
+    fixture.variant->feedback.memory = {{6, 0xff}};
+    Table[6] = 7;
+    ShadowDraw shadow(fixture, fixture.user);
+    const auto plan = shadow.Run(EntryOutcome::Equal, {}, false, true);
+    Require(plan != nullptr && plan->matched && !plan->complete && (plan->incomplete & GatherNotTemplatable) != 0, "changed feedback without a streaming destination was admitted live");
 }
 
 void StrictModeFailsOnAFalseDiffer() {
@@ -475,13 +595,19 @@ int main() {
         ExtentFollowsTheBindingRules();
         ClassifiesBaseValueAndStructureWords();
         StructuralChangeIsDetected();
+        ImageDescriptorsRemainStructural();
         MovedBaseMatchesAndYieldsTheNewAddress();
         NestedPointersAreCarriedWithTheirReads();
         ShadowRunsThroughTheCacheAndHandsThePlanToTheCommitter();
         PendingSourcesRefuseOrLeaveThePlanIncomplete();
         IndirectArgumentsAreAPlanElement();
         MovedNestedPointerOnADirectHitHasItsOwnClass();
+        FailedNestedDiagnosisDoesNotExemptAMatch();
         GuardedReadsFallBackAndNeverFault();
+        HashCollisionStillChecksStructure();
+        BindingOwnerAndPendingRangeAreExact();
+        GenerationWindowIncludesPlanValidation();
+        ChangedFeedbackWaitsForACompleteStreamingMap();
         StrictModeFailsOnAFalseDiffer();
         std::cout << "Gather templates classify base, value and structural words, detect structural changes, and carry moved and nested addresses in the plan\n";
         return 0;

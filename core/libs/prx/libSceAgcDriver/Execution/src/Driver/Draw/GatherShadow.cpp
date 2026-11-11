@@ -335,21 +335,24 @@ GatherOutcome EvaluateGather(const GatherTemplate& shape, std::span<const std::u
         if ((changed & shape.wordMask[word]) != 0 && shape.wordClass[word] == GatherWord::Feedback) outcome.feedbackChanged = true;
     }
     outcome.signature = hash;
-    outcome.matched = hash == shape.signature;
+    outcome.matched = hash == shape.signature && first == GatherDiffer::None;
     if (!outcome.matched || diagnose) outcome.differ = first;
-    if (outcome.matched && first != GatherDiffer::None) ArchB::Recorder::Count("gather_shadow_signature_collisions");
+    if (hash == shape.signature && first != GatherDiffer::None) ArchB::Recorder::Count("gather_shadow_signature_collisions");
     return outcome;
 }
 
-void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, std::span<const std::uint32_t> liveWords, GatherStagePlan& plan, const GatherBufferLimits& limits) {
+void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, std::span<const std::uint32_t> liveWords, GatherStagePlan& plan, const GatherBufferLimits& limits, const GatherCommitStage* bound) {
     plan.words.clear();
     plan.vsharps.clear();
     plan.slots.clear();
+    plan.reads.clear();
+    plan.push.clear();
     plan.elements = {};
     plan.bytes = {};
     if (shape.compiled == nullptr) return;
     const auto& compiled = *shape.compiled;
     using Role = ShaderRecompiler::DescriptorRole;
+    plan.buffers.resize(std::count_if(compiled.bindings.begin(), compiled.bindings.end(), [](const auto& binding) { return binding.role == Role::FlattenedSrt || binding.role == Role::ShaderData; }));
     bool flat = false, shaderData = false;
     for (const auto& target : shape.targets) {
         const auto source = target.user ? (target.source < liveUser.size() ? liveUser[target.source] : 0u) : (target.source < liveWords.size() ? liveWords[target.source] : 0u);
@@ -386,6 +389,15 @@ void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> 
         const auto extent = GatherBufferExtent(vsharp.words, limits);
         vsharp.extent = extent.bytes;
         vsharp.adjustment = extent.adjustment;
+        vsharp.viewBytes = Graphics::GuestBufferMemory::ViewBytes(vsharp.extent, vsharp.adjustment);
+        if (bound != nullptr) {
+            const auto binding = std::find_if(bound->bindings.begin(), bound->bindings.end(), [&](const auto& binding) { return binding.binding == vsharp.binding && binding.element == vsharp.element; });
+            if (binding != bound->bindings.end()) {
+                vsharp.extent = binding->extent;
+                vsharp.adjustment = binding->adjustment;
+                vsharp.viewBytes = binding->viewBytes;
+            }
+        }
         ++plan.elements[at(GatherElement::Vsharp)];
         plan.bytes[at(GatherElement::Vsharp)] += vsharp.extent;
     }
@@ -409,6 +421,18 @@ void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> 
     if (push) {
         ++plan.elements[at(GatherElement::Push)];
         plan.bytes[at(GatherElement::Push)] += compiled.pushConstants.size();
+    }
+    plan.push = compiled.pushConstants;
+    for (const auto& [slot, value] : plan.slots) if ((static_cast<std::size_t>(slot) + 1) * sizeof(value) <= plan.push.size()) std::memcpy(plan.push.data() + slot * sizeof(value), &value, sizeof(value));
+    std::size_t bufferIndex = 0;
+    for (std::uint32_t index = 0; index < compiled.bindings.size(); ++index) {
+        const auto& binding = compiled.bindings[index];
+        if (binding.role != Role::FlattenedSrt && binding.role != Role::ShaderData) continue;
+        auto& buffer = plan.buffers[bufferIndex++];
+        buffer.binding = index;
+        buffer.words = binding.guestDescriptor;
+        for (const auto& word : plan.words) if (word.binding == index && word.word < buffer.words.size()) buffer.words[word.word] = word.value;
+        if (binding.role == Role::ShaderData) for (const auto& [slot, value] : plan.slots) if (slot < buffer.words.size()) buffer.words[slot] = value;
     }
 }
 
@@ -571,6 +595,7 @@ std::shared_ptr<GatherDrawPlan> acquirePlan(std::size_t stages, std::uint64_t& a
         stage.words.clear();
         stage.vsharps.clear();
         stage.slots.clear();
+        stage.reads.clear();
         stage.elements = {};
         stage.bytes = {};
     }
@@ -578,18 +603,23 @@ std::shared_ptr<GatherDrawPlan> acquirePlan(std::size_t stages, std::uint64_t& a
     plan.limits = {};
     plan.incomplete = GatherIncompleteNone;
     plan.complete = false;
+    plan.matched = false;
+    plan.commitTemplate.reset();
     return slot;
 }
 
-std::array<std::uint64_t, 3> gatherGenerations() {
-    return {Graphics::Recorder::PublishGeneration(), Graphics::StorageTexture::PendingSerial(), GuestMemory::ForgetSerial()};
+std::array<std::uint64_t, 4> gatherGenerations() {
+    return {Graphics::Recorder::PublishGeneration(), Graphics::StorageTexture::PendingSerial(), GuestMemory::ForgetSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix()};
 }
 
 }
 
 std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     const auto started = std::chrono::steady_clock::now();
-    auto& log = validationLog().entries;
+    thread_local std::vector<GatherValidation> selectedLog;
+    selectedLog.clear();
+    if (draw.live) for (std::uint32_t stage = 0; stage < draw.matched.size(); ++stage) if (draw.matched[stage] != nullptr) selectedLog.push_back({stage, draw.matched[stage], EntryOutcome::Equal});
+    const auto& log = draw.live ? selectedLog : validationLog().entries;
     if (!draw.hit && log.empty()) {
         ArchB::Recorder::Count(draw.entry == nullptr ? "gather_shadow_miss_no_entry" : "gather_shadow_miss_unvalidated");
         return nullptr;
@@ -617,6 +647,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
         ++built;
         return slot.shape;
     };
+    const auto sourceGeneration = gatherGenerations();
     PendingView pending;
     pending.Load();
     const auto busy = [&](std::uint64_t address, std::uint64_t bytes) -> bool {
@@ -661,6 +692,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     if (draw.hit) {
         plan = acquirePlan(draw.programs.size(), allocations);
         plan->limits = draw.limits;
+        plan->commitTemplate = draw.commitTemplate;
     }
     bool allMatched = draw.hit, templatable = true, wordsChanged = false, feedbackChanged = false, large = false;
     std::uint32_t incomplete = GatherIncompleteNone;
@@ -710,7 +742,19 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
         if (selected) {
             stageSeen[validation.stage] = 1;
             auto& stagePlan = plan->stages[validation.stage];
-            if (outcome.matched) FillGatherPlan(*shape, liveUser, liveWords, stagePlan, draw.limits);
+            if (outcome.matched) {
+                const auto* binding = draw.commitTemplate != nullptr && draw.commitTemplate->ready.load(std::memory_order_acquire) && validation.stage < draw.commitTemplate->stages.size() ? &draw.commitTemplate->stages[validation.stage] : nullptr;
+                FillGatherPlan(*shape, liveUser, liveWords, stagePlan, draw.limits, binding);
+                for (std::size_t run = 0; run < liveAddresses.size(); ++run) stagePlan.reads.emplace_back(liveAddresses[run], liveAddresses[run] + shape->runs[run].count * sizeof(std::uint32_t));
+                if (!stagePlan.vsharps.empty() && binding == nullptr) incomplete |= GatherUnknownBindings;
+                if (binding != nullptr) for (const auto& vsharp : stagePlan.vsharps) {
+                    const auto known = std::find_if(binding->bindings.begin(), binding->bindings.end(), [&](const auto& item) { return item.binding == vsharp.binding && item.element == vsharp.element; });
+                    const auto fresh = GatherBufferExtent(vsharp.words, draw.limits);
+                    auto viewBytes = Graphics::GuestBufferMemory::ViewBytes(fresh.bytes, vsharp.adjustment);
+                    if (draw.limits.wholeDwords && viewBytes >= 4) viewBytes &= ~std::uint64_t{3};
+                    if (known == binding->bindings.end() || fresh.bytes != vsharp.extent || vsharp.viewBytes != viewBytes || vsharp.viewBytes == 0 || vsharp.address < vsharp.adjustment) incomplete |= GatherBindingShape;
+                }
+            }
             hitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - timed).count());
             allMatched &= outcome.matched;
             wordsChanged |= outcome.wordsChanged;
@@ -723,8 +767,13 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
                 const auto bucket = vsharp.words[2] == 0xffffffffu ? 4u : vsharp.extent <= GatherSmallElementBytes ? 0u : vsharp.extent <= 65536u ? 1u : vsharp.extent <= 1048576u ? 2u : 3u;
                 ++vsharpSizes[bucket];
                 if (vsharp.extent > GatherSmallElementBytes) large = true;
-                if (vsharp.extent != 0 && busy(vsharp.address - vsharp.adjustment, vsharp.extent + vsharp.adjustment)) incomplete |= GatherPendingVsharp;
+                if (vsharp.extent != 0 && busy(vsharp.address - vsharp.adjustment, vsharp.viewBytes)) incomplete |= GatherPendingVsharp;
             }
+        }
+        if (draw.live) {
+            if (refusedPending) ++pendingRefused;
+            if (refusedGeneration) ++generationRefused;
+            continue;
         }
         if (refusedPending) {
             ++pendingRefused;
@@ -753,16 +802,23 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
             ++counts.pairs;
             if (outcome.matched) {
                 const auto& kept = *validation.variant;
+                const auto diagnosisGeneration = gatherGenerations();
+                pending.Load();
+                blocked = false;
+                bool readable = true, onlyNested = true, sawNested = false;
                 std::size_t position = 0, firstPosition = kept.words.size();
                 std::uint32_t stored = 0, fresh = 0;
                 std::size_t runIndex = 0;
                 std::vector<std::uint32_t> words;
-                for (std::size_t run = 0; run < kept.runs.size() && firstPosition == kept.words.size(); ++run) {
+                for (std::size_t run = 0; run < kept.runs.size(); ++run) {
                     const auto count = static_cast<std::size_t>((kept.runs[run].second - kept.runs[run].first) / sizeof(std::uint32_t));
+                    if (shape->nested && run < liveAddresses.size() && liveAddresses[run] != kept.runs[run].first) {
+                        position += count;
+                        continue;
+                    }
                     words.assign(count, 0);
                     if (count != 0 && !read(kept.runs[run].first, words)) {
-                        firstPosition = position;
-                        runIndex = run;
+                        readable = false;
                         break;
                     }
                     for (std::size_t word = 0; word < count; ++word) {
@@ -771,16 +827,26 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
                         if (draw.options.bufferBases) mask |= WordMask(kept.bufferBaseMasks, at);
                         if (draw.options.dataWords && std::find(kept.dataPositions.begin(), kept.dataPositions.end(), static_cast<std::uint32_t>(at)) != kept.dataPositions.end()) mask = 0xffffffffu;
                         if (((words[word] ^ kept.words[at]) & ~mask) == 0) continue;
-                        firstPosition = at;
-                        stored = kept.words[at];
-                        fresh = words[word];
-                        runIndex = run;
-                        break;
+                        const bool nestedWord = at < shape->wordClass.size() && shape->wordClass[at] == GatherWord::NestedPointer;
+                        sawNested |= nestedWord;
+                        onlyNested &= nestedWord;
+                        if (firstPosition == kept.words.size()) {
+                            firstPosition = at;
+                            stored = kept.words[at];
+                            fresh = words[word];
+                            runIndex = run;
+                        }
                     }
                     position += count;
                 }
+                if (!readable || blocked || gatherGenerations() != diagnosisGeneration) {
+                    if (!readable || blocked) ++pendingRefused;
+                    else ++generationRefused;
+                    if (selected) incomplete |= !readable || blocked ? GatherPendingWords : GatherGenerationMoved;
+                    continue;
+                }
                 const auto mine = firstPosition < shape->wordClass.size() ? GatherWordName(shape->wordClass[firstPosition]) : "none";
-                const bool nestedDirect = kept.donor == nullptr && firstPosition < shape->wordClass.size() && shape->wordClass[firstPosition] == GatherWord::NestedPointer;
+                const bool nestedDirect = kept.donor == nullptr && sawNested && onlyNested;
                 if (nestedDirect) {
                     ++counts.nestedDirect;
                     continue;
@@ -809,6 +875,12 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
             plan->indirect = draw.indirect;
             if (busy(draw.indirect.arguments, std::max<std::uint64_t>(draw.indirect.rangeBytes, 4)) || (draw.indirect.countIndirect && busy(draw.indirect.countAddress, 4))) incomplete |= GatherPendingIndirect;
         }
+        if (gatherGenerations() != sourceGeneration || (sourceGeneration[2] & 1u) != 0) {
+            incomplete |= GatherGenerationMoved;
+            ++generationRefused;
+        }
+        if (draw.live && feedbackChanged) incomplete |= GatherNotTemplatable;
+        plan->matched = allMatched && templatable;
         plan->incomplete = incomplete;
         plan->complete = allMatched && templatable && incomplete == GatherIncompleteNone;
     }
@@ -908,6 +980,20 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
         if (largeBytes[kind] != 0) Recorder::Count(largeNames[kind], static_cast<double>(largeBytes[kind]));
     }
     return plan;
+}
+
+std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> MaterializeGather(const GatherDrawPlan& plan) {
+    std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> made;
+    for (std::size_t index = 0; index < plan.stages.size(); ++index) {
+        const auto& stage = plan.stages[index];
+        const auto& donor = plan.commitTemplate->stages[index].compiled;
+        auto program = std::make_shared<ShaderRecompiler::RecompileResult>(*donor);
+        for (const auto& buffer : stage.buffers) program->bindings.at(buffer.binding).guestDescriptor = buffer.words;
+        for (const auto& vsharp : stage.vsharps) std::copy(vsharp.words.begin(), vsharp.words.end(), program->bindings.at(vsharp.binding).guestDescriptor.begin() + static_cast<std::ptrdiff_t>(vsharp.element) * 4);
+        program->pushConstants = stage.push;
+        made.push_back(std::move(program));
+    }
+    return made;
 }
 
 }

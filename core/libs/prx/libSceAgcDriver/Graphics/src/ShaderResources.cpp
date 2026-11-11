@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -8639,7 +8640,7 @@ void ShaderResources::KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const
 
 std::pair<std::uint64_t, std::size_t> ShaderResources::MovedView(const MovedBuffer& entry) const {
     const auto adjustment = allocations[entry.allocation].adjustment;
-    return {entry.address - adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, adjustment))};
+    return {entry.address - adjustment, entry.viewBytes != 0 ? entry.viewBytes : static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, adjustment))};
 }
 
 std::pair<std::size_t, std::size_t> ShaderResources::UpdateTemplateFlight(TemplateSets& sets, std::size_t flight, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace) const {
@@ -8685,7 +8686,7 @@ void ShaderResources::DropTemplateSets(const TemplateSets* sets) const {
 
 std::size_t ShaderResources::StreamBytes(const MovedBuffer& entry) const {
     if (!entry.words.empty()) return entry.size;
-    return static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, allocations[entry.allocation].adjustment));
+    return entry.viewBytes != 0 ? entry.viewBytes : static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, allocations[entry.allocation].adjustment));
 }
 
 void ShaderResources::StreamElement(const MovedBuffer& entry, std::byte* destination) const {
@@ -8716,6 +8717,77 @@ bool ShaderResources::ExpectedElementBytes(const MovedBuffer& entry, std::vector
     out.resize(bytes);
     std::memcpy(out.data(), reinterpret_cast<const void*>(begin), bytes);
     return true;
+}
+
+bool ShaderResources::RegisteredViewsCurrent(std::span<const ShaderRecompiler::RegisteredImageView> views) {
+    return registeredImageViewsCurrent(views);
+}
+
+bool ShaderResources::GatherBindings(DriverDetail::GatherCommitTemplate& target, const DriverDetail::GatherDrawPlan& plan, std::span<const MovedBuffer> moved) const {
+    if (target.ready.load(std::memory_order_acquire)) return true;
+    if (target.stages.size() != plan.stages.size()) return false;
+    for (std::size_t stage = 0; stage < plan.stages.size(); ++stage) {
+        auto& out = target.stages[stage];
+        out.bindings.clear();
+        for (const auto& vsharp : plan.stages[stage].vsharps) {
+            if (vsharp.binding >= out.compiled->bindings.size()) return false;
+            const auto& source = out.compiled->bindings[vsharp.binding];
+            const auto bound = std::find_if(bindings.begin(), bindings.end(), [&](const auto& item) { return item.layout.binding == source.binding; });
+            if (bound == bindings.end() || vsharp.element >= bound->allocations.size()) return false;
+            const auto index = bound->allocations[vsharp.element];
+            const auto& allocation = allocations[index];
+            if (!allocation.guest || allocation.written) return false;
+            const auto current = std::find_if(moved.begin(), moved.end(), [&](const auto& item) { return item.allocation == index; });
+            const auto extent = current != moved.end() ? current->size : static_cast<std::size_t>(allocation.size);
+            auto bytes = TemplateDescriptor({VK_NULL_HANDLE, 0, static_cast<VkDeviceSize>(GuestBufferMemory::ViewBytes(extent, allocation.adjustment))}).range;
+            if (current == moved.end()) {
+                const auto set = setOf(*bound) == 0 ? _set : fragment.set;
+                const auto write = std::find_if(descriptorWrites.begin(), descriptorWrites.end(), [&](const auto& write) { return write.dstSet == set && write.dstBinding == bound->layout.binding && write.pBufferInfo != nullptr; });
+                if (write == descriptorWrites.end()) return false;
+                bytes = descriptorBuffers[static_cast<std::size_t>(write->pBufferInfo - descriptorBuffers.data()) + vsharp.element].range;
+            }
+            if (bytes == 0 || bytes > context.limits.maxStorageBufferRange) return false;
+            out.bindings.push_back({vsharp.binding, vsharp.element, index, extent, allocation.adjustment, bytes});
+        }
+    }
+    return true;
+}
+
+std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::GatherBuffers(const DriverDetail::GatherDrawPlan& plan, Recorder& recorder, MoveRefusal& refusal) const {
+    const auto fail = [&](MoveRefusal why) { refusal = why; return std::optional<std::vector<MovedBuffer>>{}; };
+    if (!plan.complete || plan.commitTemplate == nullptr || !plan.commitTemplate->valid.load(std::memory_order_acquire) || !plan.commitTemplate->ready.load(std::memory_order_acquire) || usesBda) return fail(MoveRefusal::Shape);
+    std::vector<MovedBuffer> moved;
+    moved.reserve(allocations.size());
+    for (std::size_t stage = 0; stage < plan.stages.size(); ++stage) {
+        const auto& source = plan.stages[stage];
+        for (const auto& read : source.reads) {
+            if (recorder.PendingWriteOverlaps(read.first, static_cast<std::size_t>(read.second - read.first)) || PendingStorageOverlaps(read.first, static_cast<std::size_t>(read.second - read.first), nullptr) || AnyShadowedOverlaps(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
+        }
+        const auto& shape = plan.commitTemplate->stages[stage];
+        for (const auto& vsharp : source.vsharps) {
+            const auto known = std::find_if(shape.bindings.begin(), shape.bindings.end(), [&](const auto& item) { return item.binding == vsharp.binding && item.element == vsharp.element; });
+            if (known == shape.bindings.end() || known->allocation >= allocations.size()) return fail(MoveRefusal::Shape);
+            const auto& item = allocations[known->allocation];
+            if (!item.guest || item.written || item.adjustment != vsharp.adjustment || known->extent != vsharp.extent || known->viewBytes != vsharp.viewBytes || vsharp.address < vsharp.adjustment) return fail(MoveRefusal::Shape);
+            const auto begin = vsharp.address - vsharp.adjustment;
+            const auto bytes = static_cast<std::size_t>(vsharp.viewBytes);
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return fail(MoveRefusal::Inaccessible);
+            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return fail(MoveRefusal::Overlap);
+            if (vsharp.address == item.address && vsharp.extent == item.size) continue;
+            moved.push_back({known->allocation, vsharp.address, static_cast<std::size_t>(vsharp.extent), {}, bytes});
+        }
+        for (const auto& buffer : source.buffers) {
+            if (buffer.binding >= shape.compiled->bindings.size()) return fail(MoveRefusal::Shape);
+            const auto& binding = shape.compiled->bindings[buffer.binding];
+            const auto bound = std::find_if(bindings.begin(), bindings.end(), [&](const auto& item) { return item.layout.binding == binding.binding; });
+            if (bound == bindings.end() || bound->allocations.size() != 1) return fail(MoveRefusal::Shape);
+            const auto index = bound->allocations.front();
+            const auto& item = allocations[index];
+            if (item.guest || item.buffer == nullptr || item.size != buffer.words.size() * sizeof(std::uint32_t)) return fail(MoveRefusal::Shape);
+            moved.push_back({index, 0, static_cast<std::size_t>(item.size), buffer.words});
+        }
+    }
+    return moved;
 }
 
 bool ShaderResources::BoundElementBytes(const MovedBuffer& entry, const DrawBindings* bound, VkDescriptorBufferInfo& descriptor, std::vector<std::byte>& bytes) const {

@@ -113,6 +113,7 @@ enum class Feature : std::uint8_t {
     FixSampledArrayGpu,
     DrawGatherShadow,
     DrawTemplates,
+    DrawTemplatesLive,
     Count
 };
 

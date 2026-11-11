@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -11,6 +12,7 @@
 
 namespace AgcDriver::Graphics {
 struct CompiledShader;
+struct State;
 }
 
 namespace AgcDriver::DriverDetail {
@@ -92,6 +94,7 @@ struct GatherVsharp {
     std::uint64_t size = 0;
     std::uint64_t extent = 0;
     std::uint32_t adjustment = 0;
+    std::uint64_t viewBytes = 0;
 };
 
 struct GatherIndirectPlan {
@@ -105,22 +108,57 @@ struct GatherIndirectPlan {
     bool operator==(const GatherIndirectPlan&) const = default;
 };
 
+struct GatherWordBuffer {
+    std::uint32_t binding = 0;
+    std::vector<std::uint32_t> words;
+};
+
+struct GatherVsharpBinding {
+    std::uint32_t binding = 0;
+    std::uint32_t element = 0;
+    std::size_t allocation = 0;
+    std::uint64_t extent = 0;
+    std::uint32_t adjustment = 0;
+    std::uint64_t viewBytes = 0;
+};
+
+struct GatherCommitStage {
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const void> variant;
+    ShaderRecompiler::ShaderStage stage{};
+    std::uint32_t pushOffset = 0;
+    std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
+    std::vector<GatherVsharpBinding> bindings;
+};
+
+struct GatherCommitTemplate {
+    std::shared_ptr<const Graphics::State> state;
+    std::vector<GatherCommitStage> stages;
+    std::atomic<bool> ready{false};
+    std::atomic<bool> valid{true};
+};
+
 struct GatherStagePlan {
     const ShaderRecompiler::RecompileResult* program = nullptr;
     std::vector<GatherDescriptorWord> words;
     std::vector<GatherVsharp> vsharps;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> slots;
+    std::vector<GatherWordBuffer> buffers;
+    std::vector<std::byte> push;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    bool ownerKnown = false;
     std::array<std::uint64_t, static_cast<std::size_t>(GatherElement::Count)> elements{};
     std::array<std::uint64_t, static_cast<std::size_t>(GatherElement::Count)> bytes{};
 };
 
-enum GatherIncomplete : std::uint32_t { GatherIncompleteNone = 0, GatherPendingWords = 1, GatherPendingVsharp = 2, GatherPendingIndirect = 4, GatherGenerationMoved = 8, GatherNotTemplatable = 16, GatherUnmatched = 32 };
+enum GatherIncomplete : std::uint32_t { GatherIncompleteNone = 0, GatherPendingWords = 1, GatherPendingVsharp = 2, GatherPendingIndirect = 4, GatherGenerationMoved = 8, GatherNotTemplatable = 16, GatherUnmatched = 32, GatherUnknownBindings = 64, GatherBindingShape = 128 };
 
 struct GatherBufferLimits {
     std::uint64_t maxRange = 0;
     std::uint32_t alignment = 4;
     std::uint64_t targetAddress = 0;
     std::uint64_t (*readableEnd)(std::uint64_t) = nullptr;
+    bool wholeDwords = false;
 };
 
 struct GatherDrawPlan {
@@ -129,6 +167,8 @@ struct GatherDrawPlan {
     GatherBufferLimits limits;
     std::uint32_t incomplete = GatherIncompleteNone;
     bool complete = false;
+    bool matched = false;
+    std::shared_ptr<GatherCommitTemplate> commitTemplate;
 };
 
 struct GatherCheck {
@@ -159,7 +199,7 @@ struct GatherExtent {
 GatherExtent GatherBufferExtent(const std::array<std::uint32_t, 4>& words, const GatherBufferLimits& limits);
 std::shared_ptr<const GatherTemplate> BuildGatherTemplate(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::uint32_t hiddenUserWords, const GatherOptions& options);
 GatherOutcome EvaluateGather(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, const GatherReader& read, std::vector<std::uint32_t>& liveWords, std::vector<std::uint64_t>* liveAddresses, bool diagnose);
-void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, std::span<const std::uint32_t> liveWords, GatherStagePlan& plan, const GatherBufferLimits& limits = {});
+void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> liveUser, std::span<const std::uint32_t> liveWords, GatherStagePlan& plan, const GatherBufferLimits& limits = {}, const GatherCommitStage* binding = nullptr);
 void CheckGatherStage(const GatherStagePlan& plan, const ShaderRecompiler::RecompileResult& program, GatherCheck& check, const GatherBufferLimits& limits = {});
 GatherCheck CheckGatherDrawPlan(const GatherDrawPlan& plan, std::span<const Graphics::CompiledShader> stages, std::uint64_t targetAddress, const GatherIndirectPlan& committed);
 void CountGatherPlanUnchecked(const char* reason);
@@ -195,9 +235,12 @@ struct GatherShadowDraw {
     const GatherReader* read = nullptr;
     const std::function<bool(std::uint64_t, std::size_t)>* busy = nullptr;
     GatherShadowStats* stats = nullptr;
+    bool live = false;
+    std::shared_ptr<GatherCommitTemplate> commitTemplate;
 };
 
 std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw);
+std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> MaterializeGather(const GatherDrawPlan& plan);
 
 }
 

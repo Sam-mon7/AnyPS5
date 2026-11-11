@@ -23,6 +23,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParameterArena.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -18233,6 +18235,7 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
     if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
     Require(Switches::Enabled(Feature::ArchcDrawReplay) && Switches::Enabled(Feature::ArchcReplayPatchSlots) && Switches::Enabled(Feature::ZeroCopyStorage), "the template cases need draw replay, patch slots and zero-copy storage");
     const bool on = Switches::Enabled(Feature::DrawTemplates);
+    if (scenario == "live") Census::Boundary(true, 1, Census::Clock::now());
     const char* verifyText = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_VERIFY");
     const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
     constexpr std::size_t unit = 65536;
@@ -18436,6 +18439,72 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
     };
     const auto target = stateFor(address, scenario == "flights" || scenario == "publish");
     const auto variant = std::make_shared<std::uint64_t>(vertex->variantId);
+    using namespace AgcDriver::DriverDetail;
+    std::shared_ptr<GatherCommitTemplate> liveTemplate;
+    std::shared_ptr<GatherDrawPlan> learning;
+    std::shared_ptr<DispatchVariant> gatherVariant;
+    alignas(16) std::array<std::uint64_t, 2> liveRoot{};
+    alignas(16) std::array<std::uint32_t, 8> firstChild{}, secondChild{};
+    std::vector<std::uint32_t> liveUser;
+    std::shared_ptr<GatherTemplate> liveShape;
+    if (scenario == "live") {
+        vertex->memoryOffsetDword = 1;
+        vertex->pushConstants.resize(8);
+        auto words = vertex->spirv.Words();
+        std::vector<std::uint32_t> module(words.begin(), words.end());
+        std::uint32_t uintType = 0;
+        std::size_t annotations = 0, declarations = 0;
+        for (std::size_t at = 5; at < module.size(); at += module[at] >> 16u) {
+            const auto opcode = module[at] & 0xffffu;
+            if (annotations == 0 && opcode >= spv::OpTypeVoid && opcode <= spv::OpTypeForwardPointer) annotations = at;
+            if (opcode == spv::OpTypeInt && module[at + 2] == 32 && module[at + 3] == 0) uintType = module[at + 1];
+            if (opcode == spv::OpFunction) { declarations = at; break; }
+        }
+        Require(uintType != 0 && annotations != 0 && declarations != 0, "the live fixture lacks its SPIR-V declaration points");
+        const auto length = module[3]++, array = module[3]++, structure = module[3]++, pointer = module[3]++, variable = module[3]++;
+        const std::vector<std::uint32_t> declared{(4u << 16u) | spv::OpConstant, uintType, length, 32, (4u << 16u) | spv::OpTypeArray, array, uintType, length, (3u << 16u) | spv::OpTypeStruct, structure, array, (4u << 16u) | spv::OpTypePointer, pointer, spv::StorageClassPushConstant, structure, (4u << 16u) | spv::OpVariable, pointer, variable, spv::StorageClassPushConstant};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(declarations), declared.begin(), declared.end());
+        const std::vector<std::uint32_t> decorated{(4u << 16u) | spv::OpDecorate, array, spv::DecorationArrayStride, 4, (3u << 16u) | spv::OpDecorate, structure, spv::DecorationBlock, (5u << 16u) | spv::OpMemberDecorate, structure, 0, spv::DecorationOffset, 0};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(annotations), decorated.begin(), decorated.end());
+        vertex->spirv = std::move(module);
+
+        vertex->shaderDataUserWords = {2};
+        vertex->bindings[1].guestDescriptor[0] = 1;
+        vertex->bindings[2].guestDescriptor[0] = 4;
+        const std::uint32_t offset = 4;
+        std::memcpy(vertex->pushConstants.data(), &offset, 4);
+        const auto guest = vsharp(data + 4, 16);
+        std::copy(guest.begin(), guest.end(), firstChild.begin());
+        firstChild[4] = 1;
+        liveRoot[0] = reinterpret_cast<std::uintptr_t>(firstChild.data());
+        const auto root = reinterpret_cast<std::uintptr_t>(liveRoot.data());
+        liveUser = {static_cast<std::uint32_t>(root), static_cast<std::uint32_t>(root >> 32), 4};
+        gatherVariant = std::make_shared<DispatchVariant>();
+        gatherVariant->compiled = vertex;
+        gatherVariant->runs = {{root, root + 8}, {liveRoot[0], liveRoot[0] + sizeof(firstChild)}};
+        gatherVariant->words = {static_cast<std::uint32_t>(liveRoot[0]), static_cast<std::uint32_t>(liveRoot[0] >> 32)};
+        gatherVariant->words.insert(gatherVariant->words.end(), firstChild.begin(), firstChild.end());
+        gatherVariant->runBases = {0, -1};
+        gatherVariant->runParents = {{DispatchVariant::NoFlatBinding, 0}, {0, 0}};
+        gatherVariant->relocatableWords = 1;
+        gatherVariant->userWordsWalked = 3;
+        gatherVariant->nestedPointerProof = true;
+        gatherVariant->flatBinding = 1;
+        gatherVariant->dataPositions = {6};
+        gatherVariant->dataSlots = {0};
+        gatherVariant->bufferBaseMasks = {{2, 0xfffffffcu}, {3, 0xffffu}};
+        gatherVariant->bufferBasePatches = {{2, 0, 0}, {3, 0, 1}};
+        liveShape = std::make_shared<GatherTemplate>(*BuildGatherTemplate(*gatherVariant, liveUser, 0, {true, true, true, true}));
+        Require(liveShape->refusal == nullptr && liveShape->nested, "the live pixel fixture did not get a nested gather template");
+        liveTemplate = std::make_shared<GatherCommitTemplate>();
+        liveTemplate->state = target;
+        liveTemplate->stages = {{vertex, variant, ShaderRecompiler::ShaderStage::Vertex, 0}, {pixel, {}, ShaderRecompiler::ShaderStage::Fragment, 0}};
+        learning = std::make_shared<GatherDrawPlan>();
+        learning->matched = true;
+        learning->incomplete = GatherUnknownBindings;
+        learning->stages.resize(2);
+        FillGatherPlan(*liveShape, liveUser, gatherVariant->words, learning->stages[0]);
+    }
     const auto draw = [&](std::uint64_t at, std::uint32_t size, std::uint32_t word) {
         auto current = std::make_shared<ShaderRecompiler::RecompileResult>(*vertex);
         current->bindings[0].guestDescriptor = vsharp(at, size);
@@ -18452,6 +18521,8 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
             programs.push_back(currentPixel);
         }
         DrawSlotIdentity identity{target, {{vertex, variant, std::move(words), true, false}, {pixel}}};
+        identity.gatherTemplate = liveTemplate;
+        identity.learning = learning.get();
         if (scenario == "tail") identity.stages[1] = {pixel, variant, {}, true, false};
         const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, current.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, currentPixel.get(), 0u}};
         Draw(context, *target, indirect, shaders, {}, nullptr, nullptr, 0, nullptr, false, &identity);
@@ -18526,7 +18597,77 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
     }
     Require(warmed.captures != 0 && warmed.hits != 0, "the repeated template draw was not replayed");
     const std::uint32_t warmDraws = 7;
-    if (scenario == "stream") {
+    if (scenario == "live") {
+        Require(liveTemplate->ready.load(), "the committer did not publish the live pixel layout");
+        static_cast<void>(collect());
+        const auto moved = data + 0x100 + 4;
+        put(moved, 0x0101);
+        put(moved + 4, 0x6655);
+        const auto words = vsharp(moved, 16);
+        std::copy(words.begin(), words.end(), secondChild.begin());
+        secondChild[4] = 0x77;
+        liveRoot[0] = reinterpret_cast<std::uintptr_t>(secondChild.data());
+        liveUser[2] = 8;
+        std::vector<std::uint32_t> gathered;
+        const GatherReader reader = [](std::uint64_t address, std::span<std::uint32_t> out) {
+            bool owned = false;
+            return AgcDriver::GuestMemory::CopyMappedGuarded(address, std::as_writable_bytes(out), owned) == AgcDriver::GuestMemory::Compare::Equal;
+        };
+        const auto outcome = EvaluateGather(*liveShape, liveUser, reader, gathered, nullptr, true);
+        Require(outcome.matched, "moving the nested pointer, V# and constants changed structure");
+        auto plan = std::make_shared<GatherDrawPlan>();
+        plan->stages.resize(2);
+        plan->commitTemplate = liveTemplate;
+        plan->matched = plan->complete = true;
+        FillGatherPlan(*liveShape, liveUser, gathered, plan->stages[0], {}, &liveTemplate->stages[0]);
+        auto old = std::make_shared<ShaderRecompiler::RecompileResult>(*vertex);
+        old->bindings[0].guestDescriptor = words;
+        old->bindings[1].guestDescriptor[0] = secondChild[4];
+        old->bindings[2].guestDescriptor[0] = liveUser[2];
+        std::memcpy(old->pushConstants.data(), &liveUser[2], 4);
+        const std::array oldStages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, old.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        const std::array donorStages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        DrawSlotIdentity live{target, {{vertex, variant}, {pixel}}};
+        live.gatherTemplate = liveTemplate;
+        live.gather = plan.get();
+        live.referenceStages = oldStages;
+        live.referenceDraw = &indirect;
+        Draw(context, *target, indirect, donorStages, {}, nullptr, nullptr, 0, nullptr, false, &live);
+        expect(0x55, 0x66, 0x77, "the live plan's nested pointer, V# and constant words");
+        const auto counters = collect();
+        for (const auto& [name, count] : counters) if (name.starts_with("draw_templates_live")) std::cout << name << " " << count << "\n";
+        Require(counters.contains("draw_templates_live_commits") && counters.at("draw_templates_live_commits") == 1, "the changed-value pixel draw did not commit a live template");
+        for (const auto& [name, count] : counters) Require(!name.starts_with("draw_templates_live_verify_mismatch_") || count == 0, "the changed-value live template differs from the old binding path");
+        DrawSlotIdentity oldIdentity{target, {{old}, {pixel}}};
+        Draw(context, *target, indirect, oldStages, {}, nullptr, nullptr, 0, nullptr, false, &oldIdentity);
+        expect(0x55, 0x66, 0x77, "the old path for the same changed values");
+        auto decode = std::make_shared<DrawDecode>();
+        DrawProgram front{}, fragment{};
+        front.userData = liveUser;
+        front.binary.stage = ShaderRecompiler::ShaderStage::Vertex;
+        fragment.binary.stage = ShaderRecompiler::ShaderStage::Fragment;
+        decode->programs = {front, fragment};
+        DrawEntry entry;
+        entry.decode = decode;
+        auto fragmentVariant = std::make_shared<DispatchVariant>();
+        fragmentVariant->compiled = pixel;
+        const std::array variants{gatherVariant, fragmentVariant};
+        GatherShadowDraw capture;
+        capture.programs = decode->programs;
+        capture.entry = &entry;
+        capture.matched = variants;
+        capture.hit = capture.keyed = capture.live = true;
+        capture.options = {true, true, true, true};
+        capture.commitTemplate = liveTemplate;
+        capture.read = &reader;
+        const auto safe = RunGatherShadow(capture);
+        Require(safe != nullptr && safe->complete, "the pending-write fixture did not begin with a complete plan");
+        recorder.NotePendingWrite(reinterpret_cast<std::uintptr_t>(liveRoot.data()), sizeof(std::uint64_t));
+        const auto pending = RunGatherShadow(capture);
+        Require(pending == nullptr || !pending->complete, "an open-batch GPU write over the captured parent allowed a live plan");
+        recorder.Sync();
+        std::cout << "agc_draw_templates_live: exact changed-value pixels match; a pending captured parent refuses\n";
+    } else if (scenario == "stream") {
         static_cast<void>(collect());
         const auto moved = data + 0x100 + 4;
         put(moved, 0x4231u);

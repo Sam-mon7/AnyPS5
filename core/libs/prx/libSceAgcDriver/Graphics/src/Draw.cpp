@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
@@ -5294,11 +5295,25 @@ std::uint32_t currentSwitches() {
     return bits;
 }
 
+struct SlotTemplateOwnership {
+    std::weak_ptr<ShaderResources> resources;
+    std::vector<std::weak_ptr<ShaderResources::TemplateSets>> sets;
+    ~SlotTemplateOwnership() {
+        std::unique_lock lock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) lock.lock();
+        const auto owner = resources.lock();
+        if (owner == nullptr) return;
+        for (const auto& weak : sets) if (const auto set = weak.lock()) owner->DropTemplateSets(set.get());
+    }
+};
+
 struct Slot {
     std::uint64_t lastUse = 0;
     // C_REPLAY_PATCH_SLOTS: keyed without the patch words of its patched stages (no static moved list, no
     // kept moved list or cached moved set: the replay takes both live).
     bool wordless = false;
+    const DriverDetail::GatherCommitTemplate* gatherTemplate = nullptr;
+    std::weak_ptr<const DriverDetail::GatherCommitTemplate> gatherHeld;
     VkDevice device = VK_NULL_HANDLE;
     const void* stateOwner = nullptr;
     const State* state = nullptr;
@@ -5350,6 +5365,7 @@ struct Slot {
     VkDescriptorSet bindFragment = VK_NULL_HANDLE;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> bindReads;
     HostImportsProof bindProof{};
+    std::shared_ptr<SlotTemplateOwnership> templateOwnership;
     std::array<std::weak_ptr<ShaderResources::TemplateSets>, 4> templates{};
     std::array<const ShaderResources::TemplateSets*, 4> templateRaw{};
     std::array<std::uint64_t, 4> templateUse{};
@@ -5403,17 +5419,20 @@ bool wordlessIdentity(const DrawSlotIdentity& identity) {
 
 std::uint64_t keyOf(VkDevice device, const DrawSlotIdentity& identity, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool wordless = false) {
     std::uint64_t hash = mix(0x534c4f54u, reinterpret_cast<std::uintptr_t>(device));
+    const bool live = identity.gather != nullptr;
+    if (live) hash = mix(hash, reinterpret_cast<std::uintptr_t>(identity.gatherTemplate.get()));
     hash = mix(hash, reinterpret_cast<std::uintptr_t>(identity.state.get()));
     for (std::size_t i = 0; i < shaders.size(); ++i) {
         const auto& stage = identity.stages[i];
         hash = mix(hash, reinterpret_cast<std::uintptr_t>(stage.owner.get()));
         hash = mix(hash, reinterpret_cast<std::uintptr_t>(stage.variant.get()));
         hash = mix(hash, (static_cast<std::uint64_t>(shaders[i].stage) << 32u) | shaders[i].pushConstantOffset);
+        if (live) continue;
         hash = mix(hash, (stage.patched ? 1u : 0u) | (stage.bufferBases ? 2u : 0u));
         if (wordless && stage.patched && !stage.bufferBases) continue;
         for (const auto word : stage.words) hash = mix(hash, word);
     }
-    hash = mix(hash, draw.indexAddress);
+    if (!live) hash = mix(hash, draw.indexAddress);
     hash = mix(hash, (static_cast<std::uint64_t>(draw.indexCount) << 32u) | draw.indexSize);
     if (draw.indirect) hash = mix(hash, (static_cast<std::uint64_t>(draw.indirect->count) << 32u) | draw.indirect->stride);
     return hash;
@@ -5432,11 +5451,19 @@ bool usableIdentity(const DrawSlotIdentity& identity, const State& state, std::s
 
 bool sameIdentity(const Slot& slot, VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity& identity, bool pipelineStateReuse, bool wordless) {
     static_cast<void>(state);
+    if (slot.gatherTemplate != (identity.gather != nullptr ? identity.gatherTemplate.get() : nullptr)) return false;
+    if (identity.gather != nullptr && slot.gatherHeld.lock() != identity.gatherTemplate) return false;
     if (slot.device != device || slot.stateOwner != identity.state.get() || slot.stageCount != shaders.size() || slot.pipelineStateReuse != pipelineStateReuse || slot.stateHeld.expired() || slot.wordless != wordless) return false;
     for (std::size_t i = 0; i < shaders.size(); ++i) {
         const auto& stage = identity.stages[i];
-        const bool words = !(wordless && stage.patched && !stage.bufferBases);
+        const bool words = identity.gather == nullptr && !(wordless && stage.patched && !stage.bufferBases);
         if (slot.ownerRaw[i] != stage.owner.get() || slot.variantRaw[i] != stage.variant.get() || slot.patched[i] != ((stage.patched ? 1u : 0u) | (stage.bufferBases ? 2u : 0u)) || slot.stages[i].stage != shaders[i].stage || slot.stages[i].pushConstantOffset != shaders[i].pushConstantOffset || (words && slot.words[i] != stage.words) || slot.owners[i].expired() || (stage.patched && slot.variants[i].expired())) return false;
+    }
+    if (identity.gather != nullptr) {
+        auto kept = slot.draw;
+        kept.indexAddress = draw.indexAddress;
+        if (kept.indirect && draw.indirect) kept.indirect->countAddress = draw.indirect->countAddress;
+        return sameDraw(kept, draw);
     }
     return sameDraw(slot.draw, draw);
 }
@@ -5543,6 +5570,47 @@ Slot* lookupKeyed(VkDevice device, const State& state, const Pm4::DrawParameters
     const auto found = made.slots.find(keyOf(device, identity, draw, shaders, wordless));
     if (found == made.slots.end() || !sameIdentity(found->second, device, state, draw, shaders, identity, pipelineStateReuse, wordless)) return nullptr;
     return &found->second;
+}
+
+void publishGatherSlot(const Context& context, const State& state, const Pm4::DrawParameters& draw, const DrawSlotIdentity& identity, const Slot& source, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved) {
+    const auto& link = identity.gatherTemplate;
+    const auto* plan = identity.learning;
+    if (link == nullptr || plan == nullptr || !plan->matched || (plan->incomplete & ~DriverDetail::GatherUnknownBindings) != 0 || !link->valid.load(std::memory_order_acquire)) return;
+    if (link->stages.size() != source.stageCount || !resources.GatherBindings(*link, *plan, moved)) return;
+    auto slot = source;
+    slot.gatherTemplate = link.get();
+    slot.gatherHeld = link;
+    slot.wordless = false;
+    slot.movedStatic = false;
+    slot.liveKept = false;
+    slot.bindSet.reset();
+    slot.state = link->state.get();
+    slot.stateHeld = link->state;
+    slot.stateOwner = link->state.get();
+    DrawSlotIdentity structure;
+    structure.state = link->state;
+    structure.gatherTemplate = link;
+    structure.gather = plan;
+    std::vector<CompiledShader> stages;
+    for (std::size_t index = 0; index < link->stages.size(); ++index) {
+        const auto& stage = link->stages[index];
+        structure.stages.push_back({stage.compiled, stage.variant});
+        stages.push_back({stage.stage, stage.compiled.get(), stage.pushOffset, stage.registeredViews.get()});
+        slot.stages[index] = stages.back();
+        slot.owners[index] = stage.compiled;
+        slot.ownerRaw[index] = stage.compiled.get();
+        slot.variants[index] = stage.variant;
+        slot.variantRaw[index] = stage.variant.get();
+        slot.words[index].clear();
+        slot.patched[index] = 0;
+    }
+    auto& slots = table().slots;
+    const auto key = keyOf(context.device, structure, draw, stages);
+    if (slots.size() >= TableLimit && !slots.contains(key)) return;
+    slots.insert_or_assign(key, std::move(slot));
+    link->ready.store(true, std::memory_order_release);
+    AgcDriver::ArchB::Recorder::Count("draw_templates_live_templates_ready");
+    static_cast<void>(state);
 }
 
 // The slot keyed with the patch words first; under C_REPLAY_PATCH_SLOTS the one keyed without them next, so a
@@ -5756,7 +5824,8 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         counters().evictions.fetch_add(made.slots.size(), std::memory_order_relaxed);
         made.slots.clear();
     }
-    made.slots.insert_or_assign(key, std::move(slot));
+    auto [captured, inserted] = made.slots.insert_or_assign(key, std::move(slot));
+    publishGatherSlot(context, state, draw, identity, captured->second, *resources, prepared.resolved.moved);
     counters().captures.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -5876,6 +5945,20 @@ bool sameShape(std::span<const ShaderResources::TemplateElement> a, std::span<co
     return true;
 }
 
+enum LiveMismatch : std::size_t { LiveElementBytes, LiveElementRange, LiveStatic, LiveElementSet, LivePush, LivePipeline, LiveVertex, LiveIndex, LiveIndirect, LiveArguments, LiveMismatchCount };
+constexpr std::array<const char*, LiveMismatchCount> LiveMismatchNames{"element_bytes", "element_range", "static_binding", "element_set", "push", "pipeline", "vertex", "index", "indirect", "arguments"};
+
+void liveMismatch(LiveMismatch kind, const char* what) {
+    static const auto names = [] {
+        std::array<std::string, LiveMismatchCount> values;
+        for (std::size_t i = 0; i < values.size(); ++i) values[i] = std::string("draw_templates_live_verify_mismatch_") + LiveMismatchNames[i];
+        return values;
+    }();
+    static std::array<std::atomic<std::uint64_t>, LiveMismatchCount> counts{};
+    ArchB::Recorder::Count(names[kind].c_str());
+    if (counts[kind].fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[draw-templates-live] VERIFY mismatch: %s: %s\n", LiveMismatchNames[kind], what);
+}
+
 struct TemplatePlan {
     std::shared_ptr<ShaderResources::TemplateSets> sets;
     std::vector<std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace;
@@ -5884,6 +5967,7 @@ struct TemplatePlan {
     std::uint64_t serial = 0;
     bool committed = false;
     bool verify = false;
+    bool liveVerify = false;
     struct Reference {
         VkDescriptorBufferInfo descriptor{};
         std::vector<std::byte> bytes;
@@ -5899,8 +5983,10 @@ TemplatePlan& templatePlan() {
 
 void verifyTemplate(const Context& context, const ShaderResources& resources, const ShaderResources::TemplateSets& sets, std::size_t flight, std::span<const ShaderResources::MovedBuffer> moved, const Slot& slot) {
     auto& counts = templateCounters();
-    counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+    if (templatePlan().liveVerify) ArchB::Recorder::Count("draw_templates_live_verify_elements");
+    else counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
     const auto mismatch = [&](TemplateMismatch kind, const char* what) {
+        if (templatePlan().liveVerify) { liveMismatch(static_cast<LiveMismatch>(kind), what); return; }
         if (counts.mismatches[kind].fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[draw-templates] VERIFY mismatch: %s\n", what);
     };
     if (sets.elements.size() != moved.size() || sets.streamed.size() != moved.size()) {
@@ -5923,16 +6009,35 @@ void verifyTemplate(const Context& context, const ShaderResources& resources, co
         if (info.range != old.descriptor.range || info.offset % (element.inPlace ? std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4) : alignment) != 0) mismatch(MismatchElementRange, "a descriptor's range or alignment differs from the old binding path");
         if (element.inPlace) {
             const auto [begin, bytes] = resources.MovedView(moved[i]);
-            const auto* import = ExistingHostImportFor(context, begin, bytes);
-            if (import == nullptr || info.buffer != import->buffer || info.offset != HostImportOffset(*import, begin)) mismatch(MismatchElementRange, "an in-place descriptor differs from its live import");
+            const auto expected = std::find_if(templatePlan().inPlace.begin(), templatePlan().inPlace.end(), [&](const auto& item) { return item.first == i; });
+            auto proof = sets.proof;
+            proof.inserted = HostImportsIdentity(context, false).inserted;
+            const bool current = HostImportsReconciledUnchanged(context, proof);
+            if (!current || expected == templatePlan().inPlace.end() || info.buffer != expected->second.buffer || info.offset != expected->second.offset || info.range != expected->second.range) {
+                static unsigned reported = 0;
+                if (templatePlan().liveVerify && reported++ < 8) {
+                    const auto now = HostImportsIdentity(context, false);
+                    std::fprintf(stderr, "[draw-templates-live] detail import element %zu current %u epoch %llu/%llu generation %llu/%llu inserted %llu/%llu selected %u\n", i, current, static_cast<unsigned long long>(proof.epoch), static_cast<unsigned long long>(now.epoch), static_cast<unsigned long long>(proof.refreshedGeneration), static_cast<unsigned long long>(now.refreshedGeneration), static_cast<unsigned long long>(proof.inserted), static_cast<unsigned long long>(now.inserted), expected != templatePlan().inPlace.end() && info.buffer == expected->second.buffer && info.offset == expected->second.offset && info.range == expected->second.range);
+                }
+                mismatch(MismatchElementRange, "an in-place descriptor lost its validated import or differs from the selected live binding");
+            }
             if (old.bytes.size() != info.range || std::memcmp(reinterpret_cast<const void*>(begin), old.bytes.data(), old.bytes.size()) != 0) mismatch(MismatchElementBytes, "the in-place bytes differ from what the old binding path binds");
         } else {
             if (info.buffer != sets.arena->Handle(flight % ParameterArena::Flights, chunk)) mismatch(MismatchElementRange, "a streamed descriptor points outside the flight");
-            if (old.bytes.size() != info.range || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, old.bytes.data(), old.bytes.size()) != 0) mismatch(MismatchElementBytes, "the slice bytes differ from what the old binding path binds");
+            if (old.bytes.size() != info.range || std::memcmp(sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset, old.bytes.data(), old.bytes.size()) != 0) {
+                static unsigned reported = 0;
+                if (templatePlan().liveVerify && reported++ < 12) {
+                    const auto* bytes = sets.arena->Bytes(flight % ParameterArena::Flights, chunk) + info.offset;
+                    std::size_t first = 0;
+                    while (first < std::min<std::size_t>(info.range, old.bytes.size()) && bytes[first] == old.bytes[first]) ++first;
+                    std::fprintf(stderr, "[draw-templates-live] detail slice element %zu allocation %zu words %u address %llx size %zu range %llu/%zu offset %zu live %02x old %02x\n", i, moved[i].allocation, !moved[i].words.empty(), static_cast<unsigned long long>(moved[i].address), moved[i].size, static_cast<unsigned long long>(info.range), old.bytes.size(), first, first < info.range ? std::to_integer<unsigned>(bytes[first]) : 0, first < old.bytes.size() ? std::to_integer<unsigned>(old.bytes[first]) : 0);
+                }
+                mismatch(MismatchElementBytes, "the slice bytes differ from what the old binding path binds");
+            }
         }
     }
     if (resources.TemplateStaticMismatches(sets, flight) != 0) mismatch(MismatchStatic, "a static binding of the template set differs from the template's own");
-    if (sets.push != slot.push) mismatch(MismatchPush, "the slot's push block changed under its template");
+    if (!templatePlan().liveVerify && sets.push != slot.push) mismatch(MismatchPush, "the slot's push block changed under its template");
 }
 
 std::optional<std::size_t> freeFlight(const ShaderResources::TemplateSets& sets, const Recorder& recorder) {
@@ -5948,17 +6053,26 @@ void keepTemplate(Recorder& recorder, const std::shared_ptr<ShaderResources::Tem
     if (bytes != 0) templateCounters().keptBytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
-bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, bool drawUse) {
+bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, bool drawUse, const DrawSlotIdentity* live = nullptr) {
     auto& counts = templateCounters();
     auto& plan = templatePlan();
     plan.sets.reset();
     plan.inPlace.clear();
     plan.reads.clear();
     plan.committed = false;
-    plan.verify = templateVerifyNow();
+    plan.liveVerify = live != nullptr && !live->referenceStages.empty();
+    plan.verify = plan.liveVerify || templateVerifyNow();
     plan.reference.clear();
     const auto refuse = [&](TemplateRefusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
+        if (live != nullptr) {
+            static const auto names = [] {
+                std::array<std::string, TemplateRefusalCount> values;
+                for (std::size_t i = 0; i < values.size(); ++i) values[i] = std::string("draw_templates_live_commit_refused_template_") + TemplateRefusalNames[i];
+                return values;
+            }();
+            ArchB::Recorder::Count(names[why].c_str());
+        }
         plan.sets.reset();
         plan.inPlace.clear();
         plan.reads.clear();
@@ -6001,11 +6115,24 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
         plan.reads.emplace_back(begin, begin + bytes);
     }
     if (plan.verify) {
-        auto bound = resources.PrepareDrawBindings(recorder, moved, false, nullptr, true);
+        std::optional<std::vector<ShaderResources::MovedBuffer>> oldMoved;
+        if (plan.liveVerify) oldMoved = resources.MovedReadOnlyBuffers(live->referenceStages, recorder, &live->gatherTemplate->state->color);
+        if (plan.liveVerify && !oldMoved) liveMismatch(LiveElementSet, "the old path refused the gathered binding shape");
+        auto bound = resources.PrepareDrawBindings(recorder, plan.liveVerify && oldMoved ? std::span<const ShaderResources::MovedBuffer>(*oldMoved) : moved, false, nullptr, true);
         plan.reference.resize(moved.size());
         for (std::size_t i = 0; i < moved.size(); ++i) {
             auto& reference = plan.reference[i];
             reference.valid = resources.BoundElementBytes(moved[i], bound.get(), reference.descriptor, reference.bytes);
+        }
+        for (auto& [index, descriptor] : plan.inPlace) {
+            if (recorder.OpenGpuStores() != 0) return refuse(TemplateInPlaceStore);
+            const auto [begin, bytes] = resources.MovedView(moved[index]);
+            if (recorder.PendingWriteOverlaps(begin, bytes)) return refuse(TemplateInPlacePending);
+            const auto* import = ExistingHostImportFor(context, begin, bytes);
+            if (import == nullptr) return refuse(TemplateInPlaceImport);
+            const auto offset = HostImportOffset(*import, begin);
+            if (offset % storageAlignment != 0) return refuse(TemplateInPlaceAlignment);
+            descriptor = resources.TemplateDescriptor({import->buffer, offset, static_cast<VkDeviceSize>(bytes)});
         }
     }
     std::shared_ptr<ShaderResources::TemplateSets> sets;
@@ -6053,6 +6180,13 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
         sets->push = slot.push;
         counts.groups.fetch_add(1, std::memory_order_relaxed);
         resources.KeepTemplateSets(sets);
+        if (slot.templateOwnership == nullptr || slot.templateOwnership.use_count() != 1) {
+            slot.templateOwnership = std::make_shared<SlotTemplateOwnership>();
+            slot.templateOwnership->resources = slot.resources;
+        }
+        auto& owned = slot.templateOwnership->sets;
+        std::erase_if(owned, [](const auto& weak) { return weak.expired(); });
+        owned.push_back(sets);
         std::size_t place = 0;
         for (std::size_t index = 0; index < slot.templates.size(); ++index) {
             if (slot.templateRaw[index] == nullptr) {
@@ -6179,12 +6313,22 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     StepClock clock;
     const auto refuse = [&](Refusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
+        if (identity.gather != nullptr) {
+            static const auto names = [] {
+                std::array<std::string, RefusalCount> values;
+                for (std::size_t i = 0; i < values.size(); ++i) values[i] = std::string("draw_templates_live_commit_refused_") + RefusalNames[i];
+                return values;
+            }();
+            ArchB::Recorder::Count(names[why].c_str());
+            if (why == RefusedNew || why == RefusedTargets || why == RefusedDepth || why == RefusedObjects || why == RefusedTemplateGone || why == RefusedTemplateMembership || why == RefusedProof) identity.gatherTemplate->valid.store(false, std::memory_order_release);
+        }
         lastOutcome() = why == RefusedNew ? OutcomeNew : OutcomeRefused;
         scratch().inputs = DrawInputs{};
         scratch().targets.clear();
         return false;
     };
     if (!usableIdentity(identity, state, shaders) || draw.indirect == std::nullopt || state.colors.size() > 64) return refuse(RefusedNew);
+    if (identity.gather != nullptr && (identity.gatherTemplate == nullptr || !identity.gatherTemplate->valid.load(std::memory_order_acquire) || !identity.gatherTemplate->ready.load(std::memory_order_acquire))) return refuse(RefusedTemplate);
     auto* slot = lookup(context.device, state, draw, shaders, identity, pipelineStateReuse);
     if (slot == nullptr) {
         if (stepTiming()) classifyMiss(identity, draw, shaders);
@@ -6261,7 +6405,14 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     const bool slotBindings = cutEnabled(Feature::ArchcReplaySlotBindings);
     std::optional<std::vector<ShaderResources::MovedBuffer>> liveMoved;
     bool movedFromSlot = false;
-    if (!slot->movedStatic) {
+    if (identity.gather != nullptr) {
+        auto moveRefusal = ShaderResources::MoveRefusal::None;
+        liveMoved = resources->GatherBuffers(*identity.gather, *recorder, moveRefusal);
+        if (!liveMoved.has_value()) {
+            countMoveRefusal(moveRefusal);
+            return refuse(RefusedMoved);
+        }
+    } else if (!slot->movedStatic) {
         const bool verifyMoved = slotBindings && !slot->wordless && slot->liveKept && cutVerifyNow(CutSlotMoved);
         const bool holds = slotBindings && !slot->wordless && slot->liveKept && resources->MovedStillReadOnly(slot->liveMoved, *recorder);
         if (holds && !verifyMoved) {
@@ -6290,8 +6441,8 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     if (resources->NeedsCompletion() != slot->completion || resources->HasCopiedWrites() || resources->HoldsLease() || resources->UsesAddressTable() || !resources->Reusable()) return refuse(RefusedTemplate);
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     clock.Mark(StepArgs);
-    const bool patchVerify = slot->wordless && cutVerifyNow(CutPatchSlots);
-    if (patchVerify || verifyNow()) {
+    const bool patchVerify = identity.gather == nullptr && slot->wordless && cutVerifyNow(CutPatchSlots);
+    if (patchVerify || (identity.gather == nullptr && verifyNow())) {
         counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
         prepared.slotVerify = true;
         prepared.slotVerifyPatch = patchVerify;
@@ -6299,6 +6450,26 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         work.inputs = DrawInputs{};
         work.targets.clear();
         return false;
+    }
+    if (identity.gather != nullptr && !identity.referenceStages.empty() && identity.referenceDraw != nullptr) {
+        ArchB::Recorder::Count("draw_templates_live_verify_checks");
+        const auto& oldDraw = *identity.referenceDraw;
+        const auto oldPlan = planDraw(context, state, oldDraw, identity.referenceStages, nullptr, replayOutcome(), replayTimer(), nullptr, nullptr, false);
+        auto oldInputs = prepareDrawInputs(context, state, oldDraw, identity.referenceStages, oldPlan, replayTimer(), nullptr);
+        std::optional<State> masked;
+        std::uint64_t proxies = 0;
+        for (std::size_t index = 0; index < state.colors.size() && index < 64; ++index) if (AttachmentProxyFormat(context, state.colors[index].format) != VK_FORMAT_UNDEFINED) proxies |= std::uint64_t{1} << index;
+        const auto& pipelineState = pipelineStateFor(context, state, oldInputs.fragmentOutputs, proxies, masked);
+        const auto oldPipeline = CachedPipeline(context, pipelineState, oldInputs.VertexLayout(), *resources, identity.referenceStages, VK_IMAGE_LAYOUT_GENERAL);
+        if (oldPipeline != pipeline) liveMismatch(LivePipeline, "the old pipeline selection differs");
+        if (oldInputs.vertexHandles != inputs.vertexHandles || oldInputs.vertexOffsets != inputs.vertexOffsets || oldInputs.vertexInputBehindGpuWrite != inputs.vertexInputBehindGpuWrite) liveMismatch(LiveVertex, "the old vertex bindings differ");
+        if (oldInputs.indexHandle != inputs.indexHandle || oldInputs.indexOffset != inputs.indexOffset || oldInputs.indexBytes != inputs.indexBytes || oldDraw.indexSize != draw.indexSize) liveMismatch(LiveIndex, "the old index binding differs");
+        if (oldDraw.indexed != draw.indexed || oldDraw.indexCount != draw.indexCount || oldDraw.instanceCount != draw.instanceCount || oldDraw.flags != draw.flags || oldDraw.firstVertex != draw.firstVertex || oldDraw.firstInstance != draw.firstInstance || oldDraw.indexAddress != draw.indexAddress) liveMismatch(LiveArguments, "the old draw packet values differ");
+        if (!oldDraw.indirect || !sameIndirect(*oldDraw.indirect, *args) || oldDraw.indirect->arguments != args->arguments || oldDraw.indirect->countAddress != args->countAddress) liveMismatch(LiveIndirect, "the old indirect binding or rewrite rules differ");
+        else {
+            const auto* oldImport = HostImportFor(context, oldDraw.indirect->arguments, static_cast<std::size_t>(oldDraw.indirect->RangeBytes()));
+            if (oldImport == nullptr || oldImport->buffer != argumentImport->buffer || HostImportOffset(*oldImport, oldDraw.indirect->arguments) != HostImportOffset(*argumentImport, args->arguments)) liveMismatch(LiveIndirect, "the old argument import differs");
+        }
     }
     if (state.depth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     PerformanceTimer timing("Graphics.DrawReplay", AgcDriver::ArchB::Recorder::Phase::Record);
@@ -6346,8 +6517,9 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         templateCounters().nothingMoved.fetch_add(1, std::memory_order_relaxed);
     } else {
         templateCounters().candidates.fetch_add(1, std::memory_order_relaxed);
-        if (cutEnabled(Feature::DrawTemplates) && prepareTemplate(context, *recorder, *slot, *resources, moved, drawUse != nullptr)) templateSets = templatePlan().sets;
+        if (cutEnabled(Feature::DrawTemplates) && prepareTemplate(context, *recorder, *slot, *resources, moved, drawUse != nullptr, identity.gather != nullptr ? &identity : nullptr)) templateSets = templatePlan().sets;
     }
+    if (identity.gather != nullptr && templateSets == nullptr && !moved.empty()) return refuse(RefusedMoved);
     if (templateSets == nullptr && slotBindings) {
         if (moved.empty() && Recorder::ZeroCopyStorageActive()) {
             slotBound = true;
@@ -6468,7 +6640,23 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         resources->BindDrawUse(commands, pipeline->Layout(), drawUse.get());
     }
     ArchC::ProbeAt(ArchC::Probe::RcBind);
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, &slot->push, slot->pushStages, 0, false, inputs.meshLayerStride, reuse);
+    auto livePush = slot->push;
+    if (identity.gather != nullptr) {
+        livePush = {};
+        for (std::size_t stage = 0; stage < identity.gather->stages.size(); ++stage) {
+            const auto& push = identity.gather->stages[stage].push;
+            const auto offset = identity.gatherTemplate->stages[stage].pushOffset;
+            Require(offset <= livePush.size() && push.size() <= livePush.size() - offset, "live gather push exceeds its stage slot");
+            std::copy(push.begin(), push.end(), livePush.begin() + offset);
+        }
+        resources->PatchPushConstants(livePush);
+    }
+    if (identity.gather != nullptr && !identity.referenceStages.empty()) {
+        auto oldPush = AssemblePushConstants(identity.referenceStages);
+        resources->PatchPushConstants(oldPush);
+        if (oldPush != livePush || PushConstantStages(identity.referenceStages) != PushConstantStages(shaders)) liveMismatch(LivePush, "the old push block differs");
+    }
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, &livePush, identity.gather != nullptr ? PushConstantStages(shaders) : slot->pushStages, 0, false, inputs.meshLayerStride, reuse);
     ArchC::ProbeAt(ArchC::Probe::RcPush);
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
     auto eachDrawTiming = Recorder::NoTiming;
@@ -6494,6 +6682,8 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     recorder->LeaveRenderPassOpen(slot->pass.passKey, drawTiming, slot->pass.fenced, passAccess, {});
     ArchC::ProbeAt(ArchC::Probe::RcLeave);
     if (templateSets != nullptr) finishTemplate(*recorder);
+    if (identity.gather == nullptr) publishGatherSlot(context, state, draw, identity, *slot, *resources, moved);
+    else AgcDriver::ArchB::Recorder::Count("draw_templates_live_commits");
     clock.Mark(StepRecord);
     keepRecordedDraw(*recorder, resources, std::move(pipeline), std::move(framebuffer), inputs, std::move(work.targets), slot->slices, state.scissor, std::move(argumentScratch), {}, false, slot->completion, replayOutcome(), drawUse, nullptr);
     work.targets.clear();
@@ -7826,6 +8016,50 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         prepared.identity = identity;
         if (archcSlots::tryReplay(context, state, draw, shaders, *identity, trace, pipelineStateReuse, prepared)) return;
         archcSlots::counters().legacy.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (identity != nullptr && identity->gather != nullptr) {
+        AgcDriver::ArchB::Recorder::Count("draw_templates_live_commit_fallback");
+        auto programs = DriverDetail::MaterializeGather(*identity->gather);
+        if (!identity->referenceStages.empty()) {
+            AgcDriver::ArchB::Recorder::Count("draw_templates_live_verify_fallback_checks");
+            if (programs.size() != identity->referenceStages.size()) archcSlots::liveMismatch(archcSlots::LiveElementSet, "the fallback stage count differs");
+            for (std::size_t i = 0; i < programs.size() && i < identity->referenceStages.size(); ++i) {
+                const auto& live = *programs[i];
+                const auto& old = *identity->referenceStages[i].program;
+                if (live.bindings.size() != old.bindings.size()) archcSlots::liveMismatch(archcSlots::LiveElementSet, "the fallback binding count differs");
+                for (std::size_t binding = 0; binding < live.bindings.size() && binding < old.bindings.size(); ++binding) {
+                    const auto& a = live.bindings[binding];
+                    const auto& b = old.bindings[binding];
+                    if (a.kind != b.kind || a.role != b.role || a.binding != b.binding || a.count != b.count || a.descriptorSet != b.descriptorSet) archcSlots::liveMismatch(archcSlots::LiveElementSet, "the fallback binding layout differs");
+                    if (a.guestDescriptor != b.guestDescriptor) {
+                        static unsigned reported = 0;
+                        if (reported++ < 12) {
+                            const auto common = std::min(a.guestDescriptor.size(), b.guestDescriptor.size());
+                            std::size_t word = 0;
+                            while (word < common && a.guestDescriptor[word] == b.guestDescriptor[word]) ++word;
+                            std::fprintf(stderr, "[draw-templates-live] detail fallback stage %zu binding %zu role %u word %zu sizes %zu/%zu live %08x old %08x\n", i, binding, static_cast<unsigned>(a.role), word, a.guestDescriptor.size(), b.guestDescriptor.size(), word < a.guestDescriptor.size() ? a.guestDescriptor[word] : 0, word < b.guestDescriptor.size() ? b.guestDescriptor[word] : 0);
+                        }
+                        archcSlots::liveMismatch(archcSlots::LiveElementBytes, "the fallback descriptor words differ");
+                    }
+                }
+                if (live.pushConstants != old.pushConstants) archcSlots::liveMismatch(archcSlots::LivePush, "the fallback push input differs");
+                if (!std::ranges::equal(live.spirv.Words(), old.spirv.Words())) archcSlots::liveMismatch(archcSlots::LivePipeline, "the fallback shader differs");
+            }
+            if (identity->referenceDraw == nullptr || !archcSlots::sameDraw(draw, *identity->referenceDraw) || draw.indirect->arguments != identity->referenceDraw->indirect->arguments) archcSlots::liveMismatch(archcSlots::LiveArguments, "the fallback packet differs");
+        }
+        auto patched = std::vector<CompiledShader>(shaders.begin(), shaders.end());
+        auto fallback = *identity;
+        fallback.gather = nullptr;
+        fallback.learning = identity->gather;
+        fallback.referenceStages = {};
+        fallback.referenceDraw = nullptr;
+        for (std::size_t stage = 0; stage < patched.size(); ++stage) {
+            patched[stage].program = programs[stage].get();
+            fallback.stages[stage].owner = programs[stage];
+            fallback.stages[stage].variant.reset();
+        }
+        Draw(context, state, draw, patched, snapshots, recipeOut, trace, shape, preparation, pipelineStateReuse, &fallback);
+        return;
     }
     reuseCensus::begin(false);
     prepared.preparation = preparation;
