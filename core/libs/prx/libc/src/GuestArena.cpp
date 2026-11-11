@@ -56,6 +56,10 @@ std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
 
 BOOL GuestArenaVirtualProtect_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
     const LazyProtectionHold hold(reinterpret_cast<std::uintptr_t>(address), bytes);
+    return GuestArenaVirtualProtectInternal_nid_no_patch(address, bytes, protection, previous);
+}
+
+BOOL GuestArenaVirtualProtectInternal_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
     queryProtectionWriters.fetch_add(1, std::memory_order_acq_rel);
     const auto result = VirtualProtect(address, bytes, protection, previous);
     // The write tracker's pages take the new protection as the guest's (APS5_ARCHB_WT_FAULT).

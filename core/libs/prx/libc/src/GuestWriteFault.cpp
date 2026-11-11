@@ -951,10 +951,12 @@ void GuestWtFaultHold_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     if (!clamp(state, address, bytes, first, stop)) return;
     std::unique_lock lock(state.mutex);
     state.held.emplace_back(first, stop);
-    if (LazyServiceDepth::Get() == 0 && preserveLazy(address, bytes)) {
+    if (LazyServiceDepth::Get() == 0 && GuestWtFaultLazyPreservationEnabled_nid_no_patch()) {
         lock.unlock();
-        const LazyCauseScope cause(WtLazyCause::Hold);
-        GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        if (preserveLazy(address, bytes)) {
+            const LazyCauseScope cause(WtLazyCause::Hold);
+            GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        }
         lock.lock();
     }
     unwatchRange(state, first, stop, WtWatchHold);
@@ -980,11 +982,13 @@ std::size_t GuestWtFaultOpen_nid_no_patch(std::uintptr_t address, std::size_t by
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return 0;
     std::unique_lock lock(state.mutex);
-    if (LazyServiceDepth::Get() == 0 && preserveLazy(address, bytes)) {
+    if (LazyServiceDepth::Get() == 0 && GuestWtFaultLazyPreservationEnabled_nid_no_patch()) {
         state.held.emplace_back(first, stop);
         lock.unlock();
-        const LazyCauseScope cause(WtLazyCause::Open);
-        GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        if (preserveLazy(address, bytes)) {
+            const LazyCauseScope cause(WtLazyCause::Open);
+            GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        }
         lock.lock();
         const auto held = std::find(state.held.begin(), state.held.end(), std::pair{first, stop});
         if (held != state.held.end()) state.held.erase(held);
@@ -1550,11 +1554,13 @@ std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return 0;
     std::unique_lock lock(state.mutex);
-    if (LazyServiceDepth::Get() == 0 && preserveLazy(address, bytes)) {
+    if (LazyServiceDepth::Get() == 0 && GuestWtFaultLazyPreservationEnabled_nid_no_patch()) {
         state.held.emplace_back(first, stop);
         lock.unlock();
-        const LazyCauseScope cause(WtLazyCause::Unwatch);
-        GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        if (preserveLazy(address, bytes)) {
+            const LazyCauseScope cause(WtLazyCause::Unwatch);
+            GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        }
         lock.lock();
         const auto held = std::find(state.held.begin(), state.held.end(), std::pair{first, stop});
         if (held != state.held.end()) state.held.erase(held);

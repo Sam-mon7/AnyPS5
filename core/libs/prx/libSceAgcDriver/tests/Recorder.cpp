@@ -4859,6 +4859,7 @@ bool uploadCarryTests(const Device& device, Recorder& recorder, std::string_view
     commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), 0, 520);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment, view.buffer, view.offset + adjustment + 4, 4);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment + 512, view.buffer, view.offset + adjustment + 516, 4);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -15424,7 +15425,8 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     using AgcDriver::ArchB::Switches;
     using namespace AgcDriver::GuestMemory;
     namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
-    const auto& context = device.GetContext();
+    auto context = device.GetContext();
+    context.recorder = &recorder;
     if (!device.Graphics() || context.hostImportAlignment == 0 || !UnitShadowEnabled()) return 77;
     const auto decided = PrepareImportWatch(context);
     SetImportWatch(context, ImportWatch::Watch);
@@ -15467,6 +15469,17 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     } cleanup{context, recorder, block, bytes};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || !Watched(address, bytes)) return 77;
+    {
+        Buffer settled(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        const VkBufferCopy copy{import->lead, 0, 4};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(batch.Handle(), import->buffer, settled.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        settled.Invalidate();
+        Require(std::all_of(settled.Bytes().begin(), settled.Bytes().end(), [](auto value) { return value == std::byte{0x11}; }), "the host import was not settled before fault protection");
+    }
+
     AgcDriver::GuestMemory::MarkCommitterThread();
     if (on) Require(LazyShadowPublishEnabled(), "LAZY_SHADOW_PUBLISH is on but inactive (C_LAZY_PUBLISH or the fault tracker is off)");
     CollectWritesUncached(address, bytes);
@@ -15532,6 +15545,86 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         for (std::size_t i = 0; i < seen.size(); ++i) seen[i] = from[i];
         return seen;
     };
+    if (scenario == "depth_handoff" || scenario == "stencil_handoff") {
+        const bool stencil = scenario == "stencil_handoff";
+        TextureDetiler detiler(context);
+        context.detiler = &detiler;
+        const auto plane = address + unit;
+        State state{};
+        state.stages.path = ShaderPath::Vertex;
+        state.depth = DepthTarget{plane, stencil ? address + 2 * unit : 0, {64, 64}, stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        state.depth->depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+        state.depthTest = state.depthWrite = true;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+        state.stencilTest = stencil;
+        state.stencilFront = state.stencilBack = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 255, 255, 0x5d};
+        state.renderExtent = {64, 64};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0, 64, 64, -64, 0, 1};
+        state.scissor = {{0, 0}, {64, 64}};
+        ShaderRecompiler::RecompileResult vertex, pixel;
+        vertex.spirv = std::vector<std::uint32_t>(std::begin(COVER_VERT_SPV), std::end(COVER_VERT_SPV));
+        pixel.spirv = std::vector<std::uint32_t>(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+        vertex.variantId = 0xc2001;
+        pixel.variantId = 0xc2002;
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+        Draw(context, state, {0, 3, 0, 1, 0, false}, shaders);
+        WaitForOptimizedPipelines(context.device);
+        recorder.Sync();
+        std::promise<void> entered, attempting, acquired;
+        auto enteredFuture = entered.get_future();
+        auto attemptingFuture = attempting.get_future();
+        auto acquiredFuture = acquired.get_future();
+        bool escaped = false;
+        bool paused = false;
+        static std::function<void()> pause;
+        static DepthPublicationStage wanted;
+        wanted = stencil ? DepthPublicationStage::StencilRetiled : DepthPublicationStage::PlaneRetiled;
+        pause = [&] {
+            paused = true;
+            entered.set_value();
+            attemptingFuture.wait();
+            escaped = acquiredFuture.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready;
+        };
+        SetDepthPublicationHookForTest(+[](DepthPublicationStage stage) {
+            if (stage == wanted && pause) pause();
+        });
+        std::exception_ptr submitError;
+        std::vector<std::uint8_t> seen;
+        std::thread submitter([&] {
+            enteredFuture.wait();
+            attempting.set_value();
+            try {
+                std::lock_guard gpu(GpuMutex());
+                acquired.set_value();
+                recorder.Sync();
+                seen = rawRead(stencil ? address + 2 * unit : plane, 4);
+            } catch (...) { submitError = std::current_exception(); }
+        });
+        GpuMutex().unlock();
+        std::exception_ptr flushError;
+        try {
+            const ShadowConsumerScope consumer("storage image creation", plane, 2 * unit, PublishScope::None);
+            FlushDepthPlanes(plane, 2 * unit);
+        } catch (...) { flushError = std::current_exception(); }
+        if (!paused) entered.set_value();
+        submitter.join();
+        GpuMutex().lock();
+        SetDepthPublicationHookForTest(nullptr);
+        pause = {};
+        ClearDepthSurfaces(context.device);
+        SharedResourceCache().Clear();
+        ClearCachedTextures(context.device);
+        recorder.Sync();
+        ClearCachedPipelines(context.device);
+        if (flushError) std::rethrow_exception(flushError);
+        if (submitError) std::rethrow_exception(submitError);
+        Require(paused && !escaped, "a submitter acquired the GPU lock between retile and lazy enrollment");
+        const std::array<std::uint8_t, 4> wantedBytes = stencil ? std::array<std::uint8_t, 4>{0x5d, 0x5d, 0x5d, 0x5d} : std::array<std::uint8_t, 4>{0, 0, 0, 0x3f};
+        Require(seen.size() == wantedBytes.size() && std::equal(seen.begin(), seen.end(), wantedBytes.begin()), "the CPU reader saw stale depth/stencil bytes after submission");
+        std::cout << "agc_lazy_shadow_" << scenario << ": ok\n";
+        return 0;
+    }
     if (scenario == "image") {
         TextureDetiler detiler(context);
         auto imageContext = context;
@@ -15590,6 +15683,7 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     recorder.Sync();
     const auto before = LazyShadowTotals();
     const auto lazyBefore = Lazy::Totals();
+    if (scenario == "recommit") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 2 * unit);
     store(first, second + unit);
     recorder.Sync();
     const auto stored = LazyShadowTotals();
@@ -15607,6 +15701,103 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
     }
     const auto unitOne = expected(0x20);
     const auto unitTwo = expected(0x60);
+    if (scenario == "predicate_threads") {
+        static_cast<void>(rawRead(first, 2 * unit));
+        static std::function<bool()> predicate;
+        GuestArena::GuestWtFaultWatch_nid_no_patch(first, 1);
+        for (int operation = 0; operation < 3; ++operation) {
+            const auto fresh = address + 3 * unit;
+            GuestArena::GuestWtFaultForget_nid_no_patch(fresh, 4096);
+            std::promise<void> entered, tracked;
+            auto enteredFuture = entered.get_future();
+            auto trackedFuture = tracked.get_future();
+            std::thread tracker([&] {
+                enteredFuture.wait();
+                GuestArena::GuestWtFaultTrack_nid_no_patch(fresh, 4096);
+                tracked.set_value();
+            });
+            bool completed = false;
+            predicate = [&] {
+                entered.set_value();
+                completed = trackedFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+                return false;
+            };
+            GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(+[](std::uintptr_t, std::size_t) { return predicate(); });
+            if (operation == 0) GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+            if (operation == 1) GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
+            if (operation == 2) GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
+            tracker.join();
+            GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(nullptr);
+            predicate = {};
+            if (operation == 0) GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+            Require(completed, "the preservation predicate retained the fault mutex and blocked a concurrent tracker");
+        }
+        std::cout << "agc_lazy_shadow_predicate_threads: ok\n";
+        return 0;
+    }
+    if (scenario == "publication_renewal") {
+        Require(recorder.HasTimeline(), "the renewal test needs a timeline recorder");
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        const VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR, nullptr, VK_SEMAPHORE_TYPE_TIMELINE_KHR, 0};
+        const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &semaphore), "renewal semaphore");
+        retile(first, 0x41);
+        StorageTexture::PublishShadowsOnly(first, unit, PublishScope::Whole, "publication A");
+        recorder.HoldNextSubmit(semaphore, 1);
+        const auto publicationA = recorder.SubmitAndEpoch();
+        Require(!recorder.WaitSerialFor(publicationA, 0), "publication A was not held in flight");
+        const VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, semaphore, 1};
+        if (verify) Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "release verified publication A");
+        retile(first, 0x91);
+        store(first, first + unit);
+        if (on && !verify) Require(protection(first), "publication B was not protected");
+        if (!verify) Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "release publication A");
+        recorder.WaitSerial(publicationA);
+        recorder.FinishUpTo(publicationA);
+        if (on && !verify) Require(protection(first) && LazyLeftUnpublished(first, unit) == 1, "completion A cleared B's lazy authority");
+        const auto newest = expected(0x91);
+        if (!on) recorder.Sync();
+        GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+        Require(rawRead(first, unit) == newest, "publication B lost its bytes after A completed");
+        GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+        recorder.Sync();
+        context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+        std::cout << "agc_lazy_shadow_publication_renewal: ok\n";
+        return 0;
+    }
+    if (scenario == "retire_pending") {
+        retile(first, 0x31);
+        retile(second, 0x73);
+        StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "retirement test");
+        Require(recorder.Recording(), "the retirement test needs an unfinished publication");
+        GuestAllocations::Mutation().Remove(block);
+        Require(HostImportFor(context, address, bytes) == nullptr, "the removed import did not retire");
+        Require(!AnyShadowedOverlaps(first, 2 * unit), "the retired import remains in the shadow registry");
+        if (!on || verify) recorder.Sync();
+        GuestArena::GuestWtFaultHold_nid_no_patch(first, 2 * unit);
+        const auto seen = rawRead(first, 2 * unit);
+        GuestArena::GuestWtFaultRelease_nid_no_patch(first, 2 * unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require(std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "a retired in-flight publication exposed stale bytes");
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        std::cout << "agc_lazy_shadow_retire_pending: ok\n";
+        return 0;
+    }
+    if (scenario == "batch_consumer") {
+        retile(first, 0x31);
+        retile(second, 0x73);
+        store(first, second + unit);
+        const auto publications = LazyShadowTotals().publishedUnits;
+        recorder.Submit();
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require((slabOnly || !on || verify) && std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "the cross-batch slab consumer read wrong bytes");
+        Require(LazyShadowTotals().publishedUnits == publications, "the cross-batch GPU consumer published");
+        std::cout << "agc_lazy_shadow_batch_consumer: ok\n";
+        return 0;
+    }
     if (scenario == "observer_renewal") {
         StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "observer test");
         recorder.Sync();
@@ -15615,7 +15806,7 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         retile(first, 0x31);
         retile(second, 0x73);
         const auto renewed = LazyShadowTotals();
-        store(first, second + unit);
+    store(first, second + unit);
         recorder.Sync();
         Require(LazyShadowTotals().publishedUnits == renewed.publishedUnits + 2, "an observational watch was accepted as a lazy service watch");
         const auto seen = rawRead(first, 2 * unit);
@@ -15630,13 +15821,21 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         Require(slabOnly, "the upload did not read the slab");
         Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload read wrong bytes");
         if (on && !verify) Require(LazyShadowTotals().publishedUnits == stored.publishedUnits && protection(first), "a GPU-only read published");
-    } else if (scenario == "cpu_read" || scenario == "hold" || scenario == "open" || scenario == "unwatch" || scenario == "protect" || scenario == "driver_read") {
+    } else if (scenario == "cpu_read" || scenario == "hold" || scenario == "open" || scenario == "unwatch" || scenario == "protect" || scenario == "driver_read" || scenario == "recommit") {
         if (scenario == "hold") GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
         if (scenario == "open") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
         if (scenario == "unwatch") GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
         if (scenario == "protect") {
 #ifdef _WIN32
             GuestArena::GuestArenaSetProtection_nid_postfix(first, 4096, PAGE_READWRITE);
+#else
+            return 77;
+#endif
+        }
+        if (scenario == "recommit") {
+#ifdef _WIN32
+            if (on && !verify) Require((GuestArena::GuestWtFaultWord_nid_no_patch(first) & GuestArena::WtFaultStateMask) == GuestArena::WtFaultOpen, "the recommit regression needs an underlying Open page");
+            GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(first), unit, PAGE_READWRITE, unit);
 #else
             return 77;
 #endif
@@ -15657,7 +15856,7 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
         const auto again = rawRead(first, readBytes);
         Require(again == seen && LazyShadowTotals().publishedUnits == read.publishedUnits, "a second CPU read published again or read other bytes");
         if (scenario == "hold") GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
-    } else if (scenario == "cpu_write" || scenario == "host_write") {
+    } else if (scenario == "cpu_write" || scenario == "host_write" || scenario.starts_with("driver_store")) {
         const auto write = [&] {
             volatile std::uint8_t* to = reinterpret_cast<volatile std::uint8_t*>(first + 8);
             for (int i = 0; i < 16; ++i) to[i] = 0x77;
@@ -15666,6 +15865,20 @@ int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view s
             const ReadSiteScope site(ReadSite::Store);
             const GuestArena::HostWrite hold(reinterpret_cast<void*>(first + 8), 16);
             write();
+        } else if (scenario.starts_with("driver_store")) {
+            Require(!Switches::Enabled(Feature::CLazyStoreHook), "the driver-store regression needs the optional hook off");
+            if (scenario == "driver_store_toggle") {
+                const char* control = std::getenv("APS5_ARCHB_CONTROL_FILE");
+                Require(control != nullptr, "the store toggle needs a control file");
+                std::ofstream(control) << "1 LAZY_SHADOW_PUBLISH=0\n";
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (Switches::Sequence() != 1 && std::chrono::steady_clock::now() < deadline) {
+                    Switches::PollControl();
+                    std::this_thread::yield();
+                }
+                Require(!Switches::Enabled(Feature::LazyShadowPublish), "lazy shadow publication did not turn off");
+            }
+            StoreOwnBytes(first + 8, 16, std::function<void()>(write));
         } else {
             write();
         }
@@ -15830,8 +16043,6 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
         Require(std::all_of(seen.begin(), seen.begin() + 16, [](std::byte value) { return value == std::byte{0x77}; }), "the host write did not land");
         std::copy(published.begin(), published.begin() + 16, seen.begin());
     } else if (scenario == "store") {
-        // A driver store into the lazy range under the GPU mutex (C_LAZY_STORE_HOOK: published by the
-        // store hook, no fault; without it the store faults and the service publishes).
         AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         const std::array<std::byte, 1> value{std::byte{0x99}};
@@ -15850,7 +16061,7 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
     }
     Require(seen == published, "the CPU did not read the draw's results after the label");
     const auto served = Lazy::Totals();
-    const bool hooked = on && scenario == "store" && Switches::Enabled(Feature::CLazyStoreHook);
+    const bool hooked = on && scenario == "store" && (Switches::Enabled(Feature::CLazyStoreHook) || GuestArena::GuestWtFaultLazyPreservationEnabled_nid_no_patch());
     if (hooked) {
         Require(served.services == deferred.services && served.storeHooks == deferred.storeHooks + 1, "the driver store was not published by the store hook alone");
         Require(Lazy::Entries() == 0 && protection() != PAGE_NOACCESS, "the hooked range is still lazy");
@@ -18440,16 +18651,16 @@ void smallElementDetileTests(Device& device) {
 }
 
 int main(int argc, char** argv) {
-    struct SplitFacesControl {
+    struct RuntimeControl {
         std::filesystem::path path;
-        ~SplitFacesControl() { if (!path.empty()) std::filesystem::remove(path); }
-    } splitFacesControl;
-    if (argc == 3 && std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) {
-        splitFacesControl.path = std::filesystem::temp_directory_path() / ("anyps5-split-faces-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+        ~RuntimeControl() { if (!path.empty()) std::filesystem::remove(path); }
+    } runtimeControl;
+    if (argc == 3 && ((std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) || (std::string_view(argv[1]) == "--lazy-shadow" && std::string_view(argv[2]) == "driver_store_toggle"))) {
+        runtimeControl.path = std::filesystem::temp_directory_path() / ("anyps5-recorder-control-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
 #ifdef _WIN32
-        _putenv_s("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str());
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", runtimeControl.path.string().c_str());
 #else
-        setenv("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str(), 1);
+        setenv("APS5_ARCHB_CONTROL_FILE", runtimeControl.path.string().c_str(), 1);
 #endif
     }
 #ifdef _WIN32
@@ -18673,7 +18884,7 @@ int main(int argc, char** argv) {
         }
 #endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
-        Recorder recorder(device.GetContext());
+        Recorder recorder(device.GetContext(), device.Timeline());
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
             if (device.GetContext().hostImportAlignment == 0) return 77;

@@ -302,7 +302,7 @@ bool switchOn() {
 // watched) are published page-range-wise, as the service's page path would.
 void beforeDriverAccess(std::uint64_t address, std::size_t bytes) {
     if (liveCount.load(std::memory_order_relaxed) == 0 && publishing() == 0) return;
-    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook)) return;
+    if (!AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::CLazyStoreHook) && !GuestArena::GuestWtFaultLazyPreservationEnabled_nid_no_patch()) return;
     if (GuestArena::GuestWtFaultWatchedPages_nid_no_patch(static_cast<std::uintptr_t>(address), bytes) == 0) return;
     auto& c = counters();
     if (publishing() != 0) {

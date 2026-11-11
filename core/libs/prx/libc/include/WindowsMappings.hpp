@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -32,6 +33,34 @@ inline std::atomic<std::uint64_t> costGwwNs{0};
 inline std::atomic<std::uint64_t> costGwwPages{0};
 
 class WindowsMappings {
+    class PreservedLock {
+    public:
+        PreservedLock(WindowsMappings& mappings, std::uintptr_t address, std::size_t bytes, std::uintptr_t section = 0, std::uint64_t offset = 0) : lock(mappings.mutex) {
+            if (!GuestWtFaultLazyPreservationEnabled_nid_no_patch()) return;
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> pending{{address, address + bytes}};
+            for (;;) {
+                for (const auto& [begin, run] : mappings.residentRuns) {
+                    if ((begin < address + bytes && address < run.end) || (section != 0 && run.key == section && run.offset < offset + bytes && offset < run.offset + run.end - begin)) pending.emplace_back(begin, run.end);
+                }
+                std::erase_if(pending, [&](const auto& range) { return std::any_of(held.begin(), held.end(), [&](const auto& old) { return old.first <= range.first && old.second >= range.second; }); });
+                if (pending.empty()) return;
+                lock.unlock();
+                for (const auto& range : pending) {
+                    GuestWtFaultHold_nid_no_patch(range.first, range.second - range.first);
+                    held.push_back(range);
+                }
+                pending.clear();
+                lock.lock();
+            }
+        }
+        ~PreservedLock() {
+            lock.unlock();
+            for (const auto& [begin, end] : held) GuestWtFaultRelease_nid_no_patch(begin, end - begin);
+        }
+    private:
+        std::unique_lock<std::mutex> lock;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> held;
+    };
 public:
     enum class Collection { All, Armed, Fresh };
 
@@ -56,7 +85,7 @@ public:
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         if (granule == 0) throw std::invalid_argument("guest memory commit granule is zero");
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
-        std::lock_guard lock(mutex);
+        const PreservedLock lock(*this, reinterpret_cast<std::uintptr_t>(address), bytes);
         collectableRanges.clear();
         disown(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes);
         const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
@@ -108,7 +137,7 @@ public:
                     invalidate(mapped->first, mapped->second);
                 }
                 DWORD previous;
-                if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 cursor = stop;
             }
         }
@@ -116,12 +145,12 @@ public:
     }
 
     void Reset(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const PreservedLock lock(*this, reinterpret_cast<std::uintptr_t>(address), bytes);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void MapZero(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const PreservedLock lock(*this, reinterpret_cast<std::uintptr_t>(address), bytes);
         if (zeroSection == nullptr && (zeroSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READONLY, 0, static_cast<DWORD>(pageBytes), nullptr)) == nullptr) fail("create the read-only zero guest page");
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         reset(start, bytes);
@@ -133,7 +162,7 @@ public:
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched = false, bool resident = false, DWORD viewProtection = PAGE_EXECUTE_READWRITE, std::size_t sectionBytes = SIZE_MAX, std::vector<std::pair<std::uintptr_t, std::size_t>>* createdPrivate = nullptr) {
         if (sectionBytes < bytes && (resident || sectionBytes == 0 || bytes - sectionBytes >= pageBytes)) throw std::runtime_error("shared guest mapping extends a whole page past its section");
-        std::lock_guard lock(mutex);
+        const PreservedLock lock(*this, reinterpret_cast<std::uintptr_t>(address), bytes, reinterpret_cast<std::uintptr_t>(section), offset);
         collectableRanges.clear();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         if (createdPrivate != nullptr) createdPrivate->reserve(createdPrivate->size() + bytes / pageBytes);
@@ -193,7 +222,7 @@ public:
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
                 DWORD previous;
-                if (protection != PAGE_READWRITE && !GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
+                if (protection != PAGE_READWRITE && !GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
                 done += runBytes;
                 continue;
             }
@@ -229,7 +258,7 @@ public:
             split(base, runBytes);
             mapRun(base, runBytes, section, offset + done);
             DWORD previous;
-            if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
+            if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
             collectableRanges.clear();
             for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                 auto& [slot, shared] = pages[at / pageBytes];
@@ -433,7 +462,7 @@ public:
     }
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes, bool* boundsRefused = nullptr) {
-        std::lock_guard lock(mutex);
+        const PreservedLock lock(*this, address, bytes);
         if (boundsRefused != nullptr) *boundsRefused = false;
         const auto refuse = [&](const char* reason) {
             char text[192];
@@ -1229,11 +1258,11 @@ private:
         if (!map(section, GetCurrentProcess(), page, offset, sectionBytes, MEM_REPLACE_PLACEHOLDER, viewProtection, nullptr, 0)) fail("map shared guest page");
         if (!committed && query(base).State == MEM_RESERVE && !VirtualAlloc(page, viewBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
         DWORD previous;
-        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(page, viewBytes, protection, &previous)) fail("protect shared guest page");
+        if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(page, viewBytes, protection, &previous)) fail("protect shared guest page");
         if (viewBytes == pageBytes) return;
         void* zeros = reinterpret_cast<void*>(base + viewBytes);
         if (!allocate(GetCurrentProcess(), zeros, pageBytes - viewBytes, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder past the end of a file with zero pages");
-        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
+        if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
     }
 
     void mapRun(std::uintptr_t base, std::size_t bytes, HANDLE section, std::uint64_t offset) {
@@ -1272,7 +1301,7 @@ private:
             if (!part.committed) continue;
             for (const auto [from, to] : {std::pair{part.base, std::min(part.end, at)}, std::pair{std::max(part.base, at), part.end}}) {
                 DWORD previous;
-                if (from < to && !GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
+                if (from < to && !GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(from), to - from, part.protection, &previous)) fail("protect a split run of shared guest pages");
             }
         }
     }
@@ -1321,7 +1350,7 @@ private:
             created.emplace_back(std::move(shared), std::move(slot));
         }
         DWORD previous;
-        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
+        if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
         const auto section = views.at(start).section;
         auto window = open(section->handle, views.at(start).offset, stop - start);
         if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
@@ -1366,7 +1395,7 @@ private:
         disown(start, stop);
         forgetOwnedPending(start, stop);
         DWORD previous;
-        if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
+        if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
         const auto entry = indexEntry(run);
         const bool indexed = entry != residentIndex.end();
         std::vector<void*> dirty;
@@ -1494,7 +1523,7 @@ private:
             auto stop = sub + 1;
             while (stop < subpages && (mask & (1u << stop)) != 0 && stop * subpageBytes != viewBytes) ++stop;
             DWORD previous;
-            if (!GuestArena::GuestArenaVirtualProtect_nid_no_patch(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
+            if (!GuestArena::GuestArenaVirtualProtectInternal_nid_no_patch(reinterpret_cast<void*>(base + sub * subpageBytes), (stop - sub) * subpageBytes, protection, &previous)) fail(operation);
             sub = stop;
         }
     }
