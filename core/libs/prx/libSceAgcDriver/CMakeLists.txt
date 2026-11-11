@@ -758,7 +758,7 @@ add_custom_command(
         VERBATIM
 )
 
-foreach(agcVertexRangeShader IN ITEMS VertexRange.vert VertexRangeProducer.frag)
+foreach(agcVertexRangeShader IN ITEMS VertexRange.vert VertexRangeProducer.frag TemplateParams.vert TemplateParams.frag)
     string(REPLACE "." "_" agcVertexRangeName "${agcVertexRangeShader}")
     string(TOUPPER "${agcVertexRangeName}_SPV" agcVertexRangeSymbol)
     set(agcVertexRangeSpv ${agcTestShaderGeneratedRoot}/${agcVertexRangeName}.spv)

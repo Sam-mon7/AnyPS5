@@ -112,6 +112,7 @@ enum class Feature : std::uint8_t {
     FixDrawRelocNested,
     FixSampledArrayGpu,
     DrawGatherShadow,
+    DrawTemplates,
     Count
 };
 
