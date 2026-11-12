@@ -4709,16 +4709,70 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
     return !overlapped || bytes <= DccKeyCount(descriptor, guestBytes);
 }
 
-void StorageTexture::MarkDirty() {
+const char* StorageTexture::DispatchWriteRefusal(const char** shapeDetail) const {
+    if (shapeDetail != nullptr) *shapeDetail = nullptr;
+    if (std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr || std::getenv("APS5_GPU_NO_WRITEBACK") != nullptr) return "writer_mode";
+    const auto shape = [&](const char* detail) {
+        if (shapeDetail != nullptr) *shapeDetail = detail;
+        return "writer_shape";
+    };
+    if (released) return shape("dispatch_gather_writer_shape_released");
+    if (guestBytes == 0 || trackedLayers == 0u) return shape("dispatch_gather_writer_shape_empty");
+    if (descriptor.dccAddress != 0) return shape("dispatch_gather_writer_shape_dcc");
+    if (descriptor.samples != 1) return shape("dispatch_gather_writer_shape_multisample");
+    if (IsBlockCompressed(descriptor.format)) return shape("dispatch_gather_writer_shape_compressed");
+    if (geometry.thick) return shape("dispatch_gather_writer_shape_thick");
+    if (descriptor.dimension != TextureDimension::k1D && descriptor.dimension != TextureDimension::k2D && descriptor.dimension != TextureDimension::k1DArray && descriptor.dimension != TextureDimension::k2DArray) return shape("dispatch_gather_writer_shape_dimension");
+    if (imageLevels == 0u || imageLevels != descriptor.mipCount || arrayLayers == 0u || descriptor.baseArray >= arrayLayers) return shape("dispatch_gather_writer_shape_subresource_range");
+    if (!borrowedFrom.expired() || !handedOver.empty() || !handedUnits.empty() || drawingTarget || lent || otherPendingOverlaps()) return "writer_alias";
+    return nullptr;
+}
+
+void StorageTexture::MarkDirty(DispatchWriteObservation* observation) {
+    if (observation != nullptr) {
+        const auto start = std::chrono::steady_clock::now();
+        const bool generationExpected = observation->generationExpected;
+        const auto expectedCount = observation->expectedCount;
+        *observation = {};
+        observation->generationExpected = generationExpected;
+        observation->expectedCount = expectedCount;
+        observation->versionBefore = version;
+        observation->serialBefore = PendingSerial();
+        observation->dirtyBefore = dirty;
+        observation->lentBefore = lent;
+        observation->nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
     // Write generations: the storage image's results stay on the GPU until flushed (the pending
     // registry), announced over its guest range.
-    if (GuestMemory::Gen::Active() && guestBytes != 0) GuestMemory::Gen::NotePending(descriptor.baseAddress, descriptor.baseAddress + guestBytes, reinterpret_cast<std::uintptr_t>(this));
+    if (GuestMemory::Gen::Active() && guestBytes != 0) {
+        const auto begin = descriptor.baseAddress;
+        const auto end = descriptor.baseAddress + guestBytes;
+        const auto owner = reinterpret_cast<std::uintptr_t>(this);
+        GuestMemory::Gen::NotePending(begin, end, owner);
+        if (observation != nullptr) {
+            const auto start = std::chrono::steady_clock::now();
+            observation->generation = {begin, end, owner, true};
+            observation->nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
+    }
     if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
         uploadedKeys = DccKeys::Uncompressed;
     }
-    markLayersPending(0, trackedLayers);
+    markLayersPending(0, trackedLayers, observation);
+    if (observation != nullptr) {
+        const auto start = std::chrono::steady_clock::now();
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        observation->versionAfter = version;
+        observation->serialAfter = PendingSerial();
+        observation->dirtyAfter = dirty;
+        observation->allPending = layerPending.AllIn(0, trackedLayers);
+        observation->registered = std::ranges::find(pending.textures, this) != pending.textures.end();
+        observation->observed = true;
+        observation->nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
 }
 
 void StorageTexture::MarkSliceDirty(std::uint32_t slice, std::uint32_t count) {
@@ -4825,7 +4879,13 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
     return occasionalLabelStores.load(std::memory_order_relaxed);
 }
 
-void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count, DispatchWriteObservation* observation) {
+    if (observation != nullptr) {
+        const auto start = std::chrono::steady_clock::now();
+        observation->first = first;
+        observation->count = count;
+        observation->nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
     {
         auto& records = LayoutWrites();
         std::lock_guard lock(records.mutex);
@@ -4932,15 +4992,15 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (dirty) {
         if (wasLent) {
             BumpPendingSerial();
-            notePendingChange();
+            notePendingChange(observation);
         }
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
-    notePendingChange();
-    notePendingInsert();
+    notePendingChange(observation);
+    notePendingInsert(observation);
 }
 
 void StorageTexture::reconcilePending() {
@@ -6454,12 +6514,28 @@ void StorageTexture::BumpPendingSerial() {
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 
-void StorageTexture::notePendingChange() const {
-    ArchC::ImageEpochs::Note(descriptor.baseAddress, descriptor.baseAddress + guestBytes, ArchC::EpochSource::Pending, this);
+void StorageTexture::notePendingChange(DispatchWriteObservation* observation) const {
+    const auto begin = descriptor.baseAddress;
+    const auto end = descriptor.baseAddress + guestBytes;
+    const auto disposition = ArchC::ImageEpochs::Note(begin, end, ArchC::EpochSource::Pending, this);
+    if (observation != nullptr) {
+        const auto start = std::chrono::steady_clock::now();
+        observation->pendingEpoch = {begin, end, reinterpret_cast<std::uintptr_t>(this), true, disposition};
+        observation->changedEpoch = true;
+        observation->nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
 }
 
-void StorageTexture::notePendingInsert() const {
-    ArchC::ImageEpochs::Note(descriptor.baseAddress, descriptor.baseAddress + guestBytes, ArchC::EpochSource::PendingInsert, this);
+void StorageTexture::notePendingInsert(DispatchWriteObservation* observation) const {
+    const auto begin = descriptor.baseAddress;
+    const auto end = descriptor.baseAddress + guestBytes;
+    const auto disposition = ArchC::ImageEpochs::Note(begin, end, ArchC::EpochSource::PendingInsert, this);
+    if (observation != nullptr) {
+        const auto start = std::chrono::steady_clock::now();
+        observation->insertEpoch = {begin, end, reinterpret_cast<std::uintptr_t>(this), true, disposition};
+        observation->insertedEpoch = true;
+        observation->nanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {

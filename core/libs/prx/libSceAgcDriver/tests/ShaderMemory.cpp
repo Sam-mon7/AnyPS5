@@ -3505,6 +3505,188 @@ struct SrtWalkFixture {
     }
 };
 
+void verifyMergedControlProvenance() {
+    using namespace ShaderRecompiler;
+    using Tape = Detail::SrtTape;
+    for (unsigned mode = 0; mode < 3u; ++mode) {
+        IrProgram program;
+        auto& resources = program.Resources();
+        resources.srtPlanComplete = true;
+        resources.resourceTrackingComplete = true;
+        auto& condition = program.CreateValue(mode == 1u ? IrOpcode::IEqual32 : IrOpcode::Void, IrType::Bool);
+        if (mode != 1u) condition.SetImmediateBool(true);
+        auto& word = program.CreateValue(IrOpcode::Void, IrType::U32);
+        word.SetImmediateU32(42u);
+        if (mode == 1u) {
+            condition.AddArgument(&program.CreateValue(IrOpcode::GetBuiltin, IrType::U32));
+            condition.AddArgument(&word);
+        }
+        resources.srtReads = {{&word, 0u}};
+        resources.controlFlow = {{&condition, {1u, 2u}, {}}, {nullptr, {2u}, {}}, {nullptr, {}, {}}};
+        resources.controlFlow[mode != 0u ? 1u : 2u].flatSlots = {0u};
+        const auto plan = ResourceMaterializer{}.ExtractPlan(program);
+        const auto& branch = plan.controlFlow[0];
+        if (mode == 0u && Detail::DropItemFreeConditions()) {
+            require(branch.condition == nullptr && branch.conditionRemoval == ConditionRemoval::ItemFree, "merged control: item-free removal lost its proof");
+        } else if (mode == 1u) {
+            require(branch.condition == nullptr && branch.conditionRemoval == ConditionRemoval::Undecidable && branch.removedCondition != nullptr && branch.removedCondition != &condition, "merged control: undecidable condition acquired an item-free proof");
+        } else {
+            require(branch.condition != nullptr && branch.conditionRemoval == ConditionRemoval::None, "merged control: a preserved condition acquired a removal proof");
+        }
+        if (mode == 1u) {
+            require(branch.removedCondition->ArgumentCount() == 2u && branch.removedCondition->Argument(1) != &word && branch.removedCondition->Argument(1)->ImmediateU32() == 42u, "merged control: removed operand closure is not owned");
+            Tape::StrictFailure failure;
+            require(Tape::CompileStrict(plan, &failure, true) == nullptr && failure == Tape::StrictFailure::PredicateGpuValue, "merged control: extracted GPU condition was admitted");
+            continue;
+        }
+        Tape::StrictFailure failure;
+        const auto tape = Tape::CompileStrict(plan, &failure);
+        require(tape != nullptr && failure == Tape::StrictFailure::None, "merged control: represented plan did not compile strictly");
+        SrtRuntime runtime{};
+        runtime.readMemory = readDirect;
+        runtime.readSpecializationMemory = readDirect;
+        std::vector<DescriptorValue> descriptors;
+        std::vector<std::uint32_t> flat, structure;
+        std::vector<std::uint8_t> active;
+        require(tape->RunStrict(plan, runtime, descriptors, flat, active, &structure) && flat == std::vector<std::uint32_t>{42u}, "merged control: union reachability lost its join flat read");
+    }
+    SrtWalkFixture fixture(1u, false);
+    auto& phi = fixture.Make(IrOpcode::Phi, IrType::U32);
+    phi.AddArgument(&fixture.Constant(1u));
+    phi.AddArgument(&fixture.Constant(2u));
+    fixture.plan.srtReads[0].value = &phi;
+    Tape::StrictFailure failure;
+    require(Tape::CompileStrict(fixture.plan, &failure) == nullptr && failure == Tape::StrictFailure::NonInvariantPhi, "merged control: non-invariant PHI was not classified and refused");
+}
+
+void verifyRemovedPredicateTape() {
+    using namespace ShaderRecompiler;
+    using Tape = Detail::SrtTape;
+    SrtWalkFixture fixture(0u, true);
+    auto& plan = fixture.plan;
+    auto& branch = plan.controlFlow[0];
+    branch.removedCondition = branch.condition;
+    branch.condition = nullptr;
+    branch.conditionRemoval = ConditionRemoval::Undecidable;
+    plan.srtReads = {{&fixture.Constant(42u), 0u}, {&fixture.Constant(59u), 1u}};
+    plan.controlFlow[1].flatSlots = {0u};
+    plan.controlFlow[2].flatSlots = {1u};
+    Tape::StrictFailure failure;
+    const auto normal = Tape::CompileStrict(plan);
+    const auto shadow = Tape::CompileStrict(plan, &failure, true);
+    require(normal != nullptr && shadow != nullptr && failure == Tape::StrictFailure::None, "removed predicate: a representable retained graph was refused");
+    SrtRuntime runtime{fixture.userData};
+    runtime.readMemory = readDirect;
+    runtime.readSpecializationMemory = readDirect;
+    std::vector<DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat, structure;
+    std::vector<std::uint8_t> active;
+    for (const auto selector : {0u, 1u}) {
+        fixture.userData[5] = selector;
+        require(normal->RunStrict(plan, runtime, descriptors, flat, active) && flat == std::vector<std::uint32_t>{42u, 59u}, "removed predicate: default tape no longer preserves union behavior");
+        require(shadow->RunStrict(plan, runtime, descriptors, flat, active, &structure) && flat == (selector == 1u ? std::vector<std::uint32_t>{42u, 0u} : std::vector<std::uint32_t>{0u, 59u}), "removed predicate: explicit shadow did not decide its branch");
+    }
+    for (unsigned warm = 0; warm < 3u; ++warm) require(shadow->RunStrict(plan, runtime, descriptors, flat, active, &structure), "removed predicate: warm-up failed");
+    const auto before = allocationCount;
+    for (unsigned call = 0; call < 32u; ++call) require(shadow->RunStrict(plan, runtime, descriptors, flat, active, &structure), "removed predicate: warmed gather failed");
+    require(allocationCount == before, "removed predicate: warmed gather allocated");
+    branch.removedCondition = nullptr;
+    require(Tape::CompileStrict(plan, &failure, true) == nullptr && failure == Tape::StrictFailure::PredicateMissing, "removed predicate: missing provenance was admitted");
+    branch.removedCondition = &fixture.Make(IrOpcode::Void, IrType::Bool);
+    require(Tape::CompileStrict(plan, &failure, true) == nullptr && failure == Tape::StrictFailure::PredicateUnsupported, "removed predicate: unsupported value was admitted");
+    auto& gpu = fixture.Make(IrOpcode::GetBuiltin, IrType::U32);
+    branch.removedCondition = &fixture.Binary(IrOpcode::IEqual32, IrType::Bool, gpu, fixture.Constant(0u));
+    require(Tape::CompileStrict(plan, &failure, true) == nullptr && failure == Tape::StrictFailure::PredicateGpuValue, "removed predicate: GPU input was admitted");
+    auto& phi = fixture.Make(IrOpcode::Phi, IrType::U32);
+    phi.AddArgument(&fixture.Constant(1u));
+    phi.AddArgument(&fixture.Constant(2u));
+    branch.removedCondition = &fixture.Binary(IrOpcode::IEqual32, IrType::Bool, phi, fixture.Constant(1u));
+    require(Tape::CompileStrict(plan, &failure, true) == nullptr && failure == Tape::StrictFailure::PredicateNonInvariantPhi, "removed predicate: non-invariant PHI was admitted");
+    auto& address = fixture.Binary(IrOpcode::CompositeConstructU64, IrType::U64, fixture.UserData(0u), fixture.UserData(1u));
+    auto& read = fixture.Binary(IrOpcode::LoadAddressU32, IrType::U32, address, fixture.Constant(0u));
+    branch.removedCondition = &fixture.Binary(IrOpcode::IEqual32, IrType::Bool, read, fixture.Constant(1u));
+    plan.srtReads[0].value = &fixture.Binary(IrOpcode::LoadAddressU32, IrType::U32, address, fixture.Constant(4u));
+    plan.srtReads[1].value = &fixture.Binary(IrOpcode::LoadAddressU32, IrType::U32, address, fixture.Constant(8u));
+    const auto guarded = Tape::CompileStrict(plan, &failure, true);
+    require(guarded != nullptr, "removed predicate: scalar read could not be compiled");
+    std::uint32_t reads = 0u;
+    runtime.userContext = &reads;
+    runtime.readMemory = +[](void* context, std::uint64_t, std::uint32_t*) { ++*static_cast<std::uint32_t*>(context); return false; };
+    runtime.readSpecializationMemory = runtime.readMemory;
+    require(!guarded->RunStrict(plan, runtime, descriptors, flat, active) && reads == 1u, "removed predicate: blocked predicate read reached a branch child");
+}
+
+void verifyStrictAddressFlatSlots() {
+    using namespace ShaderRecompiler;
+    SrtWalkFixture fixture(0u, false);
+    auto& root = fixture.Binary(IrOpcode::CompositeConstructU64, IrType::U64, fixture.UserData(2u), fixture.UserData(3u));
+    auto& low = fixture.Binary(IrOpcode::LoadAddressU32, IrType::U32, root, fixture.Constant(0u));
+    auto& high = fixture.Binary(IrOpcode::LoadAddressU32, IrType::U32, root, fixture.Constant(4u));
+    auto& adjusted = fixture.Binary(IrOpcode::IAdd32, IrType::U32, low, fixture.Constant(0u));
+    auto& child = fixture.Binary(IrOpcode::CompositeConstructU64, IrType::U64, adjusted, high);
+    auto& leaf = fixture.Binary(IrOpcode::LoadAddressU32, IrType::U32, child, fixture.Constant(0u));
+    auto& scalar = fixture.Binary(IrOpcode::IAdd32, IrType::U32, fixture.UserData(4u), fixture.Constant(7u));
+    fixture.plan.srtReads = {{&low, 1u}, {&high, 0u}, {&leaf, 2u}, {&scalar, 3u}};
+    const auto tape = Detail::SrtTape::CompileStrict(fixture.plan);
+    require(tape != nullptr && tape->AddressFlatSlots() == std::vector<std::uint8_t>{1u, 1u, 0u, 0u}, "address flat slots: address dependency or flat offset classification is wrong");
+    SrtRuntime runtime{fixture.userData};
+    runtime.readMemory = readDirect;
+    runtime.readSpecializationMemory = readDirect;
+    std::vector<DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    fixture.words[0] = 37u;
+    require(tape->RunStrict(fixture.plan, runtime, descriptors, flat, active) && flat[2] == 37u, "address flat slots: first child was not read");
+    const auto first = flat;
+    std::array<std::uint32_t, 1> moved{37u};
+    const auto address = reinterpret_cast<std::uintptr_t>(moved.data());
+    fixture.pointer = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    require(tape->RunStrict(fixture.plan, runtime, descriptors, flat, active) && flat[2] == first[2] && (flat[0] != first[0] || flat[1] != first[1]), "address flat slots: moved equal child did not refresh the address");
+    moved[0] = 59u;
+    require(tape->RunStrict(fixture.plan, runtime, descriptors, flat, active) && flat[2] == 59u, "address flat slots: changed contents behind moved child were not reread");
+}
+
+void verifyStrictSrtWalk(bool benchmark) {
+    verifyStrictAddressFlatSlots();
+    verifyMergedControlProvenance();
+    verifyRemovedPredicateTape();
+    SrtWalkFixture fixture(300u, true);
+    for (auto& source : fixture.plan.descriptorSources) source.dwords[3] = &fixture.Constant(0u);
+    const auto tape = ShaderRecompiler::Detail::SrtTape::CompileStrict(fixture.plan);
+    require(tape != nullptr && tape->Nodes() > 512u, "SRT strict walk: the complete large tape was refused or fits inline");
+    ShaderRecompiler::SrtRuntime runtime{fixture.userData};
+    runtime.readMemory = readDirect;
+    runtime.readSpecializationMemory = readDirect;
+    const auto referenceSources = fixture.plan.materializationSources;
+    const auto referenceClean = fixture.plan.cleanFlatSlots;
+    std::vector<ShaderRecompiler::DescriptorValue> expectedDescriptors;
+    std::vector<std::uint32_t> expectedFlat;
+    std::vector<std::uint8_t> expectedActive;
+    std::vector<ShaderRecompiler::DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    std::vector<std::uint32_t> structure;
+    const auto run = [&] { return tape->RunStrict(fixture.plan, runtime, descriptors, flat, active, &structure); };
+    const unsigned iterations = benchmark ? 2000u : 64u;
+    for (std::uint32_t branch = 0; branch < 3u; ++branch) {
+        fixture.userData[4] = branch * sizeof(std::uint32_t);
+        fixture.userData[5] = branch;
+        for (std::size_t word = 0; word < fixture.words.size(); ++word) fixture.words[word] = static_cast<std::uint32_t>(word * 0x9e3779b9u + branch);
+        require(ShaderRecompiler::Detail::EvaluateRuntimeSourcesImpl(fixture.plan, referenceSources, runtime, expectedDescriptors, expectedFlat, true, referenceClean, expectedActive), "SRT strict walk: the independent reference refused valid inputs");
+        for (unsigned warm = 0; warm < 3u; ++warm) require(run(), "SRT strict walk: warm-up failed");
+        require(descriptors == expectedDescriptors && flat == expectedFlat && active == expectedActive && !structure.empty(), "SRT strict walk: warm-up differs from the independent reference or omits structure");
+        const auto expectedStructure = structure;
+        const auto before = allocationCount;
+        for (unsigned iteration = 0; iteration < iterations; ++iteration) {
+            require(run(), "SRT strict walk: a warmed walk failed");
+            require(descriptors == expectedDescriptors && flat == expectedFlat && active == expectedActive && structure == expectedStructure, "SRT strict walk: warmed values or structure changed");
+        }
+        const auto allocations = allocationCount - before;
+        require(allocations == 0u, "SRT strict walk: a warmed large walk allocated scratch or output storage");
+        if (benchmark) std::cout << "SRT strict walk: nodes=" << tape->Nodes() << " branch=" << branch << " walks=" << iterations << " allocations/walk=" << allocations / iterations << '\n';
+    }
+}
+
 void verifyFastSrtWalk(bool benchmark) {
     using namespace ShaderRecompiler;
     struct Captured {
@@ -12782,9 +12964,15 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--srt-strict-walk") {
+            verifyStrictSrtWalk(false);
+            std::cout << "SRT strict walks preserve reference values and structure without warmed heap allocations\n";
+            return 0;
+        }
         if (argc == 2 && (std::string_view(argv[1]) == "--srt-fast-walk" || std::string_view(argv[1]) == "--srt-walk-bench")) {
             verifySrtTape();
             verifyFastSrtWalk(std::string_view(argv[1]) == "--srt-walk-bench");
+            verifyStrictSrtWalk(std::string_view(argv[1]) == "--srt-walk-bench");
             std::cout << "SRT walks preserve captured words, descriptors, activity, flattened values and read origins\n";
             return 0;
         }

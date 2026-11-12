@@ -248,6 +248,8 @@ function(add_shader_recompiler target runtimeTarget)
             BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders
+            BufferDescriptorPresent
+            Detail::SrtTape::CompileStrict
             BuildPreparedShaderKey
             BuildRectListShaders
             BuildTessellationCaptureGeometryShader
@@ -269,6 +271,7 @@ function(add_shader_recompiler target runtimeTarget)
             PipelineSpecialization::WorkgroupOffsetWords
             PixelInput
             PixelInputBit
+            PointFilteredSamplerWord
             RayTracingStrict
             RayTracingMiss
             ReadWholeFile
