@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -14,6 +15,16 @@ namespace AgcDriver::DriverDetail {
 inline std::atomic<std::uint64_t>& LiveSequenceFrame() {
     static std::atomic<std::uint64_t> frame{0};
     return frame;
+}
+
+inline std::uint64_t LiveSignatureKey(std::uint64_t liveKey, std::span<const std::uint64_t> signatures) {
+    if (signatures.empty()) return 0;
+    auto key = (liveKey ^ signatures.size()) * 0x100000001b3ull;
+    for (const auto signature : signatures) {
+        if (signature == 0) return 0;
+        key = (key ^ signature) * 0x100000001b3ull;
+    }
+    return key | 1u;
 }
 
 template <typename Entry>

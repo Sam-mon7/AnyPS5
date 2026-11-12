@@ -199,6 +199,7 @@ struct DrawTail {
     std::shared_ptr<GatherLiveEntry> liveEntry;
     std::uint64_t liveKey = 0;
     LiveSequence<GatherLiveEntry>::Position livePosition;
+    std::uint64_t liveUnmatchedKey = 0;
     Pm4::DrawParameters livePacket;
     bool liveEnabled = false;
     bool liveVerify = false;
@@ -522,7 +523,10 @@ struct GatherLiveIndex {
     std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<GatherLiveEntry>>> entries;
     std::unordered_map<std::uint64_t, std::size_t> cursors;
     LiveSequence<GatherLiveEntry> sequence;
+    std::unordered_map<std::uint64_t, std::shared_ptr<GatherLiveEntry>> signatures;
 };
+
+void IndexLiveSignature(std::uint64_t key, const std::shared_ptr<GatherLiveEntry>& entry);
 
 constexpr std::size_t LiveWays = 8;
 
@@ -600,6 +604,7 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
         index.clear();
         LiveIndex().cursors.clear();
         LiveIndex().sequence.Clear();
+        LiveIndex().signatures.clear();
     }
     auto& bucket = index[tail.liveKey];
     const auto options = LiveOptions(tail);
@@ -610,6 +615,17 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
         for (std::size_t guess = 0; guess < predicted.count; ++guess) if (matches(predicted.entries[guess])) {
             CountLiveDraw(tail.drawParameters, "draw_templates_live_sequence_relearn_avoided");
             return predicted.entries[guess];
+        }
+    }
+    std::uint64_t variantsKey = 0;
+    if (ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLiveIndex)) {
+        variantsKey = LiveMix(tail.liveKey, donors.size());
+        for (const auto& donor : donors) variantsKey = LiveMix(variantsKey, reinterpret_cast<std::uintptr_t>(donor.get()));
+        variantsKey |= 1u;
+        const auto known = LiveIndex().signatures.find(variantsKey);
+        if (known != LiveIndex().signatures.end() && matches(known->second)) {
+            CountLiveDraw(tail.drawParameters, "draw_templates_live_index_relearn_avoided");
+            return known->second;
         }
     }
     auto entry = std::make_shared<GatherLiveEntry>();
@@ -662,8 +678,17 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
         CountLiveDraw(tail.drawParameters, "draw_templates_live_bucket_evictions");
     }
     bucket.push_back(entry);
+    IndexLiveSignature(variantsKey, entry);
     CountLiveDraw(tail.drawParameters, "draw_templates_live_templates_learned");
     return entry;
+}
+
+void IndexLiveSignature(std::uint64_t key, const std::shared_ptr<GatherLiveEntry>& entry) {
+    if (key == 0) return;
+    auto& signatures = LiveIndex().signatures;
+    if (signatures.size() >= 65536 && !signatures.contains(key)) signatures.clear();
+    auto& slot = signatures[key];
+    if (slot != entry) slot = entry;
 }
 
 std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submission& submission, DrawTail& tail) {
@@ -680,22 +705,21 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
     bool ready = false, feedback = false;
     auto& cursor = LiveIndex().cursors[tail.liveKey];
     const auto ways = found != LiveIndex().entries.end() ? found->second.size() : 0;
-    for (std::size_t step = 0; step < predicted.count + ways; ++step) {
-        const bool guessed = step < predicted.count;
-        const auto way = guessed ? 0 : (cursor + step - predicted.count) % ways;
-        const auto& entry = guessed ? predicted.entries[step] : found->second[way];
-        if (!guessed && predicted.Holds(entry.get())) continue;
-        if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) continue;
+    const bool indexed = ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLiveIndex);
+    std::uint64_t unmatchedKey = 0;
+    const auto attempt = [&](const std::shared_ptr<GatherLiveEntry>& entry) -> std::shared_ptr<GatherLiveDraw> {
+        unmatchedKey = 0;
+        if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) return {};
         ready = true;
         if (const char* skipped = !LivePacketMatches(entry->packet, tail.livePacket) ? "draw_templates_live_q0_skip_packet" : entry->options != options ? "draw_templates_live_q0_skip_options" : !LiveStateMatches(*entry, queue) ? "draw_templates_live_q0_skip_state" : !LiveViewsCurrent(*entry) ? "draw_templates_live_q0_skip_views" : !DecodeProgramsCurrent(*entry->decode, *submission.shaders) ? "draw_templates_live_q0_skip_decode" : nullptr) {
             CountLiveDraw(tail.drawParameters, skipped);
-            continue;
+            return {};
         }
         if (refuseFeedback && options.feedback && std::any_of(entry->variants.begin(), entry->variants.end(), [](const auto& variant) {
             return !variant->feedback.memory.empty() || !variant->feedback.userData.empty();
         })) {
             feedback = true;
-            continue;
+            return {};
         }
         programs = entry->decode->programs;
         for (auto& program : programs) ReadUserWords(queue, program, false);
@@ -715,6 +739,7 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_gathers");
         auto plan = RunGatherShadow(candidate);
         if (plan == nullptr || !plan->complete || entry->allocationGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+            if (indexed && plan != nullptr && !plan->matched && (plan->incomplete & ~static_cast<std::uint32_t>(GatherUnmatched)) == 0) unmatchedKey = LiveSignatureKey(tail.liveKey, plan->signatures);
             if (plan == nullptr) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_no_plan");
             else if (plan->complete) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_allocation_generation");
             if (plan != nullptr) {
@@ -742,7 +767,7 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
                     }
                 }
             }
-            continue;
+            return {};
         }
         auto live = std::make_shared<GatherLiveDraw>();
         live->entry = entry;
@@ -782,19 +807,48 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         }
         if (!argumentsValid) {
             CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_arguments");
-            continue;
+            return {};
         }
 
         for (const auto& stage : entry->link->stages) live->stages.push_back({stage.stage, stage.compiled.get(), stage.pushOffset, stage.registeredViews.get()});
         live->verify = tail.liveVerify;
-        if (!guessed) cursor = (way + 1) % ways;
-        if (sequenced) {
-            LiveIndex().sequence.Record(tail.livePosition, entry);
-            CountLiveDraw(tail.drawParameters, guessed ? step == 0 ? "draw_templates_live_sequence_first_guess" : "draw_templates_live_sequence_later_guess" : "draw_templates_live_sequence_scanned");
-        }
+        if (indexed) IndexLiveSignature(LiveSignatureKey(tail.liveKey, live->plan->signatures), entry);
+        return live;
+    };
+    const auto taken = [&](std::shared_ptr<GatherLiveDraw> live, const char* how) {
+        if (sequenced) LiveIndex().sequence.Record(tail.livePosition, live->entry);
+        if (how != nullptr) CountLiveDraw(tail.drawParameters, how);
         CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_taken");
         CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
         return live;
+    };
+    thread_local std::vector<const GatherLiveEntry*> tried;
+    tried.clear();
+    const auto wasTried = [&](const GatherLiveEntry* entry) { return std::find(tried.begin(), tried.end(), entry) != tried.end(); };
+    std::uint32_t indexTries = 0;
+    for (std::size_t step = 0; step < predicted.count + ways; ++step) {
+        const bool guessed = step < predicted.count;
+        const auto way = guessed ? 0 : (cursor + step - predicted.count) % ways;
+        const auto entry = guessed ? predicted.entries[step] : found->second[way];
+        if (wasTried(entry.get())) continue;
+        tried.push_back(entry.get());
+        if (auto live = attempt(entry)) {
+            if (!guessed) cursor = (way + 1) % ways;
+            return taken(std::move(live), !sequenced ? nullptr : guessed ? step == 0 ? "draw_templates_live_sequence_first_guess" : "draw_templates_live_sequence_later_guess" : "draw_templates_live_sequence_scanned");
+        }
+        if (tail.liveUnmatchedKey == 0) tail.liveUnmatchedKey = unmatchedKey;
+        while (unmatchedKey != 0 && indexTries < 2) {
+            const auto known = LiveIndex().signatures.find(unmatchedKey);
+            if (known == LiveIndex().signatures.end() || wasTried(known->second.get())) {
+                if (known == LiveIndex().signatures.end()) CountLiveDraw(tail.drawParameters, "draw_templates_live_index_unknown");
+                break;
+            }
+            const auto candidate = known->second;
+            tried.push_back(candidate.get());
+            ++indexTries;
+            if (auto live = attempt(candidate)) return taken(std::move(live), "draw_templates_live_index_hits");
+            CountLiveDraw(tail.drawParameters, "draw_templates_live_index_misses");
+        }
     }
     if (feedback) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_feedback");
     else if (ready) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_structure");
@@ -1514,6 +1568,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     tail.liveEntry = LearnLive(queue, tail);
     if (tail.live == nullptr && tail.liveEntry != nullptr) LiveIndex().sequence.Record(tail.livePosition, tail.liveEntry);
+    if (tail.live == nullptr && tail.liveEntry != nullptr && tail.liveUnmatchedKey != 0 && ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLiveIndex)) {
+        IndexLiveSignature(tail.liveUnmatchedKey, tail.liveEntry);
+        CountLiveDraw(tail.drawParameters, "draw_templates_live_index_aliases");
+    }
     if (tail.gatherShadow || (tail.liveEntry != nullptr && !tail.liveEntry->link->ready.load(std::memory_order_acquire))) {
         GatherShadowDraw shadow;
         shadow.programs = programs;
@@ -1527,6 +1585,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         shadow.live = tail.liveEnabled && !tail.liveVerify;
         shadow.commitTemplate = tail.liveEntry != nullptr ? tail.liveEntry->link : nullptr;
         tail.gatherPlan = RunGatherShadow(shadow);
+        if (tail.liveEntry != nullptr && tail.gatherPlan != nullptr && tail.gatherPlan->matched && ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLiveIndex)) IndexLiveSignature(LiveSignatureKey(tail.liveKey, tail.gatherPlan->signatures), tail.liveEntry);
         ArmGatherValidationLog(false);
         gatherLogScope.armed = false;
     }

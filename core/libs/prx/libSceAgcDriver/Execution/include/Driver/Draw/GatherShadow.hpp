@@ -184,6 +184,7 @@ struct GatherDrawPlan {
     std::uint32_t differOld = 0;
     std::uint32_t differNew = 0;
     std::uint32_t differMask = 0;
+    std::vector<std::uint64_t> signatures;
     std::shared_ptr<GatherCommitTemplate> commitTemplate;
 };
 

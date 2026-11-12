@@ -110,6 +110,18 @@ void IdleKeysAreDropped() {
     Expect(sequence.Keys() == 0, "clearing left keys behind");
 }
 
+void SignatureKeysNeedEveryStage() {
+    using AgcDriver::DriverDetail::LiveSignatureKey;
+    const std::vector<std::uint64_t> both{11, 22}, swapped{22, 11}, missing{11, 0}, one{11};
+    Expect(LiveSignatureKey(5, both) != 0, "two known stage signatures gave no key");
+    Expect(LiveSignatureKey(5, both) == LiveSignatureKey(5, both), "the key is not stable");
+    Expect(LiveSignatureKey(5, both) != LiveSignatureKey(5, swapped), "the key ignores which stage a signature belongs to");
+    Expect(LiveSignatureKey(5, both) != LiveSignatureKey(6, both), "the key ignores the live key");
+    Expect(LiveSignatureKey(5, both) != LiveSignatureKey(5, one), "the key ignores the stage count");
+    Expect(LiveSignatureKey(5, missing) == 0, "a stage without a signature still gave a key");
+    Expect(LiveSignatureKey(5, std::vector<std::uint64_t>{}) == 0, "no stages gave a key");
+}
+
 void InvalidPositionsAreIgnored() {
     Sequence sequence;
     Sequence::Position position;
@@ -130,6 +142,7 @@ int main() {
         UnrecordedPositionsPredictNothingLater();
         IdleKeysAreDropped();
         InvalidPositionsAreIgnored();
+        SignatureKeysNeedEveryStage();
         std::cout << "The live sequence offers the entries earlier frames used at a draw's position before any other\n";
         return 0;
     } catch (const std::exception& error) {

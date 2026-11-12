@@ -615,6 +615,7 @@ std::shared_ptr<GatherDrawPlan> acquirePlan(std::size_t stages, std::uint64_t& a
     }
     plan.indirect = {};
     plan.limits = {};
+    plan.signatures.assign(stages, 0);
     plan.incomplete = GatherIncompleteNone;
     plan.complete = false;
     plan.matched = false;
@@ -785,6 +786,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
         }
         if (selected) {
             stageSeen[validation.stage] = 1;
+            plan->signatures[validation.stage] = refusedPending || refusedGeneration ? 0 : outcome.signature;
             auto& stagePlan = plan->stages[validation.stage];
             if (outcome.matched) {
                 const auto* binding = draw.commitTemplate != nullptr && draw.commitTemplate->ready.load(std::memory_order_acquire) && validation.stage < draw.commitTemplate->stages.size() ? &draw.commitTemplate->stages[validation.stage] : nullptr;
