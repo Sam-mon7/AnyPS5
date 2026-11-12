@@ -4896,6 +4896,7 @@ struct PreparedDraw {
     bool slotWordless = false;
     bool slotCapture = false;
     bool slotLearnOnly = false;
+    std::optional<DrawInputs> slotDirectInputs;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -5111,6 +5112,12 @@ constexpr std::uint64_t TrimNs = 40000;
 enum OutcomeKind : int { OutcomeReplayed = 0, OutcomeVerified = 1, OutcomeRefused = 2, OutcomeNew = 3 };
 
 struct Counters {
+    struct Kind {
+        std::atomic<std::uint64_t> hits{0}, captures{0}, verifyChecks{0}, verifyMismatches{0};
+        std::array<std::atomic<std::uint64_t>, RefusalCount> refused{};
+        std::array<std::atomic<std::uint64_t>, IneligibleCount> ineligible{};
+    };
+    std::array<Kind, 2> kinds;
     std::atomic<std::uint64_t> hits{0}, captures{0}, legacy{0}, verifyChecks{0}, verifyMismatches{0}, prelockSkips{0}, replayNs{0}, evictions{0};
     std::array<std::atomic<std::uint64_t>, RefusalCount> refused{};
     std::array<std::atomic<std::uint64_t>, IneligibleCount> ineligible{};
@@ -5122,6 +5129,17 @@ struct Counters {
     std::array<std::atomic<std::uint64_t>, MissCount> misses{};
     Counters() {
         using AgcDriver::ArchB::Recorder;
+        for (std::size_t kind = 0; kind < kinds.size(); ++kind) {
+            auto& entry = kinds[kind];
+            const auto suffix = kind == 0 ? "_direct" : "_indirect";
+            const auto name = [&](const std::string& prefix) { return prefix + suffix; };
+            Recorder::RegisterCounter(name("archc_replay_hits").c_str(), entry.hits);
+            Recorder::RegisterCounter(name("archc_replay_captures").c_str(), entry.captures);
+            Recorder::RegisterCounter(name("archc_replay_verify_checks").c_str(), entry.verifyChecks);
+            Recorder::RegisterCounter(name("archc_replay_verify_mismatches").c_str(), entry.verifyMismatches);
+            for (std::size_t i = 0; i < RefusalCount; ++i) Recorder::RegisterCounter(name(std::string("archc_replay_refused_") + RefusalNames[i]).c_str(), entry.refused[i]);
+            for (std::size_t i = 0; i < IneligibleCount; ++i) Recorder::RegisterCounter(name(std::string("archc_replay_ineligible_") + IneligibleNames[i]).c_str(), entry.ineligible[i]);
+        }
         Recorder::RegisterCounter("archc_replay_hits", hits);
         Recorder::RegisterCounter("archc_replay_captures", captures);
         Recorder::RegisterCounter("archc_replay_legacy", legacy);
@@ -5612,6 +5630,7 @@ void publishGatherSlot(const Context& context, const State& state, const Pm4::Dr
     slots.insert_or_assign(key, std::move(slot));
     link->ready.store(true, std::memory_order_release);
     AgcDriver::ArchB::Recorder::Count("draw_templates_live_templates_ready");
+    AgcDriver::ArchB::Recorder::Count(draw.indirect ? "draw_templates_live_templates_ready_indirect" : "draw_templates_live_templates_ready_direct");
     static_cast<void>(state);
 }
 
@@ -5650,6 +5669,12 @@ std::array<std::uint64_t, ComponentCount> fingerprint(const Slot& slot) {
     auto& inputs = parts[ComponentInputs];
     inputs = mix(mix(inputs, slot.fragmentOutputs), slot.shaderStages);
     parts[ComponentArgs] = mix(slot.argumentRead, slot.argumentLinearRead);
+    if (!slot.draw.indirect) {
+        parts[ComponentArgs] = mix(mix(parts[ComponentArgs], slot.draw.indexAddress), slot.draw.indexCount);
+        parts[ComponentArgs] = mix(mix(parts[ComponentArgs], slot.draw.indexSize), slot.draw.instanceCount);
+        parts[ComponentArgs] = mix(mix(parts[ComponentArgs], slot.draw.flags), slot.draw.indexed);
+        parts[ComponentArgs] = mix(mix(parts[ComponentArgs], slot.draw.firstVertex), slot.draw.firstInstance);
+    }
     auto& pass = parts[ComponentPass];
     pass = mix(pass, slot.pass.passKey);
     pass = mix(pass, (slot.pass.forced ? 1u : 0u) | (slot.pass.fenced ? 2u : 0u) | (slot.pass.inPassIndirect ? 4u : 0u) | (slot.pass.unknownMemory ? 8u : 0u) | (slot.pass.unknownWrites ? 16u : 0u));
@@ -5699,8 +5724,39 @@ void noteIneligible(Ineligible why) {
     counters().ineligible[why].fetch_add(1, std::memory_order_relaxed);
 }
 
+bool sameDirectInputs(const DrawInputs& a, const DrawInputs& b) {
+    const auto copied = [](const DrawInputs& inputs, VkBuffer handle) -> Buffer* {
+        if (inputs.indices != nullptr && inputs.indices->Handle() == handle) return inputs.indices.get();
+        for (const auto& buffer : inputs.vertexBuffers) if (buffer->Handle() == handle) return buffer.get();
+        return nullptr;
+    };
+    const auto binding = [&](VkBuffer first, VkDeviceSize firstOffset, VkBuffer second, VkDeviceSize secondOffset) {
+        if (firstOffset != secondOffset) return false;
+        if (first == second) return true;
+        auto* firstCopy = copied(a, first);
+        auto* secondCopy = copied(b, second);
+        return firstCopy != nullptr && secondCopy != nullptr && std::ranges::equal(firstCopy->Bytes(), secondCopy->Bytes());
+    };
+    if (a.nothing != b.nothing || a.indexBytes != b.indexBytes || a.maxIndex != b.maxIndex || a.indexCount != b.indexCount || a.listRestartPrimitive != b.listRestartPrimitive || a.expandedIndexCount != b.expandedIndexCount || a.restartTable != b.restartTable || a.fragmentOutputs != b.fragmentOutputs || a.shaderStages != b.shaderStages || a.meshGroups != b.meshGroups || a.meshLayers != b.meshLayers || a.meshLayerStride != b.meshLayerStride || a.vertexInputBehindGpuWrite != b.vertexInputBehindGpuWrite || a.inPlaceReads != b.inPlaceReads || a.inPlaceAlignments != b.inPlaceAlignments || a.inPlaceBuffers != b.inPlaceBuffers || a.inPlaceOffsets != b.inPlaceOffsets || a.vertexHandles.size() != b.vertexHandles.size() || a.vertexOffsets.size() != b.vertexOffsets.size()) return false;
+    if (!binding(a.indexHandle, a.indexOffset, b.indexHandle, b.indexOffset)) return false;
+    for (std::size_t index = 0; index < a.vertexHandles.size(); ++index) if (!binding(a.vertexHandles[index], a.vertexOffsets[index], b.vertexHandles[index], b.vertexOffsets[index])) return false;
+    const auto sameBinding = [](const VkVertexInputBindingDescription& first, const VkVertexInputBindingDescription& second) { return first.binding == second.binding && first.stride == second.stride && first.inputRate == second.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& first, const VkVertexInputAttributeDescription& second) { return first.location == second.location && first.binding == second.binding && first.format == second.format && first.offset == second.offset; };
+    return std::ranges::equal(a.VertexLayout().bindings, b.VertexLayout().bindings, sameBinding) && std::ranges::equal(a.VertexLayout().attributes, b.VertexLayout().attributes, sameAttribute);
+}
+
+void verifyDirectInputs(const PreparedDraw& prepared, const DrawInputs& inputs) {
+    if (!prepared.slotDirectInputs) return;
+    AgcDriver::ArchB::Recorder::Count("archc_replay_direct_inputs_verified");
+    if (sameDirectInputs(*prepared.slotDirectInputs, inputs)) return;
+    auto& counts = counters();
+    counts.mismatched[ComponentInputs].fetch_add(1, std::memory_order_relaxed);
+    counts.kinds[0].verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+    if (counts.verifyMismatches.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: direct input bindings or effective draw range\n");
+}
+
 bool wantsCapture(const PreparedDraw& prepared) {
-    return prepared.identity != nullptr && prepared.slotCapture && prepared.args != nullptr && active() && !diagnosticsBlock();
+    return prepared.identity != nullptr && prepared.slotCapture && (prepared.args != nullptr || AgcDriver::ArchB::DirectDrawEnabled()) && active() && !diagnosticsBlock();
 }
 
 void capture(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDraw& prepared, SlotPassCapture& pass, bool inputsInPlace, const std::optional<std::array<std::uint64_t, ComponentCount>>& predicted) {
@@ -5711,17 +5767,19 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     const auto mismatch = [&](std::size_t component) {
         auto& counts = counters();
         counts.mismatched[component].fetch_add(1, std::memory_order_relaxed);
+        counts.kinds[draw.indirect.has_value()].verifyMismatches.fetch_add(1, std::memory_order_relaxed);
         if (prepared.slotVerifyPatch) cutMismatch(CutPatchSlots, component < ComponentCount ? ComponentNames[component] : "ineligible");
         if (counts.verifyMismatches.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[archc] draw replay VERIFY mismatch: %s (indirect 0x%llx)\n", component < ComponentCount ? ComponentNames[component] : "ineligible", static_cast<unsigned long long>(draw.indirect ? draw.indirect->arguments : 0));
     };
     const auto refuse = [&](Ineligible why) {
         noteIneligible(why);
+        counters().kinds[draw.indirect.has_value()].ineligible[why].fetch_add(1, std::memory_order_relaxed);
         made.slots.erase(key);
         if (predicted.has_value()) mismatch(ComponentCount);
     };
     if (!usableIdentity(identity, state, shaders)) return refuse(IneligibleIdentity);
     const auto* args = prepared.args;
-    if (args == nullptr || prepared.indirect.path != IndirectDrawPath::Gpu || args->countIndirect || args->RangeBytes() == 0 || prepared.indirect.argumentImport == nullptr) return refuse(IneligiblePath);
+    if (args != nullptr ? prepared.indirect.path != IndirectDrawPath::Gpu || args->countIndirect || args->RangeBytes() == 0 || prepared.indirect.argumentImport == nullptr : draw.indirect.has_value() || !AgcDriver::ArchB::DirectDrawEnabled()) return refuse(IneligiblePath);
     if (!prepared.recorded || !prepared.lean) return refuse(IneligibleUnrecorded);
     if (prepared.outcome.waited) return refuse(IneligibleWaited);
     if (prepared.listed) return refuse(IneligibleListed);
@@ -5740,7 +5798,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     if (!inputs.restartTable.empty() || inputs.expandedIndexCount != 0 || pass.passReads.size() < inputs.inPlaceReads.size() || pass.linearReads.size() < inputs.inPlaceReads.size()) return refuse(IneligibleInputs);
     const auto& resources = prepared.resolved.resources;
     if (resources == nullptr) return refuse(IneligibleTemplate);
-    if (prepared.outcome.kind != KindTemplateHit || !prepared.resolved.cacheable) return refuse(IneligibleNotHit);
+    if ((prepared.outcome.kind != KindTemplateHit && prepared.outcome.kind != KindRecipeHit) || !prepared.resolved.cacheable) return refuse(IneligibleNotHit);
     if (!resources->Reusable()) return refuse(IneligibleNotReusable);
     if (resources->HoldsLease()) return refuse(IneligibleLease);
     if (resources->UsesAddressTable()) return refuse(IneligibleAddress);
@@ -5799,14 +5857,16 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         }
     }
     slot.shaderStages = inputs.shaderStages;
-    const std::pair<std::uint64_t, std::uint64_t> argumentRange{args->arguments, args->arguments + args->RangeBytes()};
-    const auto readAt = std::find(pass.passReads.begin(), pass.passReads.end(), argumentRange);
-    const auto linearAt = std::find(pass.linearReads.begin(), pass.linearReads.end(), argumentRange);
-    if (readAt == pass.passReads.end() || linearAt == pass.linearReads.end() || std::count(pass.passReads.begin(), pass.passReads.end(), argumentRange) != 1 || std::count(pass.linearReads.begin(), pass.linearReads.end(), argumentRange) != 1) return refuse(IneligiblePath);
-    slot.argumentRead = static_cast<std::size_t>(readAt - pass.passReads.begin());
-    slot.argumentLinearRead = static_cast<std::size_t>(linearAt - pass.linearReads.begin());
-    pass.passReads.erase(readAt);
-    pass.linearReads.erase(linearAt);
+    if (args != nullptr) {
+        const std::pair<std::uint64_t, std::uint64_t> argumentRange{args->arguments, args->arguments + args->RangeBytes()};
+        const auto readAt = std::find(pass.passReads.begin(), pass.passReads.end(), argumentRange);
+        const auto linearAt = std::find(pass.linearReads.begin(), pass.linearReads.end(), argumentRange);
+        if (readAt == pass.passReads.end() || linearAt == pass.linearReads.end() || std::count(pass.passReads.begin(), pass.passReads.end(), argumentRange) != 1 || std::count(pass.linearReads.begin(), pass.linearReads.end(), argumentRange) != 1) return refuse(IneligiblePath);
+        slot.argumentRead = static_cast<std::size_t>(readAt - pass.passReads.begin());
+        slot.argumentLinearRead = static_cast<std::size_t>(linearAt - pass.linearReads.begin());
+        pass.passReads.erase(readAt);
+        pass.linearReads.erase(linearAt);
+    }
     slot.pass = std::move(pass);
     slot.pushStages = PushConstantStages(shaders);
     if (slot.pushStages != 0) {
@@ -5825,6 +5885,8 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     if (prepared.slotLearnOnly) {
         publishGatherSlot(context, state, draw, identity, slot, *resources, prepared.resolved.moved);
         AgcDriver::ArchB::Recorder::Count("draw_templates_live_first_sight_captures");
+        AgcDriver::ArchB::Recorder::Count(draw.indirect ? "draw_templates_live_first_sight_captures_indirect" : "draw_templates_live_first_sight_captures_direct");
+        counters().kinds[draw.indirect.has_value()].captures.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (made.slots.size() >= TableLimit && !made.slots.contains(key)) {
@@ -5834,6 +5896,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
     auto [captured, inserted] = made.slots.insert_or_assign(key, std::move(slot));
     publishGatherSlot(context, state, draw, identity, captured->second, *resources, prepared.resolved.moved);
     counters().captures.fetch_add(1, std::memory_order_relaxed);
+    counters().kinds[draw.indirect.has_value()].captures.fetch_add(1, std::memory_order_relaxed);
 }
 
 static_assert(ParameterArena::Flights == ShaderResources::TemplateFlights);
@@ -5846,6 +5909,12 @@ enum TemplateMismatch : std::size_t { MismatchElementBytes, MismatchElementRange
 constexpr std::array<const char*, MismatchCount> TemplateMismatchNames{"element_bytes", "element_range", "static_binding", "element_set", "push"};
 
 struct TemplateCounters {
+    struct Kind {
+        std::atomic<std::uint64_t> replays{0}, verifyChecks{0};
+        std::array<std::atomic<std::uint64_t>, TemplateRefusalCount> refused{};
+        std::array<std::atomic<std::uint64_t>, MismatchCount> mismatches{};
+    };
+    std::array<Kind, 2> kinds;
     std::atomic<std::uint64_t> replays{0}, bytes{0}, candidates{0}, nothingMoved{0}, sets{0}, writes{0}, verifyChecks{0}, largeBytes{0}, groups{0};
     std::atomic<std::uint64_t> inPlaceDraws{0}, inPlaceElements{0}, inPlaceWrites{0}, inPlaceBytes{0}, batchMoved{0}, liveSets{0}, liveBytes{0}, keptBytes{0};
     std::array<std::atomic<std::uint64_t>, TemplateRefusalCount> refused{};
@@ -5853,6 +5922,15 @@ struct TemplateCounters {
     std::array<std::atomic<std::uint64_t>, MismatchCount> mismatches{};
     TemplateCounters() {
         using AgcDriver::ArchB::Recorder;
+        for (std::size_t kind = 0; kind < kinds.size(); ++kind) {
+            auto& entry = kinds[kind];
+            const auto suffix = kind == 0 ? "_direct" : "_indirect";
+            const auto name = [&](const std::string& prefix) { return prefix + suffix; };
+            Recorder::RegisterCounter(name("draw_templates_replays").c_str(), entry.replays);
+            Recorder::RegisterCounter(name("draw_templates_verify_checks").c_str(), entry.verifyChecks);
+            for (std::size_t i = 0; i < TemplateRefusalCount; ++i) Recorder::RegisterCounter(name(std::string("draw_templates_refused_") + TemplateRefusalNames[i]).c_str(), entry.refused[i]);
+            for (std::size_t i = 0; i < MismatchCount; ++i) Recorder::RegisterCounter(name(std::string("draw_templates_verify_mismatch_") + TemplateMismatchNames[i]).c_str(), entry.mismatches[i]);
+        }
         Recorder::RegisterCounter("draw_templates_replays", replays);
         Recorder::RegisterCounter("draw_templates_bytes", bytes);
         Recorder::RegisterCounter("draw_templates_candidates", candidates);
@@ -5879,10 +5957,11 @@ TemplateCounters& templateCounters() {
     return made;
 }
 
-void countMoveRefusal(ShaderResources::MoveRefusal refusal) {
+void countMoveRefusal(ShaderResources::MoveRefusal refusal, const Pm4::DrawParameters& draw) {
     using Why = ShaderResources::MoveRefusal;
     const auto kind = refusal == Why::Written ? TemplateWritten : refusal == Why::Overlap ? TemplatePending : refusal == Why::Limit ? TemplateLarge : TemplateMovedOther;
     templateCounters().refused[kind].fetch_add(1, std::memory_order_relaxed);
+    templateCounters().kinds[draw.indirect.has_value()].refused[kind].fetch_add(1, std::memory_order_relaxed);
 }
 
 bool templateVerifyNow() {
@@ -5993,7 +6072,9 @@ void verifyTemplate(const Context& context, const ShaderResources& resources, co
     auto& counts = templateCounters();
     if (templatePlan().liveVerify) ArchB::Recorder::Count("draw_templates_live_verify_elements");
     else counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+    counts.kinds[slot.draw.indirect.has_value()].verifyChecks.fetch_add(1, std::memory_order_relaxed);
     const auto mismatch = [&](TemplateMismatch kind, const char* what) {
+        counts.kinds[slot.draw.indirect.has_value()].mismatches[kind].fetch_add(1, std::memory_order_relaxed);
         if (templatePlan().liveVerify) { liveMismatch(static_cast<LiveMismatch>(kind), what); return; }
         if (counts.mismatches[kind].fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[draw-templates] VERIFY mismatch: %s\n", what);
     };
@@ -6074,6 +6155,7 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
     plan.ignored.clear();
     const auto refuse = [&](TemplateRefusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
+        counts.kinds[slot.draw.indirect.has_value()].refused[why].fetch_add(1, std::memory_order_relaxed);
         if (live != nullptr) {
             static const auto names = [] {
                 std::array<std::string, TemplateRefusalCount> values;
@@ -6081,6 +6163,12 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
                 return values;
             }();
             ArchB::Recorder::Count(names[why].c_str());
+            static const auto typedNames = [] {
+                std::array<std::array<std::string, TemplateRefusalCount>, 2> values;
+                for (std::size_t kind = 0; kind < values.size(); ++kind) for (std::size_t i = 0; i < values[kind].size(); ++i) values[kind][i] = std::string("draw_templates_live_commit_refused_template_") + TemplateRefusalNames[i] + (kind == 0 ? "_direct" : "_indirect");
+                return values;
+            }();
+            ArchB::Recorder::Count(typedNames[slot.draw.indirect.has_value()][why].c_str());
         }
         plan.sets.reset();
         plan.inPlace.clear();
@@ -6269,6 +6357,7 @@ std::size_t commitTemplate(const Context& context, Recorder& recorder, const Sha
     }
     counts.bytes.fetch_add(copied, std::memory_order_relaxed);
     counts.replays.fetch_add(1, std::memory_order_relaxed);
+    counts.kinds[slot.draw.indirect.has_value()].replays.fetch_add(1, std::memory_order_relaxed);
     if (plan.verify) verifyTemplate(context, resources, sets, flight, moved, slot);
     plan.flight = flight;
     plan.serial = recorder.OpenSerial();
@@ -6327,6 +6416,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     StepClock clock;
     const auto refuse = [&](Refusal why) {
         counts.refused[why].fetch_add(1, std::memory_order_relaxed);
+        counts.kinds[draw.indirect.has_value()].refused[why].fetch_add(1, std::memory_order_relaxed);
         if (identity.gather != nullptr) {
             static const auto names = [] {
                 std::array<std::string, RefusalCount> values;
@@ -6334,14 +6424,21 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
                 return values;
             }();
             ArchB::Recorder::Count(names[why].c_str());
-            if (why == RefusedNew || why == RefusedTargets || why == RefusedDepth || why == RefusedObjects || why == RefusedTemplateGone || why == RefusedTemplateMembership || why == RefusedProof) identity.gatherTemplate->valid.store(false, std::memory_order_release);
+            static const auto typedNames = [] {
+                std::array<std::array<std::string, RefusalCount>, 2> values;
+                for (std::size_t kind = 0; kind < values.size(); ++kind) for (std::size_t i = 0; i < values[kind].size(); ++i) values[kind][i] = std::string("draw_templates_live_commit_refused_") + RefusalNames[i] + (kind == 0 ? "_direct" : "_indirect");
+                return values;
+            }();
+            ArchB::Recorder::Count(typedNames[draw.indirect.has_value()][why].c_str());
+            if (identity.gatherTemplate != nullptr && (why == RefusedNew || why == RefusedTargets || why == RefusedDepth || why == RefusedObjects || why == RefusedTemplateGone || why == RefusedTemplateMembership || why == RefusedProof)) identity.gatherTemplate->valid.store(false, std::memory_order_release);
         }
         lastOutcome() = why == RefusedNew ? OutcomeNew : OutcomeRefused;
         scratch().inputs = DrawInputs{};
         scratch().targets.clear();
         return false;
     };
-    if (!usableIdentity(identity, state, shaders) || draw.indirect == std::nullopt || state.colors.size() > 64) return refuse(RefusedNew);
+    if (!draw.indirect && !AgcDriver::ArchB::DirectDrawEnabled()) return refuse(RefusedSwitches);
+    if (!usableIdentity(identity, state, shaders) || state.colors.size() > 64) return refuse(RefusedNew);
     if (identity.gather != nullptr && (identity.gatherTemplate == nullptr || !identity.gatherTemplate->valid.load(std::memory_order_acquire) || !identity.gatherTemplate->ready.load(std::memory_order_acquire))) return refuse(RefusedTemplate);
     auto* slot = lookup(context.device, state, draw, shaders, identity, pipelineStateReuse);
     if (slot == nullptr) {
@@ -6372,11 +6469,11 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     auto pipeline = slot->pipeline.lock();
     auto framebuffer = slot->framebuffer.lock();
     if (pipeline == nullptr || framebuffer == nullptr || pipeline.get() != slot->pipelineRaw || framebuffer.get() != slot->framebufferRaw || (state.depth && DepthSurfacesReleased() != slot->depthReleases) || slot->targets.size() != state.colors.size()) return refuse(RefusedObjects);
-    const auto* args = &*draw.indirect;
-    const auto rangeBytes = static_cast<std::size_t>(args->RangeBytes());
+    const auto* args = draw.indirect ? &*draw.indirect : nullptr;
+    const auto rangeBytes = args != nullptr ? static_cast<std::size_t>(args->RangeBytes()) : 0;
     if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse(RefusedInputs);
-    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> argumentRange{{{args->arguments, args->arguments + rangeBytes}}};
-    if (recorder->PendingLabelIn(args->arguments, rangeBytes) || StorageTexture::AnyPendingOverlaps(argumentRange)) return refuse(RefusedArgs);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> argumentRange{{{args != nullptr ? args->arguments : 0, args != nullptr ? args->arguments + rangeBytes : 0}}};
+    if (args != nullptr && (recorder->PendingLabelIn(args->arguments, rangeBytes) || StorageTexture::AnyPendingOverlaps(argumentRange))) return refuse(RefusedArgs);
     if (archcTargets::verifyPeriod() != 0) return refuse(RefusedTargets);
     clock.Mark(StepChecks);
     using AgcDriver::ArchB::Feature;
@@ -6395,6 +6492,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         work.inputs = DrawInputs{};
         clock.Finish();
         counts.hits.fetch_add(1, std::memory_order_relaxed);
+        counts.kinds[draw.indirect.has_value()].hits.fetch_add(1, std::memory_order_relaxed);
         lastOutcome() = OutcomeReplayed;
         return true;
     }
@@ -6430,7 +6528,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         auto moveRefusal = ShaderResources::MoveRefusal::None;
         liveMoved = resources->GatherBuffers(*identity.gather, *recorder, moveRefusal);
         if (!liveMoved.has_value()) {
-            countMoveRefusal(moveRefusal);
+            countMoveRefusal(moveRefusal, draw);
             return refuse(RefusedMoved);
         }
     } else if (!slot->movedStatic) {
@@ -6445,7 +6543,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
             liveMoved = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, nullptr, &moveRefusal);
             if (verifyMoved && holds != (liveMoved.has_value() && sameMoved(*liveMoved, slot->liveMoved))) cutMismatch(CutSlotMoved, holds ? "the kept moved list held where the live list differs" : "the kept moved list was refused where the live list equals it");
             if (!liveMoved.has_value()) {
-                countMoveRefusal(moveRefusal);
+                countMoveRefusal(moveRefusal, draw);
                 return refuse(RefusedMoved);
             }
             if (slotBindings && !slot->wordless && (!slot->liveKept || !sameMoved(*liveMoved, slot->liveMoved))) keepLiveMoved(*slot, *liveMoved);
@@ -6457,14 +6555,16 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         slot->touched = present;
     }
     clock.Mark(StepMoved);
-    const auto* argumentImport = HostImportFor(context, args->arguments, rangeBytes);
-    if (argumentImport == nullptr || recorder->PendingLabelIn(args->arguments, rangeBytes) || StorageTexture::AnyPendingOverlaps(argumentRange)) return refuse(RefusedArgs);
+    const auto* argumentImport = args != nullptr ? HostImportFor(context, args->arguments, rangeBytes) : nullptr;
+    if (args != nullptr && (argumentImport == nullptr || recorder->PendingLabelIn(args->arguments, rangeBytes) || StorageTexture::AnyPendingOverlaps(argumentRange))) return refuse(RefusedArgs);
     if (resources->NeedsCompletion() != slot->completion || resources->HasCopiedWrites() || resources->HoldsLease() || resources->UsesAddressTable() || !resources->Reusable()) return refuse(RefusedTemplate);
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
     clock.Mark(StepArgs);
     const bool patchVerify = identity.gather == nullptr && slot->wordless && cutVerifyNow(CutPatchSlots);
     if (patchVerify || (identity.gather == nullptr && verifyNow())) {
         counts.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+        counts.kinds[draw.indirect.has_value()].verifyChecks.fetch_add(1, std::memory_order_relaxed);
+        if (args == nullptr) prepared.slotDirectInputs.emplace(std::move(work.inputs));
         prepared.slotVerify = true;
         prepared.slotVerifyPatch = patchVerify;
         lastOutcome() = OutcomeVerified;
@@ -6474,6 +6574,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     if (identity.gather != nullptr && !identity.referenceStages.empty() && identity.referenceDraw != nullptr) {
         ArchB::Recorder::Count("draw_templates_live_verify_checks");
+        ArchB::Recorder::Count(draw.indirect ? "draw_templates_live_verify_checks_indirect" : "draw_templates_live_verify_checks_direct");
         const auto& oldDraw = *identity.referenceDraw;
         const auto oldPlan = planDraw(context, state, oldDraw, identity.referenceStages, nullptr, replayOutcome(), replayTimer(), nullptr, nullptr, false);
         auto oldInputs = prepareDrawInputs(context, state, oldDraw, identity.referenceStages, oldPlan, replayTimer(), nullptr);
@@ -6483,11 +6584,12 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         const auto& pipelineState = pipelineStateFor(context, state, oldInputs.fragmentOutputs, proxies, masked);
         const auto oldPipeline = CachedPipeline(context, pipelineState, oldInputs.VertexLayout(), *resources, identity.referenceStages, VK_IMAGE_LAYOUT_GENERAL);
         if (oldPipeline != pipeline) liveMismatch(LivePipeline, "the old pipeline selection differs");
-        if (oldInputs.vertexHandles != inputs.vertexHandles || oldInputs.vertexOffsets != inputs.vertexOffsets || oldInputs.vertexInputBehindGpuWrite != inputs.vertexInputBehindGpuWrite) liveMismatch(LiveVertex, "the old vertex bindings differ");
-        if (oldInputs.indexHandle != inputs.indexHandle || oldInputs.indexOffset != inputs.indexOffset || oldInputs.indexBytes != inputs.indexBytes || oldDraw.indexSize != draw.indexSize) liveMismatch(LiveIndex, "the old index binding differs");
+        if (args == nullptr ? !sameDirectInputs(oldInputs, inputs) : oldInputs.vertexHandles != inputs.vertexHandles || oldInputs.vertexOffsets != inputs.vertexOffsets || oldInputs.vertexInputBehindGpuWrite != inputs.vertexInputBehindGpuWrite) liveMismatch(LiveVertex, "the old vertex bindings or direct read bounds differ");
+        if ((args != nullptr && (oldInputs.indexHandle != inputs.indexHandle || oldInputs.indexOffset != inputs.indexOffset)) || oldInputs.indexBytes != inputs.indexBytes || oldInputs.indexCount != inputs.indexCount || oldDraw.indexSize != draw.indexSize) liveMismatch(LiveIndex, "the old index binding or effective count differs");
         if (oldDraw.indexed != draw.indexed || oldDraw.indexCount != draw.indexCount || oldDraw.instanceCount != draw.instanceCount || oldDraw.flags != draw.flags || oldDraw.firstVertex != draw.firstVertex || oldDraw.firstInstance != draw.firstInstance || oldDraw.indexAddress != draw.indexAddress) liveMismatch(LiveArguments, "the old draw packet values differ");
-        if (!oldDraw.indirect || !sameIndirect(*oldDraw.indirect, *args) || oldDraw.indirect->arguments != args->arguments || oldDraw.indirect->countAddress != args->countAddress) liveMismatch(LiveIndirect, "the old indirect binding or rewrite rules differ");
-        else {
+        if (oldDraw.indirect.has_value() != draw.indirect.has_value()) liveMismatch(LiveIndirect, "the old direct or indirect command kind differs");
+        else if (args != nullptr && (!sameIndirect(*oldDraw.indirect, *args) || oldDraw.indirect->arguments != args->arguments || oldDraw.indirect->countAddress != args->countAddress)) liveMismatch(LiveIndirect, "the old indirect binding or rewrite rules differ");
+        else if (args != nullptr) {
             const auto* oldImport = HostImportFor(context, oldDraw.indirect->arguments, static_cast<std::size_t>(oldDraw.indirect->RangeBytes()));
             if (oldImport == nullptr || oldImport->buffer != argumentImport->buffer || HostImportOffset(*oldImport, oldDraw.indirect->arguments) != HostImportOffset(*argumentImport, args->arguments)) liveMismatch(LiveIndirect, "the old argument import differs");
         }
@@ -6507,14 +6609,14 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (resources->WritesOverlap(begin, bytes) || resources->ReadsOverlap(begin, bytes)) return true;
-        return begin < args->arguments + args->RangeBytes() && args->arguments < end;
+        return args != nullptr && begin < args->arguments + args->RangeBytes() && args->arguments < end;
     };
     if (recorder->HasQueuedKeyStores() && recorder->AnyQueuedKeyStore(touches)) recorder->FlushKeyStores();
     if (recorder->HasQueuedStores() && recorder->AnyQueuedStore(touches)) recorder->FlushStores();
     ArchC::ProbeAt(ArchC::Probe::BdFlush);
     auto& linearReads = work.linearReads;
     linearReads.assign(slot->pass.linearReads.begin(), slot->pass.linearReads.end());
-    linearReads.insert(linearReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentLinearRead), argumentRange.front());
+    if (args != nullptr) linearReads.insert(linearReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentLinearRead), argumentRange.front());
     linearReads.insert(linearReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(linearReads.begin(), linearReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources->WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, slot->pass.unknownMemory));
     ArchC::ProbeAt(ArchC::Probe::BdLinear);
@@ -6541,6 +6643,19 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
         if (cutEnabled(Feature::DrawTemplates) && prepareTemplate(context, *recorder, *slot, *resources, moved, drawUse != nullptr, identity.gather != nullptr ? &identity : nullptr)) templateSets = templatePlan().sets;
     }
     if (identity.gather != nullptr && templateSets == nullptr && !moved.empty()) return refuse(RefusedMoved);
+    if (args == nullptr && identity.gather == nullptr && templateSets != nullptr && templatePlan().verify) {
+        const auto oldPlan = planDraw(context, state, draw, shaders, nullptr, replayOutcome(), replayTimer(), nullptr, nullptr, false);
+        const auto oldInputs = prepareDrawInputs(context, state, draw, shaders, oldPlan, replayTimer(), nullptr);
+        std::optional<State> masked;
+        const auto& oldState = pipelineStateFor(context, state, oldInputs.fragmentOutputs, 0, masked);
+        const auto oldPipeline = CachedPipeline(context, oldState, oldInputs.VertexLayout(), *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        AgcDriver::ArchB::Recorder::Count("draw_templates_direct_inputs_verified");
+        if (!sameDraw(slot->draw, draw) || !sameDirectInputs(oldInputs, inputs) || oldPipeline != pipeline) {
+            AgcDriver::ArchB::Recorder::Count("draw_templates_direct_inputs_mismatches");
+            static unsigned reported = 0;
+            if (reported++ < 8) std::fprintf(stderr, "[draw-templates] VERIFY mismatch: direct command, input bindings, read bounds or pipeline\n");
+        }
+    }
     if (templateSets == nullptr && slotBindings) {
         if (moved.empty() && Recorder::ZeroCopyStorageActive()) {
             slotBound = true;
@@ -6582,7 +6697,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     static const bool zcNoPassReads = std::getenv("APS5_ZC_MOVED_NO_PASSREADS") != nullptr;
     auto& passReads = work.passReads;
     passReads.assign(slot->pass.passReads.begin(), slot->pass.passReads.end());
-    passReads.insert(passReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentRead), argumentRange.front());
+    if (args != nullptr) passReads.insert(passReads.begin() + static_cast<std::ptrdiff_t>(slot->argumentRead), argumentRange.front());
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     if (!zcNoPassReads && boundReads != nullptr && !boundReads->empty()) passReads.insert(passReads.end(), boundReads->begin(), boundReads->end());
     clock.Mark(StepBindings);
@@ -6632,7 +6747,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
             }
         }
         if (!held) pipeline->Continue(commands, state, reuse);
-        if (slot->pass.inPassIndirect) {
+        if (args != nullptr && slot->pass.inPassIndirect) {
             recorder->NotePendingRead(args->arguments, rangeBytes, Recorder::ReadKind::Indirect);
             argumentBuffer = argumentImport->buffer;
             argumentOffset = HostImportOffset(*argumentImport, args->arguments);
@@ -6647,7 +6762,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
             countBarrier(1);
         }
-        rewritten = recordIndirectArguments(context, commands, recorder, true, indirect, argumentScratch, argumentBuffer, argumentOffset, countBarrier);
+        if (args != nullptr) rewritten = recordIndirectArguments(context, commands, recorder, true, indirect, argumentScratch, argumentBuffer, argumentOffset, countBarrier);
         pipeline->Begin(commands, *framebuffer, state.renderExtent, state, reuse);
     }
     ArchC::ProbeAt(continued ? ArchC::Probe::RcBegin : ArchC::Probe::RcBeginNew);
@@ -6707,20 +6822,23 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     const auto ownTiming = Recorder::GpuDrawTimingEnabled() && state.renderLayers <= 1u ? recorder->BeginGpuTimingInPass(timingDrawKey(shaders, passTimingKey)) : Recorder::NoTiming;
     noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(AgcDriver::FaultStage::graphics), args);
     std::uint32_t subdraw = 0;
-    recordDrawCommands(context, commands, state, draw, inputs, &indirect, argumentBuffer, argumentOffset, trace, subdraw);
+    recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, trace, subdraw);
     if (pipeline->SplitsFaces()) {
         pipeline->ContinueBackFaces(commands, state);
-        recordDrawCommands(context, commands, state, draw, inputs, &indirect, argumentBuffer, argumentOffset, trace, subdraw);
+        recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, trace, subdraw);
     }
     recorder->EndGpuTiming(ownTiming);
     recorder->EndGpuTiming(eachDrawTiming);
-    CountIndirectDraw(IndirectDrawPath::Gpu, 0, rewritten);
+    if (args != nullptr) CountIndirectDraw(IndirectDrawPath::Gpu, 0, rewritten);
     ArchC::ProbeAt(ArchC::Probe::RcDraw);
     recorder->LeaveRenderPassOpen(slot->pass.passKey, drawTiming, slot->pass.fenced, passAccess, {});
     ArchC::ProbeAt(ArchC::Probe::RcLeave);
     if (templateSets != nullptr) finishTemplate(*recorder);
     if (identity.gather == nullptr) publishGatherSlot(context, state, draw, identity, *slot, *resources, moved);
-    else AgcDriver::ArchB::Recorder::Count("draw_templates_live_commits");
+    else {
+        AgcDriver::ArchB::Recorder::Count("draw_templates_live_commits");
+        AgcDriver::ArchB::Recorder::Count(draw.indirect ? "draw_templates_live_commits_indirect" : "draw_templates_live_commits_direct");
+    }
     clock.Mark(StepRecord);
     keepRecordedDraw(*recorder, resources, std::move(pipeline), std::move(framebuffer), inputs, std::move(work.targets), slot->slices, state.scissor, std::move(argumentScratch), {}, false, slot->completion, replayOutcome(), drawUse, nullptr);
     work.targets.clear();
@@ -6730,6 +6848,7 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     slot->replayedLast = true;
     if (slot->wordless) cutHit(CutPatchSlots);
     counts.hits.fetch_add(1, std::memory_order_relaxed);
+    counts.kinds[draw.indirect.has_value()].hits.fetch_add(1, std::memory_order_relaxed);
     lastOutcome() = OutcomeReplayed;
     return true;
 }
@@ -7306,6 +7425,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             if (auto* slot = archcSlots::lookup(context.device, state, draw, shaders, *prepared.identity, prepared.pipelineStateReuse)) predicted = archcSlots::fingerprint(*slot);
         }
         record.slotCapture = slotCapture ? &passCapture : nullptr;
+        archcSlots::verifyDirectInputs(prepared, inputs);
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace, prepared.pipelineStateReuse);
         if (slotCapture) archcSlots::capture(context, state, draw, shaders, prepared, passCapture, inputsInPlace, predicted);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
@@ -7920,7 +8040,7 @@ int ArchcTakeReplayOutcome() {
 }
 
 bool ArchcReplayLikely(VkDevice device, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawSlotIdentity* identity, bool pipelineStateReuse) {
-    if (identity == nullptr || !draw.indirect.has_value() || !archcSlots::active() || !archcSlots::usableIdentity(*identity, state, shaders)) return false;
+    if (identity == nullptr || (!draw.indirect && !AgcDriver::ArchB::DirectDrawEnabled()) || !archcSlots::active() || !archcSlots::usableIdentity(*identity, state, shaders)) return false;
     const auto* slot = archcSlots::lookup(device, state, draw, shaders, *identity, pipelineStateReuse);
     if (slot == nullptr || !slot->replayedLast) return false;
     archcSlots::counters().prelockSkips.fetch_add(1, std::memory_order_relaxed);
@@ -8050,13 +8170,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
     archcSlots::lastOutcome() = -1;
-    if (identity != nullptr && draw.indirect.has_value() && archcSlots::active()) {
+    if (identity != nullptr && (draw.indirect || AgcDriver::ArchB::DirectDrawEnabled()) && archcSlots::active()) {
         prepared.identity = identity;
         if (archcSlots::tryReplay(context, state, draw, shaders, *identity, trace, pipelineStateReuse, prepared)) return;
         archcSlots::counters().legacy.fetch_add(1, std::memory_order_relaxed);
     }
     if (identity != nullptr && identity->gather != nullptr) {
         AgcDriver::ArchB::Recorder::Count("draw_templates_live_commit_fallback");
+        AgcDriver::ArchB::Recorder::Count(draw.indirect ? "draw_templates_live_commit_fallback_indirect" : "draw_templates_live_commit_fallback_direct");
         auto programs = DriverDetail::MaterializeGather(*identity->gather);
         if (!identity->referenceStages.empty()) {
             AgcDriver::ArchB::Recorder::Count("draw_templates_live_verify_fallback_checks");
@@ -8084,7 +8205,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 if (live.pushConstants.size() != old.pushConstants.size() || !DrawReferenceMasks::SameBytes(live.pushConstants.data(), old.pushConstants.data(), old.pushConstants.size(), i < identity->referenceMasks.size() ? &identity->referenceMasks[i].push : nullptr)) archcSlots::liveMismatch(archcSlots::LivePush, "the fallback push input differs");
                 if (!std::ranges::equal(live.spirv.Words(), old.spirv.Words())) archcSlots::liveMismatch(archcSlots::LivePipeline, "the fallback shader differs");
             }
-            if (identity->referenceDraw == nullptr || !archcSlots::sameDraw(draw, *identity->referenceDraw) || draw.indirect->arguments != identity->referenceDraw->indirect->arguments) archcSlots::liveMismatch(archcSlots::LiveArguments, "the fallback packet differs");
+            if (identity->referenceDraw == nullptr || !archcSlots::sameDraw(draw, *identity->referenceDraw) || (draw.indirect && draw.indirect->arguments != identity->referenceDraw->indirect->arguments)) archcSlots::liveMismatch(archcSlots::LiveArguments, "the fallback packet differs");
         }
         auto patched = std::vector<CompiledShader>(shaders.begin(), shaders.end());
         auto fallback = *identity;
@@ -8255,7 +8376,7 @@ void ArchcNostageArm(int why) {
     if (archcNostage::enabled()) archcNostage::state().armed = why;
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse) {
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse, const DrawSlotIdentity* identity) {
     const GpuAuthorityCensus::ProducerScope censusProducer(2, GpuAuthorityCensus::Enabled() ? timingDrawKey(shaders, 0) : 0);
     if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
@@ -8282,6 +8403,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     reuseCensus::begin(true);
     auto* recorder = Recorder::Active();
     if (state.quadList || StripPatches(state, shaders) || !RecordDraws() || recorder == nullptr || DumpTargetLimit() != 0) return miss(DrawRecipeMiss::NotRecordable);
+    PreparedDraw prepared(profile);
+    prepared.pipelineStateReuse = pipelineStateReuse;
+    if (identity != nullptr && !draw.indirect && AgcDriver::ArchB::DirectDrawEnabled() && archcSlots::active()) {
+        prepared.identity = identity;
+        if (archcSlots::tryReplay(context, state, draw, shaders, *identity, trace, pipelineStateReuse, prepared)) {
+            result.recorded = true;
+            return result;
+        }
+        archcSlots::counters().legacy.fetch_add(1, std::memory_order_relaxed);
+    }
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
@@ -8416,7 +8547,41 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
     record.spaceKeep = &spaceKeep;
+    const bool slotCapture = archcSlots::wantsCapture(prepared);
+    SlotPassCapture passCapture;
+    std::optional<std::array<std::uint64_t, archcSlots::ComponentCount>> predicted;
+    if (slotCapture) {
+        prepared.recorder = recorder;
+        prepared.recorded = true;
+        prepared.lean = true;
+        prepared.completion = record.completion;
+        prepared.resolved.resources = record.resources;
+        prepared.resolved.moved.assign(record.moved.begin(), record.moved.end());
+        prepared.resolved.contentKey = recipe.key;
+        prepared.resolved.cacheable = true;
+        prepared.pipeline = record.pipeline;
+        prepared.framebuffer = record.framebuffer;
+        prepared.targetViews = recipe.targetViews;
+        prepared.depthLocations = record.depthLocations;
+        prepared.inputs = inputs;
+        prepared.targets.resize(record.targets.size());
+        for (std::size_t index = 0; index < record.targets.size(); ++index) {
+            prepared.targets[index].color = state.colors[index];
+            prepared.targets[index].resident = record.targets[index];
+            prepared.targets[index].proxied = AttachmentProxyFormat(context, state.colors[index].format) != VK_FORMAT_UNDEFINED;
+            prepared.targets[index].multisampled = state.colors[index].samples > 1;
+        }
+        if (prepared.slotVerify) {
+            if (auto* slot = archcSlots::lookup(context.device, state, draw, shaders, *identity, pipelineStateReuse)) predicted = archcSlots::fingerprint(*slot);
+        }
+        record.slotCapture = &passCapture;
+    }
+    archcSlots::verifyDirectInputs(prepared, inputs);
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace, pipelineStateReuse);
+    if (slotCapture) {
+        prepared.outcome = outcome;
+        archcSlots::capture(context, state, draw, shaders, prepared, passCapture, prepared.inputs.vertexBuffers.empty() && prepared.inputs.indices == nullptr, predicted);
+    }
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
         auto& stats = Profile();

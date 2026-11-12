@@ -415,6 +415,14 @@ struct AllocChurnSlot {};
 struct PartialSnapshotSlot {};
 }
 
+bool DirectDrawEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_DRAW_DIRECT");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
 bool AllocChurnActive() noexcept {
     return HostThreadSlot<bool, AllocChurnSlot>::Get();
 }

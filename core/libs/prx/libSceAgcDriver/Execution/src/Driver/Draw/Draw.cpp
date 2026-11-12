@@ -564,12 +564,31 @@ bool LiveViewsCurrent(GatherLiveEntry& entry) {
     return true;
 }
 
+void CountLiveDraw(const Pm4::DrawParameters& draw, const char* name, double value = 1) {
+    ArchB::Recorder::Count(name, value);
+    if (!ArchB::Recorder::Enabled()) return;
+    thread_local std::unordered_map<const char*, std::array<std::string, 2>> typedNames;
+    const auto [found, inserted] = typedNames.try_emplace(name);
+    if (inserted) found->second = {std::string(name) + "_direct", std::string(name) + "_indirect"};
+    ArchB::Recorder::Count(found->second[draw.indirect.has_value()].c_str(), value);
+}
+
 std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTail& tail) {
-    if (tail.liveKey == 0 || !tail.drawHit || tail.entry == nullptr || tail.decode == nullptr || !tail.drawParameters.indirect || tail.matched.size() != tail.decode->programs.size()) return {};
-    if (tail.decode->state.stages.path != Graphics::ShaderPath::Vertex || tail.decode->state.stages.mesh || tail.decode->state.stages.tessellation || tail.decode->state.rectList) return {};
+    if (tail.liveKey == 0) return {};
+    if (const char* refused = !tail.drawHit ? "draw_templates_live_learn_refused_cache_miss" : tail.entry == nullptr ? "draw_templates_live_learn_refused_entry" : tail.decode == nullptr ? "draw_templates_live_learn_refused_decode" : !tail.drawParameters.indirect && !ArchB::DirectDrawEnabled() ? "draw_templates_live_learn_refused_direct_disabled" : tail.matched.size() != tail.decode->programs.size() ? "draw_templates_live_learn_refused_stage_count" : nullptr) {
+        CountLiveDraw(tail.drawParameters, refused);
+        return {};
+    }
+    if (tail.decode->state.stages.path != Graphics::ShaderPath::Vertex || tail.decode->state.stages.mesh || tail.decode->state.stages.tessellation || tail.decode->state.rectList) {
+        CountLiveDraw(tail.drawParameters, "draw_templates_live_learn_refused_shader_path");
+        return {};
+    }
     std::vector<std::shared_ptr<DispatchVariant>> donors;
     for (const auto& variant : tail.matched) {
-        if (variant == nullptr || variant->compiled == nullptr) return {};
+        if (variant == nullptr || variant->compiled == nullptr) {
+            CountLiveDraw(tail.drawParameters, "draw_templates_live_learn_refused_variant");
+            return {};
+        }
         donors.push_back(variant->donor != nullptr ? variant->donor : variant);
     }
     auto& index = LiveIndex().entries;
@@ -592,7 +611,10 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
     for (std::size_t stage = 0; stage < entry->variants.size(); ++stage) {
         const auto& variant = entry->variants[stage];
         const auto& program = entry->decode->programs[stage];
-        if (program.merged || program.binary.stage != ShaderRecompiler::ShaderStage::Vertex && program.binary.stage != ShaderRecompiler::ShaderStage::Fragment) return {};
+        if (program.merged || program.binary.stage != ShaderRecompiler::ShaderStage::Vertex && program.binary.stage != ShaderRecompiler::ShaderStage::Fragment) {
+            CountLiveDraw(tail.drawParameters, "draw_templates_live_learn_refused_stage");
+            return {};
+        }
         GatherCommitStage bound;
         bound.compiled = variant->compiled;
         bound.variant = variant;
@@ -624,17 +646,17 @@ std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTa
     if (bucket.size() >= LiveWays) {
         const auto stale = std::find_if(bucket.begin(), bucket.end(), [](const auto& known) { return !known->link->valid.load(std::memory_order_acquire); });
         bucket.erase(stale != bucket.end() ? stale : bucket.begin());
-        ArchB::Recorder::Count("draw_templates_live_bucket_evictions");
+        CountLiveDraw(tail.drawParameters, "draw_templates_live_bucket_evictions");
     }
     bucket.push_back(entry);
-    ArchB::Recorder::Count("draw_templates_live_templates_learned");
+    CountLiveDraw(tail.drawParameters, "draw_templates_live_templates_learned");
     return entry;
 }
 
 std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submission& submission, DrawTail& tail) {
     const auto started = std::chrono::steady_clock::now();
     const auto found = LiveIndex().entries.find(tail.liveKey);
-    if (found == LiveIndex().entries.end()) { ArchB::Recorder::Count("draw_templates_live_q0_refused_no_template"); return {}; }
+    if (found == LiveIndex().entries.end()) { CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_no_template"); return {}; }
     const auto options = LiveOptions(tail);
     thread_local std::vector<DrawProgram> programs;
     static const bool refuseFeedback = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_FEEDBACK") != nullptr;
@@ -647,7 +669,7 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) continue;
         ready = true;
         if (const char* skipped = !LivePacketMatches(entry->packet, tail.livePacket) ? "draw_templates_live_q0_skip_packet" : entry->options != options ? "draw_templates_live_q0_skip_options" : !LiveStateMatches(*entry, queue) ? "draw_templates_live_q0_skip_state" : !LiveViewsCurrent(*entry) ? "draw_templates_live_q0_skip_views" : !DecodeProgramsCurrent(*entry->decode, *submission.shaders) ? "draw_templates_live_q0_skip_decode" : nullptr) {
-            ArchB::Recorder::Count(skipped);
+            CountLiveDraw(tail.drawParameters, skipped);
             continue;
         }
         if (refuseFeedback && options.feedback && std::any_of(entry->variants.begin(), entry->variants.end(), [](const auto& variant) {
@@ -671,28 +693,28 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         candidate.limits = GatherLimitsOf(*tail.localDevice, *entry->link->state);
         candidate.live = true;
         candidate.commitTemplate = entry->link;
-        ArchB::Recorder::Count("draw_templates_live_q0_gathers");
+        CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_gathers");
         auto plan = RunGatherShadow(candidate);
         if (plan == nullptr || !plan->complete || entry->allocationGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
-            if (plan == nullptr) ArchB::Recorder::Count("draw_templates_live_q0_refused_no_plan");
-            else if (plan->complete) ArchB::Recorder::Count("draw_templates_live_q0_refused_allocation_generation");
+            if (plan == nullptr) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_no_plan");
+            else if (plan->complete) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_allocation_generation");
             if (plan != nullptr) {
-                if (plan->incomplete & GatherUnknownBindings) ArchB::Recorder::Count("draw_templates_live_q0_refused_unknown_bindings");
-                if ((plan->incomplete & GatherUnmatched) && plan->differ == GatherDiffer::None) ArchB::Recorder::Count("draw_templates_live_q0_refused_unmatched_unclassified");
-                if (plan->incomplete == GatherIncompleteNone && !plan->matched) ArchB::Recorder::Count("draw_templates_live_q0_refused_not_matched");
-                if (plan->incomplete & GatherPendingWords) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_words");
-                if (plan->incomplete & GatherPendingVsharp) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_vsharp");
-                if (plan->incomplete & GatherPendingIndirect) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_indirect");
-                if (plan->incomplete & GatherGenerationMoved) ArchB::Recorder::Count("draw_templates_live_q0_refused_generation");
-                if (plan->incomplete & GatherBindingShape) ArchB::Recorder::Count("draw_templates_live_q0_refused_binding_shape");
-                if (plan->incomplete & GatherNotTemplatable) ArchB::Recorder::Count("draw_templates_live_q0_refused_feedback");
+                if (plan->incomplete & GatherUnknownBindings) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_unknown_bindings");
+                if ((plan->incomplete & GatherUnmatched) && plan->differ == GatherDiffer::None) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_unmatched_unclassified");
+                if (plan->incomplete == GatherIncompleteNone && !plan->matched) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_not_matched");
+                if (plan->incomplete & GatherPendingWords) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_pending_words");
+                if (plan->incomplete & GatherPendingVsharp) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_pending_vsharp");
+                if (plan->incomplete & GatherPendingIndirect) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_pending_indirect");
+                if (plan->incomplete & GatherGenerationMoved) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_generation");
+                if (plan->incomplete & GatherBindingShape) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_binding_shape");
+                if (plan->incomplete & GatherNotTemplatable) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_feedback");
                 if (plan->differ != GatherDiffer::None) {
                     static const auto names = [] {
                         std::array<std::string, static_cast<std::size_t>(GatherDiffer::Count)> values;
                         for (std::size_t kind = 0; kind < values.size(); ++kind) values[kind] = std::string("draw_templates_live_q0_differ_") + GatherDifferName(static_cast<GatherDiffer>(kind));
                         return values;
                     }();
-                    ArchB::Recorder::Count(names[static_cast<std::size_t>(plan->differ)].c_str());
+                    CountLiveDraw(tail.drawParameters, names[static_cast<std::size_t>(plan->differ)].c_str());
                     static const bool trace = std::getenv("APS5_DRAW_TEMPLATES_LIVE_TRACE_DIFFER") != nullptr;
                     static std::atomic<unsigned> traced{0};
                     if (trace && traced.fetch_add(1, std::memory_order_relaxed) % 37u == 0 && traced.load(std::memory_order_relaxed) < 37u * 120u) {
@@ -708,8 +730,12 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         live->plan = std::move(plan);
         live->parameters = entry->derived;
         live->parameters.indexAddress = tail.drawParameters.indexAddress;
-        live->parameters.indirect->arguments = tail.drawParameters.indirect->arguments;
-        live->parameters.indirect->countAddress = tail.drawParameters.indirect->countAddress;
+        if (live->parameters.indirect) {
+            live->parameters.indirect->arguments = tail.drawParameters.indirect->arguments;
+            live->parameters.indirect->countAddress = tail.drawParameters.indirect->countAddress;
+        } else {
+            live->parameters = tail.drawParameters;
+        }
         const auto& front = programs.front();
         const auto& compiled = *entry->link->stages.front().compiled;
         const auto constant = [&](std::int32_t sgpr, std::uint32_t base, std::uint32_t& out) {
@@ -723,23 +749,33 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
             out = base + value;
             return true;
         };
-        auto& args = *live->parameters.indirect;
-        using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
-        if ((args.vertexRule == Rule::Constant && !constant(compiled.vertexOffsetSgpr, live->parameters.indexed ? 0u : args.indxOffset, args.vertexConstant)) || (args.instanceRule == Rule::Constant && !constant(compiled.instanceOffsetSgpr, 0, args.instanceConstant)) || (!tail.localDevice->DrawIndirectSupport().firstInstance && (args.instanceRule == Rule::InPlace || args.instanceConstant != 0))) {
-            ArchB::Recorder::Count("draw_templates_live_q0_refused_arguments");
+        bool argumentsValid = true;
+        if (live->parameters.indirect) {
+            auto& args = *live->parameters.indirect;
+            using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+            argumentsValid = (args.vertexRule != Rule::Constant || constant(compiled.vertexOffsetSgpr, live->parameters.indexed ? 0u : args.indxOffset, args.vertexConstant)) && (args.instanceRule != Rule::Constant || constant(compiled.instanceOffsetSgpr, 0, args.instanceConstant)) && (tail.localDevice->DrawIndirectSupport().firstInstance || (args.instanceRule != Rule::InPlace && args.instanceConstant == 0));
+        } else {
+            argumentsValid = (compiled.vertexOffsetSgpr < 0 || constant(compiled.vertexOffsetSgpr, live->parameters.firstVertex, live->parameters.firstVertex)) && (compiled.instanceOffsetSgpr < 0 || constant(compiled.instanceOffsetSgpr, 0, live->parameters.firstInstance));
+            const auto& direct = live->parameters;
+            argumentsValid = argumentsValid && direct.indexCount != 0 && direct.instanceCount != 0;
+            if (direct.indexed) argumentsValid = argumentsValid && (direct.indexSize == 2 || direct.indexSize == 4);
+            else argumentsValid = argumentsValid && direct.indexAddress == 0 && direct.indexSize == 0 && direct.firstVertex <= std::numeric_limits<std::uint32_t>::max() - (direct.indexCount - 1u) && direct.firstInstance <= std::numeric_limits<std::uint32_t>::max() - (direct.instanceCount - 1u);
+        }
+        if (!argumentsValid) {
+            CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_arguments");
             continue;
         }
 
         for (const auto& stage : entry->link->stages) live->stages.push_back({stage.stage, stage.compiled.get(), stage.pushOffset, stage.registeredViews.get()});
         live->verify = tail.liveVerify;
         cursor = (way + 1) % ways;
-        ArchB::Recorder::Count("draw_templates_live_q0_taken");
-        ArchB::Recorder::Count("draw_templates_live_q0_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+        CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_taken");
+        CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
         return live;
     }
-    if (feedback) ArchB::Recorder::Count("draw_templates_live_q0_refused_feedback");
-    else if (ready) ArchB::Recorder::Count("draw_templates_live_q0_refused_structure");
-    else ArchB::Recorder::Count("draw_templates_live_q0_refused_not_ready");
+    if (feedback) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_feedback");
+    else if (ready) CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_structure");
+    else CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_not_ready");
     return {};
 }
 
@@ -964,9 +1000,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.liveVerify = tail.liveEnabled && LiveVerifyNext();
     tail.livePacket = drawParameters;
     if (tail.liveEnabled) {
-        if (const char* skipped = !registerKey ? "draw_templates_live_q0_skipped_no_register_key" : !pipelined ? "draw_templates_live_q0_skipped_not_pipelined" : submission.queue != 0 ? "draw_templates_live_q0_skipped_other_queue" : !drawParameters.indirect ? "draw_templates_live_q0_skipped_not_indirect" : lockedPrepare ? "draw_templates_live_q0_skipped_locked_prepare" : traceToken != 0 ? "draw_templates_live_q0_skipped_trace" : !deferredLabels().labels.empty() ? "draw_templates_live_q0_skipped_deferred_labels" : nullptr) ArchB::Recorder::Count(skipped);
+        if (const char* skipped = !registerKey ? "draw_templates_live_q0_skipped_no_register_key" : !pipelined ? "draw_templates_live_q0_skipped_not_pipelined" : submission.queue != 0 ? "draw_templates_live_q0_skipped_other_queue" : !drawParameters.indirect && !ArchB::DirectDrawEnabled() ? "draw_templates_live_q0_skipped_direct_disabled" : lockedPrepare ? "draw_templates_live_q0_skipped_locked_prepare" : traceToken != 0 ? "draw_templates_live_q0_skipped_trace" : !deferredLabels().labels.empty() ? "draw_templates_live_q0_skipped_deferred_labels" : nullptr) CountLiveDraw(drawParameters, skipped);
     }
-    if (ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && registerKey && pipelined && submission.queue == 0 && drawParameters.indirect && !lockedPrepare && traceToken == 0 && deferredLabels().labels.empty()) {
+    if (ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && registerKey && pipelined && submission.queue == 0 && (drawParameters.indirect || ArchB::DirectDrawEnabled()) && !lockedPrepare && traceToken == 0 && deferredLabels().labels.empty()) {
         tail.liveKey = LiveMix(LiveMix(LiveMix(RegisterStructureKey(queue), DrawShaderSetKey(queue, *submission.shaders)), localDevice->Serial()), LivePacketKey(drawParameters));
         if (tail.liveEnabled) tail.live = SelectLive(queue, submission, tail);
         if (tail.live != nullptr && !tail.liveVerify) {
@@ -1530,6 +1566,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
 void Driver::enqueueGatherDraw(DrawTail& tail) {
     const auto live = tail.live;
+    CountLiveDraw(live->parameters, "draw_templates_live_enqueued");
     const auto link = live->entry->link;
     auto writes = queuedDrawWrites(tail, *link->state, live->stages);
     auto reads = QueuedDrawReadRanges(live->parameters, live->stages);
@@ -1584,8 +1621,8 @@ void Driver::enqueueGatherDraw(DrawTail& tail) {
         }
         const auto commitStarted = std::chrono::steady_clock::now();
         commitDraw(localDevice, commitQueue, *link->state, live->parameters, live->stages, {}, nullptr, {}, 0, nullptr, {}, 0, pipelineStateReuse, memoVirtualQuery, nullptr, &identity);
-        ArchB::Recorder::Count("draw_commit_live_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
-        ArchB::Recorder::Count("draw_commit_live_n");
+        CountLiveDraw(live->parameters, "draw_commit_live_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
+        CountLiveDraw(live->parameters, "draw_commit_live_n");
     };
     auto held = std::make_shared<decltype(commit)>(std::move(commit));
     DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw);
@@ -1802,6 +1839,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             if (EmptyIndirectSkip()) CpuIndirectPrograms()[programs.front().binary.codeAddress] = indirectCpu.has_value();
         } else if (i == 0) {
             fold(result, drawParameters);
+            if (tail.liveEntry != nullptr && !tail.liveEntry->derivedReady) {
+                tail.liveEntry->derived = drawParameters;
+                tail.liveEntry->derivedReady = true;
+            }
         }
         try {
             const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
@@ -2292,7 +2333,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             const auto committing = identity.programs != 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             Graphics::DrawSlotIdentity slotIdentity;
             bool identified = false;
-            if (drawParameters.indirect.has_value() && Graphics::ArchcReplayActive()) {
+            if ((drawParameters.indirect.has_value() || ArchB::DirectDrawEnabled()) && Graphics::ArchcReplayActive()) {
                 const auto ownerOf = [&](const ShaderRecompiler::RecompileResult* program) -> std::shared_ptr<const void> {
                     for (const auto& data : stageData) {
                         if (data.compiled != nullptr && data.compiled.get() == program) return data.compiled;
@@ -2472,6 +2513,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
     GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockBegin);
+    const bool directReplay = !drawParameters.indirect && ArchB::DirectDrawEnabled() && Graphics::ArchcReplayActive();
     const bool replayLikely = identity != nullptr && recipe == nullptr && (identity->gather != nullptr || Graphics::ArchcReplayLikely(localDevice->Device(), graphics, drawParameters, stages, identity, pipelineStateReuse));
     const bool nostageTimed = Graphics::ArchcNostageArmed();
     const auto nostageNow = [] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
@@ -2520,7 +2562,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     noteDrawWriters(stages, queue);
     if (nostageTimed) nostageAt[4] = nostageNow();
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse) == RecipeOutcome::Recorded) {
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, pipelineStateReuse, directReplay ? identity : nullptr) == RecipeOutcome::Recorded) {
             slotProbe.kind = archcSlotCensus::RecipeHit;
             return;
         }
@@ -2528,7 +2570,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr ? identity : nullptr);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, &lockTiming.preparation, pipelineStateReuse, recipe == nullptr || directReplay ? identity : nullptr);
     if (nostageTimed) nostageAt[5] = nostageNow();
     slotProbe.Replay();
     if (slotProbe.kind != archcSlotCensus::Indirect && slotProbe.kind < archcSlotCensus::IndirectReplayed && slotProbe.kind != archcSlotCensus::NoStages) slotProbe.Built();

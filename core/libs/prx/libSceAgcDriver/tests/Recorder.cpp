@@ -15150,7 +15150,7 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
     }
 }
 
-bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported) {
+bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported, bool directReplay = false) {
     if (!device.Graphics() || (imported && device.GetContext().hostImportAlignment == 0)) return false;
     constexpr std::size_t unit = 65536;
     constexpr std::size_t bytes = unit * 3;
@@ -15202,8 +15202,10 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     };
     auto producerVertex = shader(COVER_VERT_SPV, 101);
     auto producerPixel = shader(VERTEXRANGEPRODUCER_FRAG_SPV, 102);
-    auto vertex = shader(VERTEXRANGE_VERT_SPV, 103);
-    auto pixel = shader(COVER_FRAG_SPV, 104);
+    const auto vertexOwner = std::make_shared<ShaderRecompiler::RecompileResult>(shader(VERTEXRANGE_VERT_SPV, 103));
+    const auto pixelOwner = std::make_shared<ShaderRecompiler::RecompileResult>(shader(COVER_FRAG_SPV, 104));
+    auto& vertex = *vertexOwner;
+    auto& pixel = *pixelOwner;
     const std::array producerShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &producerVertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &producerPixel, 0}};
     const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
     const auto stateFor = [](std::uint64_t base, VkFormat format, std::uint32_t elementBytes) {
@@ -15223,6 +15225,8 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     };
     const auto producer = stateFor(address + unit, VK_FORMAT_R32G32B32A32_SFLOAT, 16);
     const auto consumer = stateFor(address, VK_FORMAT_R8G8B8A8_UNORM, 4);
+    if (directReplay) AgcDriver::GuestMemory::MarkCommitterThread();
+    const DrawSlotIdentity identity{std::make_shared<State>(consumer), {{vertexOwner}, {pixelOwner}}};
     const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
     const auto produce = [&] {
         Draw(context, producer, triangle, producerShaders);
@@ -15264,6 +15268,22 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
         const auto read = recorder.DescribePendingRead(address + unit, 16);
         Require(read.has_value() == imported && (!read || read->kind == Recorder::ReadKind::DrawInput || read->kind == Recorder::ReadKind::StorageUpload), "the vertex regression used the wrong copied/imported path");
         check(16);
+        if (directReplay) {
+            recorder.Sync();
+            AgcDriver::GuestMemory::WtFaultFlip();
+            const auto before = ArchcReplayCounts();
+            for (unsigned repeat = 0; repeat < 8; ++repeat) {
+                Draw(context, consumer, draw, shaders, {}, nullptr, nullptr, 0, nullptr, false, &identity);
+                WaitForOptimizedPipelines(context.device);
+                recorder.Sync();
+                AgcDriver::GuestMemory::WtFaultFlip();
+            }
+            const auto after = ArchcReplayCounts();
+            Require(after.captures > before.captures && after.hits > before.hits, "direct bounded vertex fetch never captured and replayed");
+            Require(after.verifyMismatches == before.verifyMismatches, "direct bounded vertex replay VERIFY mismatch");
+            if (const auto* verify = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_VERIFY"); verify != nullptr && std::strtoull(verify, nullptr, 10) != 0) Require(after.verifyChecks > before.verifyChecks, "direct bounded vertex replay VERIFY did not run");
+            check(16);
+        }
         Require(recipe != nullptr, "the range regression did not create a draw recipe");
         std::vector<std::byte> cleared(unit);
         AgcDriver::GuestMemory::Write(address, cleared);
@@ -20050,8 +20070,8 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string_view(argv[1]) == "--archc-label-prewait") {
             return archcLabelPrewaitTests(device, recorder, argv[2]);
         }
-        if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
-            return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;
+        if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported" || std::string_view(argv[1]) == "--vertex-target-range-direct-replay")) {
+            return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) != "--vertex-target-range-copied", std::string_view(argv[1]) == "--vertex-target-range-direct-replay") ? 0 : 77;
         }
 
 #ifdef _WIN32

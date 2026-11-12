@@ -142,6 +142,8 @@ public:
     static void CountUpperBoundHit(Feature feature);
 };
 
+bool DirectDrawEnabled() noexcept;
+
 // FIX_ALLOC_CHURN is sampled once per draw or dispatch into the calling thread (AllocChurnScope);
 // the allocation sites below it read AllocChurnActive(), so a runtime toggle changes their path only
 // between draws. It is off on a thread outside any scope. Every site keeps its results identical
