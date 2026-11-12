@@ -5928,7 +5928,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
                 if (!info.has_value()) continue;
                 static const bool tracePresync = std::getenv("APS5_TRACE_PRESYNC") != nullptr;
                 static std::atomic<unsigned> traced{0};
-                if (tracePresync && traced.fetch_add(1, std::memory_order_relaxed) < 400u) std::fprintf(stderr, "[presync] surface=0x%llx bytes=%llu keys=%d open=%d serial=%llu surfaces=%zu\n", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), surface.dccKeys ? 1 : 0, info->open ? 1 : 0, static_cast<unsigned long long>(info->serial), surfaces.size());
+                if (tracePresync && traced.fetch_add(1, std::memory_order_relaxed) < 400u) std::fprintf(stderr, "[presync] surface=0x%llx bytes=%llu keys=%d open=%d serial=%llu surfaces=%zu pending_cpu=%d completion_label=%d batches:%s\n", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), surface.dccKeys ? 1 : 0, info->open ? 1 : 0, static_cast<unsigned long long>(info->serial), surfaces.size(), state->recorder->PendingCpuWritesOverlap(surface.address, bytes) ? 1 : 0, state->recorder->CompletionLabelIn(surface.address, bytes) ? 1 : 0, state->recorder->DescribeCpuCompletions(surface.address, bytes).c_str());
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
                 texelsPending = texelsPending || !surface.dccKeys;

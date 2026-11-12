@@ -1018,7 +1018,12 @@ std::shared_ptr<Texture> gpuSampledArray(const Context& context, std::span<const
     const auto bytes = static_cast<std::size_t>(guestBytes);
     if (recorder == nullptr || recorder->Device() != context.device || Recorder::InCompletion() || context.detiler == nullptr) return refuse("fix_sampled_array_gpu_refused_recorder");
     if (recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes)) return refuse("fix_sampled_array_gpu_refused_queued_store");
-    if (recorder->PendingCpuWritesOverlap(address, bytes) || recorder->CompletionLabelIn(address, bytes)) return refuse("fix_sampled_array_gpu_refused_cpu_store");
+    if (recorder->PendingCpuWritesOverlap(address, bytes) || recorder->CompletionLabelIn(address, bytes)) {
+        static const bool trace = std::getenv("APS5_TRACE_PRESYNC") != nullptr;
+        static std::atomic<unsigned> traced{0};
+        if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 60u) std::fprintf(stderr, "[presync] cpu_store array=0x%llx bytes=%zu pending_cpu=%d completion_label=%d batches:%s\n", static_cast<unsigned long long>(address), bytes, recorder->PendingCpuWritesOverlap(address, bytes) ? 1 : 0, recorder->CompletionLabelIn(address, bytes) ? 1 : 0, recorder->DescribeCpuCompletions(address, bytes).c_str());
+        return refuse("fix_sampled_array_gpu_refused_cpu_store");
+    }
     if (recorder->PendingLeaseSerial(address, bytes) != 0) return refuse("fix_sampled_array_gpu_refused_lease");
     if (AnyShadowedOverlaps(address, bytes)) {
         if (!LazyShadowPublishEnabled()) return refuse("fix_sampled_array_gpu_refused_shadow");

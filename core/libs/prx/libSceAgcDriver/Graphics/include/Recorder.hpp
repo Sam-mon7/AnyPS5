@@ -23,6 +23,7 @@
 #include <tuple>
 #include <unordered_set>
 #include <utility>
+#include <source_location>
 #include <string>
 #include <vector>
 
@@ -311,7 +312,8 @@ public:
     // bytes and stamps nothing, so C_LAZY_FENCE may leave it to run after a deferred writer wait.
     // `copiedWriter`: the action is that object's copied-buffer write-back (plus its fault check), so its
     // guest stores are exactly its CopiedWritesOverlap ranges (kept alive by the batch).
-    void OnComplete(std::function<void()> action, bool checkOnly = false, const ShaderResources* copiedWriter = nullptr);
+    void OnComplete(std::function<void()> action, bool checkOnly = false, const ShaderResources* copiedWriter = nullptr, std::source_location site = std::source_location::current());
+    std::string DescribeCpuCompletions(std::uint64_t address, std::size_t bytes) const;
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -874,6 +876,12 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
+        struct CompletionOrigin {
+            const char* file;
+            std::uint32_t line;
+            std::uint8_t kind;
+        };
+        std::vector<CompletionOrigin> completionOrigins;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;

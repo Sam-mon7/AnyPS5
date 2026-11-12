@@ -4957,9 +4957,33 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
     }
 }
 
-void Recorder::OnComplete(std::function<void()> action, bool checkOnly, const ShaderResources* copiedWriter) {
+std::string Recorder::DescribeCpuCompletions(std::uint64_t address, std::size_t bytes) const {
+    std::string text;
+    const auto describe = [&](const Batch& batch, const char* state) {
+        if (std::none_of(batch.writes.begin(), batch.writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) return;
+        text += std::string(" [") + state + " completions=" + std::to_string(batch.completions.size()) + " check_only=" + std::to_string(batch.checkOnlyCompletions) + " copied_writers=" + std::to_string(batch.copiedWriterCompletions.size());
+        std::vector<std::pair<std::string, unsigned>> counts;
+        for (const auto& origin : batch.completionOrigins) {
+            const char* slash = std::strrchr(origin.file, '/');
+            const char* back = std::strrchr(origin.file, '\\');
+            const char* name = slash != nullptr && (back == nullptr || slash > back) ? slash + 1 : back != nullptr ? back + 1 : origin.file;
+            auto key = std::string(name) + ":" + std::to_string(origin.line) + (origin.kind == 1 ? "(check)" : origin.kind == 2 ? "(copied)" : "");
+            const auto found = std::find_if(counts.begin(), counts.end(), [&](const auto& item) { return item.first == key; });
+            if (found == counts.end()) counts.emplace_back(std::move(key), 1u);
+            else ++found->second;
+        }
+        for (const auto& [key, count] : counts) text += " " + key + "x" + std::to_string(count);
+        text += "]";
+    };
+    if (open != nullptr) describe(*open, "open");
+    for (const auto& batch : inFlight) describe(*batch, "in_flight");
+    return text;
+}
+
+void Recorder::OnComplete(std::function<void()> action, bool checkOnly, const ShaderResources* copiedWriter, std::source_location site) {
     ensureOpen();
     open->completions.push_back(std::move(action));
+    open->completionOrigins.push_back({site.file_name(), site.line(), static_cast<std::uint8_t>(checkOnly ? 1 : copiedWriter != nullptr ? 2 : 0)});
     if (checkOnly) ++open->checkOnlyCompletions;
     else if (copiedWriter != nullptr) open->copiedWriterCompletions.push_back(copiedWriter);
     ++open->writeBackCompletionCount;
@@ -5704,6 +5728,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     } else {
         batch.completions.push_back([store = std::move(store)] { store([](const auto&) {}); });
     }
+    batch.completionOrigins.push_back({"label_store", 0, 0});
     if (LazyFenceEnabled()) batch.completionSites.push_back(__builtin_return_address(0));
     // Counted per batch and counted down when the batch finishes, on every exit path of finish()
     // (a label whose range became unmapped is reported there, and a lost device throws before the
@@ -5733,6 +5758,7 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
+    batch.completionOrigins.push_back({"after_recorded_work", 0, 0});
     if (LazyFenceEnabled()) batch.completionSites.push_back(__builtin_return_address(0));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
