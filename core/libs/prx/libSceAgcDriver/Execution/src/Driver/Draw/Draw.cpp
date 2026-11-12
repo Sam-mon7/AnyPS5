@@ -963,6 +963,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.liveEnabled = ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLive);
     tail.liveVerify = tail.liveEnabled && LiveVerifyNext();
     tail.livePacket = drawParameters;
+    if (tail.liveEnabled) {
+        if (const char* skipped = !registerKey ? "draw_templates_live_q0_skipped_no_register_key" : !pipelined ? "draw_templates_live_q0_skipped_not_pipelined" : submission.queue != 0 ? "draw_templates_live_q0_skipped_other_queue" : !drawParameters.indirect ? "draw_templates_live_q0_skipped_not_indirect" : lockedPrepare ? "draw_templates_live_q0_skipped_locked_prepare" : traceToken != 0 ? "draw_templates_live_q0_skipped_trace" : !deferredLabels().labels.empty() ? "draw_templates_live_q0_skipped_deferred_labels" : nullptr) ArchB::Recorder::Count(skipped);
+    }
     if (ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && registerKey && pipelined && submission.queue == 0 && drawParameters.indirect && !lockedPrepare && traceToken == 0 && deferredLabels().labels.empty()) {
         tail.liveKey = LiveMix(LiveMix(LiveMix(RegisterStructureKey(queue), DrawShaderSetKey(queue, *submission.shaders)), localDevice->Serial()), LivePacketKey(drawParameters));
         if (tail.liveEnabled) tail.live = SelectLive(queue, submission, tail);
@@ -2335,6 +2338,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
             ArchB::Recorder::Count("draw_commit_old_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
             ArchB::Recorder::Count("draw_commit_old_n");
+            {
+                const auto commitNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count());
+                const bool direct = !drawParameters.indirect.has_value();
+                ArchB::Recorder::Count(direct ? (recipe != nullptr ? "draw_commit_old_direct_recipe_ns" : "draw_commit_old_direct_plain_ns") : "draw_commit_old_indirect_ns", commitNs);
+                ArchB::Recorder::Count(direct ? (recipe != nullptr ? "draw_commit_old_direct_recipe_n" : "draw_commit_old_direct_plain_n") : "draw_commit_old_indirect_n");
+            }
             if (nostageCensus) Graphics::ArchcNostageArm(-1);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
             return 0;
