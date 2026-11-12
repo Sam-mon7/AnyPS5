@@ -232,6 +232,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::GpuAuthorityCensus, "GPU_AUTHORITY_CENSUS", false, true, {}},
     {Feature::LazyShadowPublish, "LAZY_SHADOW_PUBLISH", false, true, LazyShadowPublishPrerequisites},
     {Feature::DepthRunRepeat, "DEPTH_RUN_REPEAT", false, true, DepthRunRepeatPrerequisites},
+    {Feature::DispatchAddressReuse, "DISPATCH_ADDRESS_REUSE", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

@@ -52,6 +52,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -61,6 +62,43 @@
 
 namespace AgcDriver::Graphics {
 namespace {
+
+struct DispatchAddressStatistics {
+    std::atomic<std::uint64_t> builds{0}, eligible{0}, reusedSets{0}, freshSets{0}, retiredSets{0}, descriptorsWritten{0}, verified{0}, failures{0};
+};
+
+DispatchAddressStatistics& addressReuseStatistics() {
+    static DispatchAddressStatistics stats;
+    static const bool registered = [&] {
+        ArchB::Recorder::RegisterCounter("dispatch_address_builds", stats.builds);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_eligible", stats.eligible);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_sets", stats.reusedSets);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_fresh_sets", stats.freshSets);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_retired_sets", stats.retiredSets);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_descriptors_written", stats.descriptorsWritten);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_verified", stats.verified);
+        ArchB::Recorder::RegisterCounter("dispatch_address_reuse_failures", stats.failures);
+        return true;
+    }();
+    static_cast<void>(registered);
+    return stats;
+}
+
+bool addressBuildSteps() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_STEPS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+bool verifyAddressReuse() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_VERIFY_DISPATCH_ADDRESS_REUSE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
@@ -2311,11 +2349,20 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
     buildPrepare(shaders, nullptr, 0, 0, 0);
 }
 
+ShaderResources::DispatchAddressReuseCounts ShaderResources::AddressReuseCounts() {
+    const auto& stats = addressReuseStatistics();
+    return {stats.builds.load(std::memory_order_relaxed), stats.eligible.load(std::memory_order_relaxed), stats.reusedSets.load(std::memory_order_relaxed), stats.freshSets.load(std::memory_order_relaxed), stats.retiredSets.load(std::memory_order_relaxed), stats.descriptorsWritten.load(std::memory_order_relaxed), stats.verified.load(std::memory_order_relaxed), stats.failures.load(std::memory_order_relaxed)};
+}
+
 void ShaderResources::Complete() {
     Require(!completed, "shader resources were already completed");
     const std::span<const CompiledShader> shaders(&deferredCompute, 1);
     if (lockedBuild) {
+        std::optional<PerformanceTimer> step;
+        if (addressBuildSteps()) step.emplace("Resources.Address.PrepareAddressBindings");
         prepareAddressBindings(shaders, deferredSnapshots);
+        step.reset();
+        if (addressBuildSteps()) step.emplace("Resources.Address.BuildPrepare");
         buildPrepare(shaders, nullptr, 0, 0, 0);
     }
     buildComplete();
@@ -2941,9 +2988,17 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             if (samplerDescriptors != 0) sizes.push_back({VK_DESCRIPTOR_TYPE_SAMPLER, samplerDescriptors});
             const auto variableCount = tableVariableCount(0);
             if (context.descriptorCache != nullptr && !noPoolCache) {
-                const auto allocated = context.descriptorCache->Allocate(_layout, sizes, updateAfterBind, variableCount);
+                const bool reuse = !drawBuild && usesBda && !ownsLayout && !variableCount.has_value() && std::ranges::all_of(bindings, [](const Binding& binding) { return binding.flags == 0u; }) && ArchB::Switches::Enabled(ArchB::Feature::DispatchAddressReuse);
+                bool reused = false;
+                auto allocated = reuse ? context.descriptorCache->AllocateRewritten(_layout, sizes, updateAfterBind, variableCount, &reused, true) : context.descriptorCache->Allocate(_layout, sizes, updateAfterBind, variableCount);
                 _set = allocated.set;
-                cacheAllocation = allocated;
+                cacheAllocation = std::move(allocated);
+                recycleAddressSet = reuse && cacheAllocation.pool != VK_NULL_HANDLE && cacheAllocation.layout == VK_NULL_HANDLE;
+                if (recycleAddressSet) {
+                    auto& stats = addressReuseStatistics();
+                    ++stats.eligible;
+                    ++(reused ? stats.reusedSets : stats.freshSets);
+                }
             }
             if (_set == VK_NULL_HANDLE) {
                 pool = CreateSetPool(context, sizes, updateAfterBind);
@@ -3155,9 +3210,111 @@ struct ShaderResources::DrawSetPool {
     }
 };
 
+void ShaderResources::verifyDispatchAddressDescriptors() {
+    VkDescriptorPool referencePool = VK_NULL_HANDLE;
+    try {
+        Require(recycleAddressSet && !splitSets && bda != nullptr && _layout != VK_NULL_HANDLE, "dispatch address VERIFY has no eligible allocation");
+        std::map<VkDescriptorType, std::uint32_t> counts;
+        std::size_t bufferCount = 0, imageCount = 0;
+        for (const auto& binding : bindings) {
+            Require(binding.flags == 0u && setOf(binding) == 0u, "dispatch address VERIFY encountered a partial or split binding");
+            counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
+            if (binding.layout.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) bufferCount += binding.allocations.size();
+            else imageCount += binding.imageAllocations.size();
+        }
+        std::vector<VkDescriptorPoolSize> sizes;
+        for (const auto& [type, count] : counts) sizes.push_back({type, count});
+        referencePool = CreateSetPool(context, sizes, updateAfterBind);
+        VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocate.descriptorPool = referencePool;
+        allocate.descriptorSetCount = 1;
+        allocate.pSetLayouts = &_layout;
+        VkDescriptorSet referenceSet = VK_NULL_HANDLE;
+        Check(context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets")(context.device, &allocate, &referenceSet), "dispatch address VERIFY allocate");
+        std::vector<VkDescriptorBufferInfo> buffers;
+        std::vector<VkDescriptorImageInfo> images;
+        std::vector<VkWriteDescriptorSet> writes;
+        buffers.reserve(bufferCount);
+        images.reserve(imageCount);
+        writes.reserve(bindings.size());
+        for (const auto& binding : bindings) {
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = referenceSet;
+            write.dstBinding = binding.layout.binding;
+            write.descriptorCount = binding.layout.descriptorCount;
+            write.descriptorType = binding.layout.descriptorType;
+            if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                Require(binding.allocations.size() == write.descriptorCount, "dispatch address VERIFY buffer count differs");
+                write.pBufferInfo = buffers.data() + buffers.size();
+                for (const auto index : binding.allocations) buffers.push_back(descriptor(allocations.at(index)));
+            } else {
+                Require(binding.imageAllocations.size() == write.descriptorCount, "dispatch address VERIFY image count differs");
+                write.pImageInfo = images.data() + images.size();
+                for (const auto index : binding.imageAllocations) {
+                    switch (write.descriptorType) {
+                        case VK_DESCRIPTOR_TYPE_SAMPLER:
+                            images.push_back({samplers.at(index)->Handle(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+                            break;
+                        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                            if (index == std::numeric_limits<std::size_t>::max()) {
+                                constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+                                images.push_back({VK_NULL_HANDLE, context.nullDescriptors ? VK_NULL_HANDLE : context.placeholderImages->View(binding.layout.binding % bindingCount), VK_IMAGE_LAYOUT_GENERAL});
+                            } else if (write.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+                                const auto& texture = textures.at(index);
+                                images.push_back({VK_NULL_HANDLE, textureSrgb.at(index) ? texture->SrgbView(textureFirstLayer.at(index), textureBaseLevel.at(index)) : textureBaseLevel.at(index) ? texture->BaseLevelView() : textureFirstLayer.at(index) ? texture->FirstLayerView() : texture->View(), texture->Layout()});
+                            } else if (storageTextures.at(index) == nullptr) {
+                                images.push_back({VK_NULL_HANDLE, multisampleStorageViews.at(index), VK_IMAGE_LAYOUT_GENERAL});
+                            } else {
+                                const auto& texture = storageTextures.at(index);
+                                const auto mip = storageMips.at(index);
+                                const auto first = storageFirstLayer.at(index);
+                                images.push_back({VK_NULL_HANDLE, storageAtomic64.at(index) ? texture->Atomic64View(mip, first) : storageAtomic.at(index) ? texture->AtomicView(mip, first) : texture->StorageView(mip, first, ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(binding.layout.binding)), VK_IMAGE_LAYOUT_GENERAL});
+                            }
+                            break;
+                        default: throw std::runtime_error("dispatch address VERIFY descriptor type is unsupported");
+                    }
+                }
+            }
+            writes.push_back(write);
+        }
+        Require(writes.size() == descriptorWrites.size(), "dispatch address VERIFY write count differs");
+        for (std::size_t index = 0; index < writes.size(); ++index) {
+            const auto& expected = writes[index];
+            const auto& actual = descriptorWrites[index];
+            Require(actual.dstSet == _set && actual.dstBinding == expected.dstBinding && actual.dstArrayElement == expected.dstArrayElement && actual.descriptorCount == expected.descriptorCount && actual.descriptorType == expected.descriptorType && actual.pNext == nullptr && actual.pTexelBufferView == nullptr, "dispatch address VERIFY descriptor structure differs");
+            for (std::size_t element = 0; element < expected.descriptorCount; ++element) {
+                if (expected.pBufferInfo != nullptr) {
+                    Require(actual.pBufferInfo != nullptr, "dispatch address VERIFY buffer info is missing");
+                    const auto& left = actual.pBufferInfo[element];
+                    const auto& right = expected.pBufferInfo[element];
+                    Require(left.buffer == right.buffer && left.offset == right.offset && left.range == right.range, "dispatch address VERIFY buffer contents differ");
+                } else {
+                    Require(actual.pImageInfo != nullptr, "dispatch address VERIFY image info is missing");
+                    const auto& left = actual.pImageInfo[element];
+                    const auto& right = expected.pImageInfo[element];
+                    Require(left.sampler == right.sampler && left.imageView == right.imageView && left.imageLayout == right.imageLayout, "dispatch address VERIFY image contents differ");
+                }
+            }
+        }
+        context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, referencePool, nullptr);
+        referencePool = VK_NULL_HANDLE;
+        ++addressReuseStatistics().verified;
+    } catch (...) {
+        if (referencePool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, referencePool, nullptr);
+        ++addressReuseStatistics().failures;
+        throw;
+    }
+}
+
 void ShaderResources::buildComplete() {
     PerformanceTimer frameTiming("Resources.Complete");
     BuildLookups lookups;
+    if (!drawBuild && usesBda) ++addressReuseStatistics().builds;
+    std::optional<PerformanceTimer> addressStep;
+    const bool addressSteps = !drawBuild && usesBda && addressBuildSteps();
+    if (addressSteps) addressStep.emplace("Resources.Complete.Address.Images");
     AgcDriver::ArchB::Recorder::Count(drawBuild ? "resources_complete_draw" : usesBda ? "resources_complete_dispatch_address_table" : usesFaultBuffer ? "resources_complete_dispatch_fault_only" : "resources_complete_dispatch_plain");
     if (!GuestMemory::IsCommitterThread()) AgcDriver::ArchB::Recorder::Count(GuestMemory::GpuMutex().HeldByThisThread() ? "resources_complete_other_locked" : "resources_complete_other_unlocked");
     Require(!completed, "cannot update a published descriptor heap");
@@ -3188,14 +3345,29 @@ void ShaderResources::buildComplete() {
         const auto imagesMs = phase(BuildPhase::Images);
         timing.imagesMs += imagesMs;
         timing.bindingsMs += imagesMs;
+        addressStep.reset();
+        if (addressSteps) addressStep.emplace("Resources.Complete.Address.UploadFinish");
         requireGuestBuffers();
         guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, faultReportOnly);
+        addressStep.reset();
+        if (addressSteps) addressStep.emplace("Resources.Complete.Address.Bda");
+        const bool addressReuse = !drawBuild && usesBda && ArchB::Switches::Enabled(ArchB::Feature::DispatchAddressReuse);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, faultReportOnly, addressReuse);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context, faultReportOnly);
+        if (addressReuse && verifyAddressReuse()) {
+            try {
+                bda->VerifyTableContents(context, guestMemory);
+            } catch (...) {
+                ++addressReuseStatistics().failures;
+                throw;
+            }
+        }
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
         timing.bdaMs += phase(BuildPhase::Bda);
+        addressStep.reset();
+        if (addressSteps) addressStep.emplace("Resources.Complete.Address.Descriptors");
         if (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) {
             // One update call for the whole set: the info arrays are sized up front so every write's
             // pointer into them stays valid until the call.
@@ -3302,6 +3474,11 @@ void ShaderResources::buildComplete() {
                     default: throw std::runtime_error("AGC graphics: ShaderResources encountered an unknown descriptor type while writing the descriptor set");
                 }
                 writes.push_back(write);
+            }
+            if (recycleAddressSet) {
+                Require(keptWrites.empty(), "dispatch address reuse requires a complete descriptor rewrite");
+                for (const auto& write : writes) addressReuseStatistics().descriptorsWritten.fetch_add(write.descriptorCount, std::memory_order_relaxed);
+                if (verifyAddressReuse()) verifyDispatchAddressDescriptors();
             }
             if (keptWrites.empty()) {
                 context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -6527,29 +6704,45 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     return {set, pool, chain.size() - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}};
 }
 
-DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
+DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount, bool* reused, bool dispatch) {
+    if (reused != nullptr) *reused = false;
     {
         std::lock_guard lock(mutex);
-        if (const auto found = recycled.find({layout, variableCount.value_or(0u)}); found != recycled.end() && !found->second.empty()) {
-            const auto allocation = found->second.back();
+        auto& available = dispatch ? dispatchRecycled : recycled;
+        if (const auto found = available.find({layout, variableCount.value_or(0u)}); found != available.end() && !found->second.empty()) {
+            auto allocation = std::move(found->second.back());
             found->second.pop_back();
+            if (dispatch) {
+                --dispatchRecycledCount;
+                if (found->second.empty()) available.erase(found);
+            }
+            if (reused != nullptr) *reused = true;
             return allocation;
         }
     }
     return Allocate(layout, sizes, updateAfterBind, variableCount);
 }
 
-void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept {
+void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation, bool dispatch) noexcept {
     if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
+    if (dispatch && allocation.layout != VK_NULL_HANDLE) {
+        Free(allocation);
+        return;
+    }
     {
         std::lock_guard lock(mutex);
         try {
-            auto& list = recycled[{layout, allocation.variableCount.value_or(0u)}];
-            if (list.size() < 4096) {
-                list.push_back(allocation);
-                return;
+            if (!dispatch || dispatchRecycledCount < 256u) {
+                auto& available = dispatch ? dispatchRecycled : recycled;
+                auto& list = available[{layout, allocation.variableCount.value_or(0u)}];
+                if (list.size() < (dispatch ? 32u : 4096u)) {
+                    list.push_back(allocation);
+                    if (dispatch) ++dispatchRecycledCount;
+                    return;
+                }
             }
         } catch (...) {
+            if (dispatch) std::erase_if(dispatchRecycled, [](const auto& entry) { return entry.second.empty(); });
         }
     }
     Free(allocation);
@@ -6600,6 +6793,7 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
         }
     }
     for (const auto& [key, list] : recycled) counters.recycledSets += list.size();
+    counters.dispatchRecycledSets = dispatchRecycledCount;
     return counters;
 }
 
@@ -7971,7 +8165,13 @@ std::shared_ptr<const TableDescriptors> ShaderResources::keptTable(std::size_t s
 void ShaderResources::release() noexcept {
     // A set from the cache's pool chain goes back to it; a dedicated pool dies with its set.
     std::shared_ptr<const std::vector<std::weak_ptr<Texture>>> held;
-    if (cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(cacheAllocation, keptTable(0, held));
+    if (cacheAllocation.pool && context.descriptorCache != nullptr) {
+        if (recycleAddressSet && completed) {
+            context.descriptorCache->Recycle(_layout, cacheAllocation, true);
+            ++addressReuseStatistics().retiredSets;
+        } else context.descriptorCache->Free(cacheAllocation, keptTable(0, held));
+    }
+    recycleAddressSet = false;
     if (pool) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (_layout && ownsLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, _layout, nullptr);
     if (fragment.cacheAllocation.pool && context.descriptorCache != nullptr) context.descriptorCache->Free(fragment.cacheAllocation, keptTable(1, held));

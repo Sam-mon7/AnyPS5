@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
@@ -30,7 +32,42 @@ struct TableEntry {
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::weak_ptr<Buffer> buffer;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spaceKeys;
+    std::size_t logicalBytes = 0;
 };
+
+struct AddressTableReuseCounters {
+    std::atomic<std::uint64_t> builds{0};
+    std::atomic<std::uint64_t> cacheHits{0};
+    std::atomic<std::uint64_t> fills{0};
+    std::atomic<std::uint64_t> logicalBytesWritten{0};
+    std::atomic<std::uint64_t> storageBytesRequested{0};
+    std::atomic<std::uint64_t> paddingBytes{0};
+    std::atomic<std::uint64_t> paddedBuilds{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> verifyBytesWritten{0};
+    std::atomic<std::uint64_t> failures{0};
+    std::atomic<std::uint64_t> handleReuses{0};
+};
+
+AddressTableReuseCounters& addressTableReuseCounters() {
+    static AddressTableReuseCounters counters;
+    static const bool registered = [] {
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_builds", counters.builds);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_cache_hits", counters.cacheHits);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_fills", counters.fills);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_logical_bytes_written", counters.logicalBytesWritten);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_storage_bytes_requested", counters.storageBytesRequested);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_padding_bytes", counters.paddingBytes);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_padded_builds", counters.paddedBuilds);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_verified", counters.verified);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_verify_bytes_written", counters.verifyBytesWritten);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_verify_failures", counters.failures);
+        AgcDriver::ArchB::Recorder::RegisterCounter("dispatch_address_table_handle_reuses", counters.handleReuses);
+        return true;
+    }();
+    static_cast<void>(registered);
+    return counters;
+}
 
 struct TableCache {
     AgcDriver::Mutex mutex;
@@ -322,7 +359,9 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     return true;
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly, bool dispatchReuse) : BdaResources(context, reportOnly) {
+    this->dispatchReuse = dispatchReuse;
+    if (dispatchReuse) addressTableReuseCounters().builds.fetch_add(1, std::memory_order_relaxed);
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -340,7 +379,9 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             const auto key = std::pair{serial, guardSerial};
             if (std::find(it->spaceKeys.begin(), it->spaceKeys.end(), key) == it->spaceKeys.end()) continue;
             if (auto shared = it->buffer.lock(); shared != nullptr) {
-                tableBytes = shared->Bytes().size();
+                tableBytes = it->logicalBytes;
+                Require(tableBytes != 0 && tableBytes <= shared->Bytes().size(), "cached BDA table logical range exceeds its storage");
+                if (dispatchReuse) addressTableReuseCounters().cacheHits.fetch_add(1, std::memory_order_relaxed);
                 tableGuardSerial = guardSerial;
                 ++cache.hits;
                 ++cache.classes.spaceTables;
@@ -389,6 +430,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
                 continue;
             }
             if (sameRanges(it->ranges, ranges)) {
+                if (dispatchReuse) addressTableReuseCounters().cacheHits.fetch_add(1, std::memory_order_relaxed);
                 ++cache.hits;
                 if (serial != 0) {
                     const auto key = std::pair{serial, guardSerial};
@@ -406,10 +448,21 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     }
     Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA table ranges do not ascend by begin");
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const auto storageBytes = dispatchReuse ? BufferPool::Capacity(tableBytes) : tableBytes;
+    Require(storageBytes >= tableBytes, "BDA table storage size overflow");
+    table = std::make_shared<Buffer>(context, storageBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    if (dispatchReuse) {
+        auto& counts = addressTableReuseCounters();
+        counts.fills.fetch_add(1, std::memory_order_relaxed);
+        counts.logicalBytesWritten.fetch_add(tableBytes, std::memory_order_relaxed);
+        counts.storageBytesRequested.fetch_add(storageBytes, std::memory_order_relaxed);
+        counts.paddingBytes.fetch_add(storageBytes - tableBytes, std::memory_order_relaxed);
+        if (storageBytes > tableBytes) counts.paddedBuilds.fetch_add(1, std::memory_order_relaxed);
+        if (table->ReusedHandle()) counts.handleReuses.fetch_add(1, std::memory_order_relaxed);
+    }
     if (tableCacheEnabled()) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
@@ -418,10 +471,40 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.device = context.device;
         }
         auto cachedRanges = filtered.has_value() ? std::move(*filtered) : cached.has_value() ? *cached->ranges : std::move(built);
-        cache.entries.push_front({hash, std::move(cachedRanges), table, {}});
+        cache.entries.push_front({hash, std::move(cachedRanges), table, {}, tableBytes});
         if (serial != 0) cache.entries.front().spaceKeys.emplace_back(serial, guardSerial);
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
+}
+
+BdaResources::AddressTableReuseStats BdaResources::AddressTableReuseCounts() {
+    const auto& counts = addressTableReuseCounters();
+    return {counts.builds.load(std::memory_order_relaxed), counts.cacheHits.load(std::memory_order_relaxed), counts.fills.load(std::memory_order_relaxed), counts.logicalBytesWritten.load(std::memory_order_relaxed), counts.storageBytesRequested.load(std::memory_order_relaxed), counts.paddingBytes.load(std::memory_order_relaxed), counts.paddedBuilds.load(std::memory_order_relaxed), counts.verified.load(std::memory_order_relaxed), counts.verifyBytesWritten.load(std::memory_order_relaxed), counts.failures.load(std::memory_order_relaxed), counts.handleReuses.load(std::memory_order_relaxed)};
+}
+
+void BdaResources::VerifyTableContents(const Context& context, const GuestBufferMemory& memory) const {
+    const auto current = memory.AddressRanges();
+    auto guardSerial = MultisampleTargetRangeGeneration();
+    const auto filtered = ExcludeMultisampleTargetRanges(context.device, current, guardSerial);
+    const auto& ranges = filtered.has_value() ? *filtered : current;
+    Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA reference table range count overflow");
+    Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA reference table size overflow");
+    const auto bytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
+    Require(bytes <= context.limits.maxStorageBufferRange, "BDA reference table exceeds storage buffer range limit");
+    Require(ShaderRecompiler::BdaAbi::RangesOrdered(ranges.data(), ranges.size()), "BDA reference table ranges do not ascend by begin");
+    for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA reference range exceeds the written-page record");
+    Buffer reference(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), 0};
+    std::memcpy(reference.Bytes().data(), &header, sizeof(header));
+    if (!ranges.empty()) std::memcpy(reference.Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    const auto actual = TableBytes();
+    const bool equal = actual.size() == bytes && Table().range == bytes && std::memcmp(actual.data(), reference.Bytes().data(), bytes) == 0;
+    if (dispatchReuse) {
+        auto& counts = addressTableReuseCounters();
+        counts.verifyBytesWritten.fetch_add(bytes, std::memory_order_relaxed);
+        (equal ? counts.verified : counts.failures).fetch_add(1, std::memory_order_relaxed);
+    }
+    Require(equal, "APS5_VERIFY_DISPATCH_ADDRESS_REUSE: BDA table contents differ from an independent exact-size build");
 }
 
 BdaResources::TableCacheStats BdaResources::TableCacheCounters() {

@@ -117,6 +117,7 @@ enum class Feature : std::uint8_t {
     GpuAuthorityCensus,
     LazyShadowPublish,
     DepthRunRepeat,
+    DispatchAddressReuse,
     Count
 };
 

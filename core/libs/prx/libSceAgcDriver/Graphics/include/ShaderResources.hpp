@@ -123,8 +123,8 @@ public:
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
     void Free(const SetAllocation& allocation, std::shared_ptr<const TableDescriptors> table = {}) noexcept;
-    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
-    void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
+    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt, bool* reused = nullptr, bool dispatch = false);
+    void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation, bool dispatch = false) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
         std::uint64_t layoutHits = 0;
@@ -137,6 +137,7 @@ public:
         std::uint64_t liveSets = 0;
         std::uint64_t exhaustedPools = 0;
         std::uint64_t recycledSets = 0;
+        std::uint64_t dispatchRecycledSets = 0;
         std::uint64_t reopenedPools = 0;
     };
     Stats Counters() const;
@@ -158,6 +159,8 @@ private:
     std::vector<Pool> updateAfterBindPools;
     std::vector<VkDescriptorPool> dedicated;
     std::map<std::pair<VkDescriptorSetLayout, std::uint32_t>, std::vector<SetAllocation>> recycled;
+    std::map<std::pair<VkDescriptorSetLayout, std::uint32_t>, std::vector<SetAllocation>> dispatchRecycled;
+    std::size_t dispatchRecycledCount = 0;
     std::vector<SetAllocation> kept;
     Stats stats;
 };
@@ -198,6 +201,10 @@ public:
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt, bool allowDispatchSpaceReuse = true);
+    struct DispatchAddressReuseCounts {
+        std::uint64_t builds, eligible, reusedSets, freshSets, retiredSets, descriptorsWritten, verified, failures;
+    };
+    static DispatchAddressReuseCounts AddressReuseCounts();
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -660,6 +667,7 @@ private:
     void build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes);
     void buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes);
     void buildComplete();
+    void verifyDispatchAddressDescriptors();
     // APS5_PROFILE_DRAW: closes the current sub-phase of the build into the [resources] totals.
     double phase(BuildPhase which);
     // `written` is the element's DescriptorBinding::bufferWritten: a read-only element binds the
@@ -821,6 +829,7 @@ private:
     VkDescriptorPool pool = VK_NULL_HANDLE;
     // The cache pool the set was allocated from, freed back to it on release.
     DescriptorCache::SetAllocation cacheAllocation;
+    bool recycleAddressSet = false;
     struct SetObjects {
         VkDescriptorSetLayout layout = VK_NULL_HANDLE;
         bool ownsLayout = false;
