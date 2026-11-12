@@ -358,6 +358,7 @@ void FillGatherPlan(const GatherTemplate& shape, std::span<const std::uint32_t> 
     plan.vsharps.clear();
     plan.slots.clear();
     plan.reads.clear();
+    plan.knownReads.clear();
     plan.push.clear();
     plan.elements = {};
     plan.bytes = {};
@@ -608,6 +609,7 @@ std::shared_ptr<GatherDrawPlan> acquirePlan(std::size_t stages, std::uint64_t& a
         stage.vsharps.clear();
         stage.slots.clear();
         stage.reads.clear();
+        stage.knownReads.clear();
         stage.elements = {};
         stage.bytes = {};
     }

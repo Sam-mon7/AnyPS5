@@ -6526,7 +6526,9 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     bool movedFromSlot = false;
     if (identity.gather != nullptr) {
         auto moveRefusal = ShaderResources::MoveRefusal::None;
+        const auto gatherStart = probing.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         liveMoved = resources->GatherBuffers(*identity.gather, *recorder, moveRefusal);
+        if (probing.on) ArchB::Recorder::Count("gather_buffers_ns_total", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - gatherStart).count()));
         if (!liveMoved.has_value()) {
             countMoveRefusal(moveRefusal, draw);
             return refuse(RefusedMoved);
@@ -6551,8 +6553,13 @@ bool tryReplay(const Context& context, const State& state, const Pm4::DrawParame
     }
     const std::span<const ShaderResources::MovedBuffer> moved = slot->movedStatic ? std::span<const ShaderResources::MovedBuffer>(slot->moved) : movedFromSlot ? std::span<const ShaderResources::MovedBuffer>(slot->liveMoved) : std::span<const ShaderResources::MovedBuffer>(*liveMoved);
     if (const auto present = Recorder::Presents(); slot->touched != present) {
+        const auto touchStart = probing.on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SharedResourceCache().Touch(slot->contentKey);
         slot->touched = present;
+        if (probing.on) {
+            ArchB::Recorder::Count("replay_touch_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - touchStart).count()));
+            ArchB::Recorder::Count("replay_touch_key_words", static_cast<double>(slot->contentKey.size()));
+        }
     }
     clock.Mark(StepMoved);
     const auto* argumentImport = args != nullptr ? HostImportFor(context, args->arguments, rangeBytes) : nullptr;

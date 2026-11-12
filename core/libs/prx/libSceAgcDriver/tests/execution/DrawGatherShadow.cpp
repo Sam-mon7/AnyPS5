@@ -224,7 +224,10 @@ void MovedBaseMatchesAndYieldsTheNewAddress() {
     Require(outcome.matched && outcome.wordsChanged, "a moved table with the same structure did not match");
     Require(addresses.size() == 1 && addresses[0] == reinterpret_cast<std::uintptr_t>(MovedTable.data()), "the moved table was not read at its new address");
     GatherStagePlan plan;
+    plan.knownReads.push_back({MovedBufferBase, {1u, 2u}});
+    plan.reads.emplace_back(MovedBufferBase, MovedBufferBase + 8u);
     FillGatherPlan(*shape, user, live, plan);
+    Require(plan.knownReads.empty() && plan.reads.empty(), "a reused stage plan keeps the previous draw's reads or known reads");
     Require(plan.vsharps.size() == 2, "the plan does not carry both V# elements");
     const auto element = [&](std::uint32_t index) -> const GatherVsharp& {
         for (const auto& vsharp : plan.vsharps) if (vsharp.binding == 0 && vsharp.element == index) return vsharp;

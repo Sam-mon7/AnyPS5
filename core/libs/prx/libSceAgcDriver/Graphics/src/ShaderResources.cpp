@@ -8924,6 +8924,19 @@ bool ShaderResources::GatherBindings(DriverDetail::GatherCommitTemplate& target,
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::GatherBuffers(const DriverDetail::GatherDrawPlan& plan, Recorder& recorder, MoveRefusal& refusal) const {
     const auto fail = [&](MoveRefusal why) { refusal = why; return std::optional<std::vector<MovedBuffer>>{}; };
+    const bool timing = ArchC::probing.load(std::memory_order_relaxed);
+    enum Check : std::size_t { CheckPendingWrite, CheckPendingStorage, CheckShadowed, CheckWrites, CheckAccessible, CheckCount };
+    static constexpr const char* checkNames[CheckCount] = {"gather_buffers_ns_pending_write", "gather_buffers_ns_pending_storage", "gather_buffers_ns_shadowed", "gather_buffers_ns_writes", "gather_buffers_ns_accessible"};
+    const auto timed = [&](Check check, auto&& test) {
+        if (!timing) return test();
+        const auto start = std::chrono::steady_clock::now();
+        const bool result = test();
+        AgcDriver::ArchB::Recorder::Count(checkNames[check], static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+        return result;
+    };
+    const auto pendingWrite = [&](std::uint64_t address, std::size_t bytes) { return timed(CheckPendingWrite, [&] { return recorder.PendingWriteOverlaps(address, bytes); }); };
+    const auto pendingStorage = [&](std::uint64_t address, std::size_t bytes) { return timed(CheckPendingStorage, [&] { return PendingStorageOverlaps(address, bytes, nullptr); }); };
+    const auto shadowed = [&](std::uint64_t address, std::size_t bytes) { return timed(CheckShadowed, [&] { return AnyShadowedOverlaps(address, bytes); }); };
     if (!plan.complete || plan.commitTemplate == nullptr || !plan.commitTemplate->valid.load(std::memory_order_acquire) || !plan.commitTemplate->ready.load(std::memory_order_acquire) || usesBda) return fail(MoveRefusal::Shape);
     std::vector<MovedBuffer> moved;
     moved.reserve(allocations.size());
@@ -8932,11 +8945,11 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::Gather
         for (const auto& read : source.reads) {
             const auto known = std::find_if(source.knownReads.begin(), source.knownReads.end(), [&](const auto& item) { return item.address == read.first; });
             if (known != source.knownReads.end()) {
-                if (PendingStorageOverlaps(read.first, static_cast<std::size_t>(read.second - read.first), nullptr) || AnyShadowedOverlaps(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
+                if (pendingStorage(read.first, static_cast<std::size_t>(read.second - read.first)) || shadowed(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
                 AgcDriver::ArchB::Recorder::Count("draw_templates_live_commit_known_reads");
                 continue;
             }
-            if (recorder.PendingWriteOverlaps(read.first, static_cast<std::size_t>(read.second - read.first)) || PendingStorageOverlaps(read.first, static_cast<std::size_t>(read.second - read.first), nullptr) || AnyShadowedOverlaps(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
+            if (pendingWrite(read.first, static_cast<std::size_t>(read.second - read.first)) || pendingStorage(read.first, static_cast<std::size_t>(read.second - read.first)) || shadowed(read.first, static_cast<std::size_t>(read.second - read.first))) return fail(MoveRefusal::Overlap);
         }
         const auto& shape = plan.commitTemplate->stages[stage];
         for (const auto& vsharp : source.vsharps) {
@@ -8946,8 +8959,8 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::Gather
             if (!item.guest || item.written || item.adjustment != vsharp.adjustment || known->extent != vsharp.extent || known->viewBytes != vsharp.viewBytes || vsharp.address < vsharp.adjustment) return fail(MoveRefusal::Shape);
             const auto begin = vsharp.address - vsharp.adjustment;
             const auto bytes = static_cast<std::size_t>(vsharp.viewBytes);
-            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return fail(MoveRefusal::Inaccessible);
-            if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return fail(MoveRefusal::Overlap);
+            if (!timed(CheckAccessible, [&] { return GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes); })) return fail(MoveRefusal::Inaccessible);
+            if (timed(CheckWrites, [&] { return guestMemory.WritesOverlap(begin, bytes); }) || pendingWrite(begin, bytes) || pendingStorage(begin, bytes) || shadowed(begin, bytes)) return fail(MoveRefusal::Overlap);
             if (vsharp.address == item.address && vsharp.extent == item.size) continue;
             moved.push_back({known->allocation, vsharp.address, static_cast<std::size_t>(vsharp.extent), {}, bytes});
         }
