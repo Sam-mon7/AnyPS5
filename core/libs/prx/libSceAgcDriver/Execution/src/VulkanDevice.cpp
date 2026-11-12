@@ -5926,6 +5926,9 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
                 if (surface.dccKeys && !Graphics::DccKeyWriterNeedsSync(surface.address, bytes)) continue;
                 const auto info = state->recorder->DescribePendingWrite(surface.address, bytes);
                 if (!info.has_value()) continue;
+                static const bool tracePresync = std::getenv("APS5_TRACE_PRESYNC") != nullptr;
+                static std::atomic<unsigned> traced{0};
+                if (tracePresync && traced.fetch_add(1, std::memory_order_relaxed) < 400u) std::fprintf(stderr, "[presync] surface=0x%llx bytes=%llu keys=%d open=%d serial=%llu surfaces=%zu\n", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), surface.dccKeys ? 1 : 0, info->open ? 1 : 0, static_cast<unsigned long long>(info->serial), surfaces.size());
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
                 texelsPending = texelsPending || !surface.dccKeys;
@@ -5936,6 +5939,8 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     if (serial != 0) {
         const auto waitStart = std::chrono::steady_clock::now();
         WaitRecorded(serial);
+        ArchB::Recorder::Count("presync_waits");
+        ArchB::Recorder::Count("presync_wait_us", static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()));
         counters.presyncs.fetch_add(1, std::memory_order_relaxed);
         if (!texelsPending) counters.keyWaits.fetch_add(1, std::memory_order_relaxed);
         counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
