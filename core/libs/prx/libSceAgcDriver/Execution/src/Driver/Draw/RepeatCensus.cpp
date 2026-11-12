@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -67,7 +68,8 @@ std::size_t SizeClass(std::size_t draws) {
 
 struct State {
     std::mutex mutex;
-    std::vector<Item> previous;
+    std::deque<std::vector<Item>> history;
+    std::vector<Item> coarsePrevious;
     std::vector<Item> current;
     bool tentative = false;
     std::uint64_t frames = 0;
@@ -125,6 +127,38 @@ void Emit(const Summary& summary) {
         }
         Recorder::Count(found->second.c_str(), static_cast<double>(count));
     }
+}
+
+void EmitLag(std::size_t lag, const Summary& summary) {
+    static const auto names = [] {
+        std::array<std::array<std::string, 4>, MaxLag + 1> values;
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            const auto prefix = "repeat_census_lag" + std::to_string(index);
+            values[index] = {prefix + "_draws_same_sequence", prefix + "_draws_identical", prefix + "_draws_values_only", prefix + "_draws_structure"};
+        }
+        return values;
+    }();
+    using ArchB::Recorder;
+    Recorder::Count(names[lag][0].c_str(), static_cast<double>(summary.drawsSameSequence));
+    Recorder::Count(names[lag][1].c_str(), static_cast<double>(summary.drawsIdentical));
+    Recorder::Count(names[lag][2].c_str(), static_cast<double>(summary.drawsValuesOnly));
+    Recorder::Count(names[lag][3].c_str(), static_cast<double>(summary.drawsStructure));
+}
+
+void EmitBest(std::size_t lag, const Summary& summary) {
+    static const auto names = [] {
+        std::array<std::string, MaxLag + 1> values;
+        for (std::size_t index = 0; index < values.size(); ++index) values[index] = "repeat_census_best_lag_is_" + std::to_string(index);
+        return values;
+    }();
+    using ArchB::Recorder;
+    Recorder::Count(names[lag].c_str());
+    Recorder::Count("repeat_census_best_draws_same_sequence", static_cast<double>(summary.drawsSameSequence));
+    Recorder::Count("repeat_census_best_draws_identical", static_cast<double>(summary.drawsIdentical));
+    Recorder::Count("repeat_census_best_draws_values_only", static_cast<double>(summary.drawsValuesOnly));
+    Recorder::Count("repeat_census_best_draws_structure", static_cast<double>(summary.drawsStructure));
+    Recorder::Count("repeat_census_best_draws_not_live", static_cast<double>(summary.drawsNotLive));
+    Recorder::Count("repeat_census_best_draws_in_replayable_regions", static_cast<double>(summary.drawsInIdenticalRegions + summary.drawsInValuesOnlyRegions));
 }
 
 void Trace(std::uint64_t frame, const Summary& summary, const std::vector<RegionRow>& rows) {
@@ -271,10 +305,30 @@ void EndFrame() {
     const auto period = TracePeriod();
     const bool trace = period != 0 && state.frames % period == 0;
     std::vector<RegionRow> rows;
-    const auto summary = Compare(state.previous, state.current, trace ? &rows : nullptr);
+    static const std::vector<Item> none;
+    const auto summary = Compare(state.history.empty() ? none : state.history.front(), state.current, trace ? &rows : nullptr);
     Emit(summary);
     if (trace) Trace(state.frames, summary, rows);
-    state.previous.swap(state.current);
+    std::size_t best = 1;
+    auto bestSummary = summary;
+    for (std::size_t lag = 2; lag <= state.history.size(); ++lag) {
+        const auto older = Compare(state.history[lag - 1], state.current, nullptr);
+        EmitLag(lag, older);
+        if (trace) std::fprintf(stderr, "[repeat-census-lag] frame %llu lag %zu: %llu draws same sequence, %llu identical, %llu values only, %llu structure\n", static_cast<unsigned long long>(state.frames), lag, static_cast<unsigned long long>(older.drawsSameSequence), static_cast<unsigned long long>(older.drawsIdentical), static_cast<unsigned long long>(older.drawsValuesOnly), static_cast<unsigned long long>(older.drawsStructure));
+        if (older.drawsIdentical + older.drawsValuesOnly > bestSummary.drawsIdentical + bestSummary.drawsValuesOnly) {
+            best = lag;
+            bestSummary = older;
+        }
+    }
+    EmitBest(best, bestSummary);
+    auto coarse = state.current;
+    for (auto& item : coarse) item.draw.site = item.draw.coarse;
+    const auto coarseSummary = Compare(state.coarsePrevious, coarse, nullptr);
+    ArchB::Recorder::Count("repeat_census_coarse_draws_same_sequence", static_cast<double>(coarseSummary.drawsSameSequence));
+    ArchB::Recorder::Count("repeat_census_coarse_draws_unmatched_prefix", static_cast<double>(coarseSummary.drawsUnmatchedPrefix));
+    state.coarsePrevious = std::move(coarse);
+    state.history.push_front(std::move(state.current));
+    if (state.history.size() > MaxLag) state.history.pop_back();
     state.current.clear();
 }
 

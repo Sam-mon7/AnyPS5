@@ -16,7 +16,7 @@ void Expect(bool condition, const char* what) {
 Item Drawn(std::uint64_t site, std::uint64_t target, std::uint64_t structure = 1, std::uint64_t addresses = 1, std::uint64_t constants = 1, std::uint64_t arguments = 1, bool live = true) {
     Item item;
     item.isDraw = true;
-    item.draw = {site, structure, target, addresses, constants, arguments, live};
+    item.draw = {site, site, structure, target, addresses, constants, arguments, live};
     return item;
 }
 

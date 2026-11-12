@@ -780,11 +780,12 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
     return {};
 }
 
-RepeatCensus::Draw CensusDraw(const DrawTail& tail) {
+RepeatCensus::Draw CensusDraw(const DrawTail& tail, std::uint64_t coarse) {
     using RepeatCensus::Mix;
     RepeatCensus::Draw out;
     const auto& packet = tail.livePacket;
     out.site = tail.liveKey != 0 ? tail.liveKey : Mix(Mix(0x51u, packet.indexed), packet.indirect ? packet.indirect->opcode : 0u);
+    out.coarse = coarse != 0 ? coarse : out.site;
     if (tail.live == nullptr) return out;
     const auto& live = *tail.live;
     out.live = true;
@@ -1058,7 +1059,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && registerKey && pipelined && submission.queue == 0 && (drawParameters.indirect || ArchB::DirectDrawEnabled()) && !lockedPrepare && traceToken == 0 && deferredLabels().labels.empty()) {
         tail.liveKey = LiveMix(LiveMix(LiveMix(RegisterStructureKey(queue), DrawShaderSetKey(queue, *submission.shaders)), localDevice->Serial()), LivePacketKey(drawParameters));
         if (tail.liveEnabled) tail.live = SelectLive(queue, submission, tail);
-        if (RepeatCensus::Enabled()) RepeatCensus::NoteDraw(CensusDraw(tail));
+        if (RepeatCensus::Enabled()) RepeatCensus::NoteDraw(CensusDraw(tail, LiveMix(DrawShaderSetKey(queue, *submission.shaders), LivePacketKey(drawParameters))));
         if (tail.live != nullptr && !tail.liveVerify) {
             tail.programs = &tail.live->entry->decode->programs;
             tail.submissionQueue = submission.queue;
@@ -1068,7 +1069,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             return drawn();
         }
     } else if (submission.queue == 0 && RepeatCensus::Enabled()) {
-        RepeatCensus::NoteDraw(CensusDraw(tail));
+        RepeatCensus::NoteDraw(CensusDraw(tail, 0));
     }
 
     auto& drawKey = tail.drawKey;

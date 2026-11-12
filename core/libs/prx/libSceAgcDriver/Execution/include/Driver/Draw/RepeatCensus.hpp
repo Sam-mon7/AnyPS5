@@ -11,6 +11,7 @@ namespace AgcDriver::DriverDetail::RepeatCensus {
 
 struct Draw {
     std::uint64_t site = 0;
+    std::uint64_t coarse = 0;
     std::uint64_t structure = 0;
     std::uint64_t target = 0;
     std::uint64_t addresses = 0;
@@ -26,6 +27,7 @@ struct Item {
 };
 
 constexpr std::size_t SizeClasses = 4;
+constexpr std::size_t MaxLag = 8;
 
 struct Summary {
     std::uint64_t regions = 0;
