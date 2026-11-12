@@ -169,12 +169,12 @@ bool ImageEpochs::Active() {
     return true;
 }
 
-void ImageEpochs::Note(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except) {
+EpochPublication ImageEpochs::Note(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except) {
     if (!Active()) {
         NoteDropped();
-        return;
+        return EpochPublication::Inactive;
     }
-    Get().Invalidate(begin, end, source, except);
+    return Get().Invalidate(begin, end, source, except);
 }
 
 void ImageEpochs::InvalidateAll() {
@@ -279,12 +279,12 @@ EpochCensus ImageEpochs::Census(const StorageTexture& image) {
     return found == made.records.end() ? EpochCensus{} : found->second.census;
 }
 
-void ImageEpochs::Invalidate(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except) {
-    if (end <= begin) return;
+EpochPublication ImageEpochs::Invalidate(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except) {
+    if (end <= begin) return EpochPublication::NoRecipients;
     auto& made = index();
     const auto which = static_cast<std::size_t>(source);
-    if (made.suppressed[which].load(std::memory_order_acquire)) return;
-    if (!filterAny(made, begin, end)) return;
+    if (made.suppressed[which].load(std::memory_order_acquire)) return EpochPublication::Suppressed;
+    if (!filterAny(made, begin, end)) return EpochPublication::NoRecipients;
     const bool census = CensusEnabled();
     const void* self = census ? SelfScope::Current() : nullptr;
     std::uint64_t bumped = 0;
@@ -308,9 +308,10 @@ void ImageEpochs::Invalidate(std::uint64_t begin, std::uint64_t end, EpochSource
             }
         }
     }
-    if (bumped == 0) return;
+    if (bumped == 0) return EpochPublication::NoRecipients;
     counters().invalidations[which].fetch_add(1, std::memory_order_relaxed);
     counters().bumps[which].fetch_add(bumped, std::memory_order_relaxed);
+    return EpochPublication::Published;
 }
 
 bool ImageEpochs::DrainIfNew() {

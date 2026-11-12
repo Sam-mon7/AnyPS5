@@ -38,6 +38,8 @@ struct EpochCensus {
     bool registered = false;
 };
 
+enum class EpochPublication : std::uint8_t { Inactive, Suppressed, NoRecipients, Published };
+
 class ImageEpochs {
 public:
     static ImageEpochs& Get();
@@ -48,14 +50,14 @@ public:
     void Unregister(const StorageTexture& image);
     void UnregisterOwner(const void* owner);
     static void RegisterImage(StorageTexture& image, std::uint64_t cmaskAddress, std::uint64_t cmaskBytes);
-    void Invalidate(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except);
+    EpochPublication Invalidate(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except);
     bool DrainIfNew();
     std::uint64_t Loss() const;
     bool Registered(const StorageTexture& image);
     EpochCensus Census(const StorageTexture& image);
     std::size_t CountImagePages(bool (*open)(std::uint64_t page));
     static void InstallHooks();
-    static void Note(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except);
+    static EpochPublication Note(std::uint64_t begin, std::uint64_t end, EpochSource source, const void* except);
     static void NoteDropped();
     static void InvalidateAll();
     static void SetSuppressed(EpochSource source, bool suppressed);

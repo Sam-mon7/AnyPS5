@@ -86,12 +86,15 @@ struct SrtReadPoison {
     bool operator==(const SrtReadPoison& other) const = default;
 };
 
+enum class ConditionRemoval : std::uint8_t { None, Undecidable, ItemFree };
+
 struct ResourceBlock {
     IrValue* condition = nullptr;
     std::vector<std::uint32_t> successors;
     std::vector<std::uint32_t> sources;
     std::vector<std::uint32_t> images;
     std::vector<std::uint32_t> flatSlots;
+    ConditionRemoval conditionRemoval = ConditionRemoval::None;
 };
 
 }

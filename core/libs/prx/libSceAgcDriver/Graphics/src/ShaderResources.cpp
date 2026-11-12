@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchGatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -2641,6 +2642,8 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
+    dispatchGatherShadow = !drawBuild && DriverDetail::DispatchShadow::Enabled();
+    dispatchGatherImageBindingCount = 0;
     registeredImageViews.clear();
     for (const auto& shader : shaders) if (shader.registeredImageViews != nullptr) registeredImageViews.insert(registeredImageViews.end(), shader.registeredImageViews->begin(), shader.registeredImageViews->end());
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource capture");
@@ -3321,6 +3324,13 @@ void ShaderResources::buildComplete() {
             Require(data.buffer != nullptr && allocation.dataByte < data.size, "guest buffer offset lies outside the shader's data buffer");
             data.buffer->Bytes()[allocation.dataByte] = static_cast<std::byte>(allocation.adjustment);
             dataPatches.push_back({static_cast<std::size_t>(allocation.dataAllocation), allocation.dataByte, allocation.adjustment});
+        }
+        if (dispatchGatherShadow && DriverDetail::DispatchShadow::Enabled()) {
+            for (const auto& allocation : allocations) {
+                if (allocation.guest || allocation.buffer == nullptr || allocation.size % sizeof(std::uint32_t) != 0) continue;
+                allocation.dispatchGatherUploadedWords.resize(allocation.size / sizeof(std::uint32_t));
+                std::memcpy(allocation.dispatchGatherUploadedWords.data(), allocation.buffer->Bytes().data(), allocation.size);
+            }
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         computeSnapshotCandidates();
@@ -6637,6 +6647,211 @@ bool ShaderResources::DataWordsDiffer(const CompiledShader& shader) const {
     return false;
 }
 
+ShaderResources::DispatchGatherCommitDifference ShaderResources::CompareDispatchGather(const DriverDetail::DispatchGatherUse& use, std::span<const std::byte> pushBytes, bool pushes) const {
+    using Difference = DispatchGatherCommitDifference;
+    dispatchGatherWriter = std::numeric_limits<std::size_t>::max();
+    dispatchGatherWriteObservation = {};
+    dispatchGatherExpectedWrite = {};
+    dispatchGatherWritePreparationNanoseconds = 0;
+    dispatchGatherWriteRefusal = nullptr;
+    dispatchGatherDepthStoreback = false;
+    std::size_t writerIndex = std::numeric_limits<std::size_t>::max();
+    std::size_t writerCount = 0;
+    bool writerDescriptorExact = true;
+    std::uint64_t writerBegin = 0;
+    std::uint64_t writerBytes = 0;
+    if (!completed || drawBuild || !use.gathered) return Difference::Unsupported;
+    if (!dispatchGatherShadow) return Difference::UnobservedUpload;
+    if (usesBda) return Difference::AddressTable;
+    if (use.registeredImages != registeredImageViews) return Difference::Unsupported;
+    for (const auto& view : registeredImageViews) {
+        const auto address = static_cast<std::uintptr_t>(view.address);
+        std::shared_ptr<const GuestAllocations::Range> range;
+        GuestAllocations::GuestAllocationsLookupEach_nid_postfix(&address, 1u, &range);
+        if (view.hasRange != (range != nullptr)) return Difference::Unsupported;
+        if (range != nullptr && (range->address != view.rangeAddress || range->bytes != view.rangeBytes || range->allocationAddress != view.allocationAddress || range->allocationBytes != view.allocationBytes || range->backingSerial != view.backingSerial || range->readable != view.readable || range->writable != view.writable || range->gpu != view.gpu)) return Difference::Unsupported;
+    }
+    if (use.bindings.size() != bindings.size()) return Difference::Binding;
+    for (const auto& expected : use.bindings) {
+        if (expected.role == ShaderRecompiler::DescriptorRole::GuestImages || expected.role == ShaderRecompiler::DescriptorRole::GuestSamplers) {
+            const bool sampled = expected.kind == ShaderRecompiler::DescriptorKind::SampledImage;
+            const bool storage = expected.kind == ShaderRecompiler::DescriptorKind::StorageImage;
+            const bool sampler = expected.kind == ShaderRecompiler::DescriptorKind::Sampler;
+            if ((!sampled && !storage && !sampler) || (sampler ? expected.role != ShaderRecompiler::DescriptorRole::GuestSamplers : expected.role != ShaderRecompiler::DescriptorRole::GuestImages)) return Difference::BindingRole;
+            const auto type = sampler ? VK_DESCRIPTOR_TYPE_SAMPLER : storage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            const auto observations = std::span<const ShaderRecompiler::DescriptorBinding>(dispatchGatherImageBindings).first(dispatchGatherImageBindingCount);
+            const auto observed = std::ranges::find_if(observations, [&](const auto& binding) { return binding.descriptorSet == expected.descriptorSet && binding.binding == expected.binding; });
+            if (observed == observations.end()) return Difference::UnobservedUpload;
+            if (observed->kind != expected.kind || observed->role != expected.role || observed->count != expected.count || observed->readOnly != expected.readOnly || observed->imageShape != expected.imageShape || observed->imageShapes != expected.imageShapes || observed->imageSamplers != expected.imageSamplers || observed->bufferExtent != expected.bufferExtent || observed->Flags() != expected.Flags() || observed->guestDescriptor != expected.guestDescriptor) return Difference::Binding;
+            const auto held = std::ranges::find_if(bindings, [&](const Binding& binding) { return binding.layout.binding == expected.binding && setOf(binding) == expected.descriptorSet; });
+            if (held == bindings.end() || held->flags != 0u || held->layout.descriptorType != type || held->layout.descriptorCount != expected.count || held->imageAllocations.size() != expected.count) return Difference::Binding;
+            const auto write = std::ranges::find_if(descriptorWrites, [&](const VkWriteDescriptorSet& candidate) { return candidate.dstSet == _set && candidate.dstBinding == expected.binding && candidate.dstArrayElement == 0u && candidate.pImageInfo != nullptr; });
+            if (expected.descriptorSet != 0u || write == descriptorWrites.end() || write->descriptorType != type || write->descriptorCount != expected.count || expected.guestDescriptor.size() != static_cast<std::size_t>(expected.count) * (sampler ? 4u : 8u)) return Difference::Binding;
+            if (!sampler && (expected.Flags().imageWritten.size() != expected.count || std::ranges::any_of(expected.Flags().imageAtomic, [](bool value) { return value; }) || std::ranges::any_of(expected.Flags().imageAtomic64, [](bool value) { return value; }))) return Difference::BindingRole;
+            if (sampled && std::ranges::any_of(expected.Flags().imageWritten, [](bool value) { return value; })) return Difference::BindingRole;
+            for (std::size_t element = 0; element < expected.count; ++element) {
+                const auto index = held->imageAllocations[element];
+                VkDescriptorImageInfo resolved{};
+                if (sampler) {
+                    if (index >= samplers.size() || samplers[index] == nullptr) return Difference::Unsupported;
+                    resolved = {samplers[index]->Handle(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+                } else if (index == std::numeric_limits<std::size_t>::max()) {
+                    const auto words = std::span<const std::uint32_t>(expected.guestDescriptor).subspan(element * 8u, 8u);
+                    if (!(sampled ? IsNullSampledTextureResource(words) : IsNullTextureResource(words))) return Difference::Address;
+                    if (!context.nullDescriptors && context.placeholderImages == nullptr) return Difference::Unsupported;
+                    constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+                    resolved = {VK_NULL_HANDLE, context.nullDescriptors ? VK_NULL_HANDLE : context.placeholderImages->View(expected.binding % bindingCount), VK_IMAGE_LAYOUT_GENERAL};
+                } else if (sampled) {
+                    if (index >= textures.size() || index >= textureFirstLayer.size() || index >= textureBaseLevel.size() || index >= textureSrgb.size() || textures[index] == nullptr || textures[index]->Released()) return Difference::Unsupported;
+                    const auto& texture = textures[index];
+                    resolved = {VK_NULL_HANDLE, textureSrgb[index] ? texture->SrgbView(textureFirstLayer[index], textureBaseLevel[index]) : textureBaseLevel[index] ? texture->BaseLevelView() : textureFirstLayer[index] ? texture->FirstLayerView() : texture->View(), texture->Layout()};
+                } else {
+                    if (index >= storageTextures.size() || index >= storageWritten.size() || index >= storageAtomic.size() || index >= storageAtomic64.size() || index >= storageMips.size() || index >= storageFirstLayer.size() || storageAtomic[index] || storageAtomic64[index]) return Difference::Unsupported;
+                    if (storageWritten[index] != expected.Flags().imageWritten[element]) return Difference::Binding;
+                    if (storageWritten[index]) {
+                        if (!use.imageWriter || ++writerCount != 1u || storageTextures[index] == nullptr) return Difference::BindingRole;
+                        writerIndex = index;
+                        const auto words = std::span<const std::uint32_t>(expected.guestDescriptor).subspan(element * 8u, 8u);
+                        const auto descriptor = TryDecodeTextureResource(words);
+                        const auto& actualDescriptor = storageTextures[index]->Descriptor();
+                        writerDescriptorExact = descriptor.has_value() && descriptor->baseAddress == actualDescriptor.baseAddress
+                            && descriptor->width == actualDescriptor.width && descriptor->height == actualDescriptor.height
+                            && descriptor->depthOrLastArray == actualDescriptor.depthOrLastArray && descriptor->baseArray == actualDescriptor.baseArray
+                            && descriptor->mipCount == actualDescriptor.mipCount && descriptor->baseLevel == actualDescriptor.baseLevel
+                            && descriptor->tileMode == actualDescriptor.tileMode && descriptor->dimension == actualDescriptor.dimension
+                            && descriptor->format == actualDescriptor.format && descriptor->pipeBankXor == actualDescriptor.pipeBankXor
+                            && descriptor->dccAddress == actualDescriptor.dccAddress && descriptor->samples == actualDescriptor.samples;
+                        if (writerDescriptorExact) {
+                            writerBegin = descriptor->baseAddress;
+                            writerBytes = DescribeSurfaceGuestBytes(*descriptor);
+                            writerDescriptorExact = writerBytes != 0u && writerBegin <= std::numeric_limits<std::uint64_t>::max() - writerBytes && writerBytes == storageTextures[index]->GuestBytes();
+                        }
+                    }
+                    if (storageTextures[index] == nullptr) {
+                        if (index >= multisampleStorageViews.size()) return Difference::Unsupported;
+                        resolved = {VK_NULL_HANDLE, multisampleStorageViews[index], VK_IMAGE_LAYOUT_GENERAL};
+                    } else {
+                        resolved = {VK_NULL_HANDLE, storageTextures[index]->StorageView(storageMips[index], storageFirstLayer[index], ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(expected.binding)), VK_IMAGE_LAYOUT_GENERAL};
+                    }
+                }
+                const auto& actual = write->pImageInfo[element];
+                if (actual.sampler != resolved.sampler || actual.imageView != resolved.imageView || actual.imageLayout != resolved.imageLayout) return Difference::Address;
+            }
+            continue;
+        }
+        if (expected.kind != ShaderRecompiler::DescriptorKind::StorageBuffer) return Difference::BindingRole;
+        const auto held = std::ranges::find_if(bindings, [&](const Binding& binding) { return binding.layout.binding == expected.binding && setOf(binding) == 0; });
+        if (held == bindings.end() || held->layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || held->allocations.size() != expected.count) return Difference::Binding;
+        const auto write = std::ranges::find_if(descriptorWrites, [&](const VkWriteDescriptorSet& candidate) { return candidate.dstSet == _set && candidate.dstBinding == expected.binding && candidate.dstArrayElement == 0 && candidate.pBufferInfo != nullptr; });
+        if (write == descriptorWrites.end() || write->descriptorCount != expected.count) return Difference::Binding;
+        if (expected.role == ShaderRecompiler::DescriptorRole::GuestBuffers) {
+            if (expected.guestDescriptor.size() != static_cast<std::size_t>(expected.count) * 4u) return Difference::Binding;
+            for (std::size_t element = 0; element < expected.count; ++element) {
+                const auto& allocation = allocations[held->allocations[element]];
+                const auto words = std::span<const std::uint32_t>(expected.guestDescriptor).subspan(element * 4u, 4u);
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1] & ~0x40000000u, words[2], words[3]}};
+                const auto address = descriptor.Base48();
+                const auto bytes = guestBufferBytes(words);
+                const auto& actual = write->pBufferInfo[element];
+                if (address == 0 || bytes == 0) {
+                    if (allocation.guest || allocation.address != 0) return Difference::Address;
+                    const bool oversized = address != 0 && descriptor.GetSize() != 0;
+                    const auto placeholder = oversized ? context.oversizedBuffer : context.emptyBuffer;
+                    if (actual.buffer != placeholder || actual.offset != 0) return Difference::Address;
+                    if (allocation.size != EmptyBufferBytes || actual.range != EmptyBufferBytes) return Difference::Extent;
+                    continue;
+                }
+                if (!allocation.guest || allocation.address != address) return Difference::Address;
+                if (bytes != allocation.size || bytes > std::numeric_limits<std::size_t>::max()) return Difference::Extent;
+                std::uint32_t adjustment = 0;
+                VkDescriptorBufferInfo resolved{};
+                try {
+                    resolved = wholeDwordRange(guestMemory.Descriptor(address, static_cast<std::size_t>(bytes), adjustment));
+                } catch (...) {
+                    return Difference::Extent;
+                }
+                if (actual.buffer != resolved.buffer || actual.offset != resolved.offset || allocation.adjustment != adjustment) return Difference::Address;
+                if (actual.range != resolved.range) return Difference::Extent;
+            }
+        } else if (expected.role == ShaderRecompiler::DescriptorRole::FaultBuffer) {
+            if (expected.count != 1 || !expected.guestDescriptor.empty() || bda == nullptr) return Difference::FaultBuffer;
+            const auto& allocation = allocations[held->allocations.front()];
+            if (allocation.guest || allocation.role != ShaderRecompiler::DescriptorRole::FaultBuffer) return Difference::Binding;
+            const auto resolved = bda->Fault();
+            const auto& actual = write->pBufferInfo[0];
+            if (actual.buffer != resolved.buffer || actual.offset != resolved.offset) return Difference::Address;
+            if (actual.range != resolved.range) return Difference::Extent;
+        } else if (DataRole(expected.role)) {
+            if (held->allocations.size() != 1) return Difference::Binding;
+            const auto index = held->allocations.front();
+            const auto& allocation = allocations[index];
+            const auto expectedBytes = std::as_bytes(std::span(expected.guestDescriptor));
+            const auto actualBytes = std::as_bytes(std::span(allocation.dispatchGatherUploadedWords));
+            if (actualBytes.size() != allocation.size) return Difference::UnobservedUpload;
+            if (allocation.guest || allocation.buffer == nullptr || actualBytes.size() != expectedBytes.size()) return Difference::Data;
+            const auto& actual = write->pBufferInfo[0];
+            if (actual.buffer != allocation.buffer->Handle() || actual.offset != 0) return Difference::Address;
+            if (actual.range != expectedBytes.size() || allocation.size != expectedBytes.size()) return Difference::Extent;
+            for (std::size_t byte = 0; byte < expectedBytes.size(); ++byte) {
+                auto value = expectedBytes[byte];
+                for (const auto& patch : dataPatches) if (patch.allocation == index && patch.byte == byte) value = static_cast<std::byte>(patch.adjustment);
+                if (value != actualBytes[byte]) return Difference::Data;
+            }
+        } else {
+            return Difference::BindingRole;
+        }
+    }
+    if (pushes != !use.pushConstants.empty()) return Difference::Push;
+    if (pushes) {
+        if (use.pushConstants.size() > ComputePushConstantBytes || pushBytes.size() < ComputePushConstantBytes) return Difference::Push;
+        std::array<std::byte, ComputePushConstantBytes> expected{};
+        std::copy(use.pushConstants.begin(), use.pushConstants.end(), expected.begin());
+        for (const auto& [position, adjustment] : pushPatches) {
+            if (position >= expected.size()) return Difference::Push;
+            expected[position] = static_cast<std::byte>(adjustment);
+        }
+        if (!std::equal(expected.begin(), expected.end(), pushBytes.begin())) return Difference::Push;
+    }
+    if (use.imageWriter != (writerCount == 1u)) return Difference::BindingRole;
+    if (use.imageWriter) {
+        dispatchGatherWriter = writerIndex;
+        dispatchGatherExpectedWrite = {writerBegin, writerBegin + writerBytes, reinterpret_cast<std::uintptr_t>(storageTextures[writerIndex].get()), true};
+        dispatchGatherWriteObservation.generationExpected = GuestMemory::Gen::Active() && writerBytes != 0u;
+        dispatchGatherWriteObservation.expectedCount = storageTextures[writerIndex]->TrackedUnits();
+        dispatchGatherWriteRefusal = storageTextures[writerIndex]->DispatchWriteRefusal();
+        if (!writerDescriptorExact || storageMips[writerIndex] != 0u || storageFirstLayer[writerIndex] || !guestMemory.Writes().empty() || std::ranges::count(storageWritten, true) != 1) dispatchGatherWriteRefusal = "writer_shape";
+    }
+    return Difference::None;
+}
+
+ShaderResources::DispatchGatherWriteResult ShaderResources::VerifyDispatchGatherWrite() const {
+    if (dispatchGatherWriteRefusal != nullptr) return {true, false, dispatchGatherWriteRefusal};
+    if (dispatchGatherDepthStoreback) return {true, false, "writer_depth"};
+    const auto& observation = dispatchGatherWriteObservation;
+    if (!observation.observed) return {true, false, "writer_unobserved"};
+    bool suppressed = false;
+    for (const auto* event : {&observation.pendingEpoch, &observation.insertEpoch}) {
+        if (!event->noted) continue;
+        switch (event->disposition) {
+            case ArchC::EpochPublication::Inactive: AgcDriver::ArchB::Recorder::Count("dispatch_gather_writer_epoch_inactive"); break;
+            case ArchC::EpochPublication::Suppressed: AgcDriver::ArchB::Recorder::Count("dispatch_gather_writer_epoch_suppressed"); suppressed = true; break;
+            case ArchC::EpochPublication::NoRecipients: AgcDriver::ArchB::Recorder::Count("dispatch_gather_writer_epoch_no_recipients"); break;
+            case ArchC::EpochPublication::Published: AgcDriver::ArchB::Recorder::Count("dispatch_gather_writer_epoch_published"); break;
+        }
+    }
+    if (suppressed) return {true, false, "writer_epoch_suppressed"};
+    const bool publication = !observation.dirtyBefore || observation.lentBefore;
+    const auto matches = [&](const StorageTexture::DispatchWritePublication& actual, bool expected) {
+        return actual.noted == expected && (!expected || (actual.begin == dispatchGatherExpectedWrite.begin && actual.end == dispatchGatherExpectedWrite.end && actual.owner == dispatchGatherExpectedWrite.owner));
+    };
+    const bool compatible = dispatchGatherExpectedWrite.noted && observation.first == 0u && observation.expectedCount != 0u && observation.count == observation.expectedCount
+        && matches(observation.generation, observation.generationExpected) && matches(observation.pendingEpoch, publication) && matches(observation.insertEpoch, !observation.dirtyBefore)
+        && observation.versionAfter == observation.versionBefore + 1u && observation.dirtyAfter && observation.allPending && observation.registered
+        && observation.changedEpoch == publication && observation.insertedEpoch == !observation.dirtyBefore
+        && (!publication || observation.serialAfter > observation.serialBefore);
+    return {compatible, true, compatible ? "none" : "writer_publication", observation.count};
+}
+
 bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder) {
     Require(shader.program != nullptr, "missing compiled shader");
     Require(!refreshResourceKey.empty() && MatchesContentKey(shader, refreshResourceKey), "runtime data refresh cannot replace bound resources");
@@ -6693,6 +6908,7 @@ VkBuffer ShaderResources::shaderDataBuffer(const CompiledShader& shader) const {
 void ShaderResources::forgetShaderDataWords(const CompiledShader& shader) {
     if (const auto allocation = shaderDataAllocation(shader)) {
         allocations[*allocation].dataWords.clear();
+        allocations[*allocation].dispatchGatherUploadedWords.clear();
         rehashDataWords();
     }
 }
@@ -6700,7 +6916,10 @@ void ShaderResources::forgetShaderDataWords(const CompiledShader& shader) {
 void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t allocation, std::span<const std::uint32_t> words) const {
     const auto& buffer = *allocations[allocation].buffer;
     const auto size = words.size() * sizeof(std::uint32_t);
+    const bool observe = dispatchGatherShadow && DriverDetail::DispatchShadow::Enabled();
+    if (!observe) allocations[allocation].dispatchGatherUploadedWords.clear();
     if (std::none_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == allocation; })) {
+        if (observe) allocations[allocation].dispatchGatherUploadedWords.assign(words.begin(), words.end());
         context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, words.data());
         return;
     }
@@ -6709,6 +6928,7 @@ void ShaderResources::writeDataWords(VkCommandBuffer commands, std::size_t alloc
     for (const auto& patch : dataPatches) {
         if (patch.allocation == allocation && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
     }
+    if (observe) allocations[allocation].dispatchGatherUploadedWords.assign(patched.begin(), patched.end());
     context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer.Handle(), 0, size, patched.data());
 }
 
@@ -6764,6 +6984,10 @@ void ShaderResources::PrecollectSurfaces(bool memoVirtualQuery) const {
 }
 
 void ShaderResources::addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags) {
+    if (dispatchGatherShadow) {
+        if (dispatchGatherImageBindingCount == dispatchGatherImageBindings.size()) dispatchGatherImageBindings.emplace_back();
+        dispatchGatherImageBindings[dispatchGatherImageBindingCount++] = binding;
+    }
     Require(binding.count != 0, "empty descriptor binding");
     const auto heap = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
     const auto capacity = binding.count;
@@ -9294,11 +9518,23 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         }
     });
     const auto inRun = std::exchange(afterRunSelf, nullptr);
+    const auto gatherWriter = std::exchange(dispatchGatherWriter, std::numeric_limits<std::size_t>::max());
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
-        storageTextures[index]->MarkDirty();
-        static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
+        auto* observation = index == gatherWriter ? &dispatchGatherWriteObservation : nullptr;
+        if (observation != nullptr) {
+            const auto start = std::chrono::steady_clock::now();
+            if (dispatchGatherWriteRefusal == nullptr) dispatchGatherWriteRefusal = storageTextures[index]->DispatchWriteRefusal();
+            dispatchGatherWritePreparationNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
+        storageTextures[index]->MarkDirty(observation);
+        const bool depthStoreback = DepthSurfaceStoreBack(context, *storageTextures[index]);
+        if (observation != nullptr) {
+            const auto start = std::chrono::steady_clock::now();
+            dispatchGatherDepthStoreback = depthStoreback;
+            dispatchGatherWritePreparationNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
     }
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),

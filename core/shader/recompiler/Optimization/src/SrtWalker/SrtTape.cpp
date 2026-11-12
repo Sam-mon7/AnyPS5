@@ -51,7 +51,9 @@ public:
         contexts.push_back({nullptr, true, false});
     }
 
-    bool Build() {
+    bool NonInvariantPhi() const { return nonInvariantPhi; }
+
+    bool Build(bool strict = false) {
         tape.sourceDwords.assign(plan.descriptorSources.size(), {});
         for (auto& dwords : tape.sourceDwords) dwords.fill(SrtTape::NoNode);
         for (const auto index : plan.materializationSources) {
@@ -59,6 +61,13 @@ public:
             const auto& source = plan.descriptorSources[index];
             if (source.dwordCount > source.dwords.size()) return false;
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) tape.sourceDwords[index][dword] = compile(source.dwords[dword], MainContext, 0);
+        }
+        if (strict) {
+            for (std::size_t index = 0; index < plan.descriptorSources.size(); ++index) {
+                const auto& source = plan.descriptorSources[index];
+                if (source.dwordCount == 0u || source.dwordCount > source.dwords.size()) return false;
+                for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) tape.sourceDwords[index][dword] = compile(source.dwords[dword], MainContext, 0);
+            }
         }
         tape.flatRoots.resize(plan.srtReads.size());
         for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
@@ -70,7 +79,7 @@ public:
         for (std::size_t block = 0; block < plan.controlFlow.size(); ++block) {
             if (plan.controlFlow[block].condition != nullptr) tape.conditionRoots[block] = compile(plan.controlFlow[block].condition, CleanContext, 0);
         }
-        if (SrtTape::FastEnabled()) {
+        if (strict || SrtTape::FastEnabled()) {
             tape.needsCleanMemory = std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; });
             tape.initialActive.assign(plan.descriptorSources.size() + plan.info.images.size(), 1u);
             tape.initialActiveFlat.assign(plan.srtReads.size(), 1u);
@@ -99,7 +108,7 @@ public:
                 }
             }
         }
-        return !malformed;
+        return !malformed && (!strict || std::none_of(tape.nodes.begin(), tape.nodes.end(), [](const auto& node) { return node.op == Op::Fail; }));
     }
 
 private:
@@ -187,7 +196,11 @@ private:
             }
             case IrOpcode::Phi: {
                 IrValue* resolved = ResolveInvariantPhi(plan, value);
-                return resolved != nullptr ? compile(resolved, context, depth + 1) : fail();
+                if (resolved == nullptr) {
+                    nonInvariantPhi = true;
+                    return fail();
+                }
+                return compile(resolved, context, depth + 1);
             }
             case IrOpcode::ReadFirstLane: {
                 if (value->ArgumentCount() < 2) return malformedFail();
@@ -330,6 +343,7 @@ private:
     std::map<std::pair<const IrValue*, std::uint32_t>, std::uint32_t> built;
     std::uint32_t failNode = SrtTape::NoNode;
     bool malformed = false;
+    bool nonInvariantPhi = false;
 };
 
 bool SrtTape::Enabled() {
@@ -358,6 +372,41 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
     return tape;
 }
 
+std::shared_ptr<const SrtTape> SrtTape::CompileStrict(const IrResourcePlan& plan, StrictFailure* failure) {
+    if (failure != nullptr) *failure = StrictFailure::Unsupported;
+    if (!plan.srtPlanComplete || !plan.resourceTrackingComplete) return nullptr;
+    auto tape = std::make_shared<SrtTape>();
+    SrtTapeCompiler compiler(plan, *tape);
+    if (!compiler.Build(true)) {
+        if (failure != nullptr && compiler.NonInvariantPhi()) *failure = StrictFailure::NonInvariantPhi;
+        return nullptr;
+    }
+    std::vector<std::uint8_t> visited(tape->nodes.size());
+    std::vector<std::uint32_t> pending = tape->flatRoots;
+    for (const auto root : tape->conditionRoots) if (root != NoNode) pending.push_back(root);
+    for (const auto source : plan.materializationSources) {
+        for (std::uint32_t word = 0; word < plan.descriptorSources[source].dwordCount; ++word) pending.push_back(tape->sourceDwords[source][word]);
+    }
+    while (!pending.empty()) {
+        const auto index = pending.back();
+        pending.pop_back();
+        if (index >= tape->nodes.size()) return nullptr;
+        if (visited[index] != 0u) continue;
+        visited[index] = 1u;
+        const auto& node = tape->nodes[index];
+        if (node.op == Op::UserData) {
+            if (node.immediate >= 64u) return nullptr;
+            tape->userDataMask |= std::uint64_t{1} << node.immediate;
+        }
+        for (std::uint8_t argument = 0; argument < node.argumentCount; ++argument) {
+            if ((node.literalArguments & (1u << argument)) == 0u) pending.push_back(node.arguments[argument]);
+        }
+    }
+    tape->strictProgram = true;
+    if (failure != nullptr) *failure = StrictFailure::None;
+    return tape;
+}
+
 const SrtTape* SrtTape::For(const IrResourcePlan& plan) {
     auto* slot = plan.tapeSlot.get();
     if (slot == nullptr || !Enabled()) return nullptr;
@@ -379,6 +428,9 @@ struct SrtTape::Frame {
     std::uint64_t* values;
     std::uint8_t* states;
     bool fast = false;
+    bool strict = false;
+    bool failed = false;
+    std::vector<std::uint32_t>* structure = nullptr;
     bool nullRoot = false;
     std::uint32_t addressDepth = 0;
     std::size_t descriptorBytes = 0;
@@ -386,6 +438,7 @@ struct SrtTape::Frame {
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
+    if (frame.failed) return false;
     const auto state = frame.states[index];
     if (state == 1) {
         result = frame.values[index];
@@ -394,6 +447,7 @@ bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result)
     if (state == 2) return false;
     std::uint64_t value = 0;
     if (!compute(frame, nodes[index], value)) {
+        frame.failed = frame.strict;
         frame.states[index] = 2;
         return false;
     }
@@ -413,6 +467,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         std::uint64_t first = 0;
         std::uint64_t second = 0;
         const bool firstEvaluated = evaluate(frame, node.arguments[0], first);
+        if (frame.strict && !firstEvaluated) return false;
         if (firstEvaluated && (first != 0u) == decisive) {
             result = decisive ? 1u : 0u;
             return true;
@@ -431,6 +486,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         std::uint64_t first = 0;
         std::uint64_t second = 0;
         const bool firstEvaluated = evaluate(frame, node.arguments[0], first);
+        if (frame.strict && !firstEvaluated) return false;
         if (firstEvaluated && static_cast<std::uint32_t>(first) == (greater ? 0u : 0xffffffffu)) {
             result = 0u;
             return true;
@@ -445,6 +501,22 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         const auto rhs = static_cast<std::uint32_t>(greater ? first : second);
         result = lhs < rhs ? 1u : 0u;
         return true;
+    }
+    if (frame.strict && node.op == Op::Select) {
+        const auto argument = [&](std::uint8_t index, std::uint64_t& value) {
+            if ((node.literalArguments & (1u << index)) != 0u) {
+                value = node.arguments[index];
+                return true;
+            }
+            return evaluate(frame, node.arguments[index], value);
+        };
+        std::uint64_t condition = 0;
+        if (!argument(0, condition)) return false;
+        if (frame.structure != nullptr) {
+            frame.structure->push_back(0x40000000u | static_cast<std::uint32_t>(&node - nodes.data()));
+            frame.structure->push_back(condition != 0u ? 1u : 0u);
+        }
+        return argument(condition != 0u ? 1u : 2u, result);
     }
     std::array<std::uint64_t, 5> operand{};
     std::int32_t origin = -1;
@@ -481,6 +553,15 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         case Op::ShaderBase: result = frame.runtime.shaderBase; return true;
         case Op::Read:
         case Op::ReadConstBuffer: {
+            if (frame.structure != nullptr) {
+                frame.structure->push_back(0x20000000u | static_cast<std::uint32_t>(&node - nodes.data()));
+                frame.structure->push_back(static_cast<std::uint32_t>(a) & 3u);
+                frame.structure->push_back(static_cast<std::uint32_t>(b) & 0xffff0000u);
+                if (node.op == Op::ReadConstBuffer) {
+                    frame.structure->push_back(static_cast<std::uint32_t>(d));
+                    frame.structure->push_back(static_cast<std::uint32_t>(operand[4]));
+                }
+            }
             const auto base = ((b << 32u) | static_cast<std::uint32_t>(a)) & AddressMask;
             const auto immediate = static_cast<std::int64_t>(node.immediate);
             std::uint64_t address = 0;
@@ -515,6 +596,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
                 else trace->otherReads.push_back(address);
             }
+            if (frame.structure != nullptr) frame.structure->push_back(static_cast<std::uint32_t>(&node - nodes.data()));
             const auto reader = node.clean ? frame.runtime.readSpecializationMemory : frame.runtime.readMemory;
             std::uint32_t word = 0;
             if (reader != nullptr) {
@@ -618,8 +700,17 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
 }
 
 bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const {
+    return run(plan, runtime, results, flat, activeSources, false);
+}
+
+bool SrtTape::RunStrict(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<std::uint32_t>* structure) const {
+    if (!strictProgram || runtime.readMemory == nullptr || runtime.readSpecializationMemory == nullptr || runtime.descriptorScope != nullptr || runtime.userDataUse != nullptr || runtime.readTrace != nullptr) return false;
+    return run(plan, runtime, results, flat, activeSources, true, structure);
+}
+
+bool SrtTape::run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, bool strict, std::vector<std::uint32_t>* structure) const {
     if (!plan.srtPlanComplete) return false;
-    const bool fast = FastEnabled();
+    const bool fast = strict || FastEnabled();
     if ((fast ? needsCleanMemory : std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; })) && runtime.readSpecializationMemory == nullptr) return false;
     bool pooled = false;
     bool grew = false;
@@ -661,7 +752,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         bool busy = false;
     };
     struct ScratchStorage {};
-    auto& sharedScratch = HostThreadLocal<Scratch, ScratchStorage>();
+    struct StrictScratchStorage {};
+    auto& sharedScratch = strict ? HostThreadLocal<Scratch, StrictScratchStorage>() : HostThreadLocal<Scratch, ScratchStorage>();
+    if (strict && sharedScratch.busy) return refuse();
     struct AttemptScope {
         std::uint32_t& depth;
         ~AttemptScope() { --depth; }
@@ -694,7 +787,11 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     } else {
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
-    Frame frame {runtime, values, states, fast};
+    if (structure != nullptr) {
+        structure->clear();
+        structure->reserve(nodes.size() * 8u + plan.controlFlow.size() * 2u);
+    }
+    Frame frame {runtime, values, states, fast, strict, false, structure, false, 0u, 0u, {}};
     const SrtForceSyncScope forceSync(runtime, attempt == 2u);
     const auto invalidationsBefore = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
     auto& active = scratch.active;
@@ -739,7 +836,11 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
                 const SrtBranchScope branch;
                 cleanEvaluable = block.condition != nullptr && runtime.readSpecializationMemory != nullptr && conditionRoots[index] != NoNode && evaluate(frame, conditionRoots[index], condition);
             }
-            if (frame.nullRoot) return refuse();
+            if (frame.nullRoot || (strict && block.condition != nullptr && !cleanEvaluable)) return refuse();
+            if (structure != nullptr) {
+                structure->push_back(0x80000000u | index);
+                structure->push_back(cleanEvaluable ? (condition != 0u ? 1u : 0u) : 2u);
+            }
             if (cleanEvaluable) {
                 if (block.successors.size() < 2) return refuse();
                 pending.push_back(block.successors[static_cast<std::uint32_t>(condition) != 0u ? 0u : 1u]);
@@ -790,8 +891,13 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         refuse();
         return attempt + 1u < 3u && Run(plan, runtime, results, flat, activeSources);
     }
-    results.swap(evaluated);
-    activeSources.swap(active);
+    if (strict) {
+        results.assign(evaluated.begin(), evaluated.end());
+        activeSources.assign(active.begin(), active.end());
+    } else {
+        results.swap(evaluated);
+        activeSources.swap(active);
+    }
     flat.assign(flattened.begin(), flattened.end());
     profileWalk(fast, pooled, grew, true, fast ? activityEntries : 0u);
     return true;
