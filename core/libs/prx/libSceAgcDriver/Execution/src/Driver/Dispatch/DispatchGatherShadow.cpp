@@ -218,6 +218,7 @@ struct Candidate {
     std::array<std::shared_ptr<Use>, UseLimit> uses;
     std::uint64_t program = 0;
     DispatchGatherRefusal refusal = DispatchGatherRefusal::None;
+    const char* refusalDetail = nullptr;
     std::uint8_t populationMask = 0;
     bool calls = false;
 };
@@ -480,11 +481,18 @@ void Resolved(const std::shared_ptr<Use>& use, const ShaderRecompiler::ResourceC
     }
     if (use->graph && use->matched && !registeredViewsCurrent(*use)) { noteRefusal(*use, DispatchGatherRefusal::RegisteredViews); use->matched = false; return; }
     if (!use->graph) {
-        if (use->owner->refusal != DispatchGatherRefusal::None) { noteRefusal(*use, use->owner->refusal); return; }
+        if (use->owner->refusal != DispatchGatherRefusal::None) {
+            if (use->owner->refusalDetail != nullptr) ArchB::Recorder::Count(use->owner->refusalDetail);
+            noteRefusal(*use, use->owner->refusal);
+            return;
+        }
         if (!capture) { noteRefusal(*use, DispatchGatherRefusal::MissingPlan); return; }
         DispatchGatherRefusal refusal;
         use->graph = DispatchGatherGraph::Create(*capture, compiled, refusal);
         if (!use->graph) {
+            const auto* detail = DispatchGatherGraph::LastRefusalDetail();
+            if (detail != nullptr) ArchB::Recorder::Count(detail);
+            use->owner->refusalDetail = detail;
             if (refusal != DispatchGatherRefusal::AbsentBuffer && refusal != DispatchGatherRefusal::Poison && refusal != DispatchGatherRefusal::Unbounded && refusal != DispatchGatherRefusal::BindingLayout && refusal != DispatchGatherRefusal::UserData && refusal != DispatchGatherRefusal::RegisteredViews && refusal != DispatchGatherRefusal::ImageNormalization) use->owner->refusal = refusal;
             noteRefusal(*use, refusal);
             return;

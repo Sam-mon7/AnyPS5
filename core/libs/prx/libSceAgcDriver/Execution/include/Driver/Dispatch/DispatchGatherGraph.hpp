@@ -54,6 +54,7 @@ struct DispatchGatherUse {
 class DispatchGatherGraph {
 public:
     static std::shared_ptr<const DispatchGatherGraph> Create(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, DispatchGatherRefusal& refusal);
+    static const char* LastRefusalDetail();
     DispatchGatherRefusal Evaluate(std::span<const std::uint32_t> userData, std::uint64_t shaderBase, ShaderRecompiler::SrtMemoryReader guardedRead, void* context, DispatchGatherUse& use) const;
     bool SetStructure(const DispatchGatherUse& use) const;
     DispatchGatherDifference Matches(const DispatchGatherUse& use) const;

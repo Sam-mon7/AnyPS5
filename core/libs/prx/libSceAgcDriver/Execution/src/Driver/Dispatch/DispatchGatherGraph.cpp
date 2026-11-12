@@ -36,28 +36,41 @@ ShaderRecompiler::ShaderBufferResource bufferResource(const ShaderRecompiler::De
     return resource;
 }
 
+const char*& refusalDetail() {
+    static thread_local const char* detail = nullptr;
+    return detail;
+}
+
+bool layoutRefused(const char* detail) {
+    refusalDetail() = detail;
+    return false;
+}
+
 bool sourceLayoutValid(const ShaderRecompiler::IrResourcePlan& plan) {
-    if (plan.materializationSources.size() != plan.info.buffers.size() + plan.info.images.size() + plan.info.samplers.size()) return false;
+    if (plan.materializationSources.size() != plan.info.buffers.size() + plan.info.images.size() + plan.info.samplers.size()) return layoutRefused("dispatch_gather_census_layout_source_count");
     for (std::size_t index = 0; index < plan.info.buffers.size(); ++index) {
         const auto source = plan.materializationSources[index];
-        if (source >= plan.descriptorSources.size() || source != plan.info.buffers[index].source || plan.descriptorSources[source].dwordCount != 4u || plan.info.buffers[index].imageAlias != ShaderRecompiler::BufferResource::NoImageAlias) return false;
+        if (source >= plan.descriptorSources.size() || source != plan.info.buffers[index].source) return layoutRefused("dispatch_gather_census_layout_buffer_mapping");
+        if (plan.descriptorSources[source].dwordCount != 4u) return layoutRefused("dispatch_gather_census_layout_buffer_width");
+        if (plan.info.buffers[index].imageAlias != ShaderRecompiler::BufferResource::NoImageAlias) return layoutRefused("dispatch_gather_census_layout_buffer_image_alias");
     }
     std::size_t cursor = plan.info.buffers.size();
     for (const auto& image : plan.info.images) {
         const auto source = plan.materializationSources[cursor++];
-        if (source >= plan.descriptorSources.size() || source != image.source || plan.descriptorSources[source].dwordCount != 8u) return false;
+        if (source >= plan.descriptorSources.size() || source != image.source || plan.descriptorSources[source].dwordCount != 8u) return layoutRefused("dispatch_gather_census_layout_image_source");
     }
     for (const auto& sampler : plan.info.samplers) {
         const auto source = plan.materializationSources[cursor++];
-        if (source >= plan.descriptorSources.size() || source != sampler.source || plan.descriptorSources[source].dwordCount != 4u) return false;
+        if (source >= plan.descriptorSources.size() || source != sampler.source || plan.descriptorSources[source].dwordCount != 4u) return layoutRefused("dispatch_gather_census_layout_sampler_source");
     }
     for (const auto& source : plan.descriptorSources) {
-        if (source.tableColumn) return false;
-        for (const auto block : source.requiredBlocks) if (block >= plan.controlFlow.size()) return false;
+        if (source.tableColumn) return layoutRefused("dispatch_gather_census_layout_table_column");
+        for (const auto block : source.requiredBlocks) if (block >= plan.controlFlow.size()) return layoutRefused("dispatch_gather_census_layout_required_block");
     }
     for (const auto& block : plan.controlFlow) {
-        if ((block.condition == nullptr && block.successors.size() > 1u) || (block.condition != nullptr && block.successors.size() != 2u)) return false;
-        for (const auto successor : block.successors) if (successor >= plan.controlFlow.size()) return false;
+        if (block.condition == nullptr && block.successors.size() > 1u) return layoutRefused("dispatch_gather_census_layout_merged_control");
+        if (block.condition != nullptr && block.successors.size() != 2u) return layoutRefused("dispatch_gather_census_layout_conditioned_successors");
+        for (const auto successor : block.successors) if (successor >= plan.controlFlow.size()) return layoutRefused("dispatch_gather_census_layout_successor_range");
     }
     std::vector<std::uint32_t> incoming(plan.controlFlow.size());
     std::vector<std::uint32_t> ready;
@@ -70,10 +83,10 @@ bool sourceLayoutValid(const ShaderRecompiler::IrResourcePlan& plan) {
         ++blocks;
         for (const auto successor : plan.controlFlow[block].successors) if (--incoming[successor] == 0u) ready.push_back(successor);
     }
-    if (blocks != plan.controlFlow.size()) return false;
+    if (blocks != plan.controlFlow.size()) return layoutRefused("dispatch_gather_census_layout_control_cycle");
     std::vector<std::uint8_t> slots(plan.srtReads.size());
     for (const auto& read : plan.srtReads) {
-        if (read.flatOffset >= slots.size() || slots[read.flatOffset] != 0u) return false;
+        if (read.flatOffset >= slots.size() || slots[read.flatOffset] != 0u) return layoutRefused("dispatch_gather_census_layout_flat_slots");
         slots[read.flatOffset] = 1u;
     }
     return true;
@@ -81,7 +94,12 @@ bool sourceLayoutValid(const ShaderRecompiler::IrResourcePlan& plan) {
 
 }
 
+const char* DispatchGatherGraph::LastRefusalDetail() {
+    return refusalDetail();
+}
+
 std::shared_ptr<const DispatchGatherGraph> DispatchGatherGraph::Create(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, DispatchGatherRefusal& refusal) {
+    refusalDetail() = nullptr;
     const auto reject = [&](DispatchGatherRefusal reason) -> std::shared_ptr<const DispatchGatherGraph> {
         refusal = reason;
         return nullptr;
@@ -102,7 +120,19 @@ std::shared_ptr<const DispatchGatherGraph> DispatchGatherGraph::Create(const Sha
     if (!snapshot.tables.tables.empty() || !snapshot.tables.nested.empty() || !snapshot.tables.ranges.empty() || std::ranges::any_of(plan.descriptorSources, [](const auto& source) { return source.tableColumn.has_value(); })) return reject(DispatchGatherRefusal::ImageTables);
     for (const auto& image : plan.info.images) {
         if (image.table != ShaderRecompiler::NoTable) return reject(DispatchGatherRefusal::ImageTables);
-        if (image.written || image.atomic || image.atomic64 || image.targetMerge) return reject(DispatchGatherRefusal::ImageWrites);
+        if (image.written || image.atomic || image.atomic64 || image.targetMerge) {
+            std::size_t written = 0, atomics = 0, merges = 0, readers = 0, tables = 0;
+            for (const auto& other : plan.info.images) {
+                if (other.table != ShaderRecompiler::NoTable) ++tables;
+                if (other.atomic || other.atomic64) ++atomics;
+                else if (other.targetMerge) ++merges;
+                else if (other.written) ++written;
+                else ++readers;
+            }
+            const bool addressTable = compiled.bdaWrites || plan.info.usesDma || plan.info.bdaWrites;
+            refusalDetail() = tables != 0 ? "dispatch_gather_census_writer_with_tables" : atomics != 0 ? "dispatch_gather_census_writer_atomic" : merges != 0 ? "dispatch_gather_census_writer_target_merge" : addressTable ? "dispatch_gather_census_writer_address_table" : written == 1 ? (readers == 0 ? "dispatch_gather_census_writer_one_image_no_readers" : "dispatch_gather_census_writer_one_image_with_readers") : (readers == 0 ? "dispatch_gather_census_writer_many_images_no_readers" : "dispatch_gather_census_writer_many_images_with_readers");
+            return reject(DispatchGatherRefusal::ImageWrites);
+        }
         if (image.resourceClass != ShaderRecompiler::ImageResourceClass::Sampled && image.resourceClass != ShaderRecompiler::ImageResourceClass::Storage) return reject(DispatchGatherRefusal::ImageResources);
     }
     for (const auto& sampler : plan.info.samplers) if (sampler.table != ShaderRecompiler::NoTable) return reject(DispatchGatherRefusal::ImageTables);
@@ -114,11 +144,18 @@ std::shared_ptr<const DispatchGatherGraph> DispatchGatherGraph::Create(const Sha
     }
     if (snapshot.nullRootReads != 0u || !snapshot.srtPoison.empty() || compiled.poisonedSrtReads != 0u || compiled.imageTableFaults != 0u || compiled.descriptorFaults != 0u) return reject(DispatchGatherRefusal::Poison);
     if (plan.descriptorSources.size() > MaxSources || plan.materializationSources.size() > MaxSources || plan.srtReads.size() > MaxFlatWords || plan.userDataCount > 64u || plan.controlFlow.size() > MaxSources || plan.valueStorage.Size() > MaxNodes) return reject(DispatchGatherRefusal::Unbounded);
-    if (!sourceLayoutValid(plan) || snapshot.buffers.size() != plan.info.buffers.size() || snapshot.images.size() != plan.info.images.size() || snapshot.samplers.size() != plan.info.samplers.size() || snapshot.flattenedSrt.size() != plan.srtReads.size() + plan.guardedSrtSlots.size()) return reject(DispatchGatherRefusal::SourceLayout);
+    if (!sourceLayoutValid(plan)) return reject(DispatchGatherRefusal::SourceLayout);
+    if (snapshot.buffers.size() != plan.info.buffers.size() || snapshot.images.size() != plan.info.images.size() || snapshot.samplers.size() != plan.info.samplers.size() || snapshot.flattenedSrt.size() != plan.srtReads.size() + plan.guardedSrtSlots.size()) {
+        refusalDetail() = "dispatch_gather_census_layout_snapshot_counts";
+        return reject(DispatchGatherRefusal::SourceLayout);
+    }
     if (std::any_of(snapshot.flattenedSrt.begin() + plan.srtReads.size(), snapshot.flattenedSrt.end(), [](std::uint32_t word) { return word != 0u; })) return reject(DispatchGatherRefusal::Poison);
     if (plan.info.dispatchThreadLimit || (compiled.runtimeImageCount != 0u && compiled.runtimeImageCount != plan.info.images.size()) || compiled.functionLdsBuffer || compiled.meshWindowBuffer || compiled.scratchPoolSlotDwords != 0u) return reject(DispatchGatherRefusal::BindingLayout);
     for (const auto& descriptor : snapshot.buffers) {
-        if (descriptor.dwordCount != 4u || descriptor.availableDwordMask != 0u) return reject(DispatchGatherRefusal::SourceLayout);
+        if (descriptor.dwordCount != 4u || descriptor.availableDwordMask != 0u) {
+            refusalDetail() = "dispatch_gather_census_layout_partial_buffer_descriptor";
+            return reject(DispatchGatherRefusal::SourceLayout);
+        }
         if (!ShaderRecompiler::BufferDescriptorPresent(descriptor)) return reject(DispatchGatherRefusal::AbsentBuffer);
         if (bufferResource(descriptor).GetSize() > MaxBufferBytes) return reject(DispatchGatherRefusal::Unbounded);
     }
