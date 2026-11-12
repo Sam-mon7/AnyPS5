@@ -3156,6 +3156,8 @@ struct ShaderResources::DrawSetPool {
 void ShaderResources::buildComplete() {
     PerformanceTimer frameTiming("Resources.Complete");
     BuildLookups lookups;
+    AgcDriver::ArchB::Recorder::Count(drawBuild ? "resources_complete_draw" : usesBda ? "resources_complete_dispatch_address_table" : usesFaultBuffer ? "resources_complete_dispatch_fault_only" : "resources_complete_dispatch_plain");
+    if (!GuestMemory::IsCommitterThread()) AgcDriver::ArchB::Recorder::Count(GuestMemory::GpuMutex().HeldByThisThread() ? "resources_complete_other_locked" : "resources_complete_other_unlocked");
     Require(!completed, "cannot update a published descriptor heap");
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource preparation");
     const auto stageStart = std::chrono::steady_clock::now();
