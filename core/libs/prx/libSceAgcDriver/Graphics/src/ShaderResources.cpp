@@ -9409,9 +9409,16 @@ void ShaderResources::AddTemplateFlights(TemplateSets& made, std::span<const std
 }
 
 void ShaderResources::KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const {
-    constexpr std::size_t Held = 256;
-    if (templateSetsHeld.size() >= Held) templateSetsHeld.erase(templateSetsHeld.begin(), templateSetsHeld.begin() + static_cast<std::ptrdiff_t>(Held / 2));
+    const std::size_t held = ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLevelCapacity) ? 4096 : 256;
+    if (templateSetsHeld.size() >= held) TrimTemplateSets(held / 2);
     templateSetsHeld.push_back(std::move(sets));
+}
+
+void ShaderResources::TrimTemplateSets(std::size_t count) const {
+    count = std::min(count, templateSetsHeld.size());
+    if (count == 0) return;
+    ArchB::Recorder::Count("draw_templates_held_dropped", static_cast<double>(count));
+    templateSetsHeld.erase(templateSetsHeld.begin(), templateSetsHeld.begin() + static_cast<std::ptrdiff_t>(count));
 }
 
 std::pair<std::uint64_t, std::size_t> ShaderResources::MovedView(const MovedBuffer& entry) const {

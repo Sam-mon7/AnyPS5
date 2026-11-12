@@ -359,6 +359,8 @@ public:
     bool ExpectedElementBytes(const MovedBuffer& entry, std::vector<std::byte>& out) const;
     std::size_t TemplateStaticMismatches(const TemplateSets& sets, std::size_t flight) const;
     void KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const;
+    void TrimTemplateSets(std::size_t count) const;
+    std::size_t TemplateSetsHeld() const { return templateSetsHeld.size(); }
     std::pair<std::size_t, std::size_t> UpdateTemplateFlight(TemplateSets& sets, std::size_t flight, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace) const;
     std::pair<std::uint64_t, std::size_t> MovedView(const MovedBuffer& entry) const;
     VkDescriptorBufferInfo TemplateDescriptor(VkDescriptorBufferInfo info) const { return wholeDwordRange(info); }

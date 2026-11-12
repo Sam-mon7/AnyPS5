@@ -6269,9 +6269,12 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
     std::shared_ptr<ShaderResources::TemplateSets> sets;
     std::size_t held = slot.templates.size();
     bool other = false;
+    bool expired = false;
+    bool otherRecorder = false;
     for (std::size_t index = 0; index < slot.templates.size(); ++index) {
         auto candidate = slot.templates[index].lock();
         if (candidate == nullptr || candidate.get() != slot.templateRaw[index]) {
+            expired = expired || slot.templateRaw[index] != nullptr;
             slot.templates[index].reset();
             slot.templateRaw[index] = nullptr;
             continue;
@@ -6281,8 +6284,10 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
             held = index;
             break;
         }
+        otherRecorder = otherRecorder || candidate->recorder != &recorder;
         other = true;
     }
+    if (sets == nullptr) ArchB::Recorder::Count(otherRecorder ? "draw_templates_build_other_recorder" : other ? "draw_templates_build_other_shape" : expired ? "draw_templates_build_expired" : "draw_templates_build_first");
     std::optional<TemplateBuild> build;
     if (sets == nullptr) build = other ? BuildShape : BuildNew;
     else if (!HostImportsUnchanged(context, sets->proof)) build = BuildImports;
@@ -6295,7 +6300,10 @@ bool prepareTemplate(const Context& context, Recorder& recorder, Slot& slot, con
             slot.templateRaw[held] = nullptr;
             sets.reset();
         }
-        if (!templateBudgetHolds(groupSets, groupBytes)) return refuse(TemplateBudget);
+        if (!templateBudgetHolds(groupSets, groupBytes)) {
+            if (levelCapacity()) resources.TrimTemplateSets(resources.TemplateSetsHeld() / 2);
+            return refuse(TemplateBudget);
+        }
         auto arena = parameterArena(context, recorder);
         auto lease = ParameterArena::Allocate(arena, static_cast<std::size_t>(std::max<VkDeviceSize>(total, 1)), static_cast<std::size_t>(templateByteBudget()));
         if (lease == nullptr) return refuse(total > ParameterArena::ChunkBytes ? TemplateLarge : TemplateBudget);
