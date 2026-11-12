@@ -37,6 +37,15 @@ namespace GuestArena {
 namespace {
 std::atomic<std::uint64_t> queryProtectionSerial{1};
 std::atomic<std::uint32_t> queryProtectionWriters{0};
+
+struct LazyProtectionHold {
+    LazyProtectionHold(std::uintptr_t address, std::size_t bytes) : address(address), bytes(GuestWtFaultLazyPreservationEnabled_nid_no_patch() ? bytes : 0) {
+        if (this->bytes != 0) GuestWtFaultHold_nid_no_patch(address, this->bytes);
+    }
+    ~LazyProtectionHold() { if (bytes != 0) GuestWtFaultRelease_nid_no_patch(address, bytes); }
+    std::uintptr_t address;
+    std::size_t bytes;
+};
 }
 
 std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
@@ -46,6 +55,11 @@ std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
 }
 
 BOOL GuestArenaVirtualProtect_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
+    const LazyProtectionHold hold(reinterpret_cast<std::uintptr_t>(address), bytes);
+    return GuestArenaVirtualProtectInternal_nid_no_patch(address, bytes, protection, previous);
+}
+
+BOOL GuestArenaVirtualProtectInternal_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
     queryProtectionWriters.fetch_add(1, std::memory_order_acq_rel);
     const auto result = VirtualProtect(address, bytes, protection, previous);
     // The write tracker's pages take the new protection as the guest's (APS5_ARCHB_WT_FAULT).
@@ -727,6 +741,7 @@ bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS* exception) {
 }
 
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    const LazyProtectionHold hold(address, bytes);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
     GuestWtFaultForget_nid_no_patch(address, bytes);
     noteAccess(reinterpret_cast<const void*>(address), bytes);

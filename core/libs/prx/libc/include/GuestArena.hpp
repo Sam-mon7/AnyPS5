@@ -21,6 +21,7 @@ struct QueryMemoContext {
 };
 extern "C" bool GuestArenaCollectWritesMemo_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, bool armed, const QueryMemoContext* memo);
 extern "C" int GuestArenaVirtualProtect_nid_no_patch(void* address, std::size_t bytes, unsigned long protection, unsigned long* previous);
+extern "C" int GuestArenaVirtualProtectInternal_nid_no_patch(void* address, std::size_t bytes, unsigned long protection, unsigned long* previous);
 extern "C" std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch();
 #endif
 

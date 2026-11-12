@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -1331,6 +1332,7 @@ public:
     std::shared_ptr<StorageTexture> StoreDepthPlane(const GuestTextureResource& resource, std::vector<bool>& units) {
         ApplyFastClear();
         auto mirror = Mirror(resource);
+        const GpuAuthorityCensus::ProducerScope censusProducer(GpuAuthorityCensus::ProducerFor(target.address, target.address + mirror->GuestBytes()));
         auto& counters = depthPlaneStoreCounters();
         ++counters.stores;
         const auto planeBytes = mirror->GuestBytes();
@@ -1373,6 +1375,7 @@ public:
     }
 
     void MarkAllStale(std::uint64_t planeBytes) {
+        GpuAuthorityCensus::Produced(target.address, target.address + planeBytes, target.address);
         SizeUnits(planeBytes);
         staleUnits.assign(staleUnits.size(), true);
         staleCount = staleUnits.size();
@@ -2605,6 +2608,7 @@ void DepthSurface::PublishToGuest() {
             const auto offset = static_cast<std::size_t>(part.address - publication[index].range.address);
             const auto lost = GuestMemory::WriteChangedIfHeld(part.address, std::span<const std::byte>(result[index]).subspan(offset, part.bytes), std::span<const std::byte>(current[index]).subspan(offset, part.bytes), (seen++)->generation);
             Require(lost == 0u, "guest writes raced native multisample depth publication");
+            GpuAuthorityCensus::Published(part.address, part.address + part.bytes, GpuAuthorityCensus::Kind::DepthPlane);
         }
         if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::PlaneCommitted);
     }
@@ -3683,9 +3687,19 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         // per store: a deferral left unresolved at its end is covered afterwards by the write-back's
         // own pending write, which is later than the writer.
         const Recorder::LazyFenceScope lazyFence(Recorder::LazyFenceScope::Kind::Depth);
-        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
+        const std::lock_guard gpu(GuestMemory::GpuMutex());
+        const auto storeScope = PlaneStoreScope("depth plane store");
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store", storeScope);
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::PlaneRetiled);
+        SettlePlaneStore("depth plane store", entry.begin, entry.end, storeScope);
     }
-    for (auto& entry : storedStencils) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "stencil plane store");
+    for (auto& entry : storedStencils) {
+        const std::lock_guard gpu(GuestMemory::GpuMutex());
+        const auto storeScope = PlaneStoreScope("stencil plane store");
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "stencil plane store", storeScope);
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::StencilRetiled);
+        SettlePlaneStore("stencil plane store", entry.begin, entry.end, storeScope);
+    }
     const auto generation = GuestMemory::TrackerGeneration();
     std::lock_guard lock(surfacesMutex());
     for (const auto& entry : storedStencils) {

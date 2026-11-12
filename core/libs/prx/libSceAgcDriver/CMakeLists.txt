@@ -492,6 +492,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ImageEpochs.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/LazyPublish.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GpuAuthorityCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassHazards.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/StagedMerge.cpp

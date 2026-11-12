@@ -160,6 +160,20 @@ bool watchedPage(const Leaf& leaf, std::uintptr_t page) {
 
 struct LazyServiceTag {};
 using LazyServiceDepth = HostThreadSlot<std::uintptr_t, LazyServiceTag>;
+struct LazyCauseTag {};
+using LazyCause = HostThreadSlot<std::uintptr_t, LazyCauseTag>;
+std::atomic<bool (*)(std::uintptr_t, std::size_t)> lazyPreservation{nullptr};
+
+bool preserveLazy(std::uintptr_t address, std::size_t bytes) {
+    const auto predicate = lazyPreservation.load(std::memory_order_acquire);
+    return predicate != nullptr && predicate(address, bytes);
+}
+
+struct LazyCauseScope {
+    explicit LazyCauseScope(WtLazyCause cause) : previous(LazyCause::Get()) { LazyCause::Set(static_cast<std::uintptr_t>(cause)); }
+    ~LazyCauseScope() { LazyCause::Set(previous); }
+    std::uintptr_t previous;
+};
 // The faulting instruction and stack pointer of the thread's last access violation while a watch
 // exists (diagnostics: the lazy service names the driver code that touched a lazy range).
 struct FaultIpTag {};
@@ -500,6 +514,7 @@ void GuestWtFaultEnable_nid_no_patch(bool verify, std::uint64_t clockAbove) {
         // The thread slot's TLS index is allocated here, never inside the handler.
         static_cast<void>(DriverThread::Get());
         static_cast<void>(LazyServiceDepth::Get());
+        static_cast<void>(LazyCause::Get());
         static_cast<void>(FaultIp::Get());
         static_cast<void>(FaultSp::Get());
         g_state = state;
@@ -934,9 +949,17 @@ void GuestWtFaultHold_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return;
-    std::lock_guard lock(state.mutex);
-    unwatchRange(state, first, stop, WtWatchHold);
+    std::unique_lock lock(state.mutex);
     state.held.emplace_back(first, stop);
+    if (LazyServiceDepth::Get() == 0 && GuestWtFaultLazyPreservationEnabled_nid_no_patch()) {
+        lock.unlock();
+        if (preserveLazy(address, bytes)) {
+            const LazyCauseScope cause(WtLazyCause::Hold);
+            GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        }
+        lock.lock();
+    }
+    unwatchRange(state, first, stop, WtWatchHold);
     state.counters.holds.fetch_add(1, std::memory_order_relaxed);
     state.counters.heldOpened.fetch_add(openRange(state, first, stop, WtFaultLogHold), std::memory_order_relaxed);
 }
@@ -958,7 +981,18 @@ std::size_t GuestWtFaultOpen_nid_no_patch(std::uintptr_t address, std::size_t by
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return 0;
-    std::lock_guard lock(state.mutex);
+    std::unique_lock lock(state.mutex);
+    if (LazyServiceDepth::Get() == 0 && GuestWtFaultLazyPreservationEnabled_nid_no_patch()) {
+        state.held.emplace_back(first, stop);
+        lock.unlock();
+        if (preserveLazy(address, bytes)) {
+            const LazyCauseScope cause(WtLazyCause::Open);
+            GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        }
+        lock.lock();
+        const auto held = std::find(state.held.begin(), state.held.end(), std::pair{first, stop});
+        if (held != state.held.end()) state.held.erase(held);
+    }
     unwatchRange(state, first, stop, WtWatchOpen);
     const auto opened = openRange(state, first, stop, WtFaultLogOpen);
     state.counters.opens.fetch_add(opened, std::memory_order_relaxed);
@@ -1301,7 +1335,9 @@ bool GuestWtFaultStoredLastFrame_nid_no_patch(std::uintptr_t address) {
     return ((leaf->storedLast[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1) != 0;
 }
 
-std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes) {
+namespace {
+
+std::size_t watchCauses(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes, bool lazy) {
     if (!g_enabled.load(std::memory_order_acquire)) return 0;
     auto& state = *g_state;
     std::uintptr_t first = 0;
@@ -1376,6 +1412,7 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
         while (j < claims.size() && claims[j].page == claims[j - 1].page + PageBytes) ++j;
         for (auto k = i; k < j; ++k) {
             const auto index = (claims[k].page >> PageShift) & (LeafPages - 1);
+            if (lazy) claims[k].leaf->lazy[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_acq_rel);
             claims[k].leaf->watch[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_acq_rel);
         }
         g_watchedPages.fetch_add(j - i, std::memory_order_relaxed);
@@ -1395,29 +1432,27 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
     return watched;
 }
 
+}
+
+std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes) {
+    return watchCauses(address, bytes, causes, false);
+}
+
 std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     return GuestWtFaultWatchCauses_nid_no_patch(address, bytes, nullptr);
 }
 
 std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
-    const auto watched = GuestWtFaultWatch_nid_no_patch(address, bytes);
-    if (watched == 0) return 0;
-    auto& state = *g_state;
-    std::uintptr_t first = 0;
-    std::uintptr_t stop = 0;
-    if (!clamp(state, address, bytes, first, stop)) return watched;
-    std::size_t marked = 0;
-    for (auto page = first; page < stop; page += PageBytes) {
-        auto* leaf = leafAt(state, page);
-        if (leaf == nullptr || !watchedPage(*leaf, page)) continue;
-        const auto index = (page >> PageShift) & (LeafPages - 1);
-        leaf->lazy[index / 64].fetch_or(std::uint64_t{1} << (index % 64), std::memory_order_acq_rel);
-        ++marked;
-    }
-    return marked;
+    return watchCauses(address, bytes, nullptr, true);
 }
 
-std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+std::size_t GuestWtFaultWatchLazyCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes) {
+    return watchCauses(address, bytes, causes, true);
+}
+
+namespace {
+
+std::size_t countWatchedPages(std::uintptr_t address, std::size_t bytes, bool lazy) {
     if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire)) return 0;
     auto& state = *g_state;
     std::uintptr_t first = 0;
@@ -1426,22 +1461,34 @@ std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t address, std::s
     std::size_t watched = 0;
     for (auto page = first; page < stop; page += PageBytes) {
         const auto* leaf = leafAt(state, page);
-        if (leaf != nullptr && watchedPage(*leaf, page)) ++watched;
+        if (leaf != nullptr && watchedPage(*leaf, page) && (!lazy || lazyPage(*leaf, page))) ++watched;
     }
     return watched;
 }
 
+}
+
+std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return countWatchedPages(address, bytes, false);
+}
+
+std::size_t GuestWtFaultLazyPages_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return countWatchedPages(address, bytes, true);
+}
+
 void GuestWtFaultSetLazyService_nid_no_patch(void (*service)(std::uintptr_t page, bool write)) {
     if (g_enabled.load(std::memory_order_acquire)) static_cast<void>(LazyServiceDepth::Get());
+    if (g_enabled.load(std::memory_order_acquire)) static_cast<void>(LazyCause::Get());
     g_lazyService.store(service, std::memory_order_release);
 }
 
 void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
-    if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire) || g_lazyService.load(std::memory_order_acquire) == nullptr) return;
+    if (!g_enabled.load(std::memory_order_acquire) || !g_watchEver.load(std::memory_order_acquire) || g_lazyService.load(std::memory_order_acquire) == nullptr || LazyServiceDepth::Get() != 0) return;
     auto& state = *g_state;
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return;
+    const LazyCauseScope cause(LazyCause::Get() == 0 ? WtLazyCause::Range : static_cast<WtLazyCause>(LazyCause::Get()));
     for (auto page = first; page < stop; page += PageBytes) {
         auto* leaf = leafAt(state, page);
         if (leaf == nullptr) {
@@ -1450,6 +1497,18 @@ void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t address, std::size_t
         }
         if (lazyPage(*leaf, page)) serveLazy(*leaf, page, true);
     }
+}
+
+WtLazyCause GuestWtFaultLazyServiceCause_nid_no_patch() {
+    return g_enabled.load(std::memory_order_acquire) ? static_cast<WtLazyCause>(LazyCause::Get()) : WtLazyCause::Fault;
+}
+
+void GuestWtFaultSetLazyPreservation_nid_no_patch(bool (*predicate)(std::uintptr_t, std::size_t)) {
+    lazyPreservation.store(predicate, std::memory_order_release);
+}
+
+bool GuestWtFaultLazyPreservationEnabled_nid_no_patch() {
+    return lazyPreservation.load(std::memory_order_acquire) != nullptr;
 }
 
 void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested) {
@@ -1494,7 +1553,18 @@ std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return 0;
-    std::lock_guard lock(state.mutex);
+    std::unique_lock lock(state.mutex);
+    if (LazyServiceDepth::Get() == 0 && GuestWtFaultLazyPreservationEnabled_nid_no_patch()) {
+        state.held.emplace_back(first, stop);
+        lock.unlock();
+        if (preserveLazy(address, bytes)) {
+            const LazyCauseScope cause(WtLazyCause::Unwatch);
+            GuestWtFaultServeLazyRange_nid_no_patch(address, bytes);
+        }
+        lock.lock();
+        const auto held = std::find(state.held.begin(), state.held.end(), std::pair{first, stop});
+        if (held != state.held.end()) state.held.erase(held);
+    }
     return unwatchRange(state, first, stop, 0);
 }
 
@@ -1618,9 +1688,14 @@ std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t, std::size_t) { return
 std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*) { return 0; }
 std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
 std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
+std::size_t GuestWtFaultWatchLazyCauses_nid_no_patch(std::uintptr_t, std::size_t, std::uint64_t*) { return 0; }
 std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
+std::size_t GuestWtFaultLazyPages_nid_no_patch(std::uintptr_t, std::size_t) { return 0; }
 void GuestWtFaultSetLazyService_nid_no_patch(void (*)(std::uintptr_t, bool)) {}
 void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t, std::size_t) {}
+WtLazyCause GuestWtFaultLazyServiceCause_nid_no_patch() { return WtLazyCause::Fault; }
+void GuestWtFaultSetLazyPreservation_nid_no_patch(bool (*)(std::uintptr_t, std::size_t)) {}
+bool GuestWtFaultLazyPreservationEnabled_nid_no_patch() { return false; }
 void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested) {
     *services = 0;
     *nested = 0;

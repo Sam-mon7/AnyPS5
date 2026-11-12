@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Stage4Diag.hpp"
@@ -8016,6 +8017,7 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, DrawPreparation* preparation, bool pipelineStateReuse, const DrawSlotIdentity* identity) {
+    const GpuAuthorityCensus::ProducerScope censusProducer(2, GpuAuthorityCensus::Enabled() ? timingDrawKey(shaders, 0) : 0);
     if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     if (preparation != nullptr) RecheckDrawPreparation(context, *preparation);
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
@@ -8254,6 +8256,7 @@ void ArchcNostageArm(int why) {
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawPreparation* preparation, bool pipelineStateReuse) {
+    const GpuAuthorityCensus::ProducerScope censusProducer(2, GpuAuthorityCensus::Enabled() ? timingDrawKey(shaders, 0) : 0);
     if (!pipelineStateReuse && context.recorder != nullptr) context.recorder->InvalidatePipelineState("fix_pso_reuse_invalidations_off");
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
@@ -8457,6 +8460,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassW
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {
+    const GpuAuthorityCensus::ProducerScope censusProducer(7);
     if (pass.mode == ColorMetadataPass::Mode::Resolve) {
         Require(pass.source.has_value() && pass.targets.size() == 1, "CB resolve without its source and destination");
         const auto& destination = pass.targets.front();

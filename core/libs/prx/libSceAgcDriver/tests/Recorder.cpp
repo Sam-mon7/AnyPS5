@@ -4873,6 +4873,7 @@ bool uploadCarryTests(const Device& device, Recorder& recorder, std::string_view
     commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), 0, 520);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment, view.buffer, view.offset + adjustment + 4, 4);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment + 512, view.buffer, view.offset + adjustment + 516, 4);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -15433,6 +15434,503 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
     return 0;
 }
 
+int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    using namespace AgcDriver::GuestMemory;
+    namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    if (!device.Graphics() || context.hostImportAlignment == 0 || !UnitShadowEnabled()) return 77;
+    const auto decided = PrepareImportWatch(context);
+    SetImportWatch(context, ImportWatch::Watch);
+    struct RestoreWatch {
+        const Context& context;
+        ImportWatch decided;
+        ~RestoreWatch() { SetImportWatch(context, decided); }
+    } restoreWatch{context, decided};
+    const bool on = Switches::Enabled(Feature::LazyShadowPublish);
+    const bool verify = LazyShadowVerifyEnabled();
+    constexpr std::uint64_t unit = 65536;
+    const std::size_t bytes = scenario == "evict" ? (9u << 20u) : scenario == "image" ? (4u << 20u) : static_cast<std::size_t>(4 * unit);
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) return 77;
+    struct Release {
+        void* block;
+        std::size_t bytes;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block, bytes};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::size_t bytes;
+        ~Cleanup() {
+            Lazy::PublishAll();
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block, bytes};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) return 77;
+    {
+        Buffer settled(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        const VkBufferCopy copy{import->lead, 0, 4};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(batch.Handle(), import->buffer, settled.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        settled.Invalidate();
+        Require(std::all_of(settled.Bytes().begin(), settled.Bytes().end(), [](auto value) { return value == std::byte{0x11}; }), "the host import was not settled before fault protection");
+    }
+
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    if (on) Require(LazyShadowPublishEnabled(), "LAZY_SHADOW_PUBLISH is on but inactive (C_LAZY_PUBLISH or the fault tracker is off)");
+    CollectWritesUncached(address, bytes);
+    GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    AgcDriver::GuestMemory::WtFaultFlip();
+    AgcDriver::GuestMemory::WtFaultFlip();
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value) {
+        auto destination = ShadowDestinationFor(context, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole unit has no slab destination");
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::size_t i = 0; i < unit; ++i) pattern->Bytes()[i] = static_cast<std::byte>(value + (i % 251));
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, destination->offset, unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    };
+    const auto expected = [&](std::uint8_t value) {
+        std::vector<std::uint8_t> bytesOf(static_cast<std::size_t>(unit));
+        for (std::size_t i = 0; i < unit; ++i) bytesOf[i] = static_cast<std::uint8_t>(value + (i % 251));
+        return bytesOf;
+    };
+    const auto store = [&](std::uint64_t begin, std::uint64_t end) {
+        const ShadowConsumerScope consumer("storage image creation", begin, static_cast<std::size_t>(end - begin), PublishScope::None);
+        const auto storeScope = PlaneStoreScope("depth plane store");
+        Require((storeScope == PublishScope::None) == on, "the plane store's publication scope does not follow the switch");
+        static_cast<void>(StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store", storeScope));
+        SettlePlaneStore("depth plane store", begin, end, storeScope);
+    };
+    const auto gpuRead = [&](std::uint64_t begin, std::uint64_t end) {
+        const std::pair<std::uint64_t, std::uint64_t> run{begin - address, end - address};
+        const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {});
+        auto host = std::make_shared<Buffer>(context, static_cast<std::size_t>(end - begin), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        recorder.Keep(host);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        bool slabOnly = true;
+        for (const auto& source : sources) {
+            const VkBufferCopy piece{source.offset, source.begin - run.first, source.end - source.begin};
+            copyBuffer(commands, source.buffer, host->Handle(), 1, &piece);
+            if (source.slab != nullptr) recorder.Keep(source.slab);
+            slabOnly = slabOnly && source.shadow;
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        host->Invalidate();
+        std::vector<std::uint8_t> seen(host->Bytes().size());
+        std::memcpy(seen.data(), host->Bytes().data(), seen.size());
+        return std::make_pair(seen, slabOnly);
+    };
+    const auto protection = [&](std::uint64_t at) {
+        return GuestArena::GuestWtFaultWatchedPages_nid_no_patch(at, 1) != 0;
+    };
+    const auto rawRead = [&](std::uint64_t begin, std::uint64_t length) {
+        std::vector<std::uint8_t> seen(static_cast<std::size_t>(length));
+        const volatile std::uint8_t* from = reinterpret_cast<const volatile std::uint8_t*>(begin);
+        for (std::size_t i = 0; i < seen.size(); ++i) seen[i] = from[i];
+        return seen;
+    };
+    if (scenario == "depth_handoff" || scenario == "stencil_handoff") {
+        const bool stencil = scenario == "stencil_handoff";
+        TextureDetiler detiler(context);
+        context.detiler = &detiler;
+        const auto plane = address + unit;
+        State state{};
+        state.stages.path = ShaderPath::Vertex;
+        state.depth = DepthTarget{plane, stencil ? address + 2 * unit : 0, {64, 64}, stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        state.depth->depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+        state.depthTest = state.depthWrite = true;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+        state.stencilTest = stencil;
+        state.stencilFront = state.stencilBack = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 255, 255, 0x5d};
+        state.renderExtent = {64, 64};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0, 64, 64, -64, 0, 1};
+        state.scissor = {{0, 0}, {64, 64}};
+        ShaderRecompiler::RecompileResult vertex, pixel;
+        vertex.spirv = std::vector<std::uint32_t>(std::begin(COVER_VERT_SPV), std::end(COVER_VERT_SPV));
+        pixel.spirv = std::vector<std::uint32_t>(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+        vertex.variantId = 0xc2001;
+        pixel.variantId = 0xc2002;
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+        Draw(context, state, {0, 3, 0, 1, 0, false}, shaders);
+        WaitForOptimizedPipelines(context.device);
+        recorder.Sync();
+        std::promise<void> entered, attempting, acquired;
+        auto enteredFuture = entered.get_future();
+        auto attemptingFuture = attempting.get_future();
+        auto acquiredFuture = acquired.get_future();
+        bool escaped = false;
+        bool paused = false;
+        static std::function<void()> pause;
+        static DepthPublicationStage wanted;
+        wanted = stencil ? DepthPublicationStage::StencilRetiled : DepthPublicationStage::PlaneRetiled;
+        pause = [&] {
+            paused = true;
+            entered.set_value();
+            attemptingFuture.wait();
+            escaped = acquiredFuture.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready;
+        };
+        SetDepthPublicationHookForTest(+[](DepthPublicationStage stage) {
+            if (stage == wanted && pause) pause();
+        });
+        std::exception_ptr submitError;
+        std::vector<std::uint8_t> seen;
+        std::thread submitter([&] {
+            enteredFuture.wait();
+            attempting.set_value();
+            try {
+                std::lock_guard gpu(GpuMutex());
+                acquired.set_value();
+                recorder.Sync();
+                seen = rawRead(stencil ? address + 2 * unit : plane, 4);
+            } catch (...) { submitError = std::current_exception(); }
+        });
+        GpuMutex().unlock();
+        std::exception_ptr flushError;
+        try {
+            const ShadowConsumerScope consumer("storage image creation", plane, 2 * unit, PublishScope::None);
+            FlushDepthPlanes(plane, 2 * unit);
+        } catch (...) { flushError = std::current_exception(); }
+        if (!paused) entered.set_value();
+        submitter.join();
+        GpuMutex().lock();
+        SetDepthPublicationHookForTest(nullptr);
+        pause = {};
+        ClearDepthSurfaces(context.device);
+        SharedResourceCache().Clear();
+        ClearCachedTextures(context.device);
+        recorder.Sync();
+        ClearCachedPipelines(context.device);
+        if (flushError) std::rethrow_exception(flushError);
+        if (submitError) std::rethrow_exception(submitError);
+        Require(paused && !escaped, "a submitter acquired the GPU lock between retile and lazy enrollment");
+        const std::array<std::uint8_t, 4> wantedBytes = stencil ? std::array<std::uint8_t, 4>{0x5d, 0x5d, 0x5d, 0x5d} : std::array<std::uint8_t, 4>{0, 0, 0, 0x3f};
+        Require(seen.size() == wantedBytes.size() && std::equal(seen.begin(), seen.end(), wantedBytes.begin()), "the CPU reader saw stale depth/stencil bytes after submission");
+        std::cout << "agc_lazy_shadow_" << scenario << ": ok\n";
+        return 0;
+    }
+    if (scenario == "image") {
+        TextureDetiler detiler(context);
+        auto imageContext = context;
+        imageContext.detiler = &detiler;
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = 1024;
+        resource.height = 1024;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        Require(DescribeSurface(resource).guestBytes == 64 * unit, "the lazy image test must fill 64 units");
+        auto source = StorageTexture::Create(imageContext, detiler, resource, 0);
+        const auto commands = recorder.Commands();
+        recorder.Keep(source);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        source->MarkDrawn(0, 1, {{0, 0}, {1024, 1024}});
+        const auto before = LazyShadowTotals();
+        Require(StorageTexture::StoreDrawnLinear("address-based heaps", on ? PublishScope::None : PublishScope::Whole) == 1, "the GPU image was not stored");
+        recorder.Sync();
+        const auto stored = LazyShadowTotals();
+        Require(stored.publishedUnits == before.publishedUnits + (on && !verify ? 0 : 64), "the GPU image publication did not follow the switch");
+        source.reset();
+        auto consumer = StorageTexture::Create(imageContext, detiler, resource, 0);
+        Buffer pixels(context, 64 * unit, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto readCommands = recorder.Commands();
+        recorder.Keep(consumer);
+        RecordMemoryBarrier(context, readCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {1024, 1024, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(readCommands, consumer->Image(), VK_IMAGE_LAYOUT_GENERAL, pixels.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, readCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        pixels.Invalidate();
+        constexpr std::array<std::byte, 4> wanted{std::byte{255}, std::byte{0}, std::byte{0}, std::byte{255}};
+        for (std::size_t i = 0; i < 64 * unit; ++i) Require(pixels.Bytes()[i] == wanted[i % 4], "the slab upload produced wrong pixels");
+        Require(LazyShadowTotals().publishedUnits == stored.publishedUnits, "the GPU image consumer published");
+        if (on && !verify) Require(protection(address) && AnyShadowedOverlaps(address, 64 * unit), "the GPU-only image lost its lazy authority");
+        std::cout << "agc_lazy_shadow_image: ok\n";
+        return 0;
+    }
+    const auto first = address + unit;
+    const auto second = first + unit;
+    retile(first, 0x20);
+    retile(second, 0x60);
+    recorder.Sync();
+    const auto before = LazyShadowTotals();
+    const auto lazyBefore = Lazy::Totals();
+    if (scenario == "recommit") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 2 * unit);
+    store(first, second + unit);
+    recorder.Sync();
+    const auto stored = LazyShadowTotals();
+    if (on) {
+        Require(stored.publishedUnits == before.publishedUnits + (verify ? 2 : 0), "the lazy plane store published unexpectedly");
+        Require(stored.lazyStores == before.lazyStores + 1 && stored.leftBytes == before.leftBytes + 2 * unit, "the lazy plane store left the wrong units");
+        if (!verify) {
+            Require(stored.enrolledBytes == before.enrolledBytes + 2 * unit && Lazy::Totals().deferred == lazyBefore.deferred + 2, "the left units were not enrolled with the fault watch");
+            Require(protection(first) && AnyShadowedOverlaps(first, 2 * unit), "the left units are not watched, or not shadowed");
+        } else {
+            Require(stored.verifyChecks == before.verifyChecks + 2 && stored.verifyMismatches == before.verifyMismatches, "VERIFY did not compare the forced publication with the eager copy, or they differ");
+        }
+    } else {
+        Require(stored.publishedUnits == before.publishedUnits + 2 && !AnyShadowedOverlaps(first, 2 * unit), "the eager plane store did not publish both units");
+    }
+    const auto unitOne = expected(0x20);
+    const auto unitTwo = expected(0x60);
+    if (scenario == "predicate_threads") {
+        static_cast<void>(rawRead(first, 2 * unit));
+        static std::function<bool()> predicate;
+        GuestArena::GuestWtFaultWatch_nid_no_patch(first, 1);
+        for (int operation = 0; operation < 3; ++operation) {
+            const auto fresh = address + 3 * unit;
+            GuestArena::GuestWtFaultForget_nid_no_patch(fresh, 4096);
+            std::promise<void> entered, tracked;
+            auto enteredFuture = entered.get_future();
+            auto trackedFuture = tracked.get_future();
+            std::thread tracker([&] {
+                enteredFuture.wait();
+                GuestArena::GuestWtFaultTrack_nid_no_patch(fresh, 4096);
+                tracked.set_value();
+            });
+            bool completed = false;
+            predicate = [&] {
+                entered.set_value();
+                completed = trackedFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+                return false;
+            };
+            GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(+[](std::uintptr_t, std::size_t) { return predicate(); });
+            if (operation == 0) GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+            if (operation == 1) GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
+            if (operation == 2) GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
+            tracker.join();
+            GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(nullptr);
+            predicate = {};
+            if (operation == 0) GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+            Require(completed, "the preservation predicate retained the fault mutex and blocked a concurrent tracker");
+        }
+        std::cout << "agc_lazy_shadow_predicate_threads: ok\n";
+        return 0;
+    }
+    if (scenario == "publication_renewal") {
+        Require(recorder.HasTimeline(), "the renewal test needs a timeline recorder");
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        const VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR, nullptr, VK_SEMAPHORE_TYPE_TIMELINE_KHR, 0};
+        const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &semaphore), "renewal semaphore");
+        retile(first, 0x41);
+        StorageTexture::PublishShadowsOnly(first, unit, PublishScope::Whole, "publication A");
+        recorder.HoldNextSubmit(semaphore, 1);
+        const auto publicationA = recorder.SubmitAndEpoch();
+        Require(!recorder.WaitSerialFor(publicationA, 0), "publication A was not held in flight");
+        const VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, semaphore, 1};
+        if (verify) Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "release verified publication A");
+        retile(first, 0x91);
+        store(first, first + unit);
+        if (on && !verify) Require(protection(first), "publication B was not protected");
+        if (!verify) Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "release publication A");
+        recorder.WaitSerial(publicationA);
+        recorder.FinishUpTo(publicationA);
+        if (on && !verify) Require(protection(first) && LazyLeftUnpublished(first, unit) == 1, "completion A cleared B's lazy authority");
+        const auto newest = expected(0x91);
+        if (!on) recorder.Sync();
+        GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+        Require(rawRead(first, unit) == newest, "publication B lost its bytes after A completed");
+        GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+        recorder.Sync();
+        context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+        std::cout << "agc_lazy_shadow_publication_renewal: ok\n";
+        return 0;
+    }
+    if (scenario == "retire_pending") {
+        retile(first, 0x31);
+        retile(second, 0x73);
+        StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "retirement test");
+        Require(recorder.Recording(), "the retirement test needs an unfinished publication");
+        GuestAllocations::Mutation().Remove(block);
+        Require(HostImportFor(context, address, bytes) == nullptr, "the removed import did not retire");
+        Require(!AnyShadowedOverlaps(first, 2 * unit), "the retired import remains in the shadow registry");
+        if (!on || verify) recorder.Sync();
+        GuestArena::GuestWtFaultHold_nid_no_patch(first, 2 * unit);
+        const auto seen = rawRead(first, 2 * unit);
+        GuestArena::GuestWtFaultRelease_nid_no_patch(first, 2 * unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require(std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "a retired in-flight publication exposed stale bytes");
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        std::cout << "agc_lazy_shadow_retire_pending: ok\n";
+        return 0;
+    }
+    if (scenario == "batch_consumer") {
+        retile(first, 0x31);
+        retile(second, 0x73);
+        store(first, second + unit);
+        const auto publications = LazyShadowTotals().publishedUnits;
+        recorder.Submit();
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require((slabOnly || !on || verify) && std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "the cross-batch slab consumer read wrong bytes");
+        Require(LazyShadowTotals().publishedUnits == publications, "the cross-batch GPU consumer published");
+        std::cout << "agc_lazy_shadow_batch_consumer: ok\n";
+        return 0;
+    }
+    if (scenario == "observer_renewal") {
+        StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "observer test");
+        recorder.Sync();
+        GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 2 * unit);
+        Require(GuestArena::GuestWtFaultWatch_nid_no_patch(first, 2 * unit) == 32, "the observational watch did not cover both units");
+        retile(first, 0x31);
+        retile(second, 0x73);
+        const auto renewed = LazyShadowTotals();
+    store(first, second + unit);
+        recorder.Sync();
+        Require(LazyShadowTotals().publishedUnits == renewed.publishedUnits + 2, "an observational watch was accepted as a lazy service watch");
+        const auto seen = rawRead(first, 2 * unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require(std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "renewing an observational watch lost GPU bytes");
+        std::cout << "agc_lazy_shadow_observer_renewal: ok\n";
+        return 0;
+    }
+    if (scenario == "gpu") {
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        Require(slabOnly, "the upload did not read the slab");
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload read wrong bytes");
+        if (on && !verify) Require(LazyShadowTotals().publishedUnits == stored.publishedUnits && protection(first), "a GPU-only read published");
+    } else if (scenario == "cpu_read" || scenario == "hold" || scenario == "open" || scenario == "unwatch" || scenario == "protect" || scenario == "driver_read" || scenario == "recommit") {
+        if (scenario == "hold") GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+        if (scenario == "open") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
+        if (scenario == "unwatch") GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
+        if (scenario == "protect") {
+#ifdef _WIN32
+            GuestArena::GuestArenaSetProtection_nid_postfix(first, 4096, PAGE_READWRITE);
+#else
+            return 77;
+#endif
+        }
+        if (scenario == "recommit") {
+#ifdef _WIN32
+            if (on && !verify) Require((GuestArena::GuestWtFaultWord_nid_no_patch(first) & GuestArena::WtFaultStateMask) == GuestArena::WtFaultOpen, "the recommit regression needs an underlying Open page");
+            GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(first), unit, PAGE_READWRITE, unit);
+#else
+            return 77;
+#endif
+        }
+        if (scenario == "driver_read") {
+            std::array<std::byte, 1> seen{};
+            Read(first, seen);
+        }
+        const auto readBytes = scenario == "cpu_read" ? unit : 2 * unit;
+        const auto seen = rawRead(first, readBytes);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && (readBytes == unit || std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit)), "the CPU read wrong bytes");
+        const auto read = LazyShadowTotals();
+        if (on && !verify) {
+            Require(read.publishedUnits == stored.publishedUnits + readBytes / unit, "the CPU read did not force each requested unit once");
+            if (scenario == "cpu_read") Require(Lazy::Totals().services == lazyBefore.services + 1, "the CPU fault did not run exactly one service");
+            Require(!protection(first) && !AnyShadowedOverlaps(first, readBytes), "the read range is still lazy");
+        }
+        const auto again = rawRead(first, readBytes);
+        Require(again == seen && LazyShadowTotals().publishedUnits == read.publishedUnits, "a second CPU read published again or read other bytes");
+        if (scenario == "hold") GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+    } else if (scenario == "cpu_write" || scenario == "host_write" || scenario.starts_with("driver_store")) {
+        const auto write = [&] {
+            volatile std::uint8_t* to = reinterpret_cast<volatile std::uint8_t*>(first + 8);
+            for (int i = 0; i < 16; ++i) to[i] = 0x77;
+        };
+        if (scenario == "host_write") {
+            const ReadSiteScope site(ReadSite::Store);
+            const GuestArena::HostWrite hold(reinterpret_cast<void*>(first + 8), 16);
+            write();
+        } else if (scenario.starts_with("driver_store")) {
+            Require(!Switches::Enabled(Feature::CLazyStoreHook), "the driver-store regression needs the optional hook off");
+            if (scenario == "driver_store_toggle") {
+                const char* control = std::getenv("APS5_ARCHB_CONTROL_FILE");
+                Require(control != nullptr, "the store toggle needs a control file");
+                std::ofstream(control) << "1 LAZY_SHADOW_PUBLISH=0\n";
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (Switches::Sequence() != 1 && std::chrono::steady_clock::now() < deadline) {
+                    Switches::PollControl();
+                    std::this_thread::yield();
+                }
+                Require(!Switches::Enabled(Feature::LazyShadowPublish), "lazy shadow publication did not turn off");
+            }
+            StoreOwnBytes(first + 8, 16, std::function<void()>(write));
+        } else {
+            write();
+        }
+        CollectWritesUncached(first, 2 * unit);
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        auto wanted = unitOne;
+        std::fill_n(wanted.begin() + 8, 16, std::uint8_t{0x77});
+        Require(!slabOnly, "the written unit is still read from the slab");
+        Require(std::equal(wanted.begin(), wanted.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload after the CPU write read wrong bytes");
+    } else if (scenario == "evict") {
+        retile(second, 0x90);
+        recorder.Sync();
+        const char* budgetText = std::getenv("APS5_UNIT_SHADOW_MIB");
+        Require(budgetText != nullptr && std::strtoull(budgetText, nullptr, 10) < 16, "the evict scenario needs APS5_UNIT_SHADOW_MIB=8");
+        const auto distant = address + 128 * unit;
+        auto other = ShadowDestinationFor(context, *import, distant, distant + unit);
+        Require(other.has_value() && other->slab != nullptr, "the second slab was refused");
+        other.reset();
+        if (on && !verify) {
+            GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+            const auto during = rawRead(first, 2 * unit);
+            const auto newest = expected(0x90);
+            Require(std::equal(unitOne.begin(), unitOne.end(), during.begin()) && std::equal(newest.begin(), newest.end(), during.begin() + unit), "opening an evicted publication exposed unfinished GPU bytes");
+            GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+        }
+        recorder.Sync();
+        Require(!AnyShadowedOverlaps(first, 2 * unit), "the evicted slab's units are still shadowed");
+        const auto seen = rawRead(first, 2 * unit);
+        const auto newer = expected(0x90);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(newer.begin(), newer.end(), seen.begin() + unit), "an evicted unpublished unit lost its bytes");
+    } else {
+        return 2;
+    }
+    if (on && verify) Require(LazyShadowTotals().staleReads == before.staleReads, "VERIFY saw a CPU read of unpublished lazy units");
+    std::cout << "agc_lazy_shadow_" << scenario << (on ? (verify ? " (verify)" : "") : " (off)") << ": ok\n";
+    return 0;
+}
+
 int archcLazyTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -15559,8 +16057,6 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
         Require(std::all_of(seen.begin(), seen.begin() + 16, [](std::byte value) { return value == std::byte{0x77}; }), "the host write did not land");
         std::copy(published.begin(), published.begin() + 16, seen.begin());
     } else if (scenario == "store") {
-        // A driver store into the lazy range under the GPU mutex (C_LAZY_STORE_HOOK: published by the
-        // store hook, no fault; without it the store faults and the service publishes).
         AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         const std::array<std::byte, 1> value{std::byte{0x99}};
@@ -15579,7 +16075,7 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
     }
     Require(seen == published, "the CPU did not read the draw's results after the label");
     const auto served = Lazy::Totals();
-    const bool hooked = on && scenario == "store" && Switches::Enabled(Feature::CLazyStoreHook);
+    const bool hooked = on && scenario == "store" && (Switches::Enabled(Feature::CLazyStoreHook) || GuestArena::GuestWtFaultLazyPreservationEnabled_nid_no_patch());
     if (hooked) {
         Require(served.services == deferred.services && served.storeHooks == deferred.storeHooks + 1, "the driver store was not published by the store hook alone");
         Require(Lazy::Entries() == 0 && protection() != PAGE_NOACCESS, "the hooked range is still lazy");
@@ -18877,16 +19373,16 @@ int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_
 }
 
 int main(int argc, char** argv) {
-    struct SplitFacesControl {
+    struct RuntimeControl {
         std::filesystem::path path;
-        ~SplitFacesControl() { if (!path.empty()) std::filesystem::remove(path); }
-    } splitFacesControl;
-    if (argc == 3 && std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) {
-        splitFacesControl.path = std::filesystem::temp_directory_path() / ("anyps5-split-faces-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+        ~RuntimeControl() { if (!path.empty()) std::filesystem::remove(path); }
+    } runtimeControl;
+    if (argc == 3 && ((std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) || (std::string_view(argv[1]) == "--lazy-shadow" && std::string_view(argv[2]) == "driver_store_toggle"))) {
+        runtimeControl.path = std::filesystem::temp_directory_path() / ("anyps5-recorder-control-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
 #ifdef _WIN32
-        _putenv_s("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str());
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", runtimeControl.path.string().c_str());
 #else
-        setenv("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str(), 1);
+        setenv("APS5_ARCHB_CONTROL_FILE", runtimeControl.path.string().c_str(), 1);
 #endif
     }
 #ifdef _WIN32
@@ -19110,7 +19606,7 @@ int main(int argc, char** argv) {
         }
 #endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
-        Recorder recorder(device.GetContext());
+        Recorder recorder(device.GetContext(), device.Timeline());
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
             if (device.GetContext().hostImportAlignment == 0) return 77;
@@ -19547,6 +20043,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy") {
             return archcLazyTests(device, recorder, argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--lazy-shadow") {
+            return lazyShadowTests(device, recorder, argv[2]);
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-label-prewait") {
             return archcLabelPrewaitTests(device, recorder, argv[2]);

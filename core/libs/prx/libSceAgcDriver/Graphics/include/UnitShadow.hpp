@@ -61,6 +61,43 @@ struct PublishOnCpuScope {
     bool previous;
 };
 
+struct PublishSiteScope {
+    explicit PublishSiteScope(const char* site);
+    ~PublishSiteScope();
+    const char* previous;
+};
+
+bool LazyShadowPublishEnabled();
+bool LazyShadowVerifyEnabled();
+struct ShadowConsumerScope {
+    ShadowConsumerScope(const char* reason, std::uint64_t address, std::size_t bytes, PublishScope scope);
+    ~ShadowConsumerScope();
+    struct State {
+        const char* reason = nullptr;
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        PublishScope scope = PublishScope::Whole;
+        bool set = false;
+    };
+    State previous;
+};
+PublishScope PlaneStoreScope(const char* store);
+void SettlePlaneStore(const char* store, std::uint64_t begin, std::uint64_t end, PublishScope used);
+std::size_t LazyLeftUnpublished(std::uint64_t address, std::size_t bytes);
+struct LazyShadowCounts {
+    std::uint64_t lazyStores = 0;
+    std::uint64_t eagerStores = 0;
+    std::uint64_t leftBytes = 0;
+    std::uint64_t enrolledBytes = 0;
+    std::uint64_t unwatchableBytes = 0;
+    std::uint64_t verifyChecks = 0;
+    std::uint64_t verifyMismatches = 0;
+    std::uint64_t staleReads = 0;
+    std::uint64_t publishedUnits = 0;
+};
+LazyShadowCounts LazyShadowTotals();
+void NoteLazyShadowRead(std::uint64_t address, std::size_t bytes, PublishScope scope);
+
 struct ShadowSlab {
     ShadowSlab(const Context& context, VkBuffer buffer, VkDeviceMemory memory, std::uint64_t firstUnit, std::uint32_t units);
     ShadowSlab(const ShadowSlab&) = delete;
