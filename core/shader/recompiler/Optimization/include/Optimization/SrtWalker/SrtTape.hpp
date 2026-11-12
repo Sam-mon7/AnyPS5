@@ -46,6 +46,8 @@ private:
         std::uint64_t immediate = 0;
         const IrValue* source = nullptr;
         const IrValue* parentRead = nullptr;
+        std::uint32_t sourceSlot = NoNode;
+        std::uint32_t parentSlot = NoNode;
     };
     struct Frame;
     bool evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const;
@@ -58,6 +60,7 @@ private:
     std::vector<std::uint8_t> initialActive;
     std::vector<std::uint8_t> initialActiveFlat;
     std::size_t activityEntries = 0;
+    std::uint32_t readSlots = 0;
     bool needsCleanMemory = false;
 };
 
