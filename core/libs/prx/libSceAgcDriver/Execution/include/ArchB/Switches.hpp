@@ -119,6 +119,7 @@ enum class Feature : std::uint8_t {
     DepthRunRepeat,
     DispatchAddressReuse,
     DispatchUploadReuse,
+    DispatchPartialReproof,
     Count
 };
 

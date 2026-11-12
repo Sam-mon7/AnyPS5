@@ -542,6 +542,12 @@ public:
         std::uint64_t bytes = 0;
     };
     static CollectRefusals CollectRefusalCounts();
+    enum class PartialReproofFallback : std::size_t { Unlocalized, Tables, Records, Alias, Identity, MissingLookup, Repeated, DepthMoved, Audit, Rerun, PostProof, Count };
+    struct PartialReproofStatistics {
+        std::uint64_t calls = 0, passes = 0, surfaces = 0, sampled = 0, storage = 0, verified = 0, mismatches = 0, fallbacks = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(PartialReproofFallback::Count)> reasons{};
+    };
+    static PartialReproofStatistics PartialReproofCounts();
     static std::array<std::uint64_t, static_cast<std::size_t>(FastFail::Count)> FullWalkNanoseconds();
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.
@@ -769,6 +775,9 @@ private:
         bool sourceEligible = false;
         bool depthCompare = false;
         bool sourceRefreshed = false;
+        bool exactLookup = false;
+        std::uint64_t depthSerial = 0;
+        std::uint64_t depthReleased = 0;
     };
     // `serialBefore` is StorageTexture::PendingSerial() loaded before any check of this Revalidate;
     // `refreshed` the surfaces refreshOwnObjects resolved earlier in the same Revalidate (empty on
@@ -778,7 +787,7 @@ private:
     // holds; `reason` receives why the proof failed (Count: it passed), `overlapping` the surfaces
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
-    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted);
+    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, bool localize = false);
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
     // image's Refresh (which stores the foreign images over its surface first), a view's source's
@@ -791,6 +800,7 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    PartialReproofFallback refreshPartialObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> selected);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResourceProofWork.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -4304,13 +4305,159 @@ bool ShaderResources::depthProofAccepts(std::uint64_t address, std::uint64_t byt
     return true;
 }
 
-bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
+namespace {
+struct PartialReproofCounters {
+    std::atomic<std::uint64_t> calls{0}, passes{0}, surfaces{0}, sampled{0}, storage{0}, verified{0}, mismatches{0}, fallbacks{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::PartialReproofFallback::Count)> reasons{};
+};
+PartialReproofCounters& partialReproofCounters() {
+    static PartialReproofCounters counters;
+    return counters;
+}
+void countPartialReproofFallback(ShaderResources::PartialReproofFallback reason) {
+    auto& c = partialReproofCounters();
+    c.fallbacks.fetch_add(1, std::memory_order_relaxed);
+    c.reasons[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    static constexpr const char* names[] = {"dispatch_partial_reproof_fallback_unlocalized", "dispatch_partial_reproof_fallback_tables", "dispatch_partial_reproof_fallback_records", "dispatch_partial_reproof_fallback_alias", "dispatch_partial_reproof_fallback_identity", "dispatch_partial_reproof_fallback_missing_lookup", "dispatch_partial_reproof_fallback_repeated", "dispatch_partial_reproof_fallback_depth_moved", "dispatch_partial_reproof_fallback_audit", "dispatch_partial_reproof_fallback_rerun", "dispatch_partial_reproof_fallback_post_proof"};
+    AgcDriver::ArchB::Recorder::Count(names[static_cast<std::size_t>(reason)]);
+}
+bool partialReproofVerifyNow() {
+    static const bool enabled = [] { const auto* value = std::getenv("APS5_VERIFY_DISPATCH_PARTIAL_REPROOF"); return value != nullptr && std::strcmp(value, "1") == 0; }();
+    static const std::uint64_t interval = [] {
+        const auto* value = std::getenv("APS5_VERIFY_DISPATCH_PARTIAL_REPROOF_EVERY");
+        if (value == nullptr) return std::uint64_t{64};
+        std::uint64_t parsed = 0;
+        for (const auto* at = value; *at != 0; ++at) {
+            Require(*at >= '0' && *at <= '9', "invalid dispatch partial reproof VERIFY interval");
+            const auto digit = static_cast<std::uint64_t>(*at - '0');
+            Require(parsed <= (std::numeric_limits<std::uint64_t>::max() - digit) / 10, "dispatch partial reproof VERIFY interval overflow");
+            parsed = parsed * 10 + digit;
+        }
+        Require(parsed != 0, "invalid dispatch partial reproof VERIFY interval");
+        return parsed;
+    }();
+    static std::atomic<std::uint64_t> sequence{0};
+    return enabled && sequence.fetch_add(1, std::memory_order_relaxed) % interval == 0;
+}
+}
+
+ShaderResources::PartialReproofStatistics ShaderResources::PartialReproofCounts() {
+    auto& c = partialReproofCounters();
+    PartialReproofStatistics result{c.calls.load(), c.passes.load(), c.surfaces.load(), c.sampled.load(), c.storage.load(), c.verified.load(), c.mismatches.load(), c.fallbacks.load()};
+    for (std::size_t i = 0; i < result.reasons.size(); ++i) result.reasons[i] = c.reasons[i].load();
+    return result;
+}
+
+ShaderResources::PartialReproofFallback ShaderResources::refreshPartialObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> selected) {
+    if (!tableStages.empty()) return PartialReproofFallback::Tables;
+    if (!keepsTemplateRecords() || validatedTextures.size() != textures.size()) return PartialReproofFallback::Records;
+    const auto listed = [&](std::size_t element, bool storage) {
+        return std::find_if(selected.begin(), selected.end(), [&](const PendingOverlap& entry) { return entry.element == element && entry.storage == storage; });
+    };
+    for (const auto& entry : selected) {
+        if (entry.storage ? entry.element >= storageTextures.size() : entry.element >= textures.size()) return PartialReproofFallback::Records;
+        const auto* source = entry.storage ? storageTextures[entry.element].get() : textures[entry.element]->StorageSource();
+        for (std::size_t i = 0; i < textures.size(); ++i) {
+            if (!entry.storage && i == entry.element) continue;
+            if ((!entry.storage && textures[i] == textures[entry.element]) || (source != nullptr && textures[i]->StorageSource() == source)) return PartialReproofFallback::Alias;
+        }
+        for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+            if (entry.storage && i == entry.element) continue;
+            if (source != nullptr && storageTextures[i].get() == source) return PartialReproofFallback::Alias;
+        }
+    }
+    lookupLog().clear();
+    BuildLookups lookups;
+    std::size_t textureIndex = 0, storageIndex = 0, foundCount = 0;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return PartialReproofFallback::Records;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
+            if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
+                const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto raw = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                    std::array<std::uint32_t, 8> narrowed{};
+                    const auto words = firstLayerWords(raw, binding.imageShape, narrowed, false);
+                    if (IsNullSampledTextureResource(words)) continue;
+                    const auto index = textureIndex++;
+                    if (index >= textures.size()) return PartialReproofFallback::Records;
+                    const auto chosen = listed(index, false);
+                    if (chosen == selected.end()) continue;
+                    const auto resource = DecodeTextureResource(words);
+                    const bool depthCompare = !binding.Flags().imageDepthCompare.empty() && binding.Flags().imageDepthCompare.at(element);
+                    const VkImageViewType viewType = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                    const auto boundView = [&] { return textureSrgb[index] ? textures[index]->SrgbView(textureFirstLayer[index], textureBaseLevel[index]) : textureBaseLevel[index] ? textures[index]->BaseLevelView() : textureFirstLayer[index] ? textures[index]->FirstLayerView() : textures[index]->View(); };
+                    const auto oldView = boundView();
+                    const auto oldLayout = textures[index]->Layout();
+                    const auto depthSerial = DepthSurfacesSerial();
+                    const auto depthReleased = DepthSurfacesReleased();
+                    const auto current = cachedTexture(context, words, resource, ViewComponents(resource), 0, depthCompare, viewType, layerRowsBinding(binding.imageShape, resource, depthCompare));
+                    if (current != textures[index] || boundView() != oldView || current->Layout() != oldLayout) return PartialReproofFallback::Identity;
+                    const auto record = std::find_if(lookupLog().rbegin(), lookupLog().rend(), [&](const LookupRecord& value) { return value.object == current.get(); });
+                    if (record == lookupLog().rend()) return PartialReproofFallback::MissingLookup;
+                    validatedTextures[index] = {record->resource, record->bytes, record->keys, record->generation, 0, record->source, record->depth, true, record->committed};
+                    chosen->depthCompare = depthCompare;
+                    const auto* source = record->source;
+                    chosen->sourceEligible = source != nullptr && SampledFromStorageEligible(context, resource, record->bytes) && SurfaceKey(context, source->Descriptor()) == SurfaceKey(context, resource);
+                    chosen->sourceRefreshed = source != nullptr;
+                    chosen->exactLookup = true;
+                    if (depthSerial != DepthSurfacesSerial() || depthReleased != DepthSurfacesReleased()) return PartialReproofFallback::DepthMoved;
+                    chosen->depthSerial = depthSerial;
+                    chosen->depthReleased = depthReleased;
+                    ++foundCount;
+                    partialReproofCounters().surfaces.fetch_add(1, std::memory_order_relaxed);
+                    AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_surfaces");
+                    partialReproofCounters().sampled.fetch_add(1, std::memory_order_relaxed);
+                    AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_sampled");
+                }
+            } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                    if (IsNullTextureResource(words)) continue;
+                    const auto index = storageIndex++;
+                    if (index >= storageTextures.size()) return PartialReproofFallback::Records;
+                    const auto chosen = listed(index, true);
+                    if (chosen == selected.end()) continue;
+                    const auto oldView = storageTextures[index]->View();
+                    const auto depthSerial = DepthSurfacesSerial();
+                    const auto depthReleased = DepthSurfacesReleased();
+                    const auto current = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[index], 0, storageWritten[index]);
+                    if (current != storageTextures[index] || current->View() != oldView) return PartialReproofFallback::Identity;
+                    chosen->exactLookup = true;
+                    if (depthSerial != DepthSurfacesSerial() || depthReleased != DepthSurfacesReleased()) return PartialReproofFallback::DepthMoved;
+                    chosen->depthSerial = depthSerial;
+                    chosen->depthReleased = depthReleased;
+                    ++foundCount;
+                    partialReproofCounters().surfaces.fetch_add(1, std::memory_order_relaxed);
+                    AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_surfaces");
+                    partialReproofCounters().storage.fetch_add(1, std::memory_order_relaxed);
+                    AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_storage");
+                }
+            }
+        }
+    }
+    lookupLog().clear();
+    if (textureIndex != textures.size() || storageIndex != storageTextures.size() || foundCount != selected.size()) return PartialReproofFallback::Records;
+    return PartialReproofFallback::Count;
+}
+
+bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, bool localize) {
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
     depthProofAccepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto forgetBefore = GuestMemory::ForgetSerial();
+    const auto exactDepth = [&](std::size_t element, bool storage, std::uint64_t address, std::size_t bytes) {
+        if (!localize) return false;
+        return std::any_of(refreshed.begin(), refreshed.end(), [&](const PendingOverlap& entry) {
+            return entry.element == element && entry.storage == storage && entry.exactLookup && entry.depthSerial == DepthSurfacesSerial() && entry.depthReleased == DepthSurfacesReleased() && !DepthSurfaceBlocksMemoryProof(context.device, address, bytes);
+        });
+    };
+    const auto locate = [&](std::size_t element, bool storage) {
+        if (localize) overlapping.push_back({element, storage, false});
+    };
     const auto fail = [&reason](FastFail why) {
         reason = why;
         countFastFail(why);
@@ -4330,6 +4477,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     auto& images = ThreadScratch<std::vector<const StorageTexture*>, ImagesTag>();
     struct ScannedKeysTag {};
     auto& scannedKeys = ThreadScratch<std::vector<DccKeys>, ScannedKeysTag>();
+    struct QueryOwnersTag {};
+    auto& queryOwners = ThreadScratch<std::vector<PendingOverlap>, QueryOwnersTag>();
+    queryOwners.clear();
     queries.clear();
     pending.clear();
     owners.clear();
@@ -4343,14 +4493,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         auto& surface = validatedTextures[i];
         if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) { locate(i, false); return fail(FastFail::Depth); }
             continue;
         }
         if (textures[i]->Released()) return fail(FastFail::Replaced);
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        if (DepthBlocksProof(context.device, address, bytes) && !depthProofAccepts(address, bytes)) return fail(FastFail::Depth);
-        if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
+        if (DepthBlocksProof(context.device, address, bytes) && !exactDepth(i, false, address, bytes) && !depthProofAccepts(address, bytes)) { locate(i, false); return fail(FastFail::Depth); }
+        if (!FlushDepthPlanes(address, bytes).empty()) { locate(i, false); return fail(FastFail::Changed); }
         if (!surface.committed.has_value()) {
             surface.collected = GuestMemory::CollectWrites(address, bytes);
             if (surface.collected == 0) {
@@ -4397,9 +4547,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
             queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
+            if (localize) queryOwners.push_back({i, false, false});
             images.push_back(source);
         } else if (!surface.committed.has_value()) {
             queries.push_back({address, bytes, surface.generation});
+            if (localize) queryOwners.push_back({i, false, false});
         }
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
@@ -4410,7 +4562,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (DepthBlocksProof(context.device, address, bytes) && !depthProofAccepts(address, bytes)) {
+        if (DepthBlocksProof(context.device, address, bytes) && !exactDepth(i, true, address, bytes) && !depthProofAccepts(address, bytes)) {
+            locate(i, true);
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
@@ -4428,6 +4581,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
         queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
+        if (localize) queryOwners.push_back({i, true, false});
         images.push_back(image);
     }
     if (!pending.empty()) {
@@ -4471,7 +4625,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
     if (!finishPartialSnapshots(forgetBefore)) return fail(FastFail::Changed);
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    if (!GuestMemory::UnchangedSinceAll(queries)) {
+        if (localize) {
+            for (std::size_t i = 0; i < queries.size(); ++i) {
+                if (!GuestMemory::UnchangedSinceAll(std::span<const GuestMemory::UnchangedQuery>(&queries[i], 1))) overlapping.push_back(queryOwners[i]);
+            }
+        }
+        return fail(FastFail::Changed);
+    }
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
@@ -5463,6 +5624,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         return true;
     }
+    ResourceProofWork::Scope workScope(!drawBuild && addressBuildSteps());
     const bool traceStages = report != nullptr && report->trace;
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (report != nullptr) report->trace = traceStages;
@@ -5513,6 +5675,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
     markStage(0);
+    workScope.SetPhase(ResourceProofWork::Phase::Surface);
     ArchC::ProbeAt(ArchC::Probe::RvComplete);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
@@ -5554,8 +5717,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     bool stampReused = false;
+    bool partialPassed = false;
+    bool productionFullWalk = false;
     const auto otherStarted = std::chrono::steady_clock::now();
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        workScope.Finish(productionFullWalk ? ResourceProofWork::Path::Full : partialPassed ? ResourceProofWork::Path::Partial : fast ? ResourceProofWork::Path::Fast : ResourceProofWork::Path::Failed, ok);
         if (ok) AgcDriver::ArchB::Recorder::Count(fast ? (epochReused ? "proof_fast_pass_epoch" : stampReused ? "proof_fast_pass_stamp_memo" : "proof_fast_pass_stamps") : "proof_full_pass");
         if (!ok) setStampValid(false);
         if (!ok) AgcDriver::ArchB::Recorder::Count("proof_failed");
@@ -5563,6 +5729,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             AgcDriver::ArchB::Recorder::Count(!ok ? "proof_other_failed" : !fast ? "proof_other_full_pass" : epochReused ? "proof_other_pass_epoch" : stampReused ? "proof_other_pass_stamp_memo" : "proof_other_pass_stamps");
             AgcDriver::ArchB::Recorder::Count(drawBuild ? "proof_other_draw_resources" : "proof_other_dispatch_resources");
             AgcDriver::ArchB::Recorder::Count("proof_other_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - otherStarted).count()));
+        }
+        if (!ok && partialPassed) countPartialReproofFallback(PartialReproofFallback::PostProof);
+        if (ok && partialPassed) {
+            partialReproofCounters().passes.fetch_add(1, std::memory_order_relaxed);
+            AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_passes");
         }
         if (ok) provedOnce = true;
         if (epochProofs && !ok) resourceEpochProof = {};
@@ -5752,7 +5923,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             bool verifyAccepted = false;
             auto& counters = stampProofCounters();
             counters.verified.fetch_add(1, std::memory_order_relaxed);
-            if (!fastRevalidate(serialBefore, verifyRefreshed, verifyReason, verifyOverlap, verifyAccepted)) {
+            const auto priorPhase = workScope.SetPhase(ResourceProofWork::Phase::Verify);
+            const bool verifiedFast = fastRevalidate(serialBefore, verifyRefreshed, verifyReason, verifyOverlap, verifyAccepted);
+            workScope.SetPhase(priorPhase);
+            if (!verifiedFast) {
                 const auto count = counters.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
                 if ((count & (count - 1)) == 0) std::fprintf(stderr, "[rescache] PIPE_RESOLVE_PROOFS_VERIFY: the stamp memo held where the fast proof failed (reason %zu; %llu so far)\n", static_cast<std::size_t>(verifyReason), static_cast<unsigned long long>(count));
                 stampReused = false;
@@ -5779,14 +5953,74 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         FastFail reason = FastFail::Count;
         bool accepted = false;
         markStage(1);
-        fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+        const bool partialEnabled = !drawBuild && !noFast && EpochRevalidate() && GuestMemory::GpuMutex().HeldByThisThread() && ArchB::Switches::Enabled(ArchB::Feature::DispatchPartialReproof);
+        std::optional<PerformanceTimer> fastTimer;
+        if (partialEnabled && addressBuildSteps()) fastTimer.emplace("Resources.PartialReproof.Fast", AgcDriver::ArchB::Recorder::Phase::Proof);
+        fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, partialEnabled);
+        fastTimer.reset();
+        if (!fast && partialEnabled) {
+            auto& c = partialReproofCounters();
+            c.calls.fetch_add(1, std::memory_order_relaxed);
+            AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_calls");
+            std::optional<PerformanceTimer> partialTimer;
+            if (addressBuildSteps()) partialTimer.emplace("Resources.PartialReproof", AgcDriver::ArchB::Recorder::Phase::Proof);
+            struct SelectedTag {};
+            auto& selected = ThreadScratch<std::vector<PendingOverlap>, SelectedTag>();
+            struct PartialVersionsTag {};
+            auto& versions = ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, PartialVersionsTag>();
+            struct PartialTextureRevisionsTag {};
+            auto& textureRevisions = ThreadScratch<std::vector<std::uint64_t>, PartialTextureRevisionsTag>();
+            textureRevisions.clear();
+            for (const auto& texture : textures) textureRevisions.push_back(texture->ContentRevision());
+            selected.clear();
+            versions.clear();
+            for (const auto& surface : validatedTextures) if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+            for (const auto& image : storageTextures) if (image != nullptr) versions.emplace_back(image.get(), image->Version());
+            auto fallback = PartialReproofFallback::Count;
+            for (std::size_t round = 0; !fast && round <= textures.size() + storageTextures.size(); ++round) {
+                if ((reason != FastFail::Depth && reason != FastFail::Changed && reason != FastFail::Pending) || overlapping.empty()) { fallback = PartialReproofFallback::Unlocalized; break; }
+                selected = overlapping;
+                const auto duplicate = [&](const PendingOverlap& entry) {
+                    return std::any_of(refreshed.begin(), refreshed.end(), [&](const PendingOverlap& previous) { return previous.element == entry.element && previous.storage == entry.storage; });
+                };
+                if (std::any_of(selected.begin(), selected.end(), duplicate)) { fallback = PartialReproofFallback::Repeated; break; }
+                std::optional<PerformanceTimer> lookupTimer;
+                if (addressBuildSteps()) lookupTimer.emplace("Resources.PartialReproof.Lookup", AgcDriver::ArchB::Recorder::Phase::Proof);
+                fallback = refreshPartialObjects(shaders, selected);
+                lookupTimer.reset();
+                if (fallback != PartialReproofFallback::Count) break;
+                refreshed.insert(refreshed.end(), selected.begin(), selected.end());
+                const auto touched = [&](const StorageTexture* image) {
+                    return std::any_of(refreshed.begin(), refreshed.end(), [&](const PendingOverlap& entry) {
+                        return image == (entry.storage ? storageTextures[entry.element].get() : textures[entry.element]->StorageSource());
+                    });
+                };
+                if (std::any_of(versions.begin(), versions.end(), [&](const auto& entry) { return !touched(entry.first) && entry.first->Version() != entry.second; })) { fallback = PartialReproofFallback::Alias; break; }
+                for (std::size_t i = 0; i < textures.size(); ++i) {
+                    const bool selectedTexture = std::any_of(refreshed.begin(), refreshed.end(), [&](const PendingOverlap& entry) { return !entry.storage && entry.element == i; });
+                    if (!selectedTexture && textures[i]->ContentRevision() != textureRevisions[i]) { fallback = PartialReproofFallback::Alias; break; }
+                }
+                if (fallback != PartialReproofFallback::Count) break;
+                if (std::any_of(refreshed.begin(), refreshed.end(), [&](const PendingOverlap& entry) { return entry.depthSerial != DepthSurfacesSerial() || entry.depthReleased != DepthSurfacesReleased(); })) { fallback = PartialReproofFallback::DepthMoved; break; }
+                std::optional<PerformanceTimer> rerunTimer;
+                if (addressBuildSteps()) rerunTimer.emplace("Resources.PartialReproof.Rerun", AgcDriver::ArchB::Recorder::Phase::Proof);
+                fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, true);
+            }
+            partialPassed = fast;
+            if (!fast) {
+                if (fallback == PartialReproofFallback::Count) fallback = PartialReproofFallback::Rerun;
+                countPartialReproofFallback(fallback);
+                refreshed.clear();
+                overlapping.clear();
+            }
+        }
         // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
         // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
         // them) and the fast proof run again, which is then authoritative (it accepts what stays
         // pending over the refreshed surfaces, see fastRevalidate); a fallback, or a second failure,
         // takes the full walk as before.
         bool ownRefreshed = false;
-        if (!fast && !overlapping.empty()) {
+        if (!fast && reason == FastFail::Pending && !overlapping.empty()) {
             auto fallback = OwnRefreshFallback::Count;
             if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
             else {
@@ -5804,16 +6038,19 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (fast && TemplateAuditDue(lastFullWalk) && (AuditEveryInterval() || epochProofs || stampProofsActive() || (walkImportGeneration != HostImportSetGeneration() && ImportAuditAdmitted()))) {
             fast = false;
             ownRefreshed = false;
+            if (partialPassed) countPartialReproofFallback(PartialReproofFallback::Audit);
+            partialPassed = false;
             reason = FastFail::Audit;
         }
         if (report != nullptr) {
-            report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+            report->path = !fast ? ProofPath::Full : ownRefreshed || partialPassed ? ProofPath::OwnRefreshed : ProofPath::Fast;
             report->audited = !fast && reason == FastFail::Audit;
         }
         if (report != nullptr) report->fastFail = static_cast<std::size_t>(reason);
         if (!fast) {
             countFullWalk(reason);
             const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            productionFullWalk = true;
             const bool walked = fullWalk();
             countFullWalkTime(reason, walkStart);
             if (!walked) {
@@ -5828,6 +6065,40 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                 }();
                 return finish(false, false, failure);
             }
+        } else if (partialPassed && partialReproofVerifyNow()) {
+            std::optional<PerformanceTimer> verifyTimer;
+            if (addressBuildSteps()) verifyTimer.emplace("Resources.PartialReproof.Verify", AgcDriver::ArchB::Recorder::Phase::Proof);
+            struct PartialVerifyVersionsTag {};
+            auto& versions = ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, PartialVerifyVersionsTag>();
+            struct PartialVerifyViewsTag {};
+            struct VerifiedView { const Texture* texture; VkImageView view; VkImageLayout layout; std::uint64_t revision; };
+            auto& views = ThreadScratch<std::vector<VerifiedView>, PartialVerifyViewsTag>();
+            struct PartialVerifyDescriptorsTag {};
+            auto& descriptors = ThreadScratch<std::vector<VkDescriptorImageInfo>, PartialVerifyDescriptorsTag>();
+            descriptors = descriptorImages;
+            const auto boundView = [&](std::size_t i) { return textureSrgb[i] ? textures[i]->SrgbView(textureFirstLayer[i], textureBaseLevel[i]) : textureBaseLevel[i] ? textures[i]->BaseLevelView() : textureFirstLayer[i] ? textures[i]->FirstLayerView() : textures[i]->View(); };
+            versions.clear();
+            views.clear();
+            for (std::size_t i = 0; i < textures.size(); ++i) views.push_back({textures[i].get(), boundView(i), textures[i]->Layout(), textures[i]->ContentRevision()});
+            for (const auto& surface : validatedTextures) if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+            for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+            auto& c = partialReproofCounters();
+            c.verified.fetch_add(1, std::memory_order_relaxed);
+            AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_verified");
+            const auto priorPhase = workScope.SetPhase(ResourceProofWork::Phase::Verify);
+            const bool same = fullWalk();
+            workScope.SetPhase(priorPhase);
+            const bool moved = std::any_of(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+            bool viewsSame = views.size() == textures.size();
+            for (std::size_t i = 0; viewsSame && i < views.size(); ++i) viewsSame = views[i].texture == textures[i].get() && views[i].view == boundView(i) && views[i].layout == textures[i]->Layout() && views[i].revision == textures[i]->ContentRevision();
+            const bool descriptorsSame = descriptors.size() == descriptorImages.size() && std::equal(descriptors.begin(), descriptors.end(), descriptorImages.begin(), [](const auto& a, const auto& b) { return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout; });
+            if (!same || moved || !viewsSame || !descriptorsSame) {
+                c.mismatches.fetch_add(1, std::memory_order_relaxed);
+                AgcDriver::ArchB::Recorder::Count("dispatch_partial_reproof_mismatches");
+                setStampValid(false);
+                resourceEpochProof = {};
+                Require(false, "APS5_VERIFY_DISPATCH_PARTIAL_REPROOF: the full walk changed a proved resource");
+            }
         } else if (depthProofAccepted && depthProofVerifyNow()) {
             auto& c = depthProofCounters();
             c.verified.fetch_add(1, std::memory_order_relaxed);
@@ -5839,7 +6110,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }
             for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
             const auto texturesBefore = textures;
+            const auto priorPhase = workScope.SetPhase(ResourceProofWork::Phase::Verify);
             const bool same = fullWalk();
+            workScope.SetPhase(priorPhase);
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (!same || moved != versions.end() || textures != texturesBefore) {
                 const auto count = c.mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -5859,7 +6132,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
                     if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
                 }
                 for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+                const auto priorPhase = workScope.SetPhase(ResourceProofWork::Phase::Verify);
                 const bool same = fullWalk();
+                workScope.SetPhase(priorPhase);
                 const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
                 if (!same || moved != versions.end()) {
                     std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
@@ -5871,6 +6146,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         }
     }
     markStage(3);
+    workScope.SetPhase(ResourceProofWork::Phase::Tail);
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResourceProofWork.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
@@ -274,6 +275,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
+    if (bytes != 0) ResourceProofWork::Note(path == 0 ? ResourceProofWork::Kind::TextureClear : ResourceProofWork::Kind::TextureUpload, bytes);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -286,6 +288,7 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
 }
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct, bool drawn = false) {
+    if (bytes != 0) ResourceProofWork::Note(ResourceProofWork::Kind::StoragePublish, bytes);
     if (!LookupOutcomes::Profiled()) return;
     ThreadLookupOutcomes().work[LookupOutcomes::WriteBackBytes] += bytes;
     if (!direct) ThreadLookupOutcomes().work[LookupOutcomes::CpuBytes] += bytes;
@@ -726,6 +729,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
+            ResourceProofWork::Note(ResourceProofWork::Kind::TextureClear, guestBytes);
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;
             if (profile) Profile().gpu += timer.lap();
@@ -877,6 +881,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             toShaderRead.subresourceRange = toTransferDst.subresourceRange;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toShaderRead);
 
+            ResourceProofWork::Note(ResourceProofWork::Kind::TextureUpload, guestBytes);
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;
             if (profile) Profile().gpu += timer.lap();
@@ -943,6 +948,11 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         release();
         throw;
     }
+}
+
+void Texture::noteContentWrite() {
+    Require(contentRevision != std::numeric_limits<std::uint64_t>::max(), "texture content revision overflow");
+    ++contentRevision;
 }
 
 void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached, bool gpu) {
@@ -1061,7 +1071,9 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
             regions.push_back(region);
         }
     }
+    if (!regions.empty()) noteContentWrite();
     if (!regions.empty()) context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    if (!regions.empty()) ResourceProofWork::Note(ResourceProofWork::Kind::TextureUpload, tiledBytes);
     for (auto& barrier : toTransfer) {
         barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1461,7 +1473,13 @@ bool Texture::refreshSrgbExpand() {
     toTransferDst.image = image;
     toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, copyLevels, 0, copyLayers};
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, 1, &toTransferDst);
+    noteContentWrite();
     RecordExpandBlit(context, commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, sourceDescriptor, 1u, copyLayers, copyLevels);
+    if (ResourceProofWork::Active()) {
+        std::uint64_t copiedBytes = 0;
+        for (std::uint32_t level = 0; level < copyLevels; ++level) copiedBytes += static_cast<std::uint64_t>(std::max(sourceDescriptor.width >> level, 1u)) * std::max(sourceDescriptor.height >> level, 1u) * copyLayers * 4u;
+        ResourceProofWork::Note(ResourceProofWork::Kind::TextureCopy, copiedBytes);
+    }
     VkImageMemoryBarrier toShaderRead = toTransferDst;
     toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1545,7 +1563,9 @@ bool Texture::RefreshDepthCopy() {
     } else {
         barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearReady, 0, nullptr);
     }
+    noteContentWrite();
     context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(toDepth.size()), toDepth.data());
+    ResourceProofWork::Note(ResourceProofWork::Kind::TextureCopy, linearBytes);
     VkImageMemoryBarrier toShaderRead{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -1595,7 +1615,13 @@ bool Texture::refreshBlockCopy() {
     toTransferDst.image = image;
     toTransferDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, copyLevels, 0, copyLayers};
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &produced, 0, nullptr, 1, &toTransferDst);
+    noteContentWrite();
     context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    if (ResourceProofWork::Active()) {
+        std::uint64_t copiedBytes = 0;
+        for (const auto& region : regions) copiedBytes += static_cast<std::uint64_t>(region.extent.width) * region.extent.height * region.extent.depth * region.srcSubresource.layerCount * copyElementBytes;
+        ResourceProofWork::Note(ResourceProofWork::Kind::TextureCopy, copiedBytes);
+    }
     VkImageMemoryBarrier toShaderRead = toTransferDst;
     toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;

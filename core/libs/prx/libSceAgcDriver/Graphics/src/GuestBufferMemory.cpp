@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResourceProofWork.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
@@ -7152,6 +7153,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        ResourceProofWork::Note(ResourceProofWork::Kind::StagingIn, bytes);
         if (trace) {
             uploadTraffic.gpuBytes += bytes;
             if (retained) uploadTraffic.retainedGpuBytes += bytes;
@@ -7377,6 +7379,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (alignedFrom < alignedTo && recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), counter != nullptr ? counter->DeviceAddress() : 0, reconcile, blockPublish)) {
                     reconciled = reconcile;
                     region.blockPublished = blockPublish;
+                    if (blockPublish) ResourceProofWork::Note(ResourceProofWork::Kind::BlockPublish, alignedTo - alignedFrom);
                     if (blockEnabled && !blockPublish) ArchB::Recorder::Count("c_gpu_block_publish_fallback_target_dwords_read", static_cast<double>((alignedTo - alignedFrom) / 4u));
                     if (counter != nullptr) {
                         recorder.Keep(counter);

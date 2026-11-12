@@ -234,6 +234,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::DepthRunRepeat, "DEPTH_RUN_REPEAT", false, true, DepthRunRepeatPrerequisites},
     {Feature::DispatchAddressReuse, "DISPATCH_ADDRESS_REUSE", false, true, {}},
     {Feature::DispatchUploadReuse, "DISPATCH_UPLOAD_REUSE", false, true, {}},
+    {Feature::DispatchPartialReproof, "DISPATCH_PARTIAL_REPROOF", false, true, {}},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};

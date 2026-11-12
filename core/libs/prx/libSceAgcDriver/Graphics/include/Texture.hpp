@@ -131,6 +131,7 @@ public:
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
+    std::uint64_t ContentRevision() const { return contentRevision; }
     void UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached, bool gpu = false);
     void VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor, const char* mismatchCounter = "fix_psnap_verify_mismatches") const;
     static std::uint64_t PartialSnapshotVerifyMismatches();
@@ -169,6 +170,8 @@ private:
     std::unique_ptr<CommandBatch> upload;
     PerUseCopy perUseCopy = PerUseCopy::None;
     std::atomic<bool> released{false};
+    std::uint64_t contentRevision = 0;
+    void noteContentWrite();
     bool copiedOnce = false;
     bool srgbExpand = false;
     GuestTextureResource sourceDescriptor{};
