@@ -25,6 +25,7 @@ namespace AgcDriver::DriverDetail::DispatchShadow {
 namespace {
 constexpr std::size_t CandidateLimit = 256;
 constexpr std::size_t UseLimit = 64;
+constexpr unsigned DifferReportLimit = 32;
 struct Statistics {
     std::atomic<std::uint64_t> calls{0};
     std::atomic<std::uint64_t> aheadRefused{0};
@@ -286,6 +287,7 @@ struct Candidate {
     std::size_t lastMatch = VariantLimit - 1u;
     std::uint64_t id = 0;
     bool fullReported = false;
+    unsigned differReports = 0;
     std::array<std::shared_ptr<Use>, UseLimit> uses;
     std::uint64_t program = 0;
     DispatchGatherRefusal refusal = DispatchGatherRefusal::None;
@@ -427,7 +429,13 @@ void matchVariants(Use& use) {
         if (!evaluate(use)) return;
         evaluatedGraph = use.graph;
         use.difference = use.graph->Matches(use.values);
-        if (use.difference != DispatchGatherDifference::None) continue;
+        if (use.difference != DispatchGatherDifference::None) {
+            if (candidate.differReports < DifferReportLimit && (candidate.variantCount == VariantLimit || candidate.variantCount == 1u)) {
+                ++candidate.differReports;
+                std::fprintf(stderr, "[dispatch-gather-differ] candidate=%llu program=0x%llx queue=0x%x variants=%zu variant=%zu kind=%s %s\n", static_cast<unsigned long long>(candidate.id), static_cast<unsigned long long>(use.program), use.queue, candidate.variantCount, index, DispatchGatherDifferenceName(use.difference), use.graph->DescribeDifference(use.values).c_str());
+            }
+            continue;
+        }
         candidate.lastMatch = index;
         use.matched = true;
         ++stats.variantHits;

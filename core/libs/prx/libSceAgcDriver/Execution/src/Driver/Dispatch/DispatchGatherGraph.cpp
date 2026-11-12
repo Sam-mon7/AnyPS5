@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -437,11 +439,79 @@ DispatchGatherDifference DispatchGatherGraph::Matches(const DispatchGatherUse& u
         }
     }
     if (use.flat.size() != structuralFlat.size()) return DispatchGatherDifference::FlatShape;
+    static const bool flatValues = std::getenv("APS5_DISPATCH_GATHER_FLAT_VALUES") != nullptr;
+    if (flatValues) return DispatchGatherDifference::None;
     for (std::size_t slot = 0; slot < structuralFlat.size(); ++slot) {
         if (slot < plan->pureFlatSlots.size() && plan->pureFlatSlots[slot] != 0u) continue;
         if (use.flat[slot] != structuralFlat[slot]) return DispatchGatherDifference::FlatStructure;
     }
     return DispatchGatherDifference::None;
+}
+
+std::string DispatchGatherGraph::DescribeDifference(const DispatchGatherUse& use) const {
+    char text[512];
+    const auto words = [&](const char* kind, const std::vector<ShaderRecompiler::DescriptorValue>& before, const std::vector<ShaderRecompiler::DescriptorValue>& after) -> std::string {
+        if (before.size() != after.size()) {
+            std::snprintf(text, sizeof(text), "%s_count old=%zu new=%zu", kind, before.size(), after.size());
+            return text;
+        }
+        std::size_t entries = 0;
+        std::size_t first = before.size();
+        unsigned mask = 0;
+        for (std::size_t index = 0; index < before.size(); ++index) {
+            if (before[index] == after[index]) continue;
+            ++entries;
+            if (first == before.size()) first = index;
+            for (std::size_t word = 0; word < 8u; ++word) if (before[index].dwords[word] != after[index].dwords[word]) mask |= 1u << word;
+            if (before[index].dwordCount != after[index].dwordCount || before[index].availableDwordMask != after[index].availableDwordMask) mask |= 0x100u;
+        }
+        if (entries == 0u) return {};
+        const auto& a = before[first];
+        const auto& b = after[first];
+        std::snprintf(text, sizeof(text), "%s entries=%zu/%zu first=%zu wordmask=0x%x old=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x new=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x", kind, entries, before.size(), first, mask, a.dwords[0], a.dwords[1], a.dwords[2], a.dwords[3], a.dwords[4], a.dwords[5], a.dwords[6], a.dwords[7], b.dwords[0], b.dwords[1], b.dwords[2], b.dwords[3], b.dwords[4], b.dwords[5], b.dwords[6], b.dwords[7]);
+        return text;
+    };
+    if (!structureReady.load(std::memory_order_acquire)) return "structure_not_ready";
+    if (structuralTrace != use.structuralTrace) {
+        std::size_t first = 0;
+        while (first < structuralTrace.size() && first < use.structuralTrace.size() && structuralTrace[first] == use.structuralTrace[first]) ++first;
+        std::snprintf(text, sizeof(text), "trace old_size=%zu new_size=%zu first=%zu old=%08x new=%08x", structuralTrace.size(), use.structuralTrace.size(), first, first < structuralTrace.size() ? structuralTrace[first] : 0u, first < use.structuralTrace.size() ? use.structuralTrace[first] : 0u);
+        return text;
+    }
+    if (!use.gathered) return "not_gathered";
+    if (use.descriptors.size() != structuralDescriptors.size()) return "buffer_count";
+    for (std::size_t index = 0; index < structuralDescriptors.size(); ++index) {
+        const auto& before = structuralDescriptors[index];
+        const auto& after = use.descriptors[index];
+        if (before.dwordCount != after.dwordCount || before.availableDwordMask != after.availableDwordMask || (before.dwords[0] & 3u) != (after.dwords[0] & 3u) || (before.dwords[1] & 0xffff0000u) != (after.dwords[1] & 0xffff0000u) || before.dwords[2] != after.dwords[2] || before.dwords[3] != after.dwords[3] || ShaderRecompiler::BufferDescriptorPresent(before) != ShaderRecompiler::BufferDescriptorPresent(after)) {
+            std::snprintf(text, sizeof(text), "buffer index=%zu/%zu old=%08x,%08x,%08x,%08x new=%08x,%08x,%08x,%08x", index, structuralDescriptors.size(), before.dwords[0], before.dwords[1], before.dwords[2], before.dwords[3], after.dwords[0], after.dwords[1], after.dwords[2], after.dwords[3]);
+            return text;
+        }
+    }
+    if (auto images = words("image", structuralImages, use.images); !images.empty()) return images;
+    if (auto samplers = words("sampler", structuralSamplers, use.samplers); !samplers.empty()) return samplers;
+    if (use.registeredImages != registeredImages) return "registered_images";
+    if (use.userData.size() != structuralUserData.size()) return "user_data_size";
+    for (std::size_t word = 0; word < structuralUserData.size(); ++word) {
+        if ((dynamicUserDataMask & (std::uint64_t{1} << word)) == 0u && use.userData[word] != structuralUserData[word]) {
+            std::snprintf(text, sizeof(text), "user_data word=%zu old=%08x new=%08x", word, structuralUserData[word], use.userData[word]);
+            return text;
+        }
+    }
+    if (use.flat.size() != structuralFlat.size()) return "flat_size";
+    std::size_t flatDiffers = 0;
+    std::size_t flatFirst = structuralFlat.size();
+    for (std::size_t slot = 0; slot < structuralFlat.size(); ++slot) {
+        if (slot < plan->pureFlatSlots.size() && plan->pureFlatSlots[slot] != 0u) continue;
+        if (use.flat[slot] == structuralFlat[slot]) continue;
+        ++flatDiffers;
+        if (flatFirst == structuralFlat.size()) flatFirst = slot;
+    }
+    if (flatDiffers != 0u) {
+        std::snprintf(text, sizeof(text), "flat slots=%zu/%zu first=%zu old=%08x new=%08x", flatDiffers, structuralFlat.size(), flatFirst, structuralFlat[flatFirst], use.flat[flatFirst]);
+        return text;
+    }
+    return DispatchGatherDifferenceName(Matches(use));
 }
 
 DispatchGatherDifference DispatchGatherGraph::CompareMaterialized(const DispatchGatherUse& use, const ShaderRecompiler::RecompileResult& compiled) const {

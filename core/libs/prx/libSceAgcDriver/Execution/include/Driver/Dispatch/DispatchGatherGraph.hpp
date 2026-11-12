@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -59,6 +60,7 @@ public:
     DispatchGatherRefusal Evaluate(std::span<const std::uint32_t> userData, std::uint64_t shaderBase, ShaderRecompiler::SrtMemoryReader guardedRead, void* context, DispatchGatherUse& use) const;
     bool SetStructure(const DispatchGatherUse& use) const;
     DispatchGatherDifference Matches(const DispatchGatherUse& use) const;
+    std::string DescribeDifference(const DispatchGatherUse& use) const;
     DispatchGatherDifference CompareMaterialized(const DispatchGatherUse& use, const ShaderRecompiler::RecompileResult& compiled) const;
     DispatchGatherDifference CompareCapture(const DispatchGatherUse& use, const ShaderRecompiler::ResourceCapture& capture) const;
     std::size_t Nodes() const { return tape->Nodes(); }
