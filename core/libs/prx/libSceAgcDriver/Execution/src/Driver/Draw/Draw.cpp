@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RepeatCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -779,6 +780,58 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
     return {};
 }
 
+RepeatCensus::Draw CensusDraw(const DrawTail& tail) {
+    using RepeatCensus::Mix;
+    RepeatCensus::Draw out;
+    const auto& packet = tail.livePacket;
+    out.site = tail.liveKey != 0 ? tail.liveKey : Mix(Mix(0x51u, packet.indexed), packet.indirect ? packet.indirect->opcode : 0u);
+    if (tail.live == nullptr) return out;
+    const auto& live = *tail.live;
+    out.live = true;
+    out.structure = Mix(reinterpret_cast<std::uintptr_t>(live.entry.get()), reinterpret_cast<std::uintptr_t>(live.plan->commitTemplate.get()));
+    const auto& state = *live.entry->link->state;
+    out.target = Mix(state.depth ? state.depth->address : 0u, state.hasColorTarget ? state.color.address : 0u);
+    for (const auto& color : state.colors) out.target = Mix(out.target, color.address);
+    std::uint64_t addresses = 0x61, constants = 0x62, arguments = 0x63;
+    for (const auto& stage : live.plan->stages) {
+        for (const auto& buffer : stage.vsharps) {
+            addresses = Mix(addresses, (static_cast<std::uint64_t>(buffer.binding) << 32u) | buffer.element);
+            addresses = Mix(addresses, buffer.address);
+            addresses = Mix(addresses, buffer.size);
+        }
+        for (const auto& word : stage.words) {
+            const bool address = word.source == GatherWord::TableBase || word.source == GatherWord::BufferBase || word.source == GatherWord::NestedPointer;
+            auto& digest = address ? addresses : constants;
+            digest = Mix(digest, (static_cast<std::uint64_t>(word.binding) << 32u) | word.word);
+            digest = Mix(digest, word.value);
+        }
+        for (const auto& buffer : stage.buffers) {
+            constants = Mix(constants, buffer.binding);
+            for (const auto word : buffer.words) constants = Mix(constants, word);
+        }
+        for (std::size_t offset = 0; offset < stage.push.size(); offset += 8) {
+            std::uint64_t chunk = 0;
+            std::memcpy(&chunk, stage.push.data() + offset, std::min<std::size_t>(8, stage.push.size() - offset));
+            constants = Mix(constants, chunk);
+        }
+    }
+    const auto& parameters = live.parameters;
+    addresses = Mix(addresses, parameters.indexAddress);
+    if (live.plan->indirect.present) {
+        addresses = Mix(addresses, live.plan->indirect.arguments);
+        addresses = Mix(addresses, live.plan->indirect.countAddress);
+        arguments = Mix(arguments, (static_cast<std::uint64_t>(live.plan->indirect.count) << 32u) | live.plan->indirect.recordBytes);
+    } else {
+        arguments = Mix(arguments, (static_cast<std::uint64_t>(parameters.indexCount) << 32u) | parameters.instanceCount);
+        arguments = Mix(arguments, (static_cast<std::uint64_t>(parameters.firstVertex) << 32u) | parameters.firstInstance);
+    }
+    arguments = Mix(arguments, (static_cast<std::uint64_t>(parameters.indexSize) << 1u) | static_cast<std::uint64_t>(parameters.indexed));
+    out.addresses = addresses;
+    out.constants = constants;
+    out.arguments = arguments;
+    return out;
+}
+
 bool EmptyIndirectSkip() {
     static const bool enabled = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return enabled;
@@ -1005,6 +1058,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && registerKey && pipelined && submission.queue == 0 && (drawParameters.indirect || ArchB::DirectDrawEnabled()) && !lockedPrepare && traceToken == 0 && deferredLabels().labels.empty()) {
         tail.liveKey = LiveMix(LiveMix(LiveMix(RegisterStructureKey(queue), DrawShaderSetKey(queue, *submission.shaders)), localDevice->Serial()), LivePacketKey(drawParameters));
         if (tail.liveEnabled) tail.live = SelectLive(queue, submission, tail);
+        if (RepeatCensus::Enabled()) RepeatCensus::NoteDraw(CensusDraw(tail));
         if (tail.live != nullptr && !tail.liveVerify) {
             tail.programs = &tail.live->entry->decode->programs;
             tail.submissionQueue = submission.queue;
@@ -1013,6 +1067,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             timing.Mark("draw_enqueued");
             return drawn();
         }
+    } else if (submission.queue == 0 && RepeatCensus::Enabled()) {
+        RepeatCensus::NoteDraw(CensusDraw(tail));
     }
 
     auto& drawKey = tail.drawKey;
