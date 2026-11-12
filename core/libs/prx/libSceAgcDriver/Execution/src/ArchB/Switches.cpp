@@ -69,6 +69,7 @@ constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
+    {Feature::DispatchGatherShadow, "DISPATCH_GATHER_SHADOW", false, true, {}},
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
     {Feature::Recorder, "RECORDER", false, true, {}},
