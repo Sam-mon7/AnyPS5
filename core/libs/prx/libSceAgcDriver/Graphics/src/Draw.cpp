@@ -5411,6 +5411,18 @@ struct Table {
     std::uint64_t uses = 0;
 };
 
+constexpr std::size_t LevelTableLimit = 32768;
+
+bool levelCapacity() {
+    return AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::DrawTemplatesLevelCapacity);
+}
+
+std::size_t tableLimit() {
+    return levelCapacity() ? LevelTableLimit : TableLimit;
+}
+
+bool ageSlots(Table& made);
+
 Table& table() {
     struct SlotStorage {};
     return AgcDriver::ThreadScratch<Table, SlotStorage>();
@@ -5626,7 +5638,7 @@ void publishGatherSlot(const Context& context, const State& state, const Pm4::Dr
     }
     auto& slots = table().slots;
     const auto key = keyOf(context.device, structure, draw, stages);
-    if (slots.size() >= TableLimit && !slots.contains(key)) return;
+    if (slots.size() >= tableLimit() && !slots.contains(key) && !(levelCapacity() && ageSlots(table()))) return;
     slots.insert_or_assign(key, std::move(slot));
     link->ready.store(true, std::memory_order_release);
     AgcDriver::ArchB::Recorder::Count("draw_templates_live_templates_ready");
@@ -5889,7 +5901,7 @@ void capture(const Context& context, const State& state, const Pm4::DrawParamete
         counters().kinds[draw.indirect.has_value()].captures.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (made.slots.size() >= TableLimit && !made.slots.contains(key)) {
+    if (made.slots.size() >= tableLimit() && !made.slots.contains(key) && !(levelCapacity() && ageSlots(made))) {
         counters().evictions.fetch_add(made.slots.size(), std::memory_order_relaxed);
         made.slots.clear();
     }
@@ -5979,14 +5991,31 @@ std::uint64_t templateBudget(const char* name, std::uint64_t fallback) {
     return value == nullptr ? fallback : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
 }
 
+bool ageSlots(Table& made) {
+    thread_local std::vector<std::uint64_t> uses;
+    uses.clear();
+    for (const auto& item : made.slots) uses.push_back(item.second.lastUse);
+    if (uses.empty()) return false;
+    const auto middle = uses.begin() + static_cast<std::ptrdiff_t>(uses.size() / 2);
+    std::nth_element(uses.begin(), middle, uses.end());
+    const auto cut = *middle;
+    const auto erased = std::erase_if(made.slots, [&](const auto& item) { return item.second.lastUse < cut; });
+    counters().evictions.fetch_add(erased, std::memory_order_relaxed);
+    AgcDriver::ArchB::Recorder::Count("archc_replay_slots_aged", static_cast<double>(erased));
+    AgcDriver::ArchB::Recorder::Count("archc_replay_slot_agings");
+    return erased != 0;
+}
+
 std::uint64_t templateSetBudget() {
     static const std::uint64_t budget = templateBudget("APS5_ARCHB_DRAW_TEMPLATES_BUDGET_SETS", 16384);
-    return budget;
+    static const std::uint64_t level = templateBudget("APS5_ARCHB_DRAW_TEMPLATES_BUDGET_SETS", 131072);
+    return archcSlots::levelCapacity() ? level : budget;
 }
 
 std::uint64_t templateByteBudget() {
     static const std::uint64_t budget = templateBudget("APS5_ARCHB_DRAW_TEMPLATES_BUDGET_BYTES", std::uint64_t{64} << 20u);
-    return budget;
+    static const std::uint64_t level = templateBudget("APS5_ARCHB_DRAW_TEMPLATES_BUDGET_BYTES", std::uint64_t{256} << 20u);
+    return archcSlots::levelCapacity() ? level : budget;
 }
 
 struct TemplateAccounting {

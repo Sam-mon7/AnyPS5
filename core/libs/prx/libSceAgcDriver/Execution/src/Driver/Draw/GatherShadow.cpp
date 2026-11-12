@@ -616,6 +616,8 @@ std::shared_ptr<GatherDrawPlan> acquirePlan(std::size_t stages, std::uint64_t& a
     plan.indirect = {};
     plan.limits = {};
     plan.signatures.assign(stages, 0);
+    plan.differ = GatherDiffer::None;
+    plan.differStage = plan.differIndex = plan.differOld = plan.differNew = plan.differMask = 0;
     plan.incomplete = GatherIncompleteNone;
     plan.complete = false;
     plan.matched = false;

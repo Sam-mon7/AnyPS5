@@ -233,6 +233,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::DrawTemplatesLive, "DRAW_TEMPLATES_LIVE", false, true, DrawTemplatesLivePrerequisites},
     {Feature::DrawTemplatesLiveSequence, "DRAW_TEMPLATES_LIVE_SEQUENCE", false, true, DrawTemplatesLiveSequencePrerequisites},
     {Feature::DrawTemplatesLiveIndex, "DRAW_TEMPLATES_LIVE_INDEX", false, true, DrawTemplatesLiveIndexPrerequisites},
+    {Feature::DrawTemplatesLevelCapacity, "DRAW_TEMPLATES_LEVEL_CAPACITY", false, true, {}},
     {Feature::GpuAuthorityCensus, "GPU_AUTHORITY_CENSUS", false, true, {}},
     {Feature::LazyShadowPublish, "LAZY_SHADOW_PUBLISH", false, true, LazyShadowPublishPrerequisites},
     {Feature::DepthRunRepeat, "DEPTH_RUN_REPEAT", false, true, DepthRunRepeatPrerequisites},

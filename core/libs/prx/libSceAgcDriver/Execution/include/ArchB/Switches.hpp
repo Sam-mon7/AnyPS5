@@ -116,6 +116,7 @@ enum class Feature : std::uint8_t {
     DrawTemplatesLive,
     DrawTemplatesLiveSequence,
     DrawTemplatesLiveIndex,
+    DrawTemplatesLevelCapacity,
     GpuAuthorityCensus,
     LazyShadowPublish,
     DepthRunRepeat,
