@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -1045,6 +1046,49 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
     }
     const auto walkBegin = shadow->UnitRange(first).first;
     const auto walkEnd = shadow->UnitRange(last).second;
+    static const bool traceSources = std::getenv("APS5_TRACE_SHADOW_ADDRESS") != nullptr;
+    if (traceSources) {
+        static std::atomic<std::uint64_t> calls{0};
+        if (calls.fetch_add(1, std::memory_order_relaxed) % 6000u < 70u) {
+            struct Probe {
+                std::uint64_t begin, end;
+                unsigned kind;
+            };
+            std::vector<Probe> probes;
+            {
+                std::lock_guard lock(registry.mutex);
+                const auto now = GuestMemory::WriteGeneration();
+                for (auto unit = first; unit <= last; ++unit) {
+                    if (!shadow->Live(unit)) continue;
+                    const auto range = shadow->UnitRange(unit);
+                    probes.push_back({range.first, range.second, (shadow->lazyTicket[unit] != 0 ? 2u : 0u) | (now - shadow->generation[unit] > 20000u ? 1u : 0u)});
+                }
+            }
+            std::array<std::uint64_t, 4> probeUnits{}, probePages{}, probeWalked{};
+            for (const auto& probe : probes) {
+                const auto before = GuestArena::GuestArenaWalkCost_nid_no_patch().gwwPages;
+                GuestMemory::CollectWritesUncached(probe.begin, static_cast<std::size_t>(probe.end - probe.begin));
+                ++probeUnits[probe.kind];
+                probePages[probe.kind] += (probe.end + 4095u) / 4096u - probe.begin / 4096u;
+                probeWalked[probe.kind] += GuestArena::GuestArenaWalkCost_nid_no_patch().gwwPages - before;
+            }
+            std::fprintf(stderr, "[shadow-address-walk] import=0x%llx lazy=%d fresh_plain=%llu/%llu/%llu old_plain=%llu/%llu/%llu fresh_ticketed=%llu/%llu/%llu old_ticketed=%llu/%llu/%llu\n", static_cast<unsigned long long>(shadow->importBase), LazyShadowPublishEnabled() ? 1 : 0, static_cast<unsigned long long>(probeUnits[0]), static_cast<unsigned long long>(probePages[0]), static_cast<unsigned long long>(probeWalked[0]), static_cast<unsigned long long>(probeUnits[1]), static_cast<unsigned long long>(probePages[1]), static_cast<unsigned long long>(probeWalked[1]), static_cast<unsigned long long>(probeUnits[2]), static_cast<unsigned long long>(probePages[2]), static_cast<unsigned long long>(probeWalked[2]), static_cast<unsigned long long>(probeUnits[3]), static_cast<unsigned long long>(probePages[3]), static_cast<unsigned long long>(probeWalked[3]));
+            std::lock_guard lock(registry.mutex);
+            std::uint64_t live = 0, ticketed = 0, settled = 0, oldest = ~std::uint64_t{0}, newest = 0, oldestTicket = ~std::uint64_t{0}, newestTicket = 0;
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                ++live;
+                oldest = std::min(oldest, shadow->generation[unit]);
+                newest = std::max(newest, shadow->generation[unit]);
+                if (shadow->lazySettled[unit] != 0) ++settled;
+                if (shadow->lazyTicket[unit] == 0) continue;
+                ++ticketed;
+                oldestTicket = std::min(oldestTicket, shadow->lazyTicket[unit]);
+                newestTicket = std::max(newestTicket, shadow->lazyTicket[unit]);
+            }
+            std::fprintf(stderr, "[shadow-address] present=%llu import=0x%llx+0x%llx request=0x%llx+0x%llx units=%llu live=%llu import_live=%u ticketed=%llu settled=%llu generation=%llu..%llu now=%llu ticket=%llu..%llu serial=%llu watched=%d lazy=%d reuse=%d\n",static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(shadow->importBase), static_cast<unsigned long long>(shadow->importBytes), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<unsigned long long>(last - first + 1), static_cast<unsigned long long>(live), shadow->liveUnits, static_cast<unsigned long long>(ticketed), static_cast<unsigned long long>(settled), static_cast<unsigned long long>(oldest), static_cast<unsigned long long>(newest), static_cast<unsigned long long>(GuestMemory::WriteGeneration()), static_cast<unsigned long long>(ticketed != 0 ? oldestTicket : 0), static_cast<unsigned long long>(newestTicket), static_cast<unsigned long long>(registry.lazySerial), GuestMemory::Watched(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin)) ? 1 : 0, LazyShadowPublishEnabled() ? 1 : 0, uploadReuse ? 1 : 0);
+        }
+    }
     std::vector<std::uint8_t> boundedChanged, boundedCpu;
     static const bool verify = [] {
         const auto* value = std::getenv("APS5_VERIFY_DISPATCH_UPLOAD_REUSE");

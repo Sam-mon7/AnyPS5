@@ -3097,6 +3097,26 @@ void CheckArchcWatch() {
     Require(count == 1 && (entries[0] & ~WtWatchDriver) == ((base + Page) | WtWatchWrite) && state(base + Page) == WtFaultOpen && data[Page + 16] == 0x44, "a store into a watched open page was not logged or did not land");
     std::cout << "agc_archc_watch_open_page: ok\n";
 
+    BumpCollectEpoch();
+    CollectWrites(base, Block);
+    Require(state(base + Page) == WtFaultOpen, "the lazy arm fixture needs a clean open page");
+    Require(GuestWtFaultWatch_nid_no_patch(base + Page, Page) == 1 && protection(base + Page) == PAGE_NOACCESS, "the clean open page was not watched");
+    GuestWtFaultSetLazyPreservation_nid_no_patch(+[](std::uintptr_t, std::size_t) { return false; });
+    WtFaultFlip();
+    WtFaultFlip();
+    Require(state(base + Page) == WtFaultArmed && protection(base + Page) == PAGE_NOACCESS, "with lazy preservation an arm did not take a clean watched open page, or it changed the watch protection");
+    const auto armedClock = GuestWtFaultClock_nid_no_patch();
+    Require(GuestWtFaultChangedSince_nid_no_patch(base + Page, Page, armedClock) == WtFaultAnswer::Unchanged, "an armed watched page does not answer unchanged");
+    Require(data[Page + 16] == 0x44, "an armed watched page read the wrong byte");
+    Require(state(base + Page) == WtFaultArmed && protection(base + Page) == PAGE_READONLY, "a read of an armed watched page did not leave it armed and read-only");
+    const auto armedCursor = GuestWtFaultLogHead_nid_no_patch();
+    data[Page + 24] = 0x66;
+    Require(GuestWtFaultLogHead_nid_no_patch() == armedCursor + 1 && state(base + Page) == WtFaultOpen && data[Page + 24] == 0x66, "a store into a page armed under a watch did not fault into the log");
+    Require(GuestWtFaultChangedSince_nid_no_patch(base + Page, Page, armedClock) == WtFaultAnswer::Changed, "a store into a page armed under a watch was not reported as a change");
+    GuestWtFaultSetLazyPreservation_nid_no_patch(nullptr);
+    cursor = GuestWtFaultWatchLogHead_nid_no_patch();
+    std::cout << "agc_archc_watch_open_page_armed_with_lazy: ok\n";
+
     Require(GuestWtFaultWatch_nid_no_patch(base + 2 * Page, 2 * Page) == 2, "the hold fixture was not watched");
     {
         const GuestArena::HostWrite scope(reinterpret_cast<void*>(base + 2 * Page), Page);

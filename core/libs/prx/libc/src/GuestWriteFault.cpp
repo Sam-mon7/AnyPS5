@@ -691,6 +691,14 @@ void GuestWtFaultNoteDriverStore_nid_no_patch(std::uintptr_t address, std::size_
 
 namespace {
 
+bool armWatched() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("APS5_WT_FAULT_ARM_WATCHED");
+        return value != nullptr && value[0] == '0' && value[1] == '\0';
+    }();
+    return !disabled && lazyPreservation.load(std::memory_order_acquire) != nullptr;
+}
+
 void markOpenHint(const State& state, std::uintptr_t begin, std::uintptr_t end) {
     for (auto at = begin; at < end; at = (at & ~((std::uintptr_t{1} << LeafShift) - 1)) + (std::uintptr_t{1} << LeafShift)) leafAt(state, at)->open.store(1, std::memory_order_release);
 }
@@ -716,8 +724,9 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
             for (std::size_t bit = 0; bit < 64; ++bit) {
                 const auto index = group * 64 + bit;
                 const auto page = leaf->base + (index << PageShift);
-                if (stateOf(leaf->words[index].load(std::memory_order_acquire)) != WtFaultOpen) continue;
-                if (watchedPage(*leaf, page)) {
+                const auto scannedWord = leaf->words[index].load(std::memory_order_acquire);
+                if (stateOf(scannedWord) != WtFaultOpen) continue;
+                if (watchedPage(*leaf, page) && (!armWatched() || (scannedWord & WtFaultCheckedBit) == 0)) {
                     ++kept;
                     stillOpen = true;
                     continue;
@@ -827,11 +836,12 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
             const bool eligible = kind != 0 || (queried && memory.State == MEM_COMMIT && memory.Type == MEM_PRIVATE && (memory.Protect == PAGE_READWRITE || exec));
             std::uintptr_t subBegin = 0;
             std::uintptr_t subEnd = 0;
+            bool subWatched = false;
             const auto protect = [&] {
                 if (subEnd <= subBegin) return;
                 DWORD previous;
                 const auto before = ticks();
-                const bool done = VirtualProtect(reinterpret_cast<void*>(subBegin), subEnd - subBegin, exec ? PAGE_EXECUTE_READ : PAGE_READONLY, &previous) != 0;
+                const bool done = subWatched || VirtualProtect(reinterpret_cast<void*>(subBegin), subEnd - subBegin, exec ? PAGE_EXECUTE_READ : PAGE_READONLY, &previous) != 0;
                 protectTicks += ticks() - before;
                 if (done) {
                     armed.push_back({subBegin, subEnd});
@@ -853,9 +863,11 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
                 const bool claimed = stateOf(expected) == WtFaultOpen && word.compare_exchange_strong(expected, claim, std::memory_order_acq_rel);
                 if (claimed && !eligible) ++excluded;
                 if (claimed && eligible) {
-                    if (subEnd != page) {
+                    const bool watched = watchedPage(*leaf, page);
+                    if (subEnd != page || watched != subWatched) {
                         protect();
                         subBegin = page;
+                        subWatched = watched;
                     }
                     subEnd = page + PageBytes;
                 } else {
