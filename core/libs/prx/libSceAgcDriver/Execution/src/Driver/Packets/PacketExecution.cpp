@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LiveSequence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RepeatCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
@@ -596,6 +597,7 @@ void Driver::execute(const Submission& submission) {
             Graphics::NoteHostImportFrame();
             if (Graphics::StructCensus::Enabled()) Graphics::StructCensus::NoteFrame();
             if (RepeatCensus::Enabled()) RepeatCensus::EndFrame();
+            LiveSequenceFrame().fetch_add(1, std::memory_order_relaxed);
             GuestMemory::NoteCensusFlip();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;

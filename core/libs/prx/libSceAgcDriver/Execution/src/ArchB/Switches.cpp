@@ -69,6 +69,7 @@ constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature DrawTemplatesLivePrerequisites[] = {Feature::DrawTemplates, Feature::DrawGatherShadow};
+constexpr Feature DrawTemplatesLiveSequencePrerequisites[] = {Feature::DrawTemplatesLive};
 constexpr Feature DrawTemplatesPrerequisites[] = {Feature::ArchcDrawReplay, Feature::ZeroCopyStorage};
 constexpr Feature LazyShadowPublishPrerequisites[] = {Feature::CLazyPublish};
 constexpr Feature DepthRunRepeatPrerequisites[] = {Feature::ArchcReplayDepthEpoch};
@@ -229,6 +230,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::DrawGatherShadow, "DRAW_GATHER_SHADOW", false, true, {}},
     {Feature::DrawTemplates, "DRAW_TEMPLATES", false, true, DrawTemplatesPrerequisites},
     {Feature::DrawTemplatesLive, "DRAW_TEMPLATES_LIVE", false, true, DrawTemplatesLivePrerequisites},
+    {Feature::DrawTemplatesLiveSequence, "DRAW_TEMPLATES_LIVE_SEQUENCE", false, true, DrawTemplatesLiveSequencePrerequisites},
     {Feature::GpuAuthorityCensus, "GPU_AUTHORITY_CENSUS", false, true, {}},
     {Feature::LazyShadowPublish, "LAZY_SHADOW_PUBLISH", false, true, LazyShadowPublishPrerequisites},
     {Feature::DepthRunRepeat, "DEPTH_RUN_REPEAT", false, true, DepthRunRepeatPrerequisites},
