@@ -25,6 +25,7 @@
 #include <vector>
 
 namespace AgcDriver { class VulkanDevice; }
+namespace AgcDriver::DriverDetail { struct DispatchGatherUse; }
 
 namespace AgcDriver::Graphics {
 
@@ -449,6 +450,8 @@ public:
     }
     // Whether RefreshData would record anything for `shader` (the per-word compare; verification).
     bool DataWordsDiffer(const CompiledShader& shader) const;
+    enum class DispatchGatherCommitDifference : std::uint8_t { None, Unsupported, Binding, Address, Extent, Data, Push, UnobservedUpload, AddressTable, FaultBuffer, BindingRole };
+    DispatchGatherCommitDifference CompareDispatchGather(const DriverDetail::DispatchGatherUse& use, std::span<const std::byte> pushBytes, bool pushes) const;
     std::size_t BindingCount() const { return bindings.size(); }
     // Why the fast proof of a Revalidate left the object to the full walk (the [rescache]
     // revalidate line's reasons); Count: it did not.
@@ -523,6 +526,7 @@ private:
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
         bool oversized = false;
+        mutable std::vector<std::uint32_t> dispatchGatherUploadedWords;
     };
     struct DataPatch {
         std::size_t allocation;
@@ -985,6 +989,9 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    bool dispatchGatherShadow = false;
+    std::vector<ShaderRecompiler::DescriptorBinding> dispatchGatherImageBindings;
+    std::size_t dispatchGatherImageBindingCount = 0;
     std::chrono::steady_clock::time_point phaseStart;
 };
 
