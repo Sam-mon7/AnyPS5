@@ -1688,7 +1688,126 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
+struct StorageCreationTrace {
+    struct Row {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+    };
+    std::unordered_map<std::uint64_t, const char*> evicted;
+    std::unordered_map<std::uint64_t, std::uint64_t> addresses;
+    std::map<std::string, Row> rows;
+    std::chrono::steady_clock::time_point printed = std::chrono::steady_clock::now();
+};
+
+bool traceStorageCreation() {
+    static const bool enabled = std::getenv("APS5_TRACE_STORAGE_CREATION") != nullptr;
+    return enabled;
+}
+
+StorageCreationTrace& storageCreationTrace() {
+    static StorageCreationTrace trace;
+    return trace;
+}
+
+std::uint64_t storageTraceKey(const StorageKey& key) {
+    return hashWords(14695981039346656037ull, key.words.data(), key.words.size());
+}
+
+struct ImageCostTrace {
+    struct Row {
+        std::uint64_t count = 0;
+        std::uint64_t slow = 0;
+        double ms = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t read = 0;
+        std::uint64_t largest = 0;
+        const void* largestCaller = nullptr;
+        std::uint8_t largestSite = 0;
+    };
+    AgcDriver::Mutex mutex;
+    std::map<std::string, Row> rows;
+    std::chrono::steady_clock::time_point printed = std::chrono::steady_clock::now();
+};
+
+bool traceImageCost() {
+    static const bool enabled = std::getenv("APS5_TRACE_IMAGE_COST") != nullptr;
+    return enabled;
+}
+
+std::uint64_t beginImageCost() {
+    auto& reads = GuestMemory::ThreadReads();
+    reads.largest = 0;
+    reads.largestCaller = nullptr;
+    return reads.bytes;
+}
+
+void noteImageCost(const char* kind, const GuestTextureResource& resource, std::uint64_t guestBytes, bool written, std::chrono::steady_clock::time_point started, std::uint64_t readBefore) {
+    static ImageCostTrace trace;
+    const auto reads = GuestMemory::ThreadReads();
+    const auto now = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration<double, std::milli>(now - started).count();
+    char text[200];
+    std::snprintf(text, sizeof(text), "%s 0x%llx: %ux%u slices %u..%u format %u mips %u dimension %d %s", kind, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.baseArray, resource.depthOrLastArray, resource.format, resource.mipCount, static_cast<int>(resource.dimension), written ? "written" : "read");
+    const std::lock_guard lock(trace.mutex);
+    auto& row = trace.rows[text];
+    ++row.count;
+    if (ms >= 0.2) ++row.slow;
+    row.ms += ms;
+    row.bytes = guestBytes;
+    row.read += reads.bytes - readBefore;
+    if (reads.largest > row.largest) {
+        row.largest = reads.largest;
+        row.largestCaller = reads.largestCaller;
+        row.largestSite = reads.largestSite;
+    }
+    if (now - trace.printed < std::chrono::seconds(10)) return;
+    trace.printed = now;
+    std::vector<std::pair<std::string, ImageCostTrace::Row>> sorted(trace.rows.begin(), trace.rows.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second.ms > right.second.ms; });
+    std::uint64_t count = 0;
+    double total = 0;
+    for (const auto& [name, value] : sorted) {
+        count += value.count;
+        total += value.ms;
+    }
+    std::fprintf(stderr, "[image-cost] (10 s) %llu image lookups took %.1f ms over %zu images; caller anchor %p\n", static_cast<unsigned long long>(count), total, sorted.size(), reinterpret_cast<const void*>(&GuestMemory::ThreadReads));
+    for (std::size_t index = 0; index < sorted.size() && index < 24; ++index) {
+        const auto& row = sorted[index].second;
+        std::fprintf(stderr, "[image-cost]   %.1f ms in %llu lookups (%llu of 0.2 ms or more), %.1f MiB: %s; CPU reads %.1f MiB, largest %.1f MiB by %s from %p\n", row.ms, static_cast<unsigned long long>(row.count), static_cast<unsigned long long>(row.slow), static_cast<double>(row.bytes) / 1048576.0, sorted[index].first.c_str(), static_cast<double>(row.read) / 1048576.0, static_cast<double>(row.largest) / 1048576.0, GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(row.largestSite)), row.largestCaller);
+    }
+    trace.rows.clear();
+}
+
+void noteStorageCreation(const StorageKey& key, const GuestTextureResource& resource, std::uint64_t guestBytes, bool written) {
+    auto& trace = storageCreationTrace();
+    const auto address = (static_cast<std::uint64_t>(key.words[1]) << 32u) | key.words[0];
+    const auto hash = storageTraceKey(key);
+    const auto before = trace.evicted.find(hash);
+    const auto known = trace.addresses.find(address);
+    const char* why = before != trace.evicted.end() ? before->second : known != trace.addresses.end() && known->second != hash ? "other key at this address" : "first use";
+    trace.addresses[address] = hash;
+    char text[200];
+    std::snprintf(text, sizeof(text), "%s: %ux%u slices %u..%u format %u mips %u dimension %d %s", why, resource.width, resource.height, resource.baseArray, resource.depthOrLastArray, resource.format, resource.mipCount, static_cast<int>(resource.dimension), written ? "written" : "read");
+    auto& row = trace.rows[text];
+    ++row.count;
+    row.bytes += guestBytes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.printed < std::chrono::seconds(10)) return;
+    trace.printed = now;
+    std::vector<std::pair<std::string, StorageCreationTrace::Row>> sorted(trace.rows.begin(), trace.rows.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& left, const auto& right) { return left.second.bytes > right.second.bytes; });
+    std::uint64_t count = 0, bytes = 0;
+    for (const auto& [name, value] : sorted) {
+        count += value.count;
+        bytes += value.bytes;
+    }
+    std::fprintf(stderr, "[storage-creation] (10 s) %llu storage images created over %llu MiB of guest memory, %zu kinds\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes >> 20u), sorted.size());
+    for (std::size_t index = 0; index < sorted.size() && index < 16; ++index) std::fprintf(stderr, "[storage-creation]   %llu x, %llu MiB: %s\n", static_cast<unsigned long long>(sorted[index].second.count), static_cast<unsigned long long>(sorted[index].second.bytes >> 20u), sorted[index].first.c_str());
+    trace.rows.clear();
+}
+
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, bool store = true, const char* reason = "cache eviction") {
+    if (traceStorageCreation()) storageCreationTrace().evicted[storageTraceKey(it->key)] = reason;
     auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
@@ -1835,12 +1954,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
-            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found));
+            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found, true, "more mip levels"));
         }
         auto it = findStorage(cache, key);
         std::shared_ptr<StorageTexture> detached;
         if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
-            detached = evictStorage(cache, it, false);
+            detached = evictStorage(cache, it, false, "metadata moved");
             evicted.push_back(detached);
             it = cache.entries.end();
         }
@@ -1853,6 +1972,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         } else {
             if (guestBytes == 0) guestBytes = SurfaceGuestBytes(resource);
+            if (traceStorageCreation()) noteStorageCreation(key, resource, guestBytes, written);
             bool flushed = false;
             auto handOver = StorageTexture::PrepareCreation(context, resource, guestBytes, std::move(detached), flushed);
             if (flushed && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -2101,7 +2221,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                                 ++storageKept;
                                 continue;
                             }
-                            image = evictStorage(cache, it);
+                            image = evictStorage(cache, it, true, "image memory reclaim");
                             break;
                         }
                         if (image == nullptr) break;
@@ -7643,6 +7763,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (!firstLayer && !depth1D && !firstSample && !layerRows && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : SurfaceGuestBytes(resource);
+            const auto costStarted = traceImageCost() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto costRead = traceImageCost() ? beginImageCost() : 0;
             CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
             if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
             std::shared_ptr<Texture> texture;
@@ -7657,6 +7779,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 texture = DepthSurfaceAt(resource.baseAddress) ? DepthSurfaceFirstSample(context, words, resource, components) : MultisampleTargetFirstSample(context, resource, components);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, layerRows);
+            if (traceImageCost()) noteImageCost("sampled", resource, guestBytes, false, costStarted, costRead);
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
             bool baseLevel = false;
             if (element < binding.Flags().imageUnnormalized.size() && binding.Flags().imageUnnormalized[element]) {
@@ -7736,6 +7859,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : SurfaceGuestBytes(resource);
+        const auto costStarted = traceImageCost() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto costRead = traceImageCost() ? beginImageCost() : 0;
         CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
         if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
         // Images the shader only reads have nothing to store back.
@@ -7743,6 +7868,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
+        if (traceImageCost()) noteImageCost("storage", resource, guestBytes, written, costStarted, costRead);
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);

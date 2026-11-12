@@ -413,6 +413,15 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 #endif
 }
 
+void NoteThreadRead(std::uint64_t bytes, const void* returnAddress) {
+    auto& tally = ThreadReads();
+    tally.bytes += bytes;
+    if (bytes <= tally.largest) return;
+    tally.largest = bytes;
+    tally.largestCaller = returnAddress;
+    tally.largestSite = static_cast<std::uint8_t>(CurrentReadSite());
+}
+
 void CountReadCaller(const void* returnAddress) {
     struct SampledThreadStorage {};
     auto& sampled = AgcDriver::ThreadScratch<std::uint32_t, SampledThreadStorage>();
@@ -6637,6 +6646,11 @@ void NoteUnlockedGpuWait(GpuLockSite site, double ms) {
     stats.siteUnlockedGpuWaitMs[index] += ms;
 }
 
+ThreadReadTally& ThreadReads() {
+    thread_local ThreadReadTally tally;
+    return tally;
+}
+
 std::uint64_t ThreadCollectedBytes() {
     if (!MemoryProfiled()) return 0;
     return CounterFor(CounterCollect).bytes.load(std::memory_order_relaxed);
@@ -6731,7 +6745,7 @@ void PrepareDriverRead_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes);
     GuardRead(address, bytes);
     FlushGpuWrites(address, bytes);
-    Graphics::GpuAuthorityCensus::CpuRead(address, bytes, static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, bytes, static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(bytes, __builtin_return_address(0));
 }
 
 namespace {
@@ -6854,7 +6868,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 
 #ifdef ANYPS5_ENABLE_ASAN
 [[gnu::no_sanitize("address")]] void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
-    Graphics::GpuAuthorityCensus::CpuRead(reinterpret_cast<std::uint64_t>(source), bytes, static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(reinterpret_cast<std::uint64_t>(source), bytes, static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(bytes, __builtin_return_address(0));
     using UnalignedWord [[gnu::aligned(1), gnu::may_alias]] = std::uint64_t;
     auto* to = static_cast<unsigned char*>(destination);
     const auto* from = static_cast<const unsigned char*>(source);
@@ -6867,7 +6881,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 }
 #else
 void CopyGuestBytes(void* destination, const void* source, std::size_t bytes) {
-    Graphics::GpuAuthorityCensus::CpuRead(reinterpret_cast<std::uint64_t>(source), bytes, static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(reinterpret_cast<std::uint64_t>(source), bytes, static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(bytes, __builtin_return_address(0));
     std::memcpy(destination, source, bytes);
 }
 #endif
@@ -6973,7 +6987,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, destination.size());
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
-    Graphics::GpuAuthorityCensus::CpuRead(address, destination.size(), static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, destination.size(), static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(destination.size(), __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
@@ -6984,7 +6998,7 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, destination.size());
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, destination.size());
     GuardRead(address, destination.size());
-    Graphics::GpuAuthorityCensus::CpuRead(address, destination.size(), static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, destination.size(), static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(destination.size(), __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
@@ -7000,7 +7014,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
     if (bytes.empty()) return true;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, bytes.size());
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes.size());
-    Graphics::GpuAuthorityCensus::CpuRead(address, bytes.size(), static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, bytes.size(), static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(bytes.size(), __builtin_return_address(0));
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return equalsCommittedBytes(address, bytes.data(), bytes.size());
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
@@ -7013,7 +7027,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, bytes.size());
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, bytes.size());
-    Graphics::GpuAuthorityCensus::CpuRead(address, bytes.size(), static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, bytes.size(), static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(bytes.size(), __builtin_return_address(0));
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
     // Each run's page state is consulted right before its bytes are compared.
@@ -7029,7 +7043,7 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     if (out.empty()) return Compare::Equal;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, out.size());
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, out.size());
-    Graphics::GpuAuthorityCensus::CpuRead(address, out.size(), static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, out.size(), static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(out.size(), __builtin_return_address(0));
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
@@ -7045,7 +7059,7 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out, bool checked
     if (out.empty()) return Compare::Equal;
     if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, out.size());
     if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, out.size());
-    Graphics::GpuAuthorityCensus::CpuRead(address, out.size(), static_cast<std::uint32_t>(CurrentReadSite()));
+    Graphics::GpuAuthorityCensus::CpuRead(address, out.size(), static_cast<std::uint32_t>(CurrentReadSite())); NoteThreadRead(out.size(), __builtin_return_address(0));
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
 #ifdef _WIN32
     if (address > userAddressLimit() || out.size() - 1 > userAddressLimit() - address) return Compare::Unmapped;

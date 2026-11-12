@@ -232,6 +232,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::GpuAuthorityCensus, "GPU_AUTHORITY_CENSUS", false, true, {}},
     {Feature::LazyShadowPublish, "LAZY_SHADOW_PUBLISH", false, true, LazyShadowPublishPrerequisites},
     {Feature::DepthRunRepeat, "DEPTH_RUN_REPEAT", false, true, DepthRunRepeatPrerequisites},
+    {Feature::DepthCopyKeepLive, "DEPTH_COPY_KEEP_LIVE", false, true, {}},
     {Feature::DispatchAddressReuse, "DISPATCH_ADDRESS_REUSE", false, true, {}},
     {Feature::DispatchUploadReuse, "DISPATCH_UPLOAD_REUSE", false, true, {}},
     {Feature::DispatchPartialReproof, "DISPATCH_PARTIAL_REPROOF", false, true, {}},

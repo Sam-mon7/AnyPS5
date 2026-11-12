@@ -1993,6 +1993,36 @@ struct DepthPlaneSlice {
     std::uint64_t written = 0;
 };
 
+struct DepthCopyTrace {
+    enum Reason : std::size_t { Refreshes, SurfaceKept, SurfaceCopied, GuestKept, Moved, PendingWrite, Uncommitted, NeverStamped, Uncollected, Changed, Count };
+    static constexpr std::array<const char*, Count> Names{"refreshes", "surface layers kept", "surface layers copied", "guest layers kept", "guest layers read: moved", "pending GPU write", "uncommitted before", "held generation zero", "collect returned zero", "changed since held"};
+    std::array<std::atomic<std::uint64_t>, Count> counts{};
+    std::atomic<std::int64_t> printed{0};
+
+    static bool Enabled() {
+        static const bool enabled = std::getenv("APS5_TRACE_IMAGE_COST") != nullptr;
+        return enabled;
+    }
+
+    static DepthCopyTrace& Get() {
+        static DepthCopyTrace trace;
+        return trace;
+    }
+
+    void Note(Reason reason) {
+        counts[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void Print(const GuestTextureResource& resource, std::uint32_t layers) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = printed.load(std::memory_order_relaxed);
+        if (now - last < 10 || !printed.compare_exchange_strong(last, now)) return;
+        std::string text;
+        for (std::size_t reason = 0; reason < Count; ++reason) text += std::string(reason == 0 ? "" : ", ") + Names[reason] + " " + std::to_string(counts[reason].exchange(0, std::memory_order_relaxed));
+        std::fprintf(stderr, "[depth-copy] (10 s) %s; last 0x%llx %ux%u, %u layers\n", text.c_str(), static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, layers);
+    }
+};
+
 class DepthPlaneCopy {
 public:
     DepthPlaneCopy(const Context& context, VkExtent2D extent, VkFormat format, std::uint32_t layers) : context(context), extent(extent), format(format), layers(layers), guestLayers(layers), surfaceLayers(layers) {
@@ -2040,14 +2070,20 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
+        const bool trace = DepthCopyTrace::Enabled();
+        if (trace) DepthCopyTrace::Get().Note(DepthCopyTrace::Refreshes);
         for (std::uint32_t layer = 0; layer < requested; ++layer) {
             auto& held = guestLayers[layer];
             auto& surface = surfaceLayers[layer];
             if (slices[layer].image != VK_NULL_HANDLE) {
                 held = {};
-                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
+                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) {
+                    if (trace) DepthCopyTrace::Get().Note(DepthCopyTrace::SurfaceKept);
+                    continue;
+                }
                 surface = slices[layer];
                 copiedLayers.push_back(layer);
+                if (trace) DepthCopyTrace::Get().Note(DepthCopyTrace::SurfaceCopied);
                 continue;
             }
             surface = {};
@@ -2056,18 +2092,25 @@ public:
             const bool unchanged = current.uncommitted ? held.uncommitted : held.generation != 0 && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation);
             if (held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && unchanged) {
                 held.generation = current.generation;
+                if (trace) DepthCopyTrace::Get().Note(DepthCopyTrace::GuestKept);
                 continue;
             }
+            if (trace) DepthCopyTrace::Get().Note(held.address != current.address || held.bytes != current.bytes || held.tileMode != current.tileMode || held.thick != current.thick ? DepthCopyTrace::Moved : Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) ? DepthCopyTrace::PendingWrite : current.uncommitted ? DepthCopyTrace::Uncommitted : held.generation == 0 ? DepthCopyTrace::NeverStamped : current.generation == 0 ? DepthCopyTrace::Uncollected : DepthCopyTrace::Changed);
             auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
             uploadLayers.push_back(layer);
             held = current;
         }
+        if (!uploads.empty()) {
+            ArchB::Recorder::Count("depth_copy_guest_layers_read", static_cast<double>(uploads.size()));
+            ArchB::Recorder::Count("depth_copy_guest_bytes_read", static_cast<double>(uploads.size()) * static_cast<double>(geometry.layerBytes));
+        }
         if (!copiedLayers.empty() || !uploads.empty()) {
             if (staging == nullptr || stagingBytes > staging->Size()) staging = std::make_shared<DeviceBuffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             record(slices, resource, geometry, copiedLayers, uploads, uploadLayers, staging);
         }
+        if (trace) DepthCopyTrace::Get().Print(resource, requested);
         const auto viewLayers = viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : requested - baseLayer;
         const std::array<std::uint32_t, 7> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer, viewLayers};
         auto& texture = textures[key];
@@ -2212,14 +2255,16 @@ void evictPlaneCopies(const std::tuple<VkDevice, std::uint64_t, std::uint32_t, s
     for (const auto& entry : copies) total += entry.second->HeldBytes();
     const auto present = Recorder::Presents();
     const auto ceiling = budget + std::min(budget, std::numeric_limits<VkDeviceSize>::max() - budget);
+    const bool keepLive = ArchB::Switches::Enabled(ArchB::Feature::DepthCopyKeepLive);
     while (total > budget) {
-        const bool over = total > ceiling;
+        const bool over = !keepLive && total > ceiling;
         auto oldest = copies.end();
         for (auto it = copies.begin(); it != copies.end(); ++it) {
             if (it->first == keep || (!over && it->second->lastPresent + 1u >= present)) continue;
             if (oldest == copies.end() || it->second->lastUse < oldest->second->lastUse) oldest = it;
         }
         if (oldest == copies.end()) break;
+        ArchB::Recorder::Count(oldest->second->lastPresent + 1u >= present ? "depth_copy_evictions_live" : "depth_copy_evictions_idle");
         total -= oldest->second->HeldBytes();
         copies.erase(oldest);
     }
@@ -4298,7 +4343,11 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     auto& copies = planeCopies();
     const std::tuple<VkDevice, std::uint64_t, std::uint32_t, std::uint32_t, VkFormat> copyKey{context.device, base.address, extent.width, extent.height, imageFormat};
     auto& copy = copies[copyKey];
-    if (copy == nullptr || copy->layers < layers) copy = std::make_unique<DepthPlaneCopy>(context, extent, imageFormat, layers);
+    if (copy == nullptr || copy->layers < layers) {
+        copy = std::make_unique<DepthPlaneCopy>(context, extent, imageFormat, layers);
+        ArchB::Recorder::Count("depth_copy_created");
+        ArchB::Recorder::Count("depth_copy_created_bytes", static_cast<double>(copy->imageBytes));
+    }
     copy->lastUse = ++planeCopyClock();
     copy->lastPresent = Recorder::Presents();
     auto texture = copy->Refresh(slices, resource, components, cube || resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, layered && !cube ? resource.baseArray : 0u);

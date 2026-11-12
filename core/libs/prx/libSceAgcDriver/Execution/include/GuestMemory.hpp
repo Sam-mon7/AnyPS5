@@ -431,6 +431,13 @@ void NoteUnlockedGpuWait(GpuLockSite site, double ms);
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();
+struct ThreadReadTally {
+    std::uint64_t bytes = 0;
+    std::uint64_t largest = 0;
+    const void* largestCaller = nullptr;
+    std::uint8_t largestSite = 0;
+};
+ThreadReadTally& ThreadReads();
 // A code address (a return address) as an offset into its module, in the form of the [guestmem]
 // callers (symbolized with nm against the driver's image). Takes the loader lock: for reports only.
 unsigned long long CodeOffset(const void* address);
