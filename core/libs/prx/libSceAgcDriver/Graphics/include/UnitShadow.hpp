@@ -164,7 +164,11 @@ struct ShadowAddressRun {
     VkDeviceAddress address;
     std::shared_ptr<ShadowSlabPin> pin;
 };
-std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
+struct ShadowAddressCollectCounts {
+    std::uint64_t calls = 0, spanPages = 0, walkedPages = 0, runs = 0, verified = 0, mismatches = 0;
+};
+ShadowAddressCollectCounts ShadowAddressCollectTotals();
+std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end, bool uploadReuse = false);
 std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& import, std::uint64_t surfaceBase, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> tailBlocks, bool countReads = true);
 
 // The slab destination of a retile copy [begin, end) (guest addresses inside one slab: the caller

@@ -896,3 +896,32 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+if(BUILD_TESTING)
+    foreach(uploadShadow IN ITEMS bounded verify)
+        add_test(NAME agc_driver_dispatch_upload_shadow_${uploadShadow} COMMAND agc_driver_recorder_tests --dispatch-upload-shadow-only)
+        set(uploadShadowEnvironment "APS5_ARCHB_DISPATCH_UPLOAD_REUSE=1;ANYPS5_NO_SHADER_CACHE=1")
+        if(uploadShadow STREQUAL "verify")
+            list(APPEND uploadShadowEnvironment "APS5_VERIFY_DISPATCH_UPLOAD_REUSE=1")
+        endif()
+        set_tests_properties(agc_driver_dispatch_upload_shadow_${uploadShadow} PROPERTIES
+            ENVIRONMENT "${uploadShadowEnvironment}" SKIP_RETURN_CODE 77 TIMEOUT 30
+            FAIL_REGULAR_EXPRESSION "VUID-;Validation Error;was not found but was requested by env var VK_INSTANCE_LAYERS")
+        if(WIN32)
+            set_tests_properties(agc_driver_dispatch_upload_shadow_${uploadShadow} PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+endif()
+
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_dispatch_upload_pending COMMAND agc_driver_recorder_tests --dispatch-upload-pending-only)
+    set_tests_properties(agc_driver_dispatch_upload_pending PROPERTIES
+        ENVIRONMENT "APS5_ARCHB_DISPATCH_UPLOAD_REUSE=1;APS5_VERIFY_DISPATCH_UPLOAD_REUSE=1;ANYPS5_NO_SHADER_CACHE=1;APS5_NO_OPPORTUNISTIC_REAP=1"
+        SKIP_RETURN_CODE 77 TIMEOUT 30
+        FAIL_REGULAR_EXPRESSION "VUID-;Validation Error;was not found but was requested by env var VK_INSTANCE_LAYERS")
+    if(WIN32)
+        set_tests_properties(agc_driver_dispatch_upload_pending PROPERTIES
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

@@ -90,6 +90,15 @@ Statistics& Stats() {
     return statistics;
 }
 
+struct ShadowAddressCollectStatistics {
+    std::atomic<std::uint64_t> calls{0}, spanPages{0}, walkedPages{0}, runs{0}, verified{0}, mismatches{0};
+};
+
+ShadowAddressCollectStatistics& AddressCollectStats() {
+    static ShadowAddressCollectStatistics statistics;
+    return statistics;
+}
+
 struct UnitShadow {
     Context context;
     // The import's range, buffer and lead (taken at creation: a publish under the import table's
@@ -1004,7 +1013,12 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
     return result;
 }
 
-std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
+ShadowAddressCollectCounts ShadowAddressCollectTotals() {
+    auto& stats = AddressCollectStats();
+    return {stats.calls.load(), stats.spanPages.load(), stats.walkedPages.load(), stats.runs.load(), stats.verified.load(), stats.mismatches.load()};
+}
+
+std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end, bool uploadReuse) {
     std::vector<ShadowAddressRun> result;
     if (!ShadowAddressEnabled() || !context.bufferDeviceAddress || end <= begin) return result;
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "shadow address sources require the GPU lock");
@@ -1026,7 +1040,67 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
     }
     const auto walkBegin = shadow->UnitRange(first).first;
     const auto walkEnd = shadow->UnitRange(last).second;
-    GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    std::vector<std::uint8_t> boundedChanged, boundedCpu;
+    static const bool verify = [] {
+        const auto* value = std::getenv("APS5_VERIFY_DISPATCH_UPLOAD_REUSE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (uploadReuse) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> walks;
+        {
+            std::lock_guard lock(registry.mutex);
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto range = shadow->UnitRange(unit);
+                if (!walks.empty() && walks.back().second == range.first) walks.back().second = range.second;
+                else walks.push_back(range);
+            }
+        }
+        if (verify) {
+            std::lock_guard lock(registry.mutex);
+            std::size_t run = 0;
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto range = shadow->UnitRange(unit);
+                while (run < walks.size() && walks[run].second <= range.first) ++run;
+                if (run == walks.size() || walks[run].first > range.first || walks[run].second < range.second) {
+                    AddressCollectStats().mismatches.fetch_add(1, std::memory_order_relaxed);
+                    ArchB::Recorder::Count("dispatch_upload_shadow_verify_mismatch");
+                    throw std::runtime_error("dispatch upload bounded collection omits a live unit");
+                }
+            }
+        }
+        const auto pages = [](std::uint64_t from, std::uint64_t to) { return (to + 4095u) / 4096u - from / 4096u; };
+        std::uint64_t walked = 0;
+        for (const auto& [from, to] : walks) {
+            GuestMemory::CollectWritesUncached(from, static_cast<std::size_t>(to - from));
+            walked += pages(from, to);
+        }
+        auto& stats = AddressCollectStats();
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        stats.spanPages.fetch_add(pages(walkBegin, walkEnd), std::memory_order_relaxed);
+        stats.walkedPages.fetch_add(walked, std::memory_order_relaxed);
+        stats.runs.fetch_add(walks.size(), std::memory_order_relaxed);
+        ArchB::Recorder::Count("dispatch_upload_shadow_collect_calls");
+        ArchB::Recorder::Count("dispatch_upload_shadow_span_pages", static_cast<double>(pages(walkBegin, walkEnd)));
+        ArchB::Recorder::Count("dispatch_upload_shadow_walked_pages", static_cast<double>(walked));
+        ArchB::Recorder::Count("dispatch_upload_shadow_live_runs", static_cast<double>(walks.size()));
+        if (verify) {
+            {
+                std::lock_guard lock(registry.mutex);
+                changedUnits(*shadow, first, last, boundedChanged, boundedCpu);
+            }
+            GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        }
+    } else {
+        GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    }
+    struct ReferenceSource {
+        std::uint64_t begin, end;
+        VkDeviceAddress address;
+        const ShadowSlab* slab;
+    };
+    std::vector<ReferenceSource> referenceSources;
     std::vector<std::uint8_t> fallback(static_cast<std::size_t>(last - first + 1), 0);
     bool publish = false;
     std::uint64_t bytes = 0, saved = 0, savedUnits = 0;
@@ -1035,6 +1109,28 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
+        if (uploadReuse && verify) {
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto k = static_cast<std::size_t>(unit - first);
+                if (boundedChanged[k] != changed[k] || boundedCpu[k] != cpu[k]) {
+                    AddressCollectStats().mismatches.fetch_add(1, std::memory_order_relaxed);
+                    ArchB::Recorder::Count("dispatch_upload_shadow_verify_mismatch");
+                    throw std::runtime_error("dispatch upload shadow bounded collect disagrees with old span; intervening CPU write possible but unproven");
+                }
+            }
+            for (auto unit = first; unit <= last; ++unit) {
+                const auto k = static_cast<std::size_t>(unit - first);
+                if (!shadow->Live(unit) || boundedChanged[k] != 0) continue;
+                const auto& slab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
+                if (slab == nullptr || slab->address == 0) continue;
+                const auto range = shadow->UnitRange(unit);
+                const auto from = std::max(begin, range.first);
+                const auto to = std::min(end, range.second);
+                if (!referenceSources.empty() && referenceSources.back().end == from && referenceSources.back().slab == slab.get()) referenceSources.back().end = to;
+                else referenceSources.push_back({from, to, slab->address + SlabOffset(import, *slab, from), slab.get()});
+            }
+        }
         for (auto unit = first; unit <= last; ++unit) {
             if (!shadow->Live(unit)) continue;
             const auto k = static_cast<std::size_t>(unit - first);
@@ -1063,6 +1159,21 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
                 }
             }
         }
+    }
+    if (uploadReuse && verify) {
+        bool same = referenceSources.size() == result.size();
+        for (std::size_t i = 0; same && i < result.size(); ++i) {
+            const auto& expected = referenceSources[i];
+            const auto& actual = result[i];
+            same = expected.begin == actual.begin && expected.end == actual.end && expected.address == actual.address && expected.slab == actual.pin->slab.get();
+        }
+        if (!same) {
+            AddressCollectStats().mismatches.fetch_add(1, std::memory_order_relaxed);
+            ArchB::Recorder::Count("dispatch_upload_shadow_verify_mismatch");
+            throw std::runtime_error("dispatch upload shadow sources disagree with old span");
+        }
+        AddressCollectStats().verified.fetch_add(1, std::memory_order_relaxed);
+        ArchB::Recorder::Count("dispatch_upload_shadow_verified");
     }
     if (publish) publishUnits(shadow, first, last, fallback, PublishReason::Address);
     if (profile && bytes != 0) {

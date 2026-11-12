@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -17,6 +18,10 @@
 #include <sys/mman.h>
 #endif
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <thread>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -137,12 +142,12 @@ struct Scene {
             AgcDriver::Graphics::SharedResourceCache().Clear();
         }
     }
-    void Check(std::uint32_t seed, const std::string& label, bool emit = true) {
+    void Check(std::uint32_t seed, const std::string& label, bool emit = true, std::uint32_t step = 17) {
         AgcDriver::GuestMemory::FlushGpuWrites(output.Address(), BlockBytes);
         std::array<std::uint8_t, BlockBytes> expected;
         expected.fill(0xa5);
         for (std::uint32_t lane = 0; lane < Lanes; ++lane) {
-            const auto value = Constant + 1u + seed + 17u * lane;
+            const auto value = Constant + 1u + seed + step * lane;
             std::memcpy(expected.data() + outputOffset + lane * 4, &value, sizeof(value));
         }
         for (std::size_t byte = 0; byte < BlockBytes; ++byte) {
@@ -207,6 +212,72 @@ void Repeated(Scene& scene, const std::string& mode) {
     }
 }
 
+void UploadCounts() {
+    const auto c = AgcDriver::Graphics::DispatchUploadReuseCounts();
+    std::printf("UPLOAD builds=%llu planBuilds=%llu planHits=%llu baseRegionsReused=%llu pendingHits=%llu pendingMisses=%llu pendingRegionsReused=%llu verified=%llu verifiedRegions=%llu failures=%llu noSpace=%llu importEpochMoved=%llu\n",
+        static_cast<unsigned long long>(c.builds), static_cast<unsigned long long>(c.planBuilds), static_cast<unsigned long long>(c.planHits), static_cast<unsigned long long>(c.baseRegionsReused), static_cast<unsigned long long>(c.pendingHits), static_cast<unsigned long long>(c.pendingMisses), static_cast<unsigned long long>(c.pendingRegionsReused), static_cast<unsigned long long>(c.verified), static_cast<unsigned long long>(c.verifiedRegions), static_cast<unsigned long long>(c.failures), static_cast<unsigned long long>(c.noSpace), static_cast<unsigned long long>(c.importEpochMoved));
+}
+
+void UploadToggle(std::uint64_t sequence, bool enabled) {
+    using namespace AgcDriver::ArchB;
+    const char* path = std::getenv("APS5_ARCHB_CONTROL_FILE");
+    Require(path != nullptr, "dispatch upload reuse: missing runtime control file");
+    {
+        std::ofstream file(path);
+        file << sequence << " DISPATCH_UPLOAD_REUSE=" << (enabled ? 1 : 0) << '\n';
+        Require(file.good(), "dispatch upload reuse: cannot write runtime control file");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (Switches::Sequence() != sequence && std::chrono::steady_clock::now() < deadline) {
+        Switches::PollControl();
+        std::this_thread::yield();
+    }
+    Require(Switches::Sequence() == sequence && Switches::Enabled(Feature::DispatchUploadReuse) == enabled, "dispatch upload reuse: runtime toggle failed");
+}
+
+void UploadRepeated(Scene& scene, const std::string& mode) {
+    using AgcDriver::Graphics::DispatchUploadReuseCounts;
+    const bool disabled = mode == "--upload-old";
+    std::unique_ptr<Block> extra;
+    for (unsigned round = 0; round < 5; ++round) {
+        if (round == 2 && mode == "--upload-remap") scene.input.Remap();
+        if (mode == "--upload-ranges") {
+            if (round == 2) extra = std::make_unique<Block>();
+            if (round == 4) extra.reset();
+        }
+        if (round == 2 && mode == "--upload-imports") {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::Graphics::ClearHostImports(AgcDriver::VulkanDeviceTestAccess::ContextOf(scene.device).device);
+        }
+        if (mode == "--upload-toggle" && round >= 2) UploadToggle(round - 1, round != 2);
+        scene.Compile(OutputOffset + round * 256u);
+        const auto seed = 0x100u + round * 0x321u;
+        scene.Input(seed);
+        if (mode == "--upload-gpu") {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const std::array<std::uint32_t, 4> pattern{seed, seed, seed, seed};
+            Require(scene.device.FillBuffer(scene.input.Address(), Lanes * 4, pattern), "dispatch upload reuse: GPU input fill was refused");
+        }
+        const auto before = DispatchUploadReuseCounts();
+        scene.Run();
+        const auto after = DispatchUploadReuseCounts();
+        if (disabled || (mode == "--upload-toggle" && round == 2)) {
+            Require(after.builds == before.builds, "dispatch upload reuse: disabled call entered reuse");
+        } else {
+            Require(after.builds > before.builds, "dispatch upload reuse: enabled dispatch did not enter UploadFinish reuse");
+        }
+        scene.Check(seed, "upload-" + std::to_string(round), true, mode == "--upload-gpu" ? 0 : 17);
+    }
+    const auto c = DispatchUploadReuseCounts();
+    Require(c.failures == 0, "dispatch upload reuse: VERIFY failure counted");
+    if (!disabled) {
+        Require(c.planHits > 0 && c.baseRegionsReused > 0, "dispatch upload reuse: stable address-space plans were not reused");
+        if (std::getenv("APS5_VERIFY_DISPATCH_UPLOAD_REUSE") != nullptr) Require(c.verified > 0 && c.verifiedRegions > 0, "dispatch upload reuse: VERIFY did not compare regions");
+        if (mode == "--upload-ranges" || mode == "--upload-remap" || mode == "--upload-imports") Require(c.planBuilds >= 2, "dispatch upload reuse: changed registry/imports reused a stale plan");
+    }
+    UploadCounts();
+}
+
 void InFlight(AgcDriver::VulkanDevice& device, bool requireTableHit) {
     Scene first(device), second(device);
     first.Compile(OutputOffset);
@@ -246,10 +317,14 @@ int main(int argc, char** argv) {
     try {
         Require(argc <= 2, "usage: --old | --on | --verify | --in-flight | --remap | --imports | --ranges | --no-pool | --cache");
         const std::string mode = argc == 2 ? argv[1] : "--old";
-        Require(mode == "--old" || mode == "--on" || mode == "--verify" || mode == "--in-flight" || mode == "--remap" || mode == "--imports" || mode == "--ranges" || mode == "--no-pool" || mode == "--cache", "unknown dispatch address reuse mode");
+        Require(mode.starts_with("--upload-") || mode == "--old" || mode == "--on" || mode == "--verify" || mode == "--in-flight" || mode == "--remap" || mode == "--imports" || mode == "--ranges" || mode == "--no-pool" || mode == "--cache", "unknown dispatch address reuse mode");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (mode == "--in-flight" || mode == "--cache") InFlight(*device, mode == "--cache");
+        if (mode.starts_with("--upload-")) {
+            Scene scene(*device);
+            UploadRepeated(scene, mode);
+            device->WaitIdle();
+        } else if (mode == "--in-flight" || mode == "--cache") InFlight(*device, mode == "--cache");
         else {
             Scene scene(*device);
             Repeated(scene, mode);

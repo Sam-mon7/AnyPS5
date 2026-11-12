@@ -118,6 +118,7 @@ enum class Feature : std::uint8_t {
     LazyShadowPublish,
     DepthRunRepeat,
     DispatchAddressReuse,
+    DispatchUploadReuse,
     Count
 };
 

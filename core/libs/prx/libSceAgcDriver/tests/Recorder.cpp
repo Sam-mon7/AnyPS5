@@ -8213,7 +8213,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     recorder.Sync();
 }
 
-bool addressShadowTests(const Device& device, Recorder& recorder) {
+bool addressShadowTests(const Device& device, Recorder& recorder, bool uploadReuse = false) {
     const auto& base = device.GetContext();
     if (!UnitShadowEnabled() || base.hostImportAlignment == 0) {
         std::cout << "skipped, unit shadows or host imports are unavailable\n";
@@ -8306,7 +8306,8 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
         leased.AcquireRegistered();
         if (readOnly) leased.AllowShadowAddressReads();
         if (descriptor) leased.AddReadable(address, 65536);
-        leased.Upload(true);
+        leased.UploadPrepare(true);
+        leased.UploadFinish(true, std::nullopt, uploadReuse);
         Build result{recorder.PendingWriteOverlaps(address, bytes), false, false};
         auto readback = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto ranges = leased.AddressRanges();
@@ -8399,6 +8400,39 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
             return false;
         }
         Require(holds({0x55, 0x55, 0x55, 0x55}), "a write-back into the unit shadow reached the import");
+        if (uploadReuse) {
+            constexpr std::size_t unit = 65536;
+            const auto published = PublishShadow(address + unit, bytes - 2 * unit, PublishScope::Whole, PublishReason::Other);
+            Require(published == bytes / unit - 2, "dispatch upload shadow: middle units were not published");
+            const auto before = ShadowAddressCollectTotals();
+            const auto holes = build({255, 0, 0, 255});
+            const auto after = ShadowAddressCollectTotals();
+            Require(holes.current && !holes.importCurrent, "dispatch upload shadow: sparse handoff lost GPU data");
+            Require(after.calls > before.calls && after.runs >= before.runs + 2, "dispatch upload shadow: live endpoint runs were not collected");
+            Require(after.walkedPages - before.walkedPages < after.spanPages - before.spanPages, "dispatch upload shadow: dead hole pages were collected");
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            AgcDriver::GuestMemory::CollectWrites(address, bytes);
+            std::memset(block, 0x77, unit);
+            const auto overwritten = build({255, 0, 0, 255}, true, false, true);
+            Require(overwritten.current, "dispatch upload shadow: same-epoch CPU overwrite was hidden by collect memo");
+            const auto* import = HostImportFor(context, address, bytes);
+            Require(import != nullptr, "dispatch upload shadow: partial source import disappeared");
+            const auto partialBefore = ShadowAddressCollectTotals();
+            const auto partial = ShadowAddressSources(context, *import, address + bytes - unit + 4, address + bytes - 4, true);
+            const auto partialAfter = ShadowAddressCollectTotals();
+            Require(partial.size() == 1 && partial.front().begin == address + bytes - unit + 4 && partial.front().end == address + bytes - 4, "dispatch upload shadow: partial requested edge was not preserved");
+            Require(partialAfter.walkedPages > partialBefore.walkedPages, "dispatch upload shadow: partial unit was not freshly collected");
+            std::memset(static_cast<std::uint8_t*>(block) + bytes - unit, 0x88, 4);
+            const auto partialChanged = ShadowAddressSources(context, *import, address + bytes - unit + 4, address + bytes - 4, true);
+            Require(partialChanged.empty(), "dispatch upload shadow: CPU overwrite outside the requested edge did not invalidate its whole unit");
+            Require(words[bytes - unit] == 0x88, "dispatch upload shadow: partial-edge fallback overwrote CPU bytes");
+            Require(partialAfter.mismatches == 0, "dispatch upload shadow: VERIFY mismatch");
+            if (std::getenv("APS5_VERIFY_DISPATCH_UPLOAD_REUSE") != nullptr) Require(partialAfter.verified > before.verified, "dispatch upload shadow: VERIFY did not run");
+            std::cout << "dispatch upload shadow: sparse span pages " << after.spanPages - before.spanPages << " walked pages " << after.walkedPages - before.walkedPages << " runs " << after.runs - before.runs << '\n';
+            StorageTexture::FlushPending(address, bytes, nullptr, "memory access");
+            settle();
+            return true;
+        }
         static_cast<void>(ShadowReport());
         const auto shadowed = build({255, 0, 0, 255});
         const auto report = ShadowReport();
@@ -8450,6 +8484,78 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
     }
     recorder.Sync();
     std::cout << "address-based builds read the unit shadow's stored results (address space cache " << (std::getenv("APS5_NO_ADDRESS_SPACE_CACHE") != nullptr ? "off" : "on") << ")\n";
+    return true;
+}
+
+bool uploadPendingTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t heap = unit * 2;
+    void* block = AllocateWatched(heap + unit, unit);
+    Require(block != nullptr, "dispatch upload pending: watched allocation failed");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(block, 0, heap + unit);
+    GuestAllocations::Mutation().Add(block, heap, true, true, true);
+    struct Release {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Release() {
+            GuestAllocations::Mutation().Remove(block);
+            HostImportFor(context, address, heap);
+            ReleaseWatched(block, heap + unit);
+        }
+    } release{context, block, address};
+    Require(HostImportFor(context, address, heap) != nullptr, "dispatch upload pending: registered region was not imported");
+    const auto build = [&] {
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        memory.UploadPrepare(true);
+        memory.UploadFinish(true, std::nullopt, true);
+        const auto ranges = memory.AddressRanges();
+        Require(std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address && range.end >= address + heap; }), "dispatch upload pending: registered region disappeared");
+    };
+    build();
+    unsigned completed = 0;
+    const auto store = [&](std::uint64_t destination, std::uint32_t value) {
+        recorder.OpenBatch();
+        recorder.AfterCompletions(destination, std::as_bytes(std::span(&value, 1)), 1, 0, false);
+        recorder.OnComplete([&] { ++completed; });
+    };
+    store(address + heap, 0x11223344u);
+    const auto before = DispatchUploadReuseCounts();
+    build();
+    const auto first = DispatchUploadReuseCounts();
+    build();
+    const auto repeated = DispatchUploadReuseCounts();
+    Require(first.pendingMisses > before.pendingMisses && repeated.pendingHits > first.pendingHits && repeated.pendingRegionsReused > first.pendingRegionsReused, "dispatch upload pending: unchanged pending snapshot was not cached");
+    Require(completed == 0, "dispatch upload pending: unrelated completion was forced");
+    store(address + heap + 16, 0x55667788u);
+    build();
+    const auto changed = DispatchUploadReuseCounts();
+    Require(changed.pendingMisses > repeated.pendingMisses && completed == 0, "dispatch upload pending: changed disjoint snapshot did not invalidate");
+    build();
+    const auto changedHit = DispatchUploadReuseCounts();
+    Require(changedHit.pendingHits > changed.pendingHits, "dispatch upload pending: changed stable snapshot did not reuse");
+    store(address + 4, 0xa1b2c3d4u);
+    build();
+    const auto overlapped = DispatchUploadReuseCounts();
+    Require(overlapped.pendingMisses > changedHit.pendingMisses && completed == 3, "dispatch upload pending: new overlapping completion was skipped");
+    const auto* words = static_cast<const std::uint32_t*>(block);
+    Require(words[1] == 0xa1b2c3d4u && words[heap / 4] == 0x11223344u && words[heap / 4 + 4] == 0x55667788u, "dispatch upload pending: completion bytes differ");
+    store(address + heap + 32, 0x99aabbccu);
+    build();
+    const auto afterComplete = DispatchUploadReuseCounts();
+    Require(afterComplete.pendingMisses > overlapped.pendingMisses && completed == 3, "dispatch upload pending: replacement snapshot retained completed candidates");
+    build();
+    const auto replacementHit = DispatchUploadReuseCounts();
+    Require(replacementHit.pendingHits > afterComplete.pendingHits, "dispatch upload pending: replacement stable snapshot did not reuse");
+    recorder.Sync();
+    Require(completed == 4 && words[heap / 4 + 8] == 0x99aabbccu, "dispatch upload pending: deferred completion was lost");
+    build();
+    const auto done = DispatchUploadReuseCounts();
+    Require(done.pendingHits == replacementHit.pendingHits && done.pendingMisses == replacementHit.pendingMisses && done.failures == 0, "dispatch upload pending: empty completed state reused pending candidates");
+    std::cout << "dispatch upload pending: hits " << done.pendingHits - before.pendingHits << " misses " << done.pendingMisses - before.pendingMisses << " completions " << completed << '\n';
     return true;
 }
 
@@ -19864,6 +19970,12 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--small-tiled-shadow-label-only") {
             return smallTiledShadowLabelTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-upload-pending-only") {
+            return uploadPendingTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--dispatch-upload-shadow-only") {
+            return addressShadowTests(device, recorder, true) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--bda-shadowed-results-only") {
             return addressShadowTests(device, recorder) ? 0 : 77;

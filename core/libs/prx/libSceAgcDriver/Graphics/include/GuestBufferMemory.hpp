@@ -24,6 +24,22 @@ struct ShadowSlabPin;
 
 void ShutdownGuestBufferWorkers();
 
+struct DispatchUploadReuseStats {
+    std::uint64_t builds = 0;
+    std::uint64_t planBuilds = 0;
+    std::uint64_t planHits = 0;
+    std::uint64_t baseRegionsReused = 0;
+    std::uint64_t pendingHits = 0;
+    std::uint64_t pendingMisses = 0;
+    std::uint64_t pendingRegionsReused = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t verifiedRegions = 0;
+    std::uint64_t failures = 0;
+    std::uint64_t noSpace = 0;
+    std::uint64_t importEpochMoved = 0;
+};
+DispatchUploadReuseStats DispatchUploadReuseCounts();
+
 struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;
@@ -386,7 +402,7 @@ public:
     // and the recorder's pending-write note stays closed.
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
-    void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt, bool dispatchBuild = false);
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -616,6 +632,9 @@ private:
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
     void completeSpaceWrites() const;
+    void prepareUploadPlan();
+    void verifyUploadPlan() const;
+    std::vector<ShaderRecompiler::BdaAbi::Range> addressRanges(bool freshBase) const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
@@ -668,6 +687,8 @@ private:
     bool addressStaging = true;
     bool adjustedRegions = false;
     bool shadowAddressReads = false;
+    bool uploadReuse = false;
+    bool uploadDispatch = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).

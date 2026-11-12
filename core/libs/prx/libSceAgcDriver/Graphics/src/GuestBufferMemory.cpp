@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AdaptiveStaging.hpp"
@@ -167,6 +168,15 @@ struct GuestBufferMemory::AddressSpace {
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
+    struct UploadPlan {
+        bool ready = false;
+        std::vector<std::size_t> mirrors;
+        std::vector<std::size_t> direct;
+        bool pendingReady = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pendingWrites;
+        std::vector<std::size_t> pendingRegions;
+    };
+    mutable UploadPlan uploadPlan;
     mutable AgcDriver::Mutex tableMutex;
     struct Table {
         std::uint64_t serial;
@@ -176,6 +186,62 @@ struct GuestBufferMemory::AddressSpace {
     mutable std::map<std::vector<std::uint64_t>, Table> tables;
     mutable std::list<const std::vector<std::uint64_t>*> tableRecency;
 };
+
+namespace {
+
+struct UploadReuseCounters {
+    std::atomic<std::uint64_t> builds{0};
+    std::atomic<std::uint64_t> planBuilds{0};
+    std::atomic<std::uint64_t> planHits{0};
+    std::atomic<std::uint64_t> baseRegionsReused{0};
+    std::atomic<std::uint64_t> pendingHits{0};
+    std::atomic<std::uint64_t> pendingMisses{0};
+    std::atomic<std::uint64_t> pendingRegionsReused{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> verifiedRegions{0};
+    std::atomic<std::uint64_t> failures{0};
+    std::atomic<std::uint64_t> noSpace{0};
+    std::atomic<std::uint64_t> importEpochMoved{0};
+};
+
+UploadReuseCounters& uploadReuseCounters() {
+    static UploadReuseCounters value;
+    return value;
+}
+
+void countUpload(std::atomic<std::uint64_t>& counter, const char* name, std::uint64_t amount = 1) {
+    counter.fetch_add(amount, std::memory_order_relaxed);
+    ArchB::Recorder::Count(name, amount);
+}
+
+bool verifyUploadReuse() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_VERIFY_DISPATCH_UPLOAD_REUSE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+bool uploadSteps() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_ARCHB_C_DRAW_REPLAY_STEPS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+void requireUpload(bool matches) {
+    if (matches) return;
+    countUpload(uploadReuseCounters().failures, "dispatch_upload_reuse_failures");
+    throw std::runtime_error("APS5_VERIFY_DISPATCH_UPLOAD_REUSE: upload plan differs from full path");
+}
+
+}
+
+DispatchUploadReuseStats DispatchUploadReuseCounts() {
+    const auto& value = uploadReuseCounters();
+    return {value.builds.load(std::memory_order_relaxed), value.planBuilds.load(std::memory_order_relaxed), value.planHits.load(std::memory_order_relaxed), value.baseRegionsReused.load(std::memory_order_relaxed), value.pendingHits.load(std::memory_order_relaxed), value.pendingMisses.load(std::memory_order_relaxed), value.pendingRegionsReused.load(std::memory_order_relaxed), value.verified.load(std::memory_order_relaxed), value.verifiedRegions.load(std::memory_order_relaxed), value.failures.load(std::memory_order_relaxed), value.noSpace.load(std::memory_order_relaxed), value.importEpochMoved.load(std::memory_order_relaxed)};
+}
 
 std::atomic<std::uint64_t> testHeapMirrorBudget{0};
 
@@ -6511,6 +6577,60 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     }
 }
 
+void GuestBufferMemory::prepareUploadPlan() {
+    if (!uploadReuse) return;
+    GuestMemory::AssertGpuLockHeld("GuestBufferMemory::prepareUploadPlan");
+    auto& counters = uploadReuseCounters();
+    countUpload(counters.builds, "dispatch_upload_reuse_builds");
+    if (space == nullptr) {
+        countUpload(counters.noSpace, "dispatch_upload_reuse_no_space");
+        return;
+    }
+    auto& plan = space->uploadPlan;
+    if (plan.ready) {
+        countUpload(counters.planHits, "dispatch_upload_reuse_plan_hits");
+        countUpload(counters.baseRegionsReused, "dispatch_upload_reuse_base_regions_reused", space->base.size());
+        return;
+    }
+    plan.mirrors.clear();
+    plan.direct.clear();
+    for (std::size_t index = 0; index < space->base.size(); ++index) {
+        const auto& region = space->base[index];
+        if (region.mirror != nullptr) plan.mirrors.push_back(index);
+        if (region.direct != nullptr && region.hostBacked && region.mirror == nullptr) plan.direct.push_back(index);
+    }
+    plan.ready = true;
+    countUpload(counters.planBuilds, "dispatch_upload_reuse_plan_builds");
+}
+
+void GuestBufferMemory::verifyUploadPlan() const {
+    if (!uploadReuse || !verifyUploadReuse() || space == nullptr || !space->uploadPlan.ready) return;
+    GuestMemory::AssertGpuLockHeld("GuestBufferMemory::verifyUploadPlan");
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (state.epoch != space->importsEpoch) {
+        countUpload(uploadReuseCounters().importEpochMoved, "dispatch_upload_reuse_import_epoch_moved");
+        return;
+    }
+    std::vector<std::size_t> mirrors;
+    std::vector<std::size_t> direct;
+    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    ranges.reserve(space->base.size());
+    for (std::size_t index = 0; index < space->base.size(); ++index) {
+        const auto& region = space->base[index];
+        if (region.mirror != nullptr) mirrors.push_back(index);
+        if (region.direct != nullptr && region.hostBacked && region.mirror == nullptr) direct.push_back(index);
+        ranges.push_back(addressRange(region));
+    }
+    requireUpload(mirrors == space->uploadPlan.mirrors && direct == space->uploadPlan.direct);
+    requireUpload(ranges.size() == space->ranges.size() && (ranges.empty() || std::memcmp(ranges.data(), space->ranges.data(), ranges.size() * sizeof(ranges.front())) == 0));
+    const auto actual = AddressRanges();
+    const auto fresh = addressRanges(true);
+    requireUpload(actual.size() == fresh.size() && (actual.empty() || std::memcmp(actual.data(), fresh.data(), actual.size() * sizeof(actual.front())) == 0));
+    countUpload(uploadReuseCounters().verified, "dispatch_upload_reuse_verified");
+    countUpload(uploadReuseCounters().verifiedRegions, "dispatch_upload_reuse_verified_regions", ranges.size());
+}
+
 void GuestBufferMemory::completeSpaceWrites() const {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion() || !AnyPendingCpuWrites(context)) return;
@@ -6520,7 +6640,27 @@ void GuestBufferMemory::completeSpaceWrites() const {
     std::size_t next = 0;
     while (next < base.size()) {
         recorder->PendingWriteRanges(writes);
-        OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
+        if (uploadReuse && next == 0 && writes.size() <= 4096) {
+            auto& plan = space->uploadPlan;
+            if (plan.pendingReady && writes == plan.pendingWrites) {
+                candidates = plan.pendingRegions;
+                countUpload(uploadReuseCounters().pendingHits, "dispatch_upload_reuse_pending_hits");
+                countUpload(uploadReuseCounters().pendingRegionsReused, "dispatch_upload_reuse_pending_regions_reused", base.size());
+                if (verifyUploadReuse()) {
+                    std::vector<std::size_t> fresh;
+                    OverlappedRanges(std::span<const Region>(base), next, writes, fresh);
+                    requireUpload(fresh == candidates);
+                }
+            } else {
+                OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
+                plan.pendingWrites = writes;
+                plan.pendingRegions = candidates;
+                plan.pendingReady = true;
+                countUpload(uploadReuseCounters().pendingMisses, "dispatch_upload_reuse_pending_misses");
+            }
+        } else {
+            OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
+        }
         next = base.size();
         for (const auto index : candidates) {
             if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
@@ -6530,13 +6670,24 @@ void GuestBufferMemory::completeSpaceWrites() const {
     }
 }
 
-void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
+void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, bool dispatchBuild) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
+    uploadDispatch = dispatchBuild && addressable;
+    uploadReuse = uploadDispatch && ArchB::Switches::Enabled(ArchB::Feature::DispatchUploadReuse);
+    const bool steps = uploadDispatch && uploadSteps();
+    std::optional<PerformanceTimer> step;
+    const auto phase = [&](const char* name) {
+        step.reset();
+        if (steps) step.emplace(name);
+    };
+    phase("Resources.Complete.Address.UploadFinish.Pending");
+    prepareUploadPlan();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
+    phase("Resources.Complete.Address.UploadFinish.Mirrors");
     {
         auto& state = Mirrors();
         std::lock_guard lock(state.mutex);
@@ -6545,14 +6696,20 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             if (region.mirror != nullptr) region.mirror->lastDispatch = stamp;
         }
         if (space != nullptr) {
-            for (const auto& region : space->base) {
-                if (region.mirror != nullptr) region.mirror->lastDispatch = stamp;
+            if (uploadReuse && space->uploadPlan.ready) {
+                for (const auto index : space->uploadPlan.mirrors) space->base[index].mirror->lastDispatch = stamp;
+            } else {
+                for (const auto& region : space->base) {
+                    if (region.mirror != nullptr) region.mirror->lastDispatch = stamp;
+                }
             }
         }
     }
+    phase("Resources.Complete.Address.UploadFinish.Hazards");
     for (const auto& region : regions) static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
     for (const auto& [begin, end] : writes) RequireNoResidentDepthRead_nid_no_patch(begin, static_cast<std::size_t>(end - begin), htileClear);
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+    phase("Resources.Complete.Address.UploadFinish.Imports");
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
@@ -6614,6 +6771,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     }
     // Regions the GPU copies out of their import (see Region::gpuCopy), recorded together below.
     // No recorder (tests) keeps them on the CPU path.
+    phase("Resources.Complete.Address.UploadFinish.Regions");
     auto* recorder = Recorder::Active();
     std::vector<Region*> gpuCopies;
     // One clock pair around the loop (an address-based build has ~1200 regions): the [buffers]
@@ -6629,6 +6787,12 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     }
     for (auto& region : regions) {
         if (!region.pending) continue;
+        std::optional<PerformanceTimer> regionStep;
+        const auto regionPhase = [&](const char* name) {
+            regionStep.reset();
+            if (steps) regionStep.emplace(name);
+        };
+        regionPhase("Resources.Complete.Address.UploadFinish.Regions.Reconcile");
         region.pending = false;
         const auto bytes = region.end - region.begin;
         if (region.mirror != nullptr) {
@@ -6636,6 +6800,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             // Read-only mirrors are never written back; a writable one is diffed for this sub-range
             // at write-back.
             const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            regionPhase("Resources.Complete.Address.UploadFinish.Regions.MirrorRefresh");
             refreshMirror(*region.mirror, region.begin, bytes);
             if (profile) refreshUs += microsecondsSince(refreshStart);
             continue;
@@ -6709,6 +6874,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             }
         }
         if (region.direct != nullptr) {
+            regionPhase("Resources.Complete.Address.UploadFinish.Regions.Publish");
             // The GPU reads this range in place, so storage results pending in it must be stored first
             // (outside the import lock: the store may import memory itself). The whole registered heaps
             // an address-based shader maps are exempt (they hold every pending image, and such shaders
@@ -6723,6 +6889,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             continue;
         }
         if (copyOnGpu) {
+            regionPhase("Resources.Complete.Address.UploadFinish.Regions.Staging");
             // As for a direct region, storage results pending in the range reach the import before
             // the copy reads it: the flush is recorded (GPU-direct into the import) ahead of the copy
             // in the same batch. The batch is opened first so that an import the flush's own
@@ -6735,6 +6902,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             continue;
         }
         if (sparseHeapCandidate(region)) {
+            regionPhase("Resources.Complete.Address.UploadFinish.Regions.SparseMirror");
             const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const bool bound = bindSparseMirror(region, importRanges());
             if (profile) refreshUs += microsecondsSince(refreshStart);
@@ -6748,18 +6916,27 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             region.deviceLocal = false;
         }
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        regionPhase("Resources.Complete.Address.UploadFinish.Regions.CpuCopy");
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
     }
+    phase("Resources.Complete.Address.UploadFinish.Shadows");
     if (heapsEnd > heapsBegin) {
         if (ShadowAddressEnabled() && shadowAddressReads && context.bufferDeviceAddress && recorder != nullptr && !Recorder::InCompletion() && GuestMemory::GpuMutex().HeldByThisThread()) bindShadowAddresses();
         else StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, profile && ShadowAddressEnabled() && !shadowAddressReads ? "writable address-based heaps" : "address-based heaps");
     }
+    phase("Resources.Complete.Address.UploadFinish.GpuCopies");
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
+    phase("Resources.Complete.Address.UploadFinish.HeapReferences");
     takeHeapReferences();
+    phase("Resources.Complete.Address.UploadFinish.Tracker");
     ResidentBuffer::FlushChanged(context);
+    phase("Resources.Complete.Address.UploadFinish.Release");
     static const bool releaseSnapshots = std::getenv("APS5_NO_BUFFER_SNAPSHOT_RELEASE") == nullptr;
     if (releaseSnapshots) for (auto& region : regions) std::vector<std::byte>().swap(region.snapshot);
+    phase("Resources.Complete.Address.UploadFinish.Verify");
+    verifyUploadPlan();
+    step.reset();
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
@@ -7374,23 +7551,39 @@ void GuestBufferMemory::bindShadowAddresses() {
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "shadow address binding requires the GPU lock");
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr, "shadow address binding requires a recorder");
+    const bool steps = uploadDispatch && uploadSteps();
+    std::optional<PerformanceTimer> step;
+    const auto phase = [&](const char* name) {
+        step.reset();
+        if (steps) step.emplace(name);
+    };
+    phase("Resources.Complete.Address.UploadFinish.Shadows.Publish");
     recorder->FlushKeyStores();
     recorder->FlushStores();
     StorageTexture::StoreDrawnLinear("address-based heaps", LazyShadowPublishEnabled() ? PublishScope::None : PublishScope::Whole);
     for (const auto& [begin, end] : descriptorRanges) {
         StorageTexture::PublishShadowsOnly(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, "imported buffer region");
     }
+    phase("Resources.Complete.Address.UploadFinish.Shadows.Sources");
+    const bool reuse = uploadReuse && ArchB::Switches::Enabled(ArchB::Feature::DispatchUploadReuse);
     const auto bind = [&](const Region& region) {
         if (region.direct == nullptr || !region.hostBacked || region.mirror != nullptr) return;
-        auto sources = ShadowAddressSources(context, *region.direct, region.begin, inPlaceEnd(region));
+        auto sources = ShadowAddressSources(context, *region.direct, region.begin, inPlaceEnd(region), reuse);
         for (auto& source : sources) {
             shadowRanges.push_back({source.begin, source.end, source.address, ShaderRecompiler::BdaAbi::Read, 0});
             recorder->Keep(source.pin);
             shadowPins.push_back(std::move(source.pin));
         }
     };
-    if (space != nullptr) for (const auto& region : space->base) bind(region);
+    if (space != nullptr) {
+        if (reuse && space->uploadPlan.ready) {
+            for (const auto index : space->uploadPlan.direct) bind(space->base[index]);
+        } else {
+            for (const auto& region : space->base) bind(region);
+        }
+    }
     for (const auto& region : regions) bind(region);
+    phase("Resources.Complete.Address.UploadFinish.Shadows.Vectors");
     if (shadowRanges.empty()) return;
     std::sort(shadowRanges.begin(), shadowRanges.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
     std::vector<AddressRange> disjoint;
@@ -7410,17 +7603,27 @@ bool GuestBufferMemory::RebindShadowAddresses() {
 }
 
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
+    return addressRanges(false);
+}
+
+std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::addressRanges(bool freshBase) const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
     if (space != nullptr) {
+        std::vector<ShaderRecompiler::BdaAbi::Range> recomputed;
+        if (freshBase) {
+            recomputed.reserve(space->base.size());
+            for (const auto& region : space->base) recomputed.push_back(addressRange(region));
+        }
+        const auto& base = freshBase ? recomputed : space->ranges;
         std::vector<ShaderRecompiler::BdaAbi::Range> own;
         std::vector<ShaderRecompiler::BdaAbi::Range> overlays;
         own.reserve(regions.size());
         for (const auto& region : regions) (region.overlay ? overlays : own).push_back(addressRange(region));
         std::vector<ShaderRecompiler::BdaAbi::Range> uncovered;
         uncovered.reserve(own.size());
-        AppendUncovered(own, space->ranges, uncovered);
-        result = MergeByBegin(space->ranges, uncovered);
+        AppendUncovered(own, base, uncovered);
+        result = MergeByBegin(base, uncovered);
         if (!overlays.empty()) {
             std::sort(overlays.begin(), overlays.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
             std::vector<ShaderRecompiler::BdaAbi::Range> cut;

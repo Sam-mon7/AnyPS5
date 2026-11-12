@@ -18,3 +18,18 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
         endif()
     endforeach()
 endif()
+
+if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+    foreach(agcUploadReuseCase IN ITEMS compare verify negative remap imports ranges gpu toggle)
+        add_test(NAME agc_driver_dispatch_upload_reuse_${agcUploadReuseCase}
+            COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_dispatch_upload_reuse.py"
+            "$<TARGET_FILE:agc_driver_dispatch_address_reuse_tests>" "${agcUploadReuseCase}")
+        set_tests_properties(agc_driver_dispatch_upload_reuse_${agcUploadReuseCase} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1"
+            SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(agc_driver_dispatch_upload_reuse_${agcUploadReuseCase} PROPERTIES
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+endif()

@@ -3353,7 +3353,7 @@ void ShaderResources::buildComplete() {
         addressStep.reset();
         if (addressSteps) addressStep.emplace("Resources.Complete.Address.UploadFinish");
         requireGuestBuffers();
-        guestMemory.UploadFinish(usesBda, htileClear);
+        guestMemory.UploadFinish(usesBda, htileClear, !drawBuild && usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
         addressStep.reset();
         if (addressSteps) addressStep.emplace("Resources.Complete.Address.Bda");
