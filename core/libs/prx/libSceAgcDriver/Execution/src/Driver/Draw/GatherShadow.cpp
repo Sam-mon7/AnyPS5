@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -261,8 +262,13 @@ GatherOutcome EvaluateGather(const GatherTemplate& shape, std::span<const std::u
         return outcome;
     }
     liveWords.resize(shape.words.size());
-    thread_local std::vector<std::uint8_t> states;
-    thread_local std::vector<std::uint64_t> addresses;
+    struct RunStates {
+        std::vector<std::uint8_t> states;
+        std::vector<std::uint64_t> addresses;
+    };
+    auto& runStates = HostThreadLocal<RunStates, RunStates>();
+    auto& states = runStates.states;
+    auto& addresses = runStates.addresses;
     states.assign(shape.runs.size(), 0);
     addresses.assign(shape.runs.size(), 0);
     const auto visit = [&](auto&& self, std::size_t index) -> bool {
@@ -555,8 +561,7 @@ struct ValidationLog {
 };
 
 ValidationLog& validationLog() {
-    thread_local ValidationLog log;
-    return log;
+    return HostThreadLocal<ValidationLog, ValidationLog>();
 }
 
 struct CachedTemplate {
@@ -593,8 +598,13 @@ void ArmGatherValidationLog(bool armed) {
 namespace {
 
 std::shared_ptr<GatherDrawPlan> acquirePlan(std::size_t stages, std::uint64_t& allocations) {
-    thread_local std::array<std::shared_ptr<GatherDrawPlan>, 512> ring;
-    thread_local std::size_t next = 0;
+    struct PlanRing {
+        std::array<std::shared_ptr<GatherDrawPlan>, 512> ring;
+        std::size_t next = 0;
+    };
+    auto& planRing = HostThreadLocal<PlanRing, PlanRing>();
+    auto& ring = planRing.ring;
+    auto& next = planRing.next;
     auto& slot = ring[next];
     next = (next + 1) % ring.size();
     if (slot == nullptr || slot.use_count() != 1) {
@@ -633,7 +643,15 @@ std::array<std::uint64_t, 4> gatherGenerations() {
 
 std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
     const auto started = std::chrono::steady_clock::now();
-    thread_local std::vector<GatherValidation> selectedLog;
+    struct ShadowScratch {
+        std::vector<GatherValidation> selectedLog;
+        std::unordered_map<const DispatchVariant*, CachedTemplate> cache;
+        std::vector<std::uint32_t> liveWords;
+        std::vector<std::uint64_t> liveAddresses;
+        std::vector<std::uint8_t> stageSeen;
+    };
+    auto& shadowScratch = HostThreadLocal<ShadowScratch, ShadowScratch>();
+    auto& selectedLog = shadowScratch.selectedLog;
     selectedLog.clear();
     if (draw.live) for (std::uint32_t stage = 0; stage < draw.matched.size(); ++stage) if (draw.matched[stage] != nullptr) selectedLog.push_back({stage, draw.matched[stage], EntryOutcome::Equal});
     const auto& log = draw.live ? selectedLog : validationLog().entries;
@@ -641,7 +659,7 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
         ArchB::Recorder::Count(draw.entry == nullptr ? "gather_shadow_miss_no_entry" : "gather_shadow_miss_unvalidated");
         return nullptr;
     }
-    thread_local std::unordered_map<const DispatchVariant*, CachedTemplate> cache;
+    auto& cache = shadowScratch.cache;
     if (cache.size() > 16384) cache.clear();
     std::uint64_t built = 0;
     const auto templateFor = [&](const std::shared_ptr<DispatchVariant>& variant, std::uint32_t stage) -> std::shared_ptr<const GatherTemplate> {
@@ -729,9 +747,9 @@ std::shared_ptr<GatherDrawPlan> RunGatherShadow(const GatherShadowDraw& draw) {
         }
         return baseRead(address, out);
     };
-    thread_local std::vector<std::uint32_t> liveWords;
-    thread_local std::vector<std::uint64_t> liveAddresses;
-    thread_local std::vector<std::uint8_t> stageSeen;
+    auto& liveWords = shadowScratch.liveWords;
+    auto& liveAddresses = shadowScratch.liveAddresses;
+    auto& stageSeen = shadowScratch.stageSeen;
     ShadowCounts counts;
     std::uint64_t allocations = 0;
     std::shared_ptr<GatherDrawPlan> plan;

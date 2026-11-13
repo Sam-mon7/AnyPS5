@@ -468,8 +468,13 @@ std::uint64_t GatherTargetAddress(const Graphics::State& graphics) {
 }
 
 GatherBufferLimits GatherLimitsOf(VulkanDevice& device, const Graphics::State& graphics) {
-    thread_local std::uint64_t serial = 0;
-    thread_local GatherBufferLimits limits;
+    struct LimitsOfDevice {
+        std::uint64_t serial = 0;
+        GatherBufferLimits limits;
+    };
+    auto& held = HostThreadLocal<LimitsOfDevice, LimitsOfDevice>();
+    auto& serial = held.serial;
+    auto& limits = held.limits;
     if (serial != device.Serial() || limits.maxRange == 0) {
         const auto context = device.graphicsContext();
         limits.maxRange = context.limits.maxStorageBufferRange;
@@ -531,8 +536,8 @@ void IndexLiveSignature(std::uint64_t key, const std::shared_ptr<GatherLiveEntry
 constexpr std::size_t LiveWays = 8;
 
 GatherLiveIndex& LiveIndex() {
-    thread_local GatherLiveIndex index;
-    return index;
+    struct LiveIndexStorage {};
+    return HostThreadLocal<GatherLiveIndex, LiveIndexStorage>();
 }
 
 GatherOptions LiveOptions(const DrawTail& tail) {
@@ -544,8 +549,9 @@ bool LiveVerifyNext() {
         const char* text = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_LIVE_VERIFY");
         return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
     }();
-    thread_local std::uint64_t draws = 0;
-    return period != 0 && ++draws % period == 0;
+    if (period == 0) return false;
+    struct LiveVerifyDraws {};
+    return ++HostThreadLocal<std::uint64_t, LiveVerifyDraws>() % period == 0;
 }
 
 void MergeIgnoredWords(Graphics::DrawReferenceMasks::Words& into, std::span<const std::pair<std::uint32_t, std::uint32_t>> from) {
@@ -575,7 +581,8 @@ bool LiveViewsCurrent(GatherLiveEntry& entry) {
 void CountLiveDraw(const Pm4::DrawParameters& draw, const char* name, double value = 1) {
     ArchB::Recorder::Count(name, value);
     if (!ArchB::Recorder::Enabled()) return;
-    thread_local std::unordered_map<const char*, std::array<std::string, 2>> typedNames;
+    struct TypedNamesStorage {};
+    auto& typedNames = HostThreadLocal<std::unordered_map<const char*, std::array<std::string, 2>>, TypedNamesStorage>();
     const auto [found, inserted] = typedNames.try_emplace(name);
     if (inserted) found->second = {std::string(name) + "_direct", std::string(name) + "_indirect"};
     ArchB::Recorder::Count(found->second[draw.indirect.has_value()].c_str(), value);
@@ -700,7 +707,8 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
     const auto found = LiveIndex().entries.find(tail.liveKey);
     if (found == LiveIndex().entries.end() && predicted.count == 0) { CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_refused_no_template"); return {}; }
     const auto options = LiveOptions(tail);
-    thread_local std::vector<DrawProgram> programs;
+    struct LiveProgramsStorage {};
+    auto& programs = HostThreadLocal<std::vector<DrawProgram>, LiveProgramsStorage>();
     static const bool refuseFeedback = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_FEEDBACK") != nullptr;
     bool ready = false, feedback = false;
     auto& cursor = LiveIndex().cursors[tail.liveKey];
@@ -822,7 +830,8 @@ std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submis
         CountLiveDraw(tail.drawParameters, "draw_templates_live_q0_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
         return live;
     };
-    thread_local std::vector<const GatherLiveEntry*> tried;
+    struct LiveTriedStorage {};
+    auto& tried = HostThreadLocal<std::vector<const GatherLiveEntry*>, LiveTriedStorage>();
     tried.clear();
     const auto wasTried = [&](const GatherLiveEntry* entry) { return std::find(tried.begin(), tried.end(), entry) != tried.end(); };
     std::uint32_t indexTries = 0;
