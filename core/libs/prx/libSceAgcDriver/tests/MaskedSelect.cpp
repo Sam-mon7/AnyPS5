@@ -1369,6 +1369,47 @@ int main() {
     passed &= run("an optional wave body may merge a value into a ballot whose argument is false on every helper lane", [&] { return optionalHelperFreeBallot(false); });
     passed &= run("an optional wave body cannot merge a value into a ballot that helper lanes contribute to", [&] { return !optionalHelperFreeBallot(true); });
 
+    const auto optionalQuadBody = [&](bool otherQuads, bool uniformGate, bool laneGate) {
+        Builder b;
+        b.program.Resources().stage = IrShaderStage::Pixel;
+        auto& entry = *b.block;
+        auto& zero = b.constant(0u);
+        auto& live = b.logicalAnd(pixelPredicate(b), helperPredicate(b, false));
+        auto& otherCoordinate = b.emit(IrOpcode::GetBuiltin, IrType::U32, {&b.constant(static_cast<std::uint32_t>(StageInputKind::FragCoord)), &b.constant(1u)});
+        auto& other = b.logicalAnd(b.emit(IrOpcode::INotEqual32, IrType::Bool, {&otherCoordinate, &zero}), helperPredicate(b, false));
+        auto& gate = laneGate ? b.emit(IrOpcode::INotEqual32, IrType::Bool, {&otherCoordinate, &zero}) : b.emit(IrOpcode::INotEqual32, IrType::Bool, {&b.emit(IrOpcode::GetUserData, IrType::U32, {}), &zero});
+        auto& predicate = uniformGate ? b.logicalAnd(live, gate) : live;
+        auto& quads = wholeQuads(b, otherQuads ? other : live);
+        auto& condition = b.emit(IrOpcode::LogicalNot, IrType::Bool, {&predicate});
+        auto& body = b.newBlock();
+        auto& merge = b.newBlock();
+        entry.AddBranch(&body);
+        entry.AddBranch(&merge);
+        body.AddBranch(&merge);
+        auto& entryInfo = b.program.Metadata().blockInfo[0u];
+        entryInfo.terminator.kind = TerminatorKind::ConditionalBranch;
+        entryInfo.terminator.condition = BranchCondition::ExecZero;
+        entryInfo.terminator.trueBlock = merge.Id();
+        entryInfo.terminator.falseBlock = body.Id();
+        entryInfo.condition = &condition;
+        auto& bodyInfo = b.program.Metadata().blockInfo[1u];
+        bodyInfo.terminator.kind = TerminatorKind::Branch;
+        bodyInfo.terminator.trueBlock = merge.Id();
+        b.block = &body;
+        auto& written = b.select(uniformGate ? live : quads, b.constant(42u), zero);
+        b.block = &merge;
+        auto& merged = b.phi(IrType::U32, entry, zero);
+        merged.AddPhiOperand(&body, &written);
+        b.keep(merged);
+        exportUnder(b, b.truth(), true, true);
+        return StencilReplaySafe(b.program);
+    };
+
+    passed &= run("an optional wave body may merge a value selected by the whole-quad expansion of its predicate's ballot", [&] { return optionalQuadBody(false, false, false); });
+    passed &= run("an optional wave body cannot merge a value selected by the whole-quad expansion of another predicate", [&] { return !optionalQuadBody(true, false, false); });
+    passed &= run("an optional wave body gated by a uniform value is checked against the per-lane part of its predicate", [&] { return optionalQuadBody(false, true, false); });
+    passed &= run("an optional wave body gated by a per-lane value is not checked against one part of its predicate", [&] { return !optionalQuadBody(false, true, true); });
+
     const auto optionalPixelRegion = [&](bool unmaskedArm) {
         Builder b;
         b.program.Resources().stage = IrShaderStage::Pixel;

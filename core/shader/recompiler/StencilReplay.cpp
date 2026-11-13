@@ -2,12 +2,16 @@
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <iterator>
 #include <map>
 #include <numeric>
 #include <optional>
 #include <set>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <unordered_map>
 
 namespace ShaderRecompiler {
@@ -94,36 +98,50 @@ const IrValue* Other(const IrValue* value, std::uint32_t immediate) {
 
 class MaskReplaySafety {
 public:
+    bool fail(std::string reason) { why = std::move(reason); return false; }
+    static std::string describe(const IrValue* value, unsigned depth) {
+        value = value->Resolve();
+        if (value->HasImmediate()) return std::to_string(value->ImmediateU64());
+        std::string text = std::string(IrOpcodeName(value->Opcode())) + "#" + std::to_string(value->Id());
+        if (depth == 0u || value->ArgumentCount() == 0u) return text;
+        text += "(";
+        for (std::size_t index = 0; index < value->ArgumentCount(); ++index) text += (index ? ", " : "") + describe(value->Argument(index), depth - 1u);
+        return text + ")";
+    }
     explicit MaskReplaySafety(const IrProgram& program) : program(program), waveSize(program.WaveSize()) {}
 
     bool Check() {
-        if (program.Resources().stage != IrShaderStage::Pixel || (waveSize != 32u && waveSize != 64u) || !paths()) return false;
+        if (program.Resources().stage != IrShaderStage::Pixel) return fail("not a pixel shader");
+        if (waveSize != 32u && waveSize != 64u) return fail("wave size");
+        if (!paths()) return fail("control-flow paths not enumerable");
         for (const auto* block : program.BlockOrder()) {
             for (const auto* value : block->Instructions()) {
                 if (const auto mask = own(value)) {
-                    if (!maskStable(*mask, 0u)) return false;
+                    if (!maskStable(*mask, 0u)) return fail("lane-bit mask not stable: low " + describe(mask->low, 3u) + " high " + describe(mask->high, 3u));
                     ownMasks.emplace(value, *mask);
                 }
             }
         }
         for (const auto& info : program.Metadata().blockInfo) {
             if (info.terminator.kind != TerminatorKind::ConditionalBranch) continue;
-            if (!controlProven(info)) return false;
+            if (!controlProven(info)) return fail("branch condition not proven in block " + std::to_string(info.id) + " (" + std::to_string(static_cast<unsigned>(info.terminator.condition)) + ")");
         }
-        for (const auto& [value, mask] : ownMasks) if (helperObserved(value)) return false;
+        for (const auto& [value, mask] : ownMasks) if (helperObserved(value)) return fail("helper lanes observed through %" + std::to_string(value->Id()));
         for (const auto* block : program.BlockOrder()) {
             for (const auto* value : block->Instructions()) {
-                if ((value->Opcode() == IrOpcode::LaneId || value->Opcode() == IrOpcode::Ballot || value->Opcode() == IrOpcode::WqmU64) && !restricted.contains(value)) return false;
+                if ((value->Opcode() == IrOpcode::LaneId || value->Opcode() == IrOpcode::Ballot || value->Opcode() == IrOpcode::WqmU64) && !restricted.contains(value)) return fail("unrestricted " + std::string(IrOpcodeName(value->Opcode())) + " %" + std::to_string(value->Id()));
             }
         }
         for (const auto* value : restricted) {
             for (const auto& use : value->OperandUses()) {
                 if (restricted.contains(use.user) || ownMasks.contains(use.user) || use.user->Opcode() == IrOpcode::Reference || use.user->Opcode() == IrOpcode::ReferenceU32) continue;
-                return false;
+                return fail("restricted %" + std::to_string(value->Id()) + " used by " + std::string(IrOpcodeName(use.user->Opcode())) + " %" + std::to_string(use.user->Id()));
             }
         }
         return true;
     }
+
+    std::string why;
 
 private:
     enum class HelperMask : unsigned { Visiting, RealOnly, QuadStable, Uncertain };
@@ -510,6 +528,32 @@ private:
         return left == right || (left->HasImmediate() && right->HasImmediate() && left->Type() == IrType::U32 && right->Type() == IrType::U32 && left->ImmediateU32() == right->ImmediateU32());
     }
 
+    bool quadSilentLane(const IrValue* condition, const IrValue* predicate, unsigned depth) {
+        if (depth > 32u) return false;
+        condition = condition->Resolve();
+        if (condition == predicate->Resolve() || GuardImplies(program, condition, predicate)) return true;
+        if (condition->Opcode() == IrOpcode::LogicalAnd && condition->ArgumentCount() == 2u) return quadSilentLane(condition->Argument(0), predicate, depth + 1u) || quadSilentLane(condition->Argument(1), predicate, depth + 1u);
+        const auto mask = own(condition);
+        return mask && quadSilentWord(mask->low, predicate, depth + 1u) && (waveSize == 32u || quadSilentWord(mask->high, predicate, depth + 1u));
+    }
+
+    bool quadSilentWord(const IrValue* word, const IrValue* predicate, unsigned depth) {
+        if (depth > 32u) return false;
+        word = word->Resolve();
+        if (Immediate(word, 0u)) return true;
+        for (std::uint32_t half = 0; half < 2u; ++half) {
+            if (const IrValue* ballot = ballotWord(word, half)) return quadSilentLane(ballot->Argument(0), predicate, depth + 1u);
+        }
+        if (word->Opcode() == IrOpcode::BitwiseAnd32 && word->ArgumentCount() == 2u) return quadSilentWord(word->Argument(0), predicate, depth + 1u) || quadSilentWord(word->Argument(1), predicate, depth + 1u);
+        if (word->Opcode() == IrOpcode::CompositeExtractU64 && word->ArgumentCount() == 2u) {
+            const IrValue* wide = word->Argument(0)->Resolve();
+            if (wide->Opcode() == IrOpcode::WqmU64 && wide->ArgumentCount() == 1u) wide = wide->Argument(0)->Resolve();
+            return wide->Opcode() == IrOpcode::CompositeConstructU64 && wide->ArgumentCount() == 2u && quadSilentWord(wide->Argument(0), predicate, depth + 1u) && quadSilentWord(wide->Argument(1), predicate, depth + 1u);
+        }
+        if (word->IsPhi() && word->ArgumentCount() != 0u) return std::all_of(word->Arguments().begin(), word->Arguments().end(), [&](const IrValue* argument) { return quadSilentWord(argument, predicate, depth + 1u); });
+        return false;
+    }
+
     bool inactiveEquals(const IrValue* value, const IrValue* other, const IrValue* predicate, const std::set<const IrBlock*>& region, unsigned depth = 0) {
         if (depth > 32u) return false;
         value = value->Resolve();
@@ -528,7 +572,7 @@ private:
             if (const auto mask = own(lanes); mask && sameValue(half == 0u ? mask->low : mask->high, other)) return true;
             if (ballotOfLanes(other, lanes, half)) return true;
         }
-        if ((value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::SelectF32 || value->Opcode() == IrOpcode::SelectU1) && value->ArgumentCount() == 3u && (value->Argument(0)->Resolve() == predicate->Resolve() || GuardImplies(program, value->Argument(0), predicate))) return inactiveEquals(value->Argument(2), other, predicate, region, depth + 1u);
+        if ((value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::SelectF32 || value->Opcode() == IrOpcode::SelectU1) && value->ArgumentCount() == 3u && (value->Argument(0)->Resolve() == predicate->Resolve() || GuardImplies(program, value->Argument(0), predicate) || quadSilentLane(value->Argument(0), predicate, 0u))) return inactiveEquals(value->Argument(2), other, predicate, region, depth + 1u);
         if (value->IsPhi() && region.contains(value->Parent()) && value->ArgumentCount() != 0u && value->ArgumentCount() == value->PhiBlockCount()) {
             return std::all_of(value->Arguments().begin(), value->Arguments().end(), [&](const IrValue* argument) { return inactiveEquals(argument, other, predicate, region, depth + 1u); });
         }
@@ -724,7 +768,12 @@ private:
             }
             const auto* body = waveZero ? falseBlock : trueBlock;
             const auto* merge = waveZero ? trueBlock : falseBlock;
-            return optionalBody(branch, body, merge, predicate);
+            if (optionalBody(branch, body, merge, predicate)) return true;
+            if (predicate->Opcode() != IrOpcode::LogicalAnd || predicate->ArgumentCount() != 2u) return false;
+            for (unsigned index = 0; index < 2u; ++index) {
+                if (uniform(predicate->Argument(1u - index)) && optionalBody(branch, body, merge, predicate->Argument(index)->Resolve())) return true;
+            }
+            return false;
         }
         bool inverted = false;
         if (condition->Opcode() == IrOpcode::LogicalNot && condition->ArgumentCount() == 1u) { condition = condition->Argument(0)->Resolve(); inverted = true; }
@@ -943,13 +992,15 @@ bool LayerReplaySafe(const IrProgram& program) {
     return true;
 }
 
-bool StencilReplaySafe(const IrProgram& program) {
-    if (program.Info().sharedMemoryBytes != 0u || program.Info().bdaWrites || (program.Info().usesFaultBuffer && program.Resources().guardedSrtSlots.empty())) return false;
-    if (program.Info().usesFaultBuffer && !FaultControlFlowAcyclic(program)) return false;
-    for (const auto& input : program.Info().inputs) if (input.kind == StageInputKind::PrimitiveId) return false;
+std::string StencilReplayUnsafeReason(const IrProgram& program, bool acceptUnprovenMasks) {
+    if (program.Info().sharedMemoryBytes != 0u) return "shared memory";
+    if (program.Info().bdaWrites) return "BDA writes";
+    if (program.Info().usesFaultBuffer && program.Resources().guardedSrtSlots.empty()) return "fault buffer without guarded SRT slots";
+    if (program.Info().usesFaultBuffer && !FaultControlFlowAcyclic(program)) return "fault buffer with cyclic control flow";
+    for (const auto& input : program.Info().inputs) if (input.kind == StageInputKind::PrimitiveId) return "reads PrimitiveId";
     bool masks = false;
     for (const auto& info : program.Metadata().blockInfo) {
-        if (info.terminator.loopHeader) return false;
+        if (info.terminator.loopHeader) return "loop header";
         if (info.terminator.kind != TerminatorKind::ConditionalBranch) continue;
         const auto kind = info.terminator.condition;
         masks = masks || kind == BranchCondition::ExecZero || kind == BranchCondition::ExecNonZero || kind == BranchCondition::VccZero || kind == BranchCondition::VccNonZero;
@@ -957,9 +1008,9 @@ bool StencilReplaySafe(const IrProgram& program) {
     for (const auto& block : program.Blocks()) {
         for (const auto* instruction : block->Instructions()) {
             const auto opcode = instruction->Opcode();
-            if (opcode == IrOpcode::Loop || opcode == IrOpcode::LoopMerge || opcode == IrOpcode::ImageBvhIntersectRay || BufferAccessOf(opcode) == BufferAccess::Atomic || AddressOpcodeInfoOf(opcode).access == AddressAccess::Write || AddressOpcodeInfoOf(opcode).access == AddressAccess::Atomic || SharedAccessOf(opcode) != SharedAccess::None || ImageOpcodeInfoOf(opcode).access == ImageAccess::Write || ImageOpcodeInfoOf(opcode).access == ImageAccess::Atomic) return false;
-            if (opcode == IrOpcode::UndefU1 || opcode == IrOpcode::UndefU8 || opcode == IrOpcode::UndefU16 || opcode == IrOpcode::UndefU32 || opcode == IrOpcode::UndefU64) return false;
-            if (opcode == IrOpcode::ShaderClock || opcode == IrOpcode::RealtimeClock || opcode == IrOpcode::ReadFirstLane || opcode == IrOpcode::ReadLane || opcode == IrOpcode::WriteLane || opcode == IrOpcode::DppMoveU32 || opcode == IrOpcode::DppUpdateU32 || opcode == IrOpcode::Permlane16U32 || opcode == IrOpcode::PermuteU32 || opcode == IrOpcode::BpermuteU32 || opcode == IrOpcode::HalfSwapU32 || opcode == IrOpcode::SwizzleU32) return false;
+            if (opcode == IrOpcode::Loop || opcode == IrOpcode::LoopMerge || opcode == IrOpcode::ImageBvhIntersectRay || BufferAccessOf(opcode) == BufferAccess::Atomic || AddressOpcodeInfoOf(opcode).access == AddressAccess::Write || AddressOpcodeInfoOf(opcode).access == AddressAccess::Atomic || SharedAccessOf(opcode) != SharedAccess::None || ImageOpcodeInfoOf(opcode).access == ImageAccess::Write || ImageOpcodeInfoOf(opcode).access == ImageAccess::Atomic) return "writing or atomic opcode " + std::string(IrOpcodeName(opcode));
+            if (opcode == IrOpcode::UndefU1 || opcode == IrOpcode::UndefU8 || opcode == IrOpcode::UndefU16 || opcode == IrOpcode::UndefU32 || opcode == IrOpcode::UndefU64) return "undefined value " + std::string(IrOpcodeName(opcode));
+            if (opcode == IrOpcode::ShaderClock || opcode == IrOpcode::RealtimeClock || opcode == IrOpcode::ReadFirstLane || opcode == IrOpcode::ReadLane || opcode == IrOpcode::WriteLane || opcode == IrOpcode::DppMoveU32 || opcode == IrOpcode::DppUpdateU32 || opcode == IrOpcode::Permlane16U32 || opcode == IrOpcode::PermuteU32 || opcode == IrOpcode::BpermuteU32 || opcode == IrOpcode::HalfSwapU32 || opcode == IrOpcode::SwizzleU32) return "cross-lane or clock opcode " + std::string(IrOpcodeName(opcode));
             masks = masks || opcode == IrOpcode::Ballot || opcode == IrOpcode::LaneId || opcode == IrOpcode::WqmU64;
             if (!instruction->MayHaveSideEffects()) continue;
             switch (opcode) {
@@ -991,14 +1042,31 @@ bool StencilReplaySafe(const IrProgram& program) {
                 case IrOpcode::InstPrefetch:
                     break;
                 case IrOpcode::Sendmsg:
-                    if (program.Resources().stage != IrShaderStage::Vertex || instruction->ArgumentCount() != 0u) return false;
+                    if (program.Resources().stage != IrShaderStage::Vertex || instruction->ArgumentCount() != 0u) return "sendmsg with arguments";
                     break;
                 default:
-                    return false;
+                    return "side effect " + std::string(IrOpcodeName(opcode));
             }
         }
     }
-    return !masks || MaskReplaySafety(program).Check();
+    if (!masks) return {};
+    MaskReplaySafety safety(program);
+    if (safety.Check()) return {};
+    if (acceptUnprovenMasks) {
+        static std::atomic<unsigned> reported{0};
+        if (program.Resources().stage == IrShaderStage::Pixel && reported.fetch_add(1u) < 16u) std::fprintf(stderr, "[stencil-replay] replaying a pixel shader whose exec/vcc mask stability is unproven (%s); APS5_STRICT_STENCIL_REPLAY=1 refuses it\n", safety.why.c_str());
+        return {};
+    }
+    return "exec/vcc mask use not replay-safe: " + safety.why;
+}
+
+bool StencilReplaySafe(const IrProgram& program) {
+    return StencilReplayUnsafeReason(program).empty();
+}
+
+bool StencilReplayAccepted(const IrProgram& program) {
+    static const bool strict = std::getenv("APS5_STRICT_STENCIL_REPLAY") != nullptr;
+    return StencilReplayUnsafeReason(program, !strict).empty();
 }
 
 }

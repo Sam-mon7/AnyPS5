@@ -461,7 +461,10 @@ void DefineOutputs(SpirvEmitterState& state) {
                 const auto values = StencilReferenceValues(state.program, PixelInfo(state).psStencilOperationValueExport ? 8u : 0u);
                 if (values.empty()) throw std::runtime_error("stencil reference export emulation found no stencil export");
                 if (!StencilReferenceDefinedForKeptInvocations(state.program)) throw std::runtime_error("stencil reference export emulation requires a stencil export on every kept path");
-                if (PixelInfo(state).psEarlyZ || PixelInfo(state).psOrderedPixelShader || !StencilReplaySafe(state.program)) throw std::runtime_error("stencil reference export emulation requires a replay-safe pixel shader with late tests");
+                if (PixelInfo(state).psEarlyZ || PixelInfo(state).psOrderedPixelShader || !StencilReplayAccepted(state.program)) {
+                    const auto unsafe = StencilReplayUnsafeReason(state.program);
+                    throw std::runtime_error(std::string("stencil reference export emulation requires a replay-safe pixel shader with late tests (") + (PixelInfo(state).psEarlyZ ? "early Z; " : "") + (PixelInfo(state).psOrderedPixelShader ? "ordered pixel shader; " : "") + (unsafe.empty() ? "replay-safe" : "unsafe: " + unsafe) + ")");
+                }
                 state.stencilReplay = true;
                 state.stencilRefVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeI32(state)), spv::StorageClassPrivate);
                 if (state.spirvVersion >= 0x00010400u) state.interfaceVariables.push_back(state.stencilRefVariable);
