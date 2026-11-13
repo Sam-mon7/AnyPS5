@@ -3,10 +3,7 @@
 //                 thread holds the GPU mutex (also for the draw finisher). Neither may throw or hang;
 //                 items commit in order and the caller's hold is back at its depth afterwards.
 //   --sample-on   the switch alone pipelines queue 0 (depth 8, dispatch items).
-//   --sample-off  neither the switch nor APS5_PIPELINED_DRAWS: unpipelined.
 //   --sample-env  APS5_PIPELINED_DRAWS=0 with the switch on: the variable decides alone.
-//   --transition  a runtime toggle off drains what pipelined submissions left queued before the next
-//                 submission runs unpipelined.
 //   --keep-registers   (with APS5_ARCHB_PIPE_KEEP_INDIRECT_REGS=1) a SET_CONTEXT_REG_INDIRECT whose table a
 //                 queued item writes keeps the pipeline: its valid list was read at submission.
 //   --registers-drain  (without it) the same packet drains, as before the cut.
@@ -116,9 +113,10 @@ void Sample(std::string_view mode) {
     const bool pipelined = DrawPipeline::SampleQueue0(viaSwitch);
     if (mode == "--sample-on") {
         check(pipelined && viaSwitch, "the switch did not pipeline queue 0");
-        check(DrawPipeline::Depth() == 0 && DrawPipeline::Capacity() == 8, "the switch did not select depth 8");
+        check(DrawPipeline::Depth() == 8 && DrawPipeline::Capacity() == 8, "the switch did not select depth 8");
     } else if (mode == "--sample-off") {
-        check(!pipelined && !viaSwitch, "queue 0 pipelined with neither the switch nor APS5_PIPELINED_DRAWS");
+        check(pipelined && !viaSwitch, "the disabled switch did not preserve the upstream queue 0 pipeline");
+        check(DrawPipeline::Depth() == 8 && DrawPipeline::Capacity() == 8, "the upstream default did not select depth 8");
     } else {
         check(!pipelined && !viaSwitch, "the switch overrode APS5_PIPELINED_DRAWS=0");
     }
@@ -149,6 +147,8 @@ void Transition() {
     setEnvironment("APS5_ARCHB_CONTROL_FILE", path.string().c_str());
     Switches::Initialize();
     check(Switches::Enabled(Feature::PipeQ0Committer), "the switch did not start on");
+    bool viaSwitch = false;
+    check(DrawPipeline::SampleQueue0(viaSwitch) && viaSwitch, "the enabled switch did not select the local pipeline mode");
 
     alignas(256) static std::array<std::uint32_t, 64> first{};
     alignas(256) static std::array<std::uint32_t, 64> second{};
@@ -180,12 +180,15 @@ void Transition() {
     Switches::PollControl();
     check(!Switches::Enabled(Feature::PipeQ0Committer), "the switch did not turn off");
 
-    // The next submission copies what the queued store writes; unpipelined it would read 0s unless
-    // the transition drain commits the queued items first.
+    check(DrawPipeline::SampleQueue0(viaSwitch) && !viaSwitch, "turning the local switch off disabled the upstream pipeline");
+    check(DrawPipeline::Depth() == 8 && DrawPipeline::Capacity() == 8, "turning the local switch off changed the upstream depth");
     const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(0x100);
+    const auto queuedBefore = DrawPipeline::Queue0().Outstanding();
+    std::atomic<bool> copyQueued{false};
     std::thread releaser([&] {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (DrawPipeline::DrainRequestsByOpcode(0x100) == drainsBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        while (DrawPipeline::Queue0().Outstanding() <= queuedBefore && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        copyQueued.store(DrawPipeline::Queue0().Outstanding() > queuedBefore, std::memory_order_release);
         release->store(true, std::memory_order_release);
     });
     const auto copy = DmaData(false, firstAddress, 0, secondAddress, static_cast<std::uint32_t>(sizeof(second)));
@@ -193,11 +196,12 @@ void Transition() {
     Submit(words);
     AgcDriverWaitIdle_nid_postfix();
     releaser.join();
-    check(DrawPipeline::DrainRequestsByOpcode(0x100) > drainsBefore, "the unpipelined submission did not drain the pipeline first");
+    check(copyQueued.load(std::memory_order_acquire), "the upstream pipeline did not queue the copy behind the held store");
+    check(DrawPipeline::DrainRequestsByOpcode(0x100) == drainsBefore, "the local switch transition unnecessarily disabled and drained the upstream pipeline");
     for (const auto word : first) check(word == 0x7a11c0deu, "the queued store did not land");
-    for (const auto word : second) check(word == 0x7a11c0deu, "the unpipelined copy ran before the queued store committed");
+    for (const auto word : second) check(word == 0x7a11c0deu, "the upstream-pipelined copy ran before the queued store committed");
     check(!DrawPipeline::Queue0().Busy(), "items stayed queued after the transition");
-    std::cout << "transition drained\n";
+    std::cout << "transition preserved upstream pipeline ordering\n";
 }
 
 void Registers(bool keep) {

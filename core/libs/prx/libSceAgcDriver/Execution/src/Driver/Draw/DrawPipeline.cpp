@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
+#include "prx/libc/include/HostThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -390,6 +392,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    ReserveFinisherCore();
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
@@ -460,7 +463,7 @@ std::size_t DrawPipeline::Depth() {
     static const std::size_t depth = [] {
         const char* text = std::getenv("APS5_PIPELINED_DRAWS");
         if (pipelineBlocked()) return std::size_t{0};
-        if (text == nullptr) return std::size_t{0};
+        if (text == nullptr) return SwitchDepth;
         const auto value = std::strtoull(text, nullptr, 10);
         return value == 0 ? std::size_t{0} : value == 1 ? SwitchDepth : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
@@ -471,12 +474,14 @@ bool DrawPipeline::SampleQueue0(bool& viaSwitch) {
     viaSwitch = false;
     static const bool environment = std::getenv("APS5_PIPELINED_DRAWS") != nullptr;
     if (environment) return Depth() != 0;
-    if (pipelineBlocked() || !ArchB::Switches::Enabled(ArchB::Feature::PipeQ0Committer)) return false;
-    viaSwitch = true;
-    return true;
+    if (pipelineBlocked()) return false;
+    viaSwitch = ArchB::Switches::Enabled(ArchB::Feature::PipeQ0Committer);
+    return viaSwitch || Depth() != 0;
 }
 
 std::size_t DrawPipeline::Capacity() {
+    static const bool environment = std::getenv("APS5_PIPELINED_DRAWS") != nullptr;
+    if (!environment && ArchB::Switches::Enabled(ArchB::Feature::PipeQ0Committer) && ArchB::Switches::Enabled(ArchB::Feature::PipeDeepQueue)) return DeepSwitchDepth;
     const auto depth = Depth();
     if (depth != 0) return depth;
     return ArchB::Switches::Enabled(ArchB::Feature::PipeDeepQueue) ? DeepSwitchDepth : SwitchDepth;
@@ -950,7 +955,7 @@ void DrawPipeline::enqueue(Item item) {
     outstanding.fetch_add(1, std::memory_order_release);
     pipeCounters().enqueues.fetch_add(1, std::memory_order_relaxed);
     if (!thread.joinable()) {
-        thread = std::thread([this] {
+        thread = Libc::StartHostThread([this] {
             GuestMemory::MarkProofThread();
             run();
         });
@@ -1102,6 +1107,7 @@ void DrawPipeline::run() {
     // (ReleaseRunningReads clears the running item's reads during its commit).
     std::vector<Range> stage4Reads;
     std::vector<Range> stage4Writes;
+    ReserveCommitterCore();
     StartCommitterSampler();
     static std::atomic<std::uint64_t> recorderCommits{0};
     static const bool registered = [] { ArchB::Recorder::RegisterCounter("draw_pipeline_commits", recorderCommits); return true; }();

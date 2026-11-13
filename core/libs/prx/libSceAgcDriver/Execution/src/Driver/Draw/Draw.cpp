@@ -4,7 +4,6 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
-#include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -13,13 +12,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/LiveSequence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/RepeatCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
-#include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -31,12 +28,9 @@
 #include <cstdio>
 #include <unordered_set>
 #include <cstdlib>
-#include <algorithm>
 #include <map>
-#include <cstdio>
 #include <cstring>
 #include <unordered_map>
-#include <atomic>
 #include <exception>
 #include <mutex>
 #include <set>
@@ -167,6 +161,7 @@ struct DrawTail {
     std::chrono::steady_clock::time_point phaseLap{};
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
     Pm4::DrawParameters drawParameters{};
+    Pm4::DrawParameters resolvedParameters{};
     bool pipelined = false;
     bool traceIndirect = false;
     std::uint64_t dumpTarget = 0;
@@ -1036,6 +1031,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& drawParameters = tail.drawParameters;
     try {
         drawParameters = Pm4::ResolveDraw(packet, queue);
+        tail.resolvedParameters = drawParameters;
     } catch (...) {
         TraceDrawAttemptException(traceToken, "resolve-draw", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -1692,6 +1688,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             PerformanceTimer finishTiming("Driver.DrawFinish");
             try {
                 if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
+            } catch (const RefusedDraw& refused) {
+                CaptureTrace::Log("draw-refused submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, refused.what());
+                ReportRefusedDraw(refused);
             } catch (const std::exception& error) {
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
@@ -1875,7 +1874,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
-        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
+        if (vertexInfos[i]) {
+            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
+            vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
+            Graphics::ApplyPointSize(graphics, *vertexInfos[i]);
+        }
     };
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
 
@@ -1891,6 +1894,23 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             std::memcpy(words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
         }
     };
+    const auto joinedRuns = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> joined;
+        for (const auto& run : runs) {
+            if (!joined.empty() && joined.back().second == run.first) joined.back().second = run.second;
+            else joined.push_back(run);
+        }
+        return joined;
+    };
+    const auto listRuns = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+        std::string text;
+        for (std::size_t run = 0; run < runs.size() && run < 4; ++run) {
+            char item[48];
+            std::snprintf(item, sizeof(item), " [0x%llx,0x%llx)", static_cast<unsigned long long>(runs[run].first), static_cast<unsigned long long>(runs[run].second));
+            text += item;
+        }
+        return text;
+    };
     const auto verifyDataStage = [&](std::size_t i, const DrawDataCandidate& candidate) {
         const auto& kept = *candidate.variant;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
@@ -1898,13 +1918,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         freshRuns(i, runs, words);
         const auto& compiled = *stageCaptures[i].compiled;
         const bool masked = tail.feedbackMask && candidate.feedbackHit;
-        const bool sameRuns = tail.feedbackMask ? SameCapturedRuns(kept.runs, runs) : kept.runs == runs;
-        const char* what = !sameRuns ? "runs" : !FeedbackWordsEqual(kept.words, words, masked ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(kept.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}) ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : (masked ? !FeedbackBindingsEqual(kept, *kept.compiled, compiled, true) : compiled.pushConstants != kept.compiled->pushConstants) ? "bindings" : nullptr;
+        const bool sameRuns = tail.feedbackMask ? SameCapturedRuns(kept.runs, runs) : joinedRuns(kept.runs) == joinedRuns(runs);
+        const char* what = !sameRuns ? "runs" : !FeedbackWordsEqual(kept.words, words, masked ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(kept.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}) ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : (masked ? !FeedbackBindingsEqual(kept, *kept.compiled, compiled, true) : compiled.pushConstants != kept.compiled->pushConstants) ? (masked ? "bindings" : "push constants") : nullptr;
         ++dataVerified;
         if (candidate.feedbackHit) ArchB::Recorder::Count(what == nullptr ? "fix_tsharp_mask_verified" : "fix_tsharp_mask_verify_mismatches");
         if (what == nullptr) return;
-        char message[320];
-        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey));
+        char message[640];
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx; kept%s; fresh%s)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey), listRuns(joinedRuns(kept.runs)).c_str(), listRuns(joinedRuns(runs)).c_str());
         throw std::runtime_error(message);
     };
     const auto verifyStageData = [&](std::size_t i) {
@@ -1916,9 +1936,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& fresh = *stageCaptures[i].compiled;
         const auto& patched = hit.compiled != nullptr ? *hit.compiled : *kept.compiled;
         const auto& expectedWords = hit.compiled != nullptr ? hit.words : kept.words;
-        const bool sameBindings = FeedbackBindingsEqual(kept, patched, fresh, tail.feedbackMask);
-        const bool sameRuns = tail.feedbackMask ? SameCapturedRuns(kept.runs, runs) : kept.runs == runs;
-        const char* what = !sameRuns ? "runs" : !FeedbackWordsEqual(expectedWords, words, tail.feedbackMask ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(kept.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}) ? "words" : fresh.variantId != patched.variantId ? "variant" : !sameBindings ? "bindings" : nullptr;
+        const bool sameBindings = (tail.feedbackMask ? FeedbackBindingsEqual(kept, patched, fresh, true) : fresh.bindings.size() == patched.bindings.size() && std::equal(fresh.bindings.begin(), fresh.bindings.end(), patched.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; }));
+        const bool sameRuns = tail.feedbackMask ? SameCapturedRuns(kept.runs, runs) : joinedRuns(kept.runs) == joinedRuns(runs);
+        const char* what = !sameRuns ? "runs" : !FeedbackWordsEqual(expectedWords, words, tail.feedbackMask ? std::span<const std::pair<std::uint32_t, std::uint32_t>>(kept.feedback.memory) : std::span<const std::pair<std::uint32_t, std::uint32_t>>{}) ? "words" : fresh.variantId != patched.variantId ? "variant" : !tail.feedbackMask && fresh.pushConstants != patched.pushConstants ? "push constants" : !sameBindings ? "bindings" : nullptr;
         ++stageDataVerified;
         if (hit.bufferBaseHit) ArchB::Recorder::Count(what == nullptr ? "fix_buffer_base_verified" : "fix_buffer_base_verify_mismatches");
         if (hit.feedbackHit) ArchB::Recorder::Count(what == nullptr ? "fix_tsharp_mask_verified" : "fix_tsharp_mask_verify_mismatches");
@@ -2121,6 +2141,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         static std::mutex captureMutex;
         static std::map<std::pair<std::uint32_t, std::uint32_t>, ShaderRecompiler::RecompileResult> captureShaders;
         const auto& geometry = *graphics.stages.tessellationGeometry;
+        results.reserve(programs.size() + 2u);
         {
             std::lock_guard captureLock(captureMutex);
             auto found = captureShaders.find({geometry.esgsItemSize, geometry.primitivesPerGroup});
@@ -2446,9 +2467,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         runCaptureCheckHook();
-        if (tail.queue != nullptr && capturedMemoryChanged(memory)) {
+        if (capturedMemoryChanged(memory)) {
             const RecaptureScope recapture;
-            return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
+            if (tail.queue != nullptr) return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
+            restartFinishedDraw(tail);
+            return finishDraw(tail, timing);
         }
         phaseTiming.Phase(DrawRowVectors);
         auto writes = queuedDrawWrites(tail, graphics, stages);
@@ -2579,6 +2602,72 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
     timing.Mark("draw_and_resource_release");
     return drawn();
+}
+
+void Driver::restartFinishedDraw(DrawTail& tail) {
+    using Stage = ShaderRecompiler::ShaderStage;
+    using Role = ShaderRecompiler::ProgramRole;
+    const auto changed = [](const DrawProgram& program) {
+        return std::any_of(program.memory.begin(), program.memory.end(), [](const ShaderRecompiler::MemoryRegion& region) { return !region.bytes.empty() && GuestMemory::CompareMapped(region.guestAddress, region.bytes) != GuestMemory::Compare::Equal; });
+    };
+    if (std::any_of(tail.programs->begin(), tail.programs->end(), changed)) {
+        if (tail.programs != &tail.writablePrograms) {
+            tail.writablePrograms = *tail.programs;
+            tail.programs = &tail.writablePrograms;
+        }
+        for (auto& program : tail.writablePrograms) {
+            if (program.nullPixel || !changed(program)) continue;
+            auto snapshot = ProgramSnapshot(*tail.submission->shaders, program.binary.codeAddress, {program.snapshot->type});
+            if (snapshot == program.snapshot) continue;
+            const auto& fresh = *snapshot;
+            program.codeOffset = static_cast<std::size_t>((program.binary.codeAddress - fresh.codeAddress) / sizeof(std::uint32_t));
+            program.binary.code = std::span(fresh.code).subspan(program.codeOffset);
+            program.binary.headerAddress = fresh.headerAddress;
+            program.binary.header = fresh.header;
+            program.memory = {{{fresh.codeAddress, std::as_bytes(std::span(fresh.code))}, {fresh.headerAddress, fresh.header}}};
+            if (fresh.header.empty()) NoteRawGraphicsDraw(fresh);
+            program.snapshot = std::move(snapshot);
+        }
+    }
+    const auto& programs = *tail.programs;
+    const auto& graphics = tail.decode->state;
+    const auto& roles = tail.decode->roles;
+    const auto count = programs.size();
+    tail.gatherPlan.reset();
+    tail.live.reset();
+    tail.liveEntry.reset();
+    tail.drawParameters = tail.resolvedParameters;
+    tail.memory.clear();
+    AppendProgramMemory(tail.memory, programs);
+    tail.results.clear();
+    tail.compiledStages.clear();
+    tail.stages.clear();
+    tail.pushCursorBytes = 0;
+    tail.programResults.assign(count, nullptr);
+    tail.stageCaptures.assign(count, {});
+    tail.matched.assign(count, nullptr);
+    tail.matchedRegions.assign(count, {});
+    tail.fresh.assign(count, nullptr);
+    tail.recompiled.assign(count, false);
+    tail.dataCandidates.assign(count, {});
+    tail.reused.assign(count, false);
+    tail.stageData.assign(count, {});
+    tail.dataEntry = nullptr;
+    tail.drawHit = false;
+    tail.verifyHit = false;
+    tail.patchedStages = false;
+    for (std::size_t i = 0; i < count; ++i) {
+        tail.decodeReads[i].clear();
+        tail.vertexInfos[i].reset();
+        const auto& program = programs[i];
+        if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) continue;
+        tail.vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, tail.decodeReads[i], 8u - program.firstUserSgpr);
+        if (!tail.vertexInfos[i]) continue;
+        tail.vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
+        tail.vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
+        Graphics::ApplyPointSize(graphics, *tail.vertexInfos[i]);
+    }
+    tail.shaderMemory = std::make_unique<ShaderMemory>(tail.memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
 }
 
 namespace {

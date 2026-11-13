@@ -220,14 +220,16 @@ void CommitterMutexPriority(const std::filesystem::path& control) {
         std::lock_guard held(AgcDriver::GuestMemory::GpuMutex());
         committerBusy = true;
         bool taken = true;
-        const auto start = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::duration tryDuration{};
         std::thread trier([&] {
             AgcDriver::GuestMemory::TagGpuLockThread(0x28);
+            const auto start = std::chrono::steady_clock::now();
             taken = AgcDriver::GuestMemory::GpuMutex().try_lock();
+            tryDuration = std::chrono::steady_clock::now() - start;
             if (taken) AgcDriver::GuestMemory::GpuMutex().unlock();
         });
         trier.join();
-        Check(!taken && std::chrono::steady_clock::now() - start < 5ms, "try_lock fails at once on a held mutex (no wait for the committer)");
+        Check(!taken && tryDuration < 5ms, "try_lock fails at once on a held mutex (no wait for the committer)");
     }
     std::ofstream(control, std::ios::binary | std::ios::trunc) << "1 PIPE_COMMITTER_MUTEX_PRIORITY=0\n";
     std::this_thread::sleep_for(60ms);

@@ -67,6 +67,9 @@ struct DrawReferenceMasks {
         return a.size() == b.size() && SameBytes(reinterpret_cast<const std::byte*>(a.data()), reinterpret_cast<const std::byte*>(b.data()), a.size_bytes(), words);
     }
 };
+inline std::uint32_t KeyedPushOffset(const CompiledShader& shader) {
+    return shader.program->pushConstants.empty() ? 0u : shader.pushConstantOffset;
+}
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {
     switch (stage) {

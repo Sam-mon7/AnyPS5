@@ -678,6 +678,7 @@ void NestedSpeculationRefusesProtectionChanges() {
     static_cast<void>(AgcDriver::DriverDetail::Driver::nestedContentKey(word, static_cast<std::uint32_t>(root), readable));
     Require(readable, "nested speculation: the mapped child was refused");
     Require(AgcDriver::GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content))) == AgcDriver::GuestMemory::Compare::Equal, "nested speculation: cannot prime the mapped-page cache");
+    Require(AgcDriver::GuestMemory::Accessible(block, sizeof(content)), "nested speculation: cannot prime cached page permissions");
 #ifdef _WIN32
     DWORD previous = 0;
     Require(VirtualProtect(block, bytes, PAGE_NOACCESS, &previous) != 0, "nested speculation: cannot protect pages outside guest invalidation");

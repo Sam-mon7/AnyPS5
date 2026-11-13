@@ -173,6 +173,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     PerformanceTimer recorderTiming("Driver.LabelWait");
     recorderTiming.RecorderCounter("label_wait_ms");
     ArchB::Recorder::Count("label_waits");
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Wait);
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
@@ -187,8 +188,6 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     // Arch C label census: which thread recorded the awaited label and when, against this wait's start and end.
     ArchB::LabelCensus::WaitScope labelCensus(awaited, requireMemory);
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
-    if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
-                               *reinterpret_cast<const volatile std::uint32_t*>(awaited));
     struct WaitTrace {
         bool enabled; std::uint32_t queue; std::uint64_t address; std::chrono::steady_clock::time_point begin;
         ~WaitTrace() {
@@ -259,6 +258,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             ++outcomes.shortcutSubmits;
         }
     };
+    if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
+                               *reinterpret_cast<const volatile std::uint32_t*>(awaited));
     if (memorySatisfied()) {
         ++outcomes.atEntry;
         if (storedByOwnLabel()) epochPoint.bump = false;
@@ -587,9 +588,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
                          static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
             const auto address = awaited;
-            for (const auto& record : writeHistory()) {
-                if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4))
-                    std::fprintf(stderr, "[gpu]   earlier write by queue 0x%x opcode 0x%x at 0x%llx+0x%llx\n", record.queue, record.opcode, static_cast<unsigned long long>(record.target), static_cast<unsigned long long>(record.length));
+            {
+                std::lock_guard historyLock(writeHistoryMutex());
+                for (const auto& record : writeHistory()) {
+                    if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4))
+                        std::fprintf(stderr, "[gpu]   earlier write by queue 0x%x opcode 0x%x at 0x%llx+0x%llx\n", record.queue, record.opcode, static_cast<unsigned long long>(record.target), static_cast<unsigned long long>(record.length));
+                }
             }
 
             if (const auto reportDevice = device.Load(); reportDevice != nullptr) {

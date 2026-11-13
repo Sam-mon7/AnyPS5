@@ -1,3 +1,4 @@
+#include "PortabilitySubset.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/KeyboardOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentationPass.hpp"
@@ -167,8 +168,11 @@ public:
             VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
             device.queueCreateInfoCount = 1;
             device.pQueueCreateInfos = &queue;
-            device.enabledExtensionCount = memoryBudget ? 1 : 0;
-            device.ppEnabledExtensionNames = memoryBudget ? &budgetExtension : nullptr;
+            std::vector<const char*> extensionsEnabled;
+            if (memoryBudget) extensionsEnabled.push_back(budgetExtension);
+            AgcDriver::Tests::PortabilitySubset subset;
+            subset.Enable(context.physical, function<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties"),
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2"), extensionsEnabled, device);
             Check(function<PFN_vkCreateDevice>("vkCreateDevice")(context.physical, &device, nullptr, &context.device), "vkCreateDevice");
             if (memoryBudget) context.memoryProperties2 = function<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2");
             context.deviceProc = function<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
@@ -756,13 +760,13 @@ void pageTwoSamplerTest(const Device& device) {
     present(16ms, 0x1000, 7);
     present(33ms, 0x2000, 8);
     present(1100ms, 0x2000, 9);
-    const auto near = [](const std::optional<double>& value, double expected) { return value.has_value() && std::abs(*value - expected) < 1e-6; };
-    Require(near(sample.flipsPerSecond, 60) && near(sample.drawCacheHitPercent, 90), "66 flips and 900 of 1000 draw-cache lookups over 1.1 s are not 60 flips/s and 90 %");
+    const auto approximatelyEqual = [](const std::optional<double>& value, double expected) { return value.has_value() && std::abs(*value - expected) < 1e-6; };
+    Require(approximatelyEqual(sample.flipsPerSecond, 60) && approximatelyEqual(sample.drawCacheHitPercent, 90), "66 flips and 900 of 1000 draw-cache lookups over 1.1 s are not 60 flips/s and 90 %");
     Require(sample.droppedFrames == std::optional<std::uint64_t>{2} && sample.repeatedPresents == std::optional<std::uint64_t>{2}, "2 dropped and 2 repeated presents over 1.1 s are not shown as 2/s each");
-    Require(sample.pageFaultsPerSecond.has_value() && near(sample.unimplementedPerSecond, 1 / 1.1), "the page faults or the unimplemented calls per second are missing");
-    Require(near(sample.cpuCopyMegabytesPerSecond, 10), "11 MiB of address copies over 1.1 s are not 10 MB/s");
-    if (std::getenv("APS5_ADDRESS_COPY_MAX_MIB") == nullptr) Require(near(sample.addressCopyCapPercent, 100.0 * 11 / 64), "an 11 MiB build is not 17.2 % of the 64 MiB cap");
-    Require(near(sample.renderPassesPerFrame, 2), "6 render passes over 3 frames are not 2 per frame");
+    Require(sample.pageFaultsPerSecond.has_value() && approximatelyEqual(sample.unimplementedPerSecond, 1 / 1.1), "the page faults or the unimplemented calls per second are missing");
+    Require(approximatelyEqual(sample.cpuCopyMegabytesPerSecond, 10), "11 MiB of address copies over 1.1 s are not 10 MB/s");
+    if (std::getenv("APS5_ADDRESS_COPY_MAX_MIB") == nullptr) Require(approximatelyEqual(sample.addressCopyCapPercent, 100.0 * 11 / 64), "an 11 MiB build is not 17.2 % of the 64 MiB cap");
+    Require(approximatelyEqual(sample.renderPassesPerFrame, 2), "6 render passes over 3 frames are not 2 per frame");
     const auto queue = std::find_if(sample.busy.begin(), sample.busy.end(), [](const AgcDriver::OverlayThreadBusy& busy) { return busy.name == "Q0"; });
     Require(queue != sample.busy.end() && std::abs(queue->percent - 10) < 1e-6 && sample.queueWaits.has_value(), "110 ms of packets over 1.1 s do not make queue 0 10 % busy");
     Require(!sample.phases.empty() && sample.phases.front().name == "Driver.Packet" && std::abs(sample.phases.front().msPerFrame - 110.0 / 3) < 1e-6, "the top phase is not 110 ms of packets over 3 frames");
