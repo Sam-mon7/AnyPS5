@@ -761,7 +761,7 @@ void ExpectProof(ShaderResources& resources, const CompiledShader& shader, bool 
     ShaderResources::ProofReport report;
     Require(resources.Revalidate(std::span(&shader, 1), &report), "partial resources did not revalidate " + when);
     const char* partialProof = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF");
-    const bool enabled = partialProof != nullptr && std::string_view(partialProof) == "0";
+    const bool enabled = partialProof == nullptr || std::string_view(partialProof) == "0";
     Require(report.path == (fast && enabled ? ShaderResources::ProofPath::Fast : ShaderResources::ProofPath::Full), "partial resources took the wrong proof path " + when);
     if (fast && enabled) Require(surfaceReads.load() == 0, "partial fast proof read the snapshot " + when);
 }
@@ -798,7 +798,7 @@ void ResidencyProof(Context context, std::string_view shape, std::string_view mu
     ShaderResources resources(context, shader);
     Require(resources.Reusable() && !resources.SampledTextures().front()->ViewsStorageImage(), "residency proof needs a reusable sampled snapshot");
     const char* partialProof = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF");
-    const bool enabled = partialProof != nullptr && std::string_view(partialProof) == "0";
+    const bool enabled = partialProof == nullptr || std::string_view(partialProof) == "0";
     const bool epoch = Memory::ResourceEpochProofsEnabled();
     const bool pipeline = !epoch && std::getenv("APS5_DRAW_PIPELINE") != nullptr;
     const bool stamp = !epoch && !pipeline && AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeResolveProofs);

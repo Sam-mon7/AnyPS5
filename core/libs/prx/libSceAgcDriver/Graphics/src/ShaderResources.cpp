@@ -655,7 +655,7 @@ void logLookup(LookupRecord record) {
 void logTextureLookup(const CachedTexture& entry, const GuestTextureResource& resource, std::uint64_t generation) {
     static const bool partialProof = [] {
         const char* value = std::getenv("APS5_NO_PARTIAL_SNAPSHOT_PROOF");
-        return value != nullptr && std::strcmp(value, "0") == 0;
+        return value == nullptr || std::strcmp(value, "0") == 0;
     }();
     if (partialProof && entry.source == nullptr && entry.keys == DccKeys::Uncompressed && entry.committed.has_value() && entry.generation != 0 && !entry.texture->Released()) {
         logLookup({entry.texture.get(), resource, entry.surfaceBytes, entry.keys, entry.generation, nullptr, false, entry.committed});
@@ -736,7 +736,7 @@ std::optional<VkClearColorValue> SampledClearColor(const Context& context, const
 bool ClearSnapshotCacheEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_NO_CLEAR_SNAPSHOT_CACHE");
-        return value != nullptr && std::string_view(value) == "0";
+        return value == nullptr || std::string_view(value) == "0";
     }();
     return enabled;
 }

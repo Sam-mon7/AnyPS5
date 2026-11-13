@@ -4318,7 +4318,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             if (useMemo && epochal) {
                 auto& memo = threadCollectMemo();
                 WriteTracker::Memo merged{first, stop, epoch, serial, mapping};
-                static const bool mergeMemo = false && std::getenv("APS5_NO_COLLECT_MEMO_MERGE") == nullptr;
+                static const bool mergeMemo = std::getenv("APS5_NO_COLLECT_MEMO_MERGE") == nullptr;
                 if (mergeMemo) {
                     for (auto& entry : memo.entries) {
                         if (entry.epoch != epoch || entry.unwatched != serial || entry.mapping != mapping || entry.begin > merged.end || merged.begin > entry.end) continue;

@@ -781,7 +781,7 @@ public:
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
-        static const bool rangeSkip = false && std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
+        static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
         if (rangeSkip && collection != Collection::Fresh) {
             const auto clean = cleanRanges.upper_bound(address);
             if (clean != cleanRanges.begin() && std::prev(clean)->second >= end) return true;
@@ -1153,7 +1153,7 @@ private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         auto proven = collectableRanges.upper_bound(address);
         if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
-        static const bool rangeSkip = false && std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
+        static const bool rangeSkip = std::getenv("APS5_NO_COLLECT_RANGE_SKIP") == nullptr;
         auto position = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             if (rangeSkip) {
