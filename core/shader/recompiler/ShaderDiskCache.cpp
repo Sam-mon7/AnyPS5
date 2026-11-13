@@ -35,6 +35,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1440,6 +1441,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_RESULT_MEMO_MB",
     "APS5_TABLE_RESOLUTION_MEMO_MIB",
     "APS5_TABLE_RESOLUTION_MEMO_VARIANT_ENTRIES",
+    "APS5_SHADER_CACHE_SOURCE_VERSION",
 };
 
 const std::vector<std::byte>& switchKey() {
@@ -1931,6 +1933,16 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
+    static const std::optional<std::uint64_t> pinned = []() -> std::optional<std::uint64_t> {
+        const char* text = std::getenv("APS5_SHADER_CACHE_SOURCE_VERSION");
+        if (text == nullptr || *text == 0) return std::nullopt;
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 16);
+        if (end == text || *end != 0) throw std::runtime_error("APS5_SHADER_CACHE_SOURCE_VERSION must be a hexadecimal source version");
+        std::fprintf(stderr, "[shader-disk-cache] source version pinned to %016llx (built %016llx): entries from other recompiler sources are reused as they are\n", static_cast<unsigned long long>(value), static_cast<unsigned long long>(ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull));
+        return value;
+    }();
+    if (pinned) return *pinned;
     return ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
 }
 
