@@ -8855,7 +8855,7 @@ void ShaderResources::resolveImageTables() {
         if (storageTable) AgcDriver::ArchB::Recorder::Count("tbl_storage_excluded");
         else if (item == nullptr) AgcDriver::ArchB::Recorder::Count("tbl_no_sampled_binding");
         bool droppedMatch = false;
-        auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state, &droppedMatch);
+        auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state, AgcDriver::ArchB::Recorder::Enabled() ? &droppedMatch : nullptr);
         if (!storageTable && item != nullptr && reused == nullptr) AgcDriver::ArchB::Recorder::Count(state.epoch == 0 ? "tbl_miss_state_zero" : droppedMatch ? "tbl_miss_after_wipe" : "tbl_miss_absent");
         if (reused != nullptr && AnyPendingCpuWrites(context)) {
             bool landed = false;
