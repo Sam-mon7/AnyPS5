@@ -5,12 +5,14 @@
 #include "StencilReplay.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
 #include <initializer_list>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1156,6 +1158,34 @@ int main() {
         auto& wqm = b.emit(IrOpcode::WqmU64, IrType::U64, {&b.emit(IrOpcode::CompositeConstructU64, IrType::U64, {low, high})});
         stencilByMask(b, execCopy(b, b.emit(IrOpcode::CompositeExtractU64, IrType::U32, {&wqm, &b.constant(0u)}), b.emit(IrOpcode::CompositeExtractU64, IrType::U32, {&wqm, &b.constant(1u)})));
         return !StencilReplaySafe(b.program);
+    });
+
+    passed &= run("production acceptance relaxes unproven masks and nothing else", [&] {
+        const bool strict = std::getenv("APS5_STRICT_STENCIL_REPLAY") != nullptr;
+        {
+            Builder b;
+            b.program.Resources().stage = IrShaderStage::Pixel;
+            const auto [low, high] = b.ballotWords(helperPredicate(b, true));
+            auto& wqm = b.emit(IrOpcode::WqmU64, IrType::U64, {&b.emit(IrOpcode::CompositeConstructU64, IrType::U64, {low, high})});
+            stencilByMask(b, execCopy(b, b.emit(IrOpcode::CompositeExtractU64, IrType::U32, {&wqm, &b.constant(0u)}), b.emit(IrOpcode::CompositeExtractU64, IrType::U32, {&wqm, &b.constant(1u)})));
+            if (StencilReplaySafe(b.program)) return false;
+            if (StencilReplayUnsafeReason(b.program).find("mask") == std::string::npos) return false;
+            if (!StencilReplayUnsafeReason(b.program, true).empty()) return false;
+            if (StencilReplayAccepted(b.program) == strict) return false;
+        }
+        const auto refused = [](Builder& b) {
+            return !StencilReplayUnsafeReason(b.program, true).empty() && !StencilReplayAccepted(b.program);
+        };
+        { Builder b; b.program.Info().sharedMemoryBytes = 4u; if (!refused(b)) return false; }
+        { Builder b; b.program.Info().bdaWrites = true; if (!refused(b)) return false; }
+        { Builder b; b.program.Info().usesFaultBuffer = true; if (!refused(b)) return false; }
+        { Builder b; b.program.Metadata().blockInfo.front().terminator.loopHeader = true; if (!refused(b)) return false; }
+        for (const auto opcode : {IrOpcode::Loop, IrOpcode::PermuteU32, IrOpcode::ReadLane, IrOpcode::ReadFirstLane, IrOpcode::DppMoveU32, IrOpcode::ShaderClock, IrOpcode::UndefU32}) {
+            Builder b;
+            b.emit(opcode, opcode == IrOpcode::Loop ? IrType::Void : IrType::U32, {});
+            if (!refused(b)) return false;
+        }
+        return true;
     });
 
     passed &= run("only guarded read-only SRT diagnostics can be replayed", [] {
