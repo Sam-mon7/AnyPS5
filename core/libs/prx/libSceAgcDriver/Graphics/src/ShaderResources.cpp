@@ -8756,6 +8756,7 @@ void ShaderResources::resolveImageTables() {
                     Require(!SingleLevelSamplerWords(source.words, true, false).has_value(), "an image table entry paired with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
                 }
             } catch (const std::runtime_error& error) {
+                AgcDriver::ArchB::Recorder::Count("tbl_catch_runtime_error");
                 return error.what();
             }
             return {};
@@ -8833,6 +8834,7 @@ void ShaderResources::resolveImageTables() {
                 try {
                     decoded = decodeEntry(element, *predecoded);
                 } catch (const std::runtime_error& error) {
+                    AgcDriver::ArchB::Recorder::Count("tbl_catch_runtime_error");
                     decoded.rejected = error.what();
                 }
             }
@@ -8845,6 +8847,7 @@ void ShaderResources::resolveImageTables() {
             try {
                 texture = lookupSampled(element, sampled);
             } catch (const std::runtime_error& error) {
+                AgcDriver::ArchB::Recorder::Count("tbl_catch_runtime_error");
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
                 return error.what();
             }
@@ -8947,6 +8950,7 @@ void ShaderResources::resolveImageTables() {
             try {
                 decoded = decodeEntry(element, *predecoded);
             } catch (const std::runtime_error& error) {
+                AgcDriver::ArchB::Recorder::Count("tbl_catch_runtime_error");
                 decoded.rejected = error.what();
             }
             if (!decoded.rejected.empty()) {
@@ -8978,6 +8982,7 @@ void ShaderResources::resolveImageTables() {
                 try {
                     storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, true));
                 } catch (const std::runtime_error& error) {
+                    AgcDriver::ArchB::Recorder::Count("tbl_catch_runtime_error");
                     table.map[faults + element] = rejectTableElement(table, words, error.what());
                     continue;
                 }
@@ -9001,6 +9006,7 @@ void ShaderResources::resolveImageTables() {
             try {
                 texture = lookupSampled(element, sampled);
             } catch (const std::runtime_error& error) {
+                AgcDriver::ArchB::Recorder::Count("tbl_catch_runtime_error");
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
                 if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
                 continue;

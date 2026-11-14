@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "ThreadOwned.hpp"
@@ -441,6 +442,7 @@ std::optional<GuestTextureResource> TryDecodeTextureResource(std::span<const std
         std::copy(words.begin(), words.end(), key.begin());
         auto& failures = ShaderRecompiler::ThreadOwned(slot);
         if (const auto found = failures.find(key); found != failures.end()) {
+            AgcDriver::ArchB::Recorder::Count("tbl_decode_rejected_memo");
             if (failure != nullptr) *failure = found->second;
             return std::nullopt;
         }
@@ -448,6 +450,7 @@ std::optional<GuestTextureResource> TryDecodeTextureResource(std::span<const std
     try {
         return DecodeTextureResource(words);
     } catch (const std::runtime_error& error) {
+        AgcDriver::ArchB::Recorder::Count("tex_decode_throws");
         if (keyed) {
             auto& failures = ShaderRecompiler::ThreadOwned(slot);
             if (failures.size() >= DecodeFailureEntries) failures.clear();
