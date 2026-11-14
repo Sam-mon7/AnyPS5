@@ -6365,7 +6365,8 @@ void verifyImageTableKeyBounds() {
         return out;
     };
     const auto zeroMaskKey = [&](std::initializer_list<std::uint32_t> words, std::uint32_t zeroMaskRecord, const char* plannedMessage, const char* capturedMessage) {
-        const auto request = TableRequest(wholeWith(words), userData);
+        const auto code = wholeWith(words);
+        const auto request = TableRequest(code, userData);
         const auto column = columnOf(*GetResourcePlan(request));
         require(column.maxKey == zeroMaskRecord && Abi::KeyRecords(column.maxKey, column.stride) == zeroMaskRecord + 1u && column.bitScanKeys == 0u, plannedMessage);
         ImageTableSnapshotCounts offCounts, onCounts;
@@ -6382,8 +6383,8 @@ void verifyImageTableKeyBounds() {
             require(codes.size() == zeroMaskRecord + 1u && codes[zeroMaskRecord] != Abi::NullCode && (codes[zeroMaskRecord] & Abi::PoisonFlag) == 0u && (map.at(codes[zeroMaskRecord] + Abi::ImageRecordFlags) & Abi::PoisonFlag) == 0u, capturedMessage);
         }
     };
-    zeroMaskKey({0x7e007400u, 0x360000ffu, 0x000000ffu}, 255u, "image table key bounds: findLSB(m) & 255 was not bounded to the 255 a zero mask gives", "image table key bounds: findLSB(m) & 255 did not capture and resolve record 255 with the bit-scan switch off and on");
-    zeroMaskKey({0x7e007400u, 0x260000c0u}, 64u, "image table key bounds: min(findLSB(m), 64) was not bounded to the 64 a zero mask gives", "image table key bounds: min(findLSB(m), 64) did not capture and resolve record 64 with the bit-scan switch off and on");
+    zeroMaskKey({0xb01100ffu, 0x7e007500u, 0x36000011u}, 255u, "image table key bounds: findLSB(m) & 255 was not bounded to the 255 a zero mask gives", "image table key bounds: findLSB(m) & 255 did not capture and resolve record 255 with the bit-scan switch off and on");
+    zeroMaskKey({0x7e007500u, 0x260000c0u}, 64u, "image table key bounds: min(findLSB(m), 64) was not bounded to the 64 a zero mask gives", "image table key bounds: min(findLSB(m), 64) did not capture and resolve record 64 with the bit-scan switch off and on");
 }
 
 void verifyImageTableRegistration() {
