@@ -2850,10 +2850,34 @@ bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler
     return table.device == device && table.words == binding.guestDescriptor && table.shapes == binding.imageShapes && table.depthCompare == binding.Flags().imageDepthCompare;
 }
 
-ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
+ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state, bool* droppedMatch = nullptr) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
-    std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
+    std::uint64_t dropped = 0;
+    bool epochDiffers = false;
+    bool unwatchDiffers = false;
+    bool allocationsDiffer = false;
+    bool depthDiffers = false;
+    bool matched = false;
+    std::erase_if(tables, [&](const ReusedTable& table) {
+        if (table.state == state) return false;
+        ++dropped;
+        epochDiffers = epochDiffers || table.state.epoch != state.epoch;
+        unwatchDiffers = unwatchDiffers || table.state.unwatched != state.unwatched;
+        allocationsDiffer = allocationsDiffer || table.state.allocations != state.allocations;
+        depthDiffers = depthDiffers || table.state.depthSurfaces != state.depthSurfaces;
+        matched = matched || (droppedMatch != nullptr && SameTable(table, device, binding));
+        return true;
+    });
+    if (dropped != 0) {
+        AgcDriver::ArchB::Recorder::Count("tbl_wipes");
+        AgcDriver::ArchB::Recorder::Count("tbl_wipe_entries_dropped", static_cast<double>(dropped));
+        if (epochDiffers) AgcDriver::ArchB::Recorder::Count("tbl_wipe_epoch");
+        if (unwatchDiffers) AgcDriver::ArchB::Recorder::Count("tbl_wipe_unwatch");
+        if (allocationsDiffer) AgcDriver::ArchB::Recorder::Count("tbl_wipe_alloc_gen");
+        if (depthDiffers) AgcDriver::ArchB::Recorder::Count("tbl_wipe_depth_serial");
+    }
+    if (droppedMatch != nullptr) *droppedMatch = matched;
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
     }
@@ -2895,7 +2919,11 @@ void RememberTable(ReusedTable&& table, const ShaderRecompiler::DescriptorBindin
     table.shapes = binding.imageShapes;
     table.depthCompare = binding.Flags().imageDepthCompare;
     tables.insert(tables.begin(), std::move(table));
-    if (tables.size() > ReusedTableCount) tables.resize(ReusedTableCount);
+    AgcDriver::ArchB::Recorder::Count("tbl_remembered");
+    if (tables.size() > ReusedTableCount) {
+        AgcDriver::ArchB::Recorder::Count("tbl_evict_capacity", static_cast<double>(tables.size() - ReusedTableCount));
+        tables.resize(ReusedTableCount);
+    }
 }
 
 std::string HexText(std::uint64_t value) {
@@ -3601,7 +3629,10 @@ void ShaderResources::buildComplete() {
             source.singleLevelImage = source.mipmappedImage = false;
             source.pinnedLod.reset();
         }
+        std::optional<PerformanceTimer> imageStep;
+        if (addressSteps) imageStep.emplace("Resources.Complete.Address.Images.Deferred");
         for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
+        imageStep.reset();
         previousSampled = {};
         deferredImages.clear();
         applySamplerVariants();
@@ -3612,7 +3643,9 @@ void ShaderResources::buildComplete() {
         imageRecords.shrink_to_fit();
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
+        if (addressSteps) imageStep.emplace("Resources.Complete.Address.Images.Tables");
         resolveImageTables();
+        imageStep.reset();
         Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed during resource materialization");
         const auto imagesMs = phase(BuildPhase::Images);
         timing.imagesMs += imagesMs;
@@ -3854,25 +3887,29 @@ void ShaderResources::noteReusable() {
     spaceReuse = false;
     directRegions.clear();
     const bool spaceReusable = !htileClear.has_value() && (drawBuild ? !SpaceReuseDisabled() : allowDispatchSpaceReuse && DispatchSpaceReuseEnabled()) && usesBda && bdaReadOnly && guestMemory.SpaceOnly() && !guestMemory.HasCopiedWrites() && multisampleSources.empty() && !(bda != nullptr && LoopGuardEnabled());
-    const auto blocked = [&](const char* reason) { reuseBlockReason = reason; };
+    const auto blocked = [&](const char* reason, const char* counter) {
+        reuseBlockReason = reason;
+        if (!drawBuild) AgcDriver::ArchB::Recorder::Count(counter);
+    };
     if (!spaceReusable) {
-        if (htileClear.has_value()) return blocked("htile-clear");
-        if (guestMemory.HasCopiedWrites()) return blocked("copied-writes");
-        if (HoldsLease()) return blocked("holds-lease");
-        if (usesBda) return blocked("uses-bda");
-        if (!multisampleSources.empty()) return blocked("multisample-sources");
-        if (bda != nullptr && LoopGuardEnabled()) return blocked("loop-guard");
+        if (htileClear.has_value()) return blocked("htile-clear", "rc_reuse_block_htile_clear");
+        if (guestMemory.HasCopiedWrites()) return blocked("copied-writes", "rc_reuse_block_copied_writes");
+        if (HoldsLease()) return blocked("holds-lease", "rc_reuse_block_holds_lease");
+        if (usesBda) return blocked("uses-bda", "rc_reuse_block_uses_bda");
+        if (!multisampleSources.empty()) return blocked("multisample-sources", "rc_reuse_block_multisample_sources");
+        if (bda != nullptr && LoopGuardEnabled()) return blocked("loop-guard", "rc_reuse_block_loop_guard");
     }
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return blocked("texture-per-use-refresh");
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return blocked("data-refresh-size");
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return blocked("texture-per-use-refresh", "rc_reuse_block_texture_per_use_refresh");
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return blocked("data-refresh-size", "rc_reuse_block_data_refresh_size");
     if (spaceReusable) {
         spaceReuse = true;
         reuseBlockReason = "none";
         reusable = true;
+        if (!drawBuild) AgcDriver::ArchB::Recorder::Count("rc_reuse_ok");
         return;
     }
     const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return blocked("direct-regions-unavailable");
+    if (!regions.has_value()) return blocked("direct-regions-unavailable", "rc_reuse_block_direct_regions_unavailable");
     bool mirrored = false;
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
@@ -3882,7 +3919,7 @@ void ShaderResources::noteReusable() {
         // bit set, so the two spaces never collide.
         const bool imported = serial != 0;
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return blocked("import-or-mirror-missing");
+        if (serial == 0) return blocked("import-or-mirror-missing", "rc_reuse_block_import_or_mirror_missing");
         directRegions.push_back({begin, end, serial});
         mirrored = mirrored || !imported;
     }
@@ -3898,6 +3935,7 @@ void ShaderResources::noteReusable() {
     importsReconcilable = !mirrored && !bounded;
     reuseBlockReason = "none";
     reusable = true;
+    if (!drawBuild) AgcDriver::ArchB::Recorder::Count("rc_reuse_ok");
 }
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
@@ -8803,18 +8841,28 @@ void ShaderResources::resolveImageTables() {
         const auto state = CurrentTableState();
         std::vector<std::shared_ptr<Texture>> cached;
         const bool storageTable = std::find(binding.Flags().imageWritten.begin(), binding.Flags().imageWritten.end(), true) != binding.Flags().imageWritten.end();
-        auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state);
+        AgcDriver::ArchB::Recorder::Count("tbl_tables");
+        if (storageTable) AgcDriver::ArchB::Recorder::Count("tbl_storage_excluded");
+        else if (item == nullptr) AgcDriver::ArchB::Recorder::Count("tbl_no_sampled_binding");
+        bool droppedMatch = false;
+        auto* reused = storageTable || item == nullptr ? nullptr : FindReusedTable(context.device, binding, state, &droppedMatch);
+        if (!storageTable && item != nullptr && reused == nullptr) AgcDriver::ArchB::Recorder::Count(state.epoch == 0 ? "tbl_miss_state_zero" : droppedMatch ? "tbl_miss_after_wipe" : "tbl_miss_absent");
         if (reused != nullptr && AnyPendingCpuWrites(context)) {
             bool landed = false;
             for (const auto& entry : reused->elements) {
                 if (!entry.rejected && CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes))) landed = true;
             }
-            if (landed && CurrentTableState() != state) reused = nullptr;
+            if (landed && CurrentTableState() != state) {
+                reused = nullptr;
+                AgcDriver::ArchB::Recorder::Count("tbl_miss_landed");
+            }
         }
-        if (reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
+        const bool reusedCurrent = reused != nullptr && TableCurrent(*reused);
+        if (reusedCurrent && CachedTableTextures(*reused, cached)) {
             const bool replay = TableReplay() && reused->replayable && reused->imageSamplers == binding.imageSamplers && reused->samplers == samplerKey;
             if (!replay) reused->bound.assign(binding.count, {});
             auto next = cached.begin();
+            std::uint64_t liveElements = 0;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                 const auto& entry = reused->elements[element];
@@ -8824,6 +8872,7 @@ void ShaderResources::resolveImageTables() {
                 } else if (entry.rejected) {
                     table.map[faults + element] = rejectTableElement(table, words, entry.message);
                 } else if (entry.live) {
+                    ++liveElements;
                     auto message = resolveLive(element, words);
                     if (!replay) reused->bound[element] = std::move(message);
                 } else {
@@ -8843,8 +8892,14 @@ void ShaderResources::resolveImageTables() {
                 reused->replayable = static_cast<std::uint64_t>(table.elementBase) + binding.count <= context.imageTableCapacity;
             }
             (replay ? counters.tablesReplayed : counters.tablesReused).fetch_add(1, std::memory_order_relaxed);
+            AgcDriver::ArchB::Recorder::Count(replay ? "tbl_replayed" : "tbl_reuse_hit");
+            AgcDriver::ArchB::Recorder::Count("tbl_elements_reused", static_cast<double>(binding.count - liveElements));
+            if (liveElements != 0) AgcDriver::ArchB::Recorder::Count("tbl_elements_live", static_cast<double>(liveElements));
             continue;
         }
+        if (reused != nullptr) AgcDriver::ArchB::Recorder::Count(reusedCurrent ? "tbl_miss_textures_gone" : "tbl_miss_not_current");
+        AgcDriver::ArchB::Recorder::Count("tbl_full_resolve");
+        AgcDriver::ArchB::Recorder::Count("tbl_elements_walked", static_cast<double>(binding.count));
         ReusedTable fresh;
         fresh.bound.assign(binding.count, {});
         bool reusable = state.epoch != 0;

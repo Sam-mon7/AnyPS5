@@ -4487,6 +4487,12 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
 }
 
 void BumpCollectEpoch(Gen::TicketReason reason) {
+    static constexpr const char* bumpReasonCounters[] = {"collect_epoch_bumps_by_submission", "collect_epoch_bumps_by_packet", "collect_epoch_bumps_by_wait_entry", "collect_epoch_bumps_by_wait_cpu", "collect_epoch_bumps_by_wait_gpu_label", "collect_epoch_bumps_by_wait_own", "collect_epoch_bumps_by_drain", "collect_epoch_bumps_by_reap", "collect_epoch_bumps_by_unlocked_wait", "collect_epoch_bumps_by_committer", "collect_epoch_bumps_by_present", "collect_epoch_bumps_by_uncached", "collect_epoch_bumps_by_other"};
+    static_assert(std::size(bumpReasonCounters) == static_cast<std::size_t>(Gen::TicketReason::Count));
+    const bool waitReason = reason == Gen::TicketReason::WaitEntry || reason == Gen::TicketReason::WaitCpu || reason == Gen::TicketReason::WaitGpuLabel || reason == Gen::TicketReason::WaitOwn;
+    ArchB::Recorder::Count("collect_epoch_bumps");
+    ArchB::Recorder::Count(waitReason ? "collect_epoch_bumps_wait" : "collect_epoch_bumps_other");
+    if (static_cast<std::size_t>(reason) < std::size(bumpReasonCounters)) ArchB::Recorder::Count(bumpReasonCounters[static_cast<std::size_t>(reason)]);
     census::noteBump();
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);

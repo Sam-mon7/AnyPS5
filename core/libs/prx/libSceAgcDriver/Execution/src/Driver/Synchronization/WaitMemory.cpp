@@ -205,6 +205,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         GuestMemory::Gen::TicketReason reason = GuestMemory::Gen::TicketReason::WaitCpu;
         ~EpochPoint() {
             if (bump) bumpEpoch(&EpochBumps::waits, reason);
+            ArchB::Recorder::Count(bump ? "label_wait_epoch_bumped" : "label_wait_epoch_skipped");
         }
     } epochPoint{!heldAtSubmit || requireMemory || !epochCovered};
     // V5 census (APS5_ARCHB_GEN_SHADOW): whether ticket inheritance would admit a wait satisfied by
@@ -499,6 +500,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     // leaves the event set, and the first sleep returns at once).
     const bool labelWake = !requireMemory && ArchB::LabelWake::On();
     const auto wakeSlot = ArchB::LabelWake::SlotOf(queue);
+    ArchB::Recorder::Count("label_wait_blocked");
+    if (requireMemory) ArchB::Recorder::Count("label_wait_require_memory");
+    if (wakeSlot >= ArchB::LabelWake::SlotCount) ArchB::Recorder::Count("label_wait_no_slot");
+    if (!requireMemory && !labelWake) ArchB::Recorder::Count("label_wait_wake_off");
     struct WakeArm {
         bool armed;
         std::size_t slot;
@@ -534,6 +539,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             }
         } else if (pauseSpin || polls >= 4000) {
             stage4Wait.Blocking();
+            ArchB::Recorder::Count(wakeArm.armed ? "label_wait_wake_sleeps" : "label_wait_poll_sleeps");
             if (wakeArm.armed) PollSleepOrWake(wakeSlot);
             else PollSleep();
         } else {

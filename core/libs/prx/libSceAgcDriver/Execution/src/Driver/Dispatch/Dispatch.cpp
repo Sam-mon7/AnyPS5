@@ -852,9 +852,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::uint64_t forgetAtCapture = 0;
     std::uint64_t genAtCapture = 0;
     if (cached) {
+        ArchB::Recorder::Count("dsp_cached_hits");
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         if (profile) captureMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
     } else if (!fromAhead) {
+        ArchB::Recorder::Count("dsp_capture_calls");
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan, feedbackMask);
         shaderMemory->SetImageTableSnapshotReuse(imageTableSnapshotReuse);
         shaderMemory->SetImageTableBitScanKeys(imageTableBitScanKeys);
