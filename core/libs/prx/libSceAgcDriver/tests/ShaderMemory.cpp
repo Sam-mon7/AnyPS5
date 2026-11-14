@@ -6350,6 +6350,40 @@ void verifyImageTableKeyBounds() {
         require(snapshot.keys == 41u && snapshot.records == 41u && !snapshot.outside && snapshot.codes.size() == 41u && std::none_of(snapshot.codes.begin(), snapshot.codes.end(), [](std::uint32_t code) { return (code & Abi::PoisonFlag) != 0u; }), "image table key bounds: the sentinel-preserving unsigned max did not enumerate 41 keys");
         require(TableCovered(compiled.regions, heap[40].data(), sizeof(heap[40])), "image table key bounds: the unsigned max key's record was not captured");
     }
+    static std::array<std::array<std::uint32_t, 8>, 256> wide{};
+    for (std::uint32_t entry = 0; entry < wide.size(); entry++) wide[entry] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D, entry % 64u + 1u);
+    FillTableSrt(guest, wide.data(), 32u, 256u);
+    const auto compileWith = [](RecompileRequest request, bool bitScanKeys, ImageTableSnapshotCounts& counts) {
+        TableCompiled out;
+        AgcDriver::ShaderMemory memory({});
+        memory.SetImageTableBitScanKeys(bitScanKeys);
+        memory.SetImageTableSnapshotReuse(false, &counts);
+        out.capture = memory.Capture(request);
+        out.regions = memory.Regions();
+        request.context.memory = out.regions;
+        out.result = Recompile(request, *out.capture);
+        return out;
+    };
+    const auto zeroMaskKey = [&](std::initializer_list<std::uint32_t> words, std::uint32_t zeroMaskRecord, const char* plannedMessage, const char* capturedMessage) {
+        const auto request = TableRequest(wholeWith(words), userData);
+        const auto column = columnOf(*GetResourcePlan(request));
+        require(column.maxKey == zeroMaskRecord && Abi::KeyRecords(column.maxKey, column.stride) == zeroMaskRecord + 1u && column.bitScanKeys == 0u, plannedMessage);
+        ImageTableSnapshotCounts offCounts, onCounts;
+        const auto off = compileWith(request, false, offCounts);
+        const auto on = compileWith(request, true, onCounts);
+        require(on.capture->snapshot.tables == off.capture->snapshot.tables && TableMap(*on.result) == TableMap(*off.result) && onCounts.bitScanBounded == 0u && onCounts.bitScanRefusedNoBound != 0u, capturedMessage);
+        for (const auto* compiled : {&off, &on}) {
+            const auto& snapshot = compiled->capture->snapshot.tables.tables.at(0);
+            require(snapshot.keys == zeroMaskRecord + 1u && snapshot.records == zeroMaskRecord + 1u && !snapshot.outside && snapshot.codes.size() == snapshot.keys, capturedMessage);
+            const auto code = snapshot.codes[zeroMaskRecord];
+            require((code & Abi::PoisonFlag) == 0u && snapshot.words.at(code).dwords == wide[zeroMaskRecord] && TableCovered(compiled->regions, wide[zeroMaskRecord].data(), sizeof(wide[zeroMaskRecord])), capturedMessage);
+            const auto& map = TableMap(*compiled->result);
+            const auto codes = TableCodes(map, 0);
+            require(codes.size() == zeroMaskRecord + 1u && codes[zeroMaskRecord] != Abi::NullCode && (codes[zeroMaskRecord] & Abi::PoisonFlag) == 0u && (map.at(codes[zeroMaskRecord] + Abi::ImageRecordFlags) & Abi::PoisonFlag) == 0u, capturedMessage);
+        }
+    };
+    zeroMaskKey({0x7e007400u, 0x360000ffu, 0x000000ffu}, 255u, "image table key bounds: findLSB(m) & 255 was not bounded to the 255 a zero mask gives", "image table key bounds: findLSB(m) & 255 did not capture and resolve record 255 with the bit-scan switch off and on");
+    zeroMaskKey({0x7e007400u, 0x260000c0u}, 64u, "image table key bounds: min(findLSB(m), 64) was not bounded to the 64 a zero mask gives", "image table key bounds: min(findLSB(m), 64) did not capture and resolve record 64 with the bit-scan switch off and on");
 }
 
 void verifyImageTableRegistration() {
@@ -6639,21 +6673,35 @@ void verifyImageTableBitScanKeyShader() {
     const auto lanePlan = GetResourcePlan(request(laneCode, 0x3b000u));
     require(lanePlan->descriptorSources.at(lanePlan->info.images.at(0).source).tableColumn->bitScanKeys == 0u, "bit-scan key shader: a lane key was bounded");
 
-    const auto compile = [&](bool bounded, ImageTableSnapshotCounts& counts) {
+    const auto compile = [&](const RecompileRequest& source, bool bounded, ImageTableSnapshotCounts& counts) {
         TableCompiled out;
         AgcDriver::ShaderMemory memory({});
         memory.SetImageTableBitScanKeys(bounded);
         memory.SetImageTableSnapshotReuse(false, &counts);
-        auto made = scan;
+        auto made = source;
         out.capture = memory.Capture(made);
         out.regions = memory.Regions();
         made.context.memory = out.regions;
         out.result = Recompile(made, *out.capture);
         return out;
     };
+    const auto bare = request(scanCode, 0x39000u);
+    ImageTableSnapshotCounts bareOffCounts, bareOnCounts;
+    const auto bareOff = compile(bare, false, bareOffCounts);
+    const auto bareOn = compile(bare, true, bareOnCounts);
+    require(bareOn.capture->snapshot.tables == bareOff.capture->snapshot.tables && TableMap(*bareOn.result) == TableMap(*bareOff.result), "bit-scan key shader: the switch changed a bare scan key's capture");
+    require(bareOffCounts.bitScanBounded == 0u && bareOnCounts.bitScanBounded == 0u && bareOnCounts.bitScanRefusedNotNarrower == 1u, "bit-scan key shader: the bit-scan bound was applied over an equal key bound");
+    for (const auto* compiled : {&bareOff, &bareOn}) {
+        const auto& column = compiled->capture->snapshot.tables.tables.at(0);
+        require(column.keys == 32u && column.records == 32u && !column.outside && column.codes.size() == 32u, "bit-scan key shader: a bare scan key was not captured as its 32 keys");
+        require(column.words.at(column.codes[4u]).dwords == std::array<std::uint32_t, 8>{0x1234u, 0x5678u, 0x9abcu, 0x1000ffacu, 0u, 0u, 0u, 0u} && (column.codes[31u] & Abi::PoisonFlag) == 0u, "bit-scan key shader: a bare scan key captured the wrong records");
+        require(compiled->capture->snapshot.tables.ranges == std::vector<std::pair<std::uint64_t, std::uint64_t>>{{base + Palette, 32u * 32u}}, "bit-scan key shader: a bare scan key's range is wrong");
+        require(TableCovered(compiled->regions, root + Palette / 4u, 32u * 32u) && !TableTouched(compiled->regions, root + (Palette + 32u * 32u) / 4u, Committed - Palette - 32u * 32u), "bit-scan key shader: a bare scan key's capture holds records past its 32 keys");
+        require(TableCodes(TableMap(*compiled->result), 0).size() == 32u, "bit-scan key shader: a bare scan key did not resolve 32 keys");
+    }
     ImageTableSnapshotCounts fullCounts, boundedCounts;
-    const auto full = compile(false, fullCounts);
-    const auto bounded = compile(true, boundedCounts);
+    const auto full = compile(scan, false, fullCounts);
+    const auto bounded = compile(scan, true, boundedCounts);
     const auto& fullColumn = full.capture->snapshot.tables.tables.at(0);
     const auto& boundedColumn = bounded.capture->snapshot.tables.tables.at(0);
     require(fullColumn.keys == Abi::MaxKeys && boundedColumn.keys == 32u && boundedColumn.outside && boundedCounts.bitScanBounded == 1u && fullCounts.bitScanBounded == 0u, "bit-scan key shader: the capture was not bounded");
