@@ -15,7 +15,9 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
+#include <set>
 #include <span>
 #include <string>
 #include <tuple>
@@ -179,6 +181,193 @@ U32Bound possibleU32BoundDepth(const IrValue* value, std::uint32_t depth) {
 
 std::uint32_t possibleU32UpperBound(const IrValue* value) {
     return possibleU32BoundDepth(value, 8u).upper;
+}
+
+std::uint32_t legacyU32UpperBoundDepth(const IrValue* value, std::uint32_t depth) {
+    value = value->Resolve();
+    if (value->HasImmediate()) {
+        return value->Type() == IrType::U32 ? value->ImmediateU32() : std::numeric_limits<std::uint32_t>::max();
+    }
+    if (depth == 0u) return std::numeric_limits<std::uint32_t>::max();
+    const auto add = [](std::uint32_t left, std::uint32_t right) {
+        return left > std::numeric_limits<std::uint32_t>::max() - right ? std::numeric_limits<std::uint32_t>::max() : left + right;
+    };
+    switch (value->Opcode()) {
+        case IrOpcode::BitwiseAnd32:
+            return std::min(legacyU32UpperBoundDepth(value->Argument(0), depth - 1u), legacyU32UpperBoundDepth(value->Argument(1), depth - 1u));
+        case IrOpcode::BitwiseOr32:
+            return add(legacyU32UpperBoundDepth(value->Argument(0), depth - 1u), legacyU32UpperBoundDepth(value->Argument(1), depth - 1u));
+        case IrOpcode::ShiftLeftLogical32: {
+            const IrValue* shift = value->Argument(1)->Resolve();
+            if (!shift->HasImmediate() || shift->Type() != IrType::U32) return std::numeric_limits<std::uint32_t>::max();
+            const auto bits = shift->ImmediateU32() & 31u;
+            const auto upper = legacyU32UpperBoundDepth(value->Argument(0), depth - 1u);
+            return bits != 0u && upper > (std::numeric_limits<std::uint32_t>::max() >> bits) ? std::numeric_limits<std::uint32_t>::max() : upper << bits;
+        }
+        case IrOpcode::ReadFirstLane:
+            return value->ArgumentCount() >= 1u ? legacyU32UpperBoundDepth(value->Argument(0), depth - 1u) : std::numeric_limits<std::uint32_t>::max();
+        case IrOpcode::SelectU32:
+            return value->ArgumentCount() == 3u ? (legacyU32UpperBoundDepth(value->Argument(1), depth - 1u) | legacyU32UpperBoundDepth(value->Argument(2), depth - 1u)) : std::numeric_limits<std::uint32_t>::max();
+        case IrOpcode::UMin32:
+            return value->ArgumentCount() == 2u ? std::min(legacyU32UpperBoundDepth(value->Argument(0), depth - 1u), legacyU32UpperBoundDepth(value->Argument(1), depth - 1u)) : std::numeric_limits<std::uint32_t>::max();
+        case IrOpcode::UMax32:
+            return value->ArgumentCount() == 2u ? std::max(legacyU32UpperBoundDepth(value->Argument(0), depth - 1u), legacyU32UpperBoundDepth(value->Argument(1), depth - 1u)) : std::numeric_limits<std::uint32_t>::max();
+        case IrOpcode::IAdd32:
+            return value->ArgumentCount() == 2u ? add(legacyU32UpperBoundDepth(value->Argument(0), depth - 1u), legacyU32UpperBoundDepth(value->Argument(1), depth - 1u)) : std::numeric_limits<std::uint32_t>::max();
+        case IrOpcode::Phi: {
+            std::uint32_t upper = 0;
+            for (std::uint32_t index = 0; index < value->ArgumentCount(); ++index) upper |= legacyU32UpperBoundDepth(value->Argument(index), depth - 1u);
+            return upper;
+        }
+        case IrOpcode::FindILsb32:
+        case IrOpcode::FindUMsb32:
+            return 31u;
+        default:
+            return std::numeric_limits<std::uint32_t>::max();
+    }
+}
+
+bool keyBoundTraceEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACE_KEY_BOUNDS") != nullptr;
+    return enabled;
+}
+
+std::string describeKeyTree(const IrValue* value, std::uint32_t depth, std::vector<const IrValue*>& scans) {
+    value = value->Resolve();
+    if (value->HasImmediate()) return value->Type() == IrType::U32 ? "#0x" + formatHex32(value->ImmediateU32()) : "#imm";
+    std::string text(IrOpcodeName(value->Opcode()));
+    if (value->Opcode() == IrOpcode::FindILsb32 || value->Opcode() == IrOpcode::FindUMsb32) {
+        auto found = std::ranges::find(scans, value);
+        if (found == scans.end()) found = scans.insert(scans.end(), value);
+        text += "@" + std::to_string(found - scans.begin());
+    }
+    if (depth == 0u || value->ArgumentCount() == 0u) return text;
+    text += "(";
+    for (std::uint32_t index = 0; index < value->ArgumentCount(); index++) {
+        if (index != 0u) text += ", ";
+        text += describeKeyTree(value->Argument(index), depth - 1u, scans);
+    }
+    return text + ")";
+}
+
+std::string describeTree(const IrValue* value, std::uint32_t depth) {
+    std::vector<const IrValue*> scans;
+    return describeKeyTree(value, depth, scans);
+}
+
+const char* terminatorKindName(TerminatorKind kind) {
+    switch (kind) {
+        case TerminatorKind::Branch: return "Branch";
+        case TerminatorKind::ConditionalBranch: return "ConditionalBranch";
+        case TerminatorKind::IndirectBranch: return "IndirectBranch";
+        case TerminatorKind::Return: return "Return";
+        case TerminatorKind::Unsupported: return "Unsupported";
+    }
+    return "?";
+}
+
+const char* branchConditionName(BranchCondition condition) {
+    switch (condition) {
+        case BranchCondition::Always: return "Always";
+        case BranchCondition::SccZero: return "SccZero";
+        case BranchCondition::SccNonZero: return "SccNonZero";
+        case BranchCondition::VccZero: return "VccZero";
+        case BranchCondition::VccNonZero: return "VccNonZero";
+        case BranchCondition::ExecZero: return "ExecZero";
+        case BranchCondition::ExecNonZero: return "ExecNonZero";
+        case BranchCondition::ScalarInstruction: return "ScalarInstruction";
+        case BranchCondition::IndirectTarget: return "IndirectTarget";
+        case BranchCondition::GotoVariable: return "GotoVariable";
+        case BranchCondition::Unknown: return "Unknown";
+    }
+    return "?";
+}
+
+void scanSources(const IrValue* value, std::uint32_t depth, std::vector<const IrValue*>& sources) {
+    value = value->Resolve();
+    if (value->HasImmediate()) return;
+    if (std::ranges::find(sources, value) == sources.end()) sources.push_back(value);
+    if (depth == 0u) return;
+    switch (value->Opcode()) {
+        case IrOpcode::BitwiseAnd32:
+        case IrOpcode::ShiftLeftLogical32:
+        case IrOpcode::ShiftRightLogical32:
+        case IrOpcode::ReadFirstLane:
+            for (std::uint32_t index = 0; index < value->ArgumentCount(); index++) scanSources(value->Argument(index), depth - 1u, sources);
+            break;
+        default:
+            break;
+    }
+}
+
+bool mentionsAny(const IrValue* value, const std::vector<const IrValue*>& sources, std::uint32_t depth) {
+    value = value->Resolve();
+    if (std::ranges::find(sources, value) != sources.end()) return true;
+    if (depth == 0u || value->HasImmediate()) return false;
+    for (std::uint32_t index = 0; index < value->ArgumentCount(); index++) {
+        if (mentionsAny(value->Argument(index), sources, depth - 1u)) return true;
+    }
+    return false;
+}
+
+std::string describeEdge(const IrProgram& program, const IrBlock* from, const IrBlock* to, const std::vector<const IrValue*>& sources) {
+    std::string text = "b" + std::to_string(from->Id());
+    const auto& blocks = program.Metadata().blockInfo;
+    const auto info = std::ranges::find_if(blocks, [&](const BlockInfo& candidate) { return candidate.id == from->Id(); });
+    if (info == blocks.end()) return text + ":noinfo";
+    const auto& terminator = info->terminator;
+    text += std::string(":") + terminatorKindName(terminator.kind) + "/" + branchConditionName(terminator.condition);
+    if (terminator.kind != TerminatorKind::ConditionalBranch) return text;
+    text += terminator.trueBlock == to->Id() ? ":taken=true" : terminator.falseBlock == to->Id() ? ":taken=false" : ":taken=?";
+    if (info->condition == nullptr) return text + ":cond=none";
+    return text + ":tests=" + (mentionsAny(info->condition, sources, 6u) ? "yes" : "no") + ":cond=" + describeTree(info->condition, 4u);
+}
+
+std::string describeGuards(const IrProgram& program, const IrValue* scan) {
+    const IrBlock* current = scan->Parent();
+    if (current == nullptr || scan->ArgumentCount() == 0u) return "none";
+    std::vector<const IrValue*> sources;
+    scanSources(scan->Argument(0), 3u, sources);
+    std::string text = "b" + std::to_string(current->Id());
+    for (std::uint32_t step = 0; step < 6u; step++) {
+        const auto& predecessors = current->Predecessors();
+        if (predecessors.size() != 1u) {
+            text += " join[";
+            for (std::size_t index = 0; index < predecessors.size(); index++) {
+                if (index != 0u) text += " ";
+                text += describeEdge(program, predecessors[index], current, sources);
+            }
+            return text + "]";
+        }
+        text += " dom " + describeEdge(program, predecessors[0], current, sources);
+        current = predecessors[0];
+    }
+    return text;
+}
+
+void traceKeyBound(const IrProgram& program, const IrValue* key, const TableColumn& column) {
+    const auto legacy = legacyU32UpperBoundDepth(key, 8u);
+    const auto sound = possibleU32BoundDepth(key, 8u);
+    if (legacy >= sound.upper) return;
+    static std::mutex mutex;
+    static std::set<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, bool, bool>> seen;
+    {
+        std::lock_guard lock(mutex);
+        if (!seen.emplace(program.Resources().shaderHash, column.heapSource, column.offset, column.stride, column.addend, column.address, column.indirect).second) return;
+    }
+    const auto shader = program.Resources().shaderHash;
+    std::vector<const IrValue*> scans;
+    std::string text = "[key-bounds] shader=0x" + formatHex32(static_cast<std::uint32_t>(shader >> 32u)) + formatHex32(static_cast<std::uint32_t>(shader));
+    text += " heap=" + std::to_string(column.heapSource) + " offset=0x" + formatHex32(column.offset) + " stride=" + std::to_string(column.stride) + " addend=0x" + formatHex32(column.addend);
+    text += std::string(" address=") + (column.address ? "1" : "0") + " indirect=" + (column.indirect ? "1" : "0");
+    text += " legacy=" + std::to_string(legacy) + " sound=" + (sound.upper == std::numeric_limits<std::uint32_t>::max() ? std::string("unbounded") : std::to_string(sound.upper)) + " huge=" + std::to_string(sound.huge);
+    text += " key=" + describeKeyTree(key, 10u, scans);
+    for (std::size_t index = 0; index < scans.size(); index++) {
+        text += " | scan@" + std::to_string(index) + "=" + std::string(IrOpcodeName(scans[index]->Opcode()));
+        text += " operand=" + (scans[index]->ArgumentCount() != 0u ? describeTree(scans[index]->Argument(0), 4u) : std::string("none"));
+        text += " guards=" + describeGuards(program, scans[index]);
+    }
+    std::fprintf(stderr, "%s\n", text.c_str());
 }
 
 std::uint32_t bitScanKeyCount(const IrValue* value, std::uint32_t depth = 4u) {
@@ -1008,6 +1197,7 @@ private:
         column.buffer = buffer;
         column.foldedAddend = folded ? baseAddend : 0u;
         column.foldedCarry = folded ? carry : 0u;
+        if (keyBoundTraceEnabled()) traceKeyBound(m_program, key, column);
         if (!address && !sampler && std::ranges::find(m_unselectedHandles, &handle) == m_unselectedHandles.end()) {
             DescriptorSource direct;
             MakeSource(handle, width, false, false, direct);
@@ -1209,6 +1399,7 @@ private:
         column.indirectOffset = descriptorOffset;
         column.indirectImmediate = descriptorImmediate;
         column.pointerHops = std::move(hops);
+        if (!merged && keyBoundTraceEnabled()) traceKeyBound(m_program, key, column);
         const auto domain = merged ? std::optional<KeyDomain>{} : MatchKeyDomain(key);
         DescriptorSource columnSource = heapSource;
         columnSource.tableColumn = column;
