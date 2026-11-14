@@ -882,6 +882,14 @@ void RunTests(AgcDriver::VulkanDevice& device) {
 #else
     munmap(reserved, 65536);
 #endif
+    auto undecodableImage = floatImage;
+    undecodableImage[3] |= 7u << 25u;
+    SetRecord(8, PointClamp, undecodableImage);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto undecodable = Run(device, TableCode, 1, Lanes, 64);
+        Require(Faulted(undecodable) && undecodable.log.find("rejected by the driver") != std::string::npos && undecodable.log.find("reserved BC swizzle") != std::string::npos && Zeros(undecodable), "image table: an entry whose T# the driver cannot decode was bound instead of faulting with the decoder's reason:\n" + undecodable.log);
+    }
+    SetRecord(8, PointClamp, floatImage);
 
     const auto srgbImage = Image(UintTexels.data(), Format8_8Srgb);
     SetRecord(9, PointClamp, srgbImage);

@@ -8657,13 +8657,10 @@ std::vector<std::uint32_t> variantRepresentatives(VkDevice device, const ShaderR
     for (std::uint32_t element = 0; element < binding.count && elementBase + element < capacity; ++element) {
         if (element < binding.Flags().imageWritten.size() && binding.Flags().imageWritten[element]) continue;
         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
-        GuestTextureResource resource{};
-        try {
-            if (IsNullTextureResource(words)) continue;
-            resource = DecodeTextureResource(words);
-        } catch (const std::runtime_error&) {
-            continue;
-        }
+        if (IsNullTextureResource(words)) continue;
+        const auto decoded = TryDecodeTextureResource(words);
+        if (!decoded.has_value()) continue;
+        const auto& resource = *decoded;
         const FamilyKey key{resource.baseAddress, resource.pipeBankXor, resource.format, static_cast<std::uint32_t>(resource.tileMode), static_cast<std::uint32_t>(resource.dimension), resource.mipCount, resource.baseLevel, resource.lastLevel, resource.depthOrLastArray, resource.baseArray};
         families[key].push_back({element, resource});
     }
@@ -8778,9 +8775,9 @@ void ShaderResources::resolveImageTables() {
             bool firstLayer = false;
             std::string rejected;
         };
-        const auto decodeEntry = [&](std::uint32_t element, std::span<const std::uint32_t> words, const GuestTextureResource* predecoded = nullptr) {
+        const auto decodeEntry = [&](std::uint32_t element, const GuestTextureResource& predecoded) {
             DecodedEntry decoded;
-            decoded.resource = predecoded != nullptr ? *predecoded : DecodeTextureResource(words);
+            decoded.resource = predecoded;
             const auto& resource = decoded.resource;
             const auto shape = binding.imageShapes.at(element);
             const bool depthCompare = element < binding.Flags().imageDepthCompare.size() && binding.Flags().imageDepthCompare[element];
@@ -8829,10 +8826,15 @@ void ShaderResources::resolveImageTables() {
         };
         const auto resolveLive = [&](std::uint32_t element, std::span<const std::uint32_t> words) -> std::string {
             DecodedEntry decoded;
-            try {
-                decoded = decodeEntry(element, words);
-            } catch (const std::runtime_error& error) {
-                decoded.rejected = error.what();
+            std::string failure;
+            if (const auto predecoded = TryDecodeTextureResource(words, &failure); !predecoded.has_value()) {
+                decoded.rejected = std::move(failure);
+            } else {
+                try {
+                    decoded = decodeEntry(element, *predecoded);
+                } catch (const std::runtime_error& error) {
+                    decoded.rejected = error.what();
+                }
             }
             if (!decoded.rejected.empty()) {
                 table.map[faults + element] = rejectTableElement(table, words, decoded.rejected);
@@ -8943,7 +8945,7 @@ void ShaderResources::resolveImageTables() {
             }
             DecodedEntry decoded;
             try {
-                decoded = decodeEntry(element, words, &*predecoded);
+                decoded = decodeEntry(element, *predecoded);
             } catch (const std::runtime_error& error) {
                 decoded.rejected = error.what();
             }
