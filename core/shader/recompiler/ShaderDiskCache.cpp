@@ -115,7 +115,7 @@ static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan enc
 static_assert(sizeof(DescriptorSource) == 216, "DescriptorSource changed: update the plan encoder");
 static_assert(sizeof(TableColumn) == 112, "TableColumn changed: update the plan encoder");
 static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
-static_assert(sizeof(ResourceBlock) == 104, "ResourceBlock changed: update the plan encoder");
+static_assert(sizeof(ResourceBlock) == 112, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
 static_assert(sizeof(UniformFill) == 28, "UniformFill changed: update the plan encoder");
 static_assert(sizeof(UniformFillPlan) == 64, "UniformFillPlan changed: update the plan encoder");
@@ -155,7 +155,7 @@ static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the pl
 static_assert(fieldCount<DescriptorSource>() == 4, "DescriptorSource changed: update the plan encoder");
 static_assert(fieldCount<TableColumn>() == 20, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
-static_assert(fieldCount<ResourceBlock>() == 5, "ResourceBlock changed: update the plan encoder");
+static_assert(fieldCount<ResourceBlock>() == 7, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
 static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the plan encoder");
 static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: update the plan encoder");
@@ -1199,6 +1199,8 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Values(std::span<const std::uint32_t>(block.sources));
         out.Values(std::span<const std::uint32_t>(block.images));
         out.Values(std::span<const std::uint32_t>(block.flatSlots));
+        out.Value(block.conditionRemoval);
+        out.Value(valueIndex(block.removedCondition));
     });
     writer.Values(std::span<const std::uint32_t>(plan.materializationSources));
     writer.List(plan.srtReads, [&](Writer& out, const SrtRead& read) {
@@ -1363,12 +1365,14 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
         in.Values(source.requiredBlocks);
     });
-    reader.List(plan.controlFlow, 36, [&](Reader& in, ResourceBlock& block) {
+    reader.List(plan.controlFlow, 41, [&](Reader& in, ResourceBlock& block) {
         block.condition = valueAt(in.Get<std::uint32_t>());
         in.Values(block.successors);
         in.Values(block.sources);
         in.Values(block.images);
         in.Values(block.flatSlots);
+        in.Value(block.conditionRemoval);
+        block.removedCondition = valueAt(in.Get<std::uint32_t>());
     });
     reader.Values(plan.materializationSources);
     reader.List(plan.srtReads, 8, [&](Reader& in, SrtRead& read) {
@@ -1409,7 +1413,10 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;
     const bool blocksValid = std::ranges::all_of(plan.controlFlow, [&](const ResourceBlock& block) {
-        return (block.condition == nullptr || block.successors.size() == 2u) &&
+        return (block.conditionRemoval == ConditionRemoval::None || block.conditionRemoval == ConditionRemoval::Undecidable || block.conditionRemoval == ConditionRemoval::ItemFree) &&
+               (block.conditionRemoval == ConditionRemoval::None || block.condition == nullptr) &&
+               (block.removedCondition == nullptr || (block.conditionRemoval == ConditionRemoval::Undecidable && block.successors.size() == 2u)) &&
+               (block.condition == nullptr || block.successors.size() == 2u) &&
                std::ranges::all_of(block.successors, [&](std::uint32_t successor) { return successor < plan.controlFlow.size(); }) &&
                std::ranges::all_of(block.sources, knownSource) &&
                std::ranges::all_of(block.images, [&](std::uint32_t image) { return image < plan.info.images.size(); }) &&
