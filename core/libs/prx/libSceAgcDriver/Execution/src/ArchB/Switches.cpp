@@ -68,6 +68,10 @@ constexpr Feature CLazyCopybackPrerequisites[] = {Feature::CGpuStagingCarry};
 constexpr Feature ArchcReplayCutPrerequisites[] = {Feature::ArchcDrawReplay};
 constexpr Feature CLazyFenceDepthPrerequisites[] = {Feature::CLazyFence};
 constexpr Feature CLabelLazyPrewaitPrerequisites[] = {Feature::CLazyPublish};
+constexpr Feature DrawTemplatesLivePrerequisites[] = {Feature::DrawTemplates, Feature::DrawGatherShadow};
+constexpr Feature DrawTemplatesPrerequisites[] = {Feature::ArchcDrawReplay, Feature::ZeroCopyStorage};
+constexpr Feature LazyShadowPublishPrerequisites[] = {Feature::CLazyPublish};
+constexpr Feature DepthRunRepeatPrerequisites[] = {Feature::ArchcReplayDepthEpoch};
 constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entries{{
     {Feature::GateRun, "GATE_RUN", false, false, {}},
     {Feature::GateNoop, "GATE_NOOP", false, true, {}},
@@ -221,6 +225,13 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::ReplayRecognize, "REPLAY_RECOGNIZE", false, true, {}},
     {Feature::FixStatePacketFast, "FIX_STATE_PACKET_FAST", false, true, {}},
     {Feature::FixDrawRelocNested, "FIX_DRAW_RELOC_NESTED", false, true, {}},
+    {Feature::FixSampledArrayGpu, "FIX_SAMPLED_ARRAY_GPU", false, true, {}},
+    {Feature::DrawGatherShadow, "DRAW_GATHER_SHADOW", false, true, {}},
+    {Feature::DrawTemplates, "DRAW_TEMPLATES", false, true, DrawTemplatesPrerequisites},
+    {Feature::DrawTemplatesLive, "DRAW_TEMPLATES_LIVE", false, true, DrawTemplatesLivePrerequisites},
+    {Feature::GpuAuthorityCensus, "GPU_AUTHORITY_CENSUS", false, true, {}},
+    {Feature::LazyShadowPublish, "LAZY_SHADOW_PUBLISH", false, true, LazyShadowPublishPrerequisites},
+    {Feature::DepthRunRepeat, "DEPTH_RUN_REPEAT", false, true, DepthRunRepeatPrerequisites},
 }};
 std::array<std::atomic<bool>, Entries.size()> values{};
 std::array<bool, Entries.size()> fromEnvironment{};
@@ -404,6 +415,14 @@ bool Switches::Enabled(Feature feature) {
 namespace {
 struct AllocChurnSlot {};
 struct PartialSnapshotSlot {};
+}
+
+bool DirectDrawEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ARCHB_DRAW_DIRECT");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
 }
 
 bool AllocChurnActive() noexcept {
