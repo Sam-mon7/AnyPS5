@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/StructCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchGatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -598,6 +599,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
+    const auto gatherSourceArguments = DispatchShadow::Enabled() && indirectArguments == 0 ? indirectSource().arguments : indirectArguments;
+    const auto gatheredUse = DispatchShadow::Begin(request, registeredShader, submission.queue, gatherSourceArguments, fromAhead, resolving);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
     static std::atomic<std::uint64_t> cacheHits{0};
@@ -902,6 +905,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseRecompile);
         if (!resolving) insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, genAtCapture, feedbackMask, feedbackKey);
     }
+    DispatchShadow::Resolved(gatheredUse, capture.get(), *compiledResult, cached, validated, missedDiffering);
     const auto* registeredViews = capture != nullptr ? &capture->snapshot.registeredImages : keepVariant != nullptr && keepVariant->registeredViews != nullptr ? keepVariant->registeredViews.get() : nullptr;
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -956,6 +960,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             groups[axis] = ThreadDimensionGroups(groups[axis], threads);
         }
     }
+    const auto gatherThreadGroup = gatherSourceArguments != 0 && indirectArguments == 0 && (packet[4] & 0x20u) != 0 ? compute.numThreads : threadGroup;
+    DispatchShadow::SetPayload(gatheredUse, groups, indirectArguments, gatherThreadGroup);
     const std::uint64_t dispatchThreads = indirectArguments != 0 ? 0 : std::uint64_t{groups[0]} * groups[1] * groups[2] * compute.numThreads[0] * compute.numThreads[1] * compute.numThreads[2];
     static const bool traceIo = std::getenv("APS5_TRACE_DISPATCH_IO") != nullptr;
     if (traceIo) {
@@ -998,7 +1004,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+        const bool gatherFinisherBusy = gatheredUse != nullptr && DrawFinisher::Busy();
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync, gatheredUse] {
             const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
             const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
@@ -1036,6 +1043,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 RecipeBuildFailure recipeFailure = RecipeBuildFailure::NotAttempted;
                 bool writersNoted = false;
                 Stage4::Mark(Stage4::Bucket::DispatchPrepare);
+                const DispatchShadow::CommitScope gatherCommit(gatheredUse);
                 for (;;) {
                     std::shared_ptr<PreparedDispatch> prepared;
                     if (recipeHit == nullptr || VulkanDevice::VerifyRecipes() || htileClearCompletion.has_value()) prepared = localDevice->PrepareDispatch(compiledCommit, snapshots, 0, address, htileClearCompletion, registeredViews);
@@ -1055,6 +1063,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                         VulkanDevice::IndirectOutcome outcome{0, 0};
                         const auto recipeResult = localDevice->DispatchRecipe(compiledCommit, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit);
                         if (recipeResult == RecipeOutcome::Rebuild) {
+                            DispatchShadow::MarkRebuild();
                             recipeHit = nullptr;
                             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
                             itemRebuilds.fetch_add(1, std::memory_order_relaxed);
@@ -1086,6 +1095,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 throw std::runtime_error(where + std::string(error.what()));
             }
         }, std::move(itemWrites), 0, {}, {}, false, DrawPipeline::ItemKind::Dispatch);
+        DispatchShadow::Queued(gatheredUse, readsClear && gatherSourceArguments == 0 && !gatherFinisherBusy, true);
         ReportDispatchItems(profile);
         return;
     }
@@ -1119,6 +1129,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     bool captureChecked = fromAhead;
 
+    const DispatchShadow::CommitScope gatherCommit(gatheredUse);
     for (;;) {
 
         std::shared_ptr<PreparedDispatch> prepared;
@@ -1180,7 +1191,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 VulkanDevice::IndirectOutcome outcome{0, 0};
                 const auto result = localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], indirectArguments, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit, threadGroup, std::move(privateDispatch));
                 if (result == RecipeOutcome::Rebuild) {
-
+                    DispatchShadow::MarkRebuild();
                     recipeHit = nullptr;
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, indirectArguments != 0);
                     continue;

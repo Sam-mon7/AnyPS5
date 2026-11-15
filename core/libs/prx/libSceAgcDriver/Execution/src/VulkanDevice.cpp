@@ -22,6 +22,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchGatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostReportSources.hpp"
@@ -5759,6 +5760,7 @@ struct RecordedDispatch {
     std::array<std::uint32_t, 3> threadGroup{};
     std::array<std::uint32_t, 3> threadLimit{};
     std::shared_ptr<PrivateDispatch> privateDispatch;
+    bool gatherRebuilt = false;
 };
 
 struct DispatchCompletion {
@@ -6544,6 +6546,52 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             }
         }
     }
+    if (const auto* gathered = DriverDetail::DispatchShadow::Enabled() ? DriverDetail::DispatchShadow::ActiveCommit() : nullptr) {
+        struct GatherVerificationTimer {
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~GatherVerificationTimer() {
+                DriverDetail::DispatchShadow::NoteVerificationNanoseconds(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+            }
+        } gatherVerificationTimer;
+        const auto originalArguments = record.arguments != 0 ? record.arguments : record.cpuArguments;
+        const bool argumentsMatch = gathered->arguments == originalArguments;
+        if (!argumentsMatch) {
+            DriverDetail::DispatchShadow::CommitResult(false, true, record.gatherRebuilt, "arguments");
+        } else if (gathered->values == nullptr) {
+            DriverDetail::DispatchShadow::CommitResult(true, false, record.gatherRebuilt, "no_payload");
+        } else if (record.bindings != nullptr) {
+            DriverDetail::DispatchShadow::CommitResult(true, false, record.gatherRebuilt, "overlay");
+        } else if (privateReady) {
+            DriverDetail::DispatchShadow::CommitResult(true, false, record.gatherRebuilt, "private_commands");
+        } else if (record.threadGroup != std::array<std::uint32_t, 3>{} || gathered->threadGroup != std::array<std::uint32_t, 3>{}) {
+            DriverDetail::DispatchShadow::CommitResult(true, false, record.gatherRebuilt, "thread_dimensions");
+        } else if (originalArguments != 0) {
+            DriverDetail::DispatchShadow::CommitResult(true, false, record.gatherRebuilt, "indirect_payload");
+        } else if (record.x > limit[0] || record.y > limit[1] || record.z > limit[2]) {
+            DriverDetail::DispatchShadow::CommitResult(true, false, record.gatherRebuilt, "split_groups");
+        } else if (gathered->groups != std::array{record.x, record.y, record.z}) {
+            DriverDetail::DispatchShadow::CommitResult(false, true, record.gatherRebuilt, "groups");
+        } else {
+            using Difference = Graphics::ShaderResources::DispatchGatherCommitDifference;
+            const auto difference = resources.CompareDispatchGather(*gathered->values, *record.pushBytes, record.pushStages != 0);
+            const char* reason = "none";
+            bool supported = true;
+            switch (difference) {
+                case Difference::None: break;
+                case Difference::Unsupported: reason = "resource_state"; supported = false; break;
+                case Difference::UnobservedUpload: reason = "unobserved_upload"; supported = false; break;
+                case Difference::AddressTable: reason = "address_table"; supported = false; break;
+                case Difference::FaultBuffer: reason = "fault_buffer"; supported = false; break;
+                case Difference::BindingRole: reason = "binding_role"; supported = false; break;
+                case Difference::Binding: reason = "binding"; break;
+                case Difference::Address: reason = "address"; break;
+                case Difference::Extent: reason = "extent"; break;
+                case Difference::Data: reason = "data"; break;
+                case Difference::Push: reason = "push"; break;
+            }
+            DriverDetail::DispatchShadow::CommitResult(difference == Difference::None, supported, record.gatherRebuilt, reason);
+        }
+    }
     recorder.EndGpuTiming(gpuTiming);
     if (faultToken != 0 && state->bufferMarker != nullptr) state->bufferMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state->markerBuffer, sizeof(std::uint32_t), faultToken);
     if (computeStart.deferred) {
@@ -7001,6 +7049,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer, htileClear};
     record.resourceKeyMatched = fromCache;
+    record.gatherRebuilt = !fromCache;
     record.bindings = overlay;
     record.privateDispatch = std::move(completion.privateDispatch);
     record.threadGroup = threadGroup;
