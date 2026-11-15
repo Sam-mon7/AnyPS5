@@ -99,6 +99,16 @@ public:
                 }
             }
         }
+        std::unordered_map<const IrValue*, std::uint32_t> slots;
+        for (auto& node : tape.nodes) {
+            if (node.op != Op::Read && node.op != Op::ReadConstBuffer) continue;
+            node.sourceSlot = slots.try_emplace(node.source, static_cast<std::uint32_t>(slots.size())).first->second;
+        }
+        for (auto& node : tape.nodes) {
+            if (node.op != Op::Read && node.op != Op::ReadConstBuffer) continue;
+            if (const auto parent = slots.find(node.parentRead); parent != slots.end()) node.parentSlot = parent->second;
+        }
+        tape.readSlots = static_cast<std::uint32_t>(slots.size());
         return !malformed;
     }
 
@@ -382,7 +392,8 @@ struct SrtTape::Frame {
     bool nullRoot = false;
     std::uint32_t addressDepth = 0;
     std::size_t descriptorBytes = 0;
-    std::unordered_map<const IrValue*, std::uint64_t> readAddresses;
+    std::uint64_t* readAddress = nullptr;
+    std::uint8_t* readKnown = nullptr;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -504,10 +515,11 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 return false;
             }
             if (frame.runtime.userDataUse != nullptr) {
-                const auto parent = frame.readAddresses.find(node.parentRead);
+                const bool parentKnown = node.parentSlot != NoNode && frame.readKnown[node.parentSlot] != 0u;
                 frame.runtime.userDataUse->reads.emplace_back(address, origin);
-                frame.runtime.userDataUse->nested.emplace_back(address, parent != frame.readAddresses.end() ? parent->second : 0);
-                frame.readAddresses[node.source] = address;
+                frame.runtime.userDataUse->nested.emplace_back(address, parentKnown ? frame.readAddress[node.parentSlot] : 0);
+                frame.readAddress[node.sourceSlot] = address;
+                frame.readKnown[node.sourceSlot] = 1u;
             }
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
@@ -658,6 +670,8 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::vector<std::uint32_t> pending;
         std::vector<DescriptorValue> evaluated;
         std::vector<std::uint32_t> flattened;
+        std::vector<std::uint64_t> readAddress;
+        std::vector<std::uint8_t> readKnown;
         bool busy = false;
     };
     struct ScratchStorage {};
@@ -695,6 +709,16 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
     Frame frame {runtime, values, states, fast};
+    std::vector<std::uint64_t> heapReadAddress;
+    std::vector<std::uint8_t> heapReadKnown;
+    if (use != nullptr && readSlots != 0u) {
+        auto& readAddress = fast ? scratch.readAddress : heapReadAddress;
+        auto& readKnown = fast ? scratch.readKnown : heapReadKnown;
+        if (readAddress.size() < readSlots) readAddress.resize(readSlots);
+        readKnown.assign(readSlots, 0u);
+        frame.readAddress = readAddress.data();
+        frame.readKnown = readKnown.data();
+    }
     const SrtForceSyncScope forceSync(runtime, attempt == 2u);
     const auto invalidationsBefore = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
     auto& active = scratch.active;
