@@ -1,4 +1,16 @@
 if(BUILD_TESTING)
+    foreach(relocationRefresh IN ITEMS on off)
+        set(relocationTest agc_driver_dispatch_relocation_recipe_${relocationRefresh})
+        add_test(NAME ${relocationTest} COMMAND agc_driver_dispatch_move_tests --relocation-recipe)
+        set_tests_properties(${relocationTest} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_RECIPE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(relocationRefresh STREQUAL "off")
+            set_property(TEST ${relocationTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_TEMPLATE_DATA_REFRESH=1")
+        endif()
+        if(WIN32)
+            set_tests_properties(${relocationTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_driver_private_compute_completion COMMAND agc_driver_dispatch_move_tests --completion-recipe)
     set_tests_properties(agc_driver_private_compute_completion PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PRIVATE_COMPUTE=1;APS5_PROFILE_DRAW=1;APS5_VERIFY_RECIPE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

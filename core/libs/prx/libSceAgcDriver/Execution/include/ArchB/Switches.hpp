@@ -110,6 +110,10 @@ enum class Feature : std::uint8_t {
     ReplayRecognize,
     FixStatePacketFast,
     FixDrawRelocNested,
+    FixSampledArrayGpu,
+    DrawHitCensus,
+    DispatchTiming,
+    DispatchRelocationRecipe,
     Count
 };
 

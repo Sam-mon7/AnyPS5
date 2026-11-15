@@ -351,6 +351,7 @@ public:
     RecipeOutcome DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify = nullptr, bool refreshByWords = false, const std::array<std::uint32_t, 3>& threadGroup = {}, std::shared_ptr<PrivateDispatch> privateDispatch = nullptr);
     // Whether dispatch-cache hits use recipes (APS5_NO_DISPATCH_RECIPE unset) and whether every
     // hit is verified (APS5_VERIFY_RECIPE=1).
+    static std::shared_ptr<const Recipe> RelocateDispatchRecipe(const ShaderRecompiler::RecompileResult& donor, const ShaderRecompiler::RecompileResult& live, const std::shared_ptr<const Recipe>& recipe);
     static bool DispatchRecipes();
     static bool VerifyRecipes();
     static std::size_t DispatchProfileRows();

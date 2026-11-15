@@ -1,8 +1,14 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchDetailTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
+#include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+#include <functional>
+#include <map>
+#include <set>
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
@@ -17,7 +23,98 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
+bool Driver::dispatchRelocationDirect(const DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture) {
+    if (capture.plan == nullptr || !dispatchRelocationRangesValid(variant) || variant.relocatableWords == 0 || variant.userData != capture.snapshot.userData || variant.runs.empty() || variant.runBases.size() != variant.runs.size() || variant.runParents.size() != variant.runs.size()) return false;
+    const auto& plan = *capture.plan;
+    if (!plan.srtPlanComplete || !plan.resourceTrackingComplete || plan.requiresSpecializationMemory || !plan.guardedSrtSlots.empty() || plan.uniformFill.fill.kind != ShaderRecompiler::UniformFillKind::None || !capture.snapshot.tables.tables.empty() || !capture.snapshot.tables.nested.empty() || !capture.snapshot.srtPoison.empty() || capture.snapshot.nullRootReads != 0 || capture.snapshot.uniformFill.kind != ShaderRecompiler::UniformFillKind::None) return false;
+    if (std::any_of(plan.controlFlow.begin(), plan.controlFlow.end(), [](const auto& block) { return block.condition != nullptr; }) || std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const auto& source) { return source.tableColumn.has_value(); })) return false;
+    if (std::any_of(capture.userDataUse.nested.begin(), capture.userDataUse.nested.end(), [](const auto& read) { return read.second != 0; }) || std::any_of(variant.runParents.begin(), variant.runParents.end(), [](const auto& parent) { return parent.run != DispatchVariant::NoFlatBinding; })) return false;
+    const auto userWord = [&](const ShaderRecompiler::IrValue* value) -> std::int32_t {
+        if (value == nullptr) return -1;
+        value = value->Resolve();
+        if (value->HasImmediate() || value->Type() != ShaderRecompiler::IrType::U32 || value->Opcode() != ShaderRecompiler::IrOpcode::GetUserData || value->ArgumentCount() != 1 || value->Argument(0) == nullptr || value->Argument(0)->Type() != ShaderRecompiler::IrType::ScalarReg) return -1;
+        const auto reg = ShaderRecompiler::RegIndex(static_cast<ShaderRecompiler::ScalarReg>(value->Argument(0)->Register().index));
+        if (reg < plan.userDataBase || reg - plan.userDataBase >= variant.userData.size() || reg - plan.userDataBase >= ShaderRecompiler::SrtUserDataUse::TrackedWords) return -1;
+        return static_cast<std::int32_t>(reg - plan.userDataBase);
+    };
+    std::map<std::uint64_t, std::int32_t> expected;
+    std::set<const ShaderRecompiler::IrValue*> active, complete;
+    std::function<bool(const ShaderRecompiler::IrValue*, std::size_t)> visit = [&](const ShaderRecompiler::IrValue* raw, std::size_t depth) {
+        if (raw == nullptr || depth > 64) return false;
+        const auto* value = raw->Resolve();
+        if (value->HasImmediate() || complete.contains(value)) return true;
+        if (!active.insert(value).second) return false;
+        const auto opcode = value->Opcode();
+        if (opcode == ShaderRecompiler::IrOpcode::Phi || ShaderRecompiler::Detail::IsRuntimeSelect(opcode) || opcode == ShaderRecompiler::IrOpcode::Void) return false;
+        if (opcode == ShaderRecompiler::IrOpcode::GetUserData) {
+            if (userWord(value) < 0) return false;
+        } else if (opcode == ShaderRecompiler::IrOpcode::ReadConst) {
+            if (value->ArgumentCount() != 2 || value->Argument(0) == nullptr || value->Argument(0)->Resolve()->Opcode() != ShaderRecompiler::IrOpcode::GetSrtResource || value->Argument(1) == nullptr) return false;
+            const auto* slot = value->Argument(1)->Resolve();
+            if (!slot->HasImmediate() || slot->Type() != ShaderRecompiler::IrType::U32 || slot->ImmediateU32() >= plan.srtReads.size() || !visit(plan.srtReads[slot->ImmediateU32()].value, depth + 1)) return false;
+        } else {
+            if (ShaderRecompiler::Detail::IsMemoryRead(opcode)) {
+                if (opcode != ShaderRecompiler::IrOpcode::LoadAddressU32 || !ShaderRecompiler::Detail::IsRawRead(plan, *value) || value->ArgumentCount() != 4 || std::any_of(value->Arguments().begin(), value->Arguments().end(), [](const auto* argument) { return argument == nullptr; })) return false;
+                const auto& memory = plan.memoryInfo[value->Flags<ShaderRecompiler::MemoryFlags>().index];
+                const auto* highOffset = value->Argument(2)->Resolve();
+                const auto* enabled = value->Argument(3)->Resolve();
+                if (memory.addressIsFull || memory.dataBits != 32 || memory.dataDwords != 1 || !highOffset->HasImmediate() || highOffset->Type() != ShaderRecompiler::IrType::U32 || highOffset->ImmediateU32() != 0 || !enabled->HasImmediate() || enabled->Type() != ShaderRecompiler::IrType::U1 || !enabled->ImmediateBool()) return false;
+                const auto* handle = value->Argument(0)->Resolve();
+                const auto* offset = value->Argument(1)->Resolve();
+                if ((handle->Opcode() != ShaderRecompiler::IrOpcode::GetAddressResource && handle->Opcode() != ShaderRecompiler::IrOpcode::CompositeConstructU64) || handle->ArgumentCount() != 2 || handle->Argument(0) == nullptr || handle->Argument(1) == nullptr || !offset->HasImmediate() || offset->Type() != ShaderRecompiler::IrType::U32) return false;
+                const auto root = userWord(handle->Argument(0));
+                if (root < 0 || (variant.relocatableWords >> root & 1u) == 0) return false;
+                const auto* highValue = handle->Argument(1)->Resolve();
+                std::uint32_t high = 0;
+                if (highValue->HasImmediate() && highValue->Type() == ShaderRecompiler::IrType::U32) high = highValue->ImmediateU32();
+                else {
+                    const auto highWord = userWord(highValue);
+                    if (highWord < 0 || (variant.relocatableWords >> highWord & 1u) != 0) return false;
+                    high = variant.userData[highWord];
+                }
+                const auto base = ((std::uint64_t{high} << 32u) | variant.userData[root]) & ShaderRecompiler::Detail::AddressMask;
+                if (base == 0) return false;
+                const auto immediate = static_cast<std::int64_t>(static_cast<std::int32_t>(plan.memoryInfo[value->Flags<ShaderRecompiler::MemoryFlags>().index].offset));
+                const auto relative = (immediate & ~std::int64_t{3}) + static_cast<std::int64_t>(offset->ImmediateU32() & ~3u);
+                std::uint64_t address = 0;
+                if (!ShaderRecompiler::Detail::AddSignedAddress(base & ~std::uint64_t{3}, relative, address)) return false;
+                const auto [found, inserted] = expected.emplace(address, root);
+                if (!inserted && found->second != root) return false;
+            } else if (!ShaderRecompiler::Detail::IsRuntimeUniformOp(opcode) && !ShaderRecompiler::Detail::IsDescriptorHandle(opcode) && opcode != ShaderRecompiler::IrOpcode::GetSrtResource) return false;
+            for (const auto* argument : value->Arguments()) if (!visit(argument, depth + 1)) return false;
+        }
+        active.erase(value);
+        complete.insert(value);
+        return true;
+    };
+    for (const auto& read : plan.srtReads) if (!visit(read.value, 0)) return false;
+    for (const auto& source : plan.descriptorSources) {
+        if (source.dwordCount > source.dwords.size()) return false;
+        for (std::size_t word = 0; word < source.dwordCount; ++word) if (!visit(source.dwords[word], 0)) return false;
+    }
+    for (const auto& value : plan.valueStorage) if (!value.IsEmpty() && !visit(&value, 0)) return false;
+    if (expected.empty()) return false;
+    std::map<std::uint64_t, std::int32_t> observed;
+    for (const auto& [address, root] : capture.userDataUse.reads) {
+        if (root < 0) return false;
+        const auto [found, inserted] = observed.emplace(address, root);
+        if (!inserted && found->second != root) return false;
+    }
+    if (observed != expected) return false;
+    observed.clear();
+    std::size_t words = 0;
+    for (std::size_t run = 0; run < variant.runs.size(); ++run) {
+        const auto [begin, end] = variant.runs[run];
+        const auto root = variant.runBases[run];
+        if (root < 0 || root >= ShaderRecompiler::SrtUserDataUse::TrackedWords || (variant.relocatableWords >> root & 1u) == 0 || end < begin || (begin & 3u) != 0 || (end - begin) % sizeof(std::uint32_t) != 0 || (end - begin) / sizeof(std::uint32_t) > variant.words.size() - words) return false;
+        for (auto address = begin; address < end; address += sizeof(std::uint32_t), ++words) if (!observed.emplace(address, root).second) return false;
+    }
+    return words == variant.words.size() && observed == expected;
+}
+
 void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, std::uint64_t genAtCapture, bool feedbackMask, std::uint64_t feedbackKey) {
+    DispatchDetailTiming detail("Dispatch.Detail.InsertVariant");
+    detail.Point("dispatch.insert.request", address, key);
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -39,10 +136,15 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         fresh->words.reserve(capturedWords);
         // APS5_ARCHB_FIX_DISPATCH_RELOCATION (sampled per insert): runs split and tagged by the user
         // word they are read through, as for draw stages.
-        const bool relocation = capture != nullptr && feedbackKey != 0 && !stampValidate() && ArchB::Switches::Enabled(ArchB::Feature::FixDispatchRelocation);
+        const bool relocation = capture != nullptr && feedbackKey != 0 && !stampValidate() && (ArchB::Switches::Enabled(ArchB::Feature::FixDispatchRelocation) || ArchB::Switches::Enabled(ArchB::Feature::DispatchRelocationRecipe));
         if (relocation) {
             tagVariantRuns(*fresh, srtRegions, capture->userDataUse, true, 0, supplied);
             if (fresh->userData.empty()) fresh->userData = capture->snapshot.userData;
+            if (!dispatchRelocationDirect(*fresh, *capture)) {
+                fresh->relocatableWords = 0;
+                ArchB::Recorder::Count("dispatch_relocation_refused_topology");
+                detail.Point("dispatch.relocation_recipe.shape_refused", address);
+            }
         } else {
             for (const auto& region : srtRegions) {
                 fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
@@ -111,6 +213,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         }
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
+            detail.Point("dispatch.insert.stable", address, key);
             if (profile) {
                 if (capture != nullptr && capture->plan != nullptr) {
                     const auto& plan = *capture->plan;
@@ -217,11 +320,13 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             if (over()) {
                 if (lru) {
                     while (over()) {
+                        detail.Point("dispatch.evict.key", dispatchOrder.back(), dispatchCache.size());
                         eraseDispatchEntry(dispatchCache.find(dispatchOrder.back()));
                         ++dispatchCacheEvictions;
                     }
                 } else {
                     dispatchCacheEvictions += dispatchCache.size();
+                    detail.Point("dispatch.evict.clear", 0, dispatchCache.size());
                     dispatchCache.clear();
                     dispatchOrder.clear();
                     dispatchCacheVariants = 0;
@@ -230,6 +335,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             }
         } else {
             ++entryCounters.unstable;
+            detail.Point("dispatch.insert.unstable", address, key);
         }
         phaseTiming.Phase(PhaseInsert);
     }

@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -6282,7 +6283,41 @@ std::chrono::nanoseconds GpuLockPriorityWindow() {
 }
 
 // LockSpinning with the Stage 4 wait scope (M1/M4) around a contended acquisition.
-static void lockSpinningTracked(Mutex& mutex) {
+struct GpuMutexCensusSlot {};
+struct GpuMutexAcquireSlot {};
+
+std::uint64_t ThreadGpuMutexAcquireNs() { return HostThreadSlot<std::uint64_t, GpuMutexAcquireSlot>::Get(); }
+
+bool SetGpuMutexCensusForThread(bool enabled) {
+    const bool previous = HostThreadSlot<bool, GpuMutexCensusSlot>::Get();
+    HostThreadSlot<bool, GpuMutexCensusSlot>::Set(enabled);
+    return previous;
+}
+
+static void lockSpinningTracked(Mutex& mutex, const std::uint64_t& criticalRelease) {
+    struct Acquisition {
+        bool enabled = HostThreadSlot<bool, GpuMutexCensusSlot>::Get();
+        std::chrono::steady_clock::time_point start = enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~Acquisition() {
+            if (!enabled) return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+            HostThreadSlot<std::uint64_t, GpuMutexAcquireSlot>::Set(ThreadGpuMutexAcquireNs() + static_cast<std::uint64_t>(ns));
+        }
+    } acquisition;
+    if (CriticalPath::Enabled()) {
+        if (mutex.try_lock()) return;
+        CriticalPath::Wait critical("GpuMutex", CriticalPath::Object(&mutex));
+        if (!Stage4::Tracking()) LockSpinning(mutex, HandoffSpinWindow());
+        else {
+            Stage4::WaitScope wait(Stage4::Wait::GpuMutex, true);
+            if (!SpinUntil(HandoffSpinWindow(), [&] { return mutex.try_lock(); })) {
+                wait.Blocking();
+                mutex.lock();
+            }
+        }
+        critical.End(criticalRelease, "mutex.release");
+        return;
+    }
     if (!Stage4::Tracking()) {
         LockSpinning(mutex, HandoffSpinWindow());
         return;
@@ -6295,7 +6330,7 @@ static void lockSpinningTracked(Mutex& mutex) {
 }
 
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) lockSpinningTracked(mutex);
+    if (!HeldByThisThread()) lockSpinningTracked(mutex, criticalRelease);
 }
 
 bool GpuMutexType::tryEnter() {
@@ -6305,6 +6340,7 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
+        if (CriticalPath::Enabled()) CriticalPath::Emit(CriticalPath::Kind::Point, "mutex.acquire", CriticalPath::Object(&mutex));
 #ifdef _WIN32
         if (HoldLog::Instance() != nullptr) holdLogBegin = HoldLog::Now();
 #endif
@@ -6424,6 +6460,7 @@ void GpuMutexType::unlock() {
             holdLogBegin = 0;
         }
 #endif
+        if (CriticalPath::Enabled()) criticalRelease = CriticalPath::Emit(CriticalPath::Kind::Release, "mutex.release", CriticalPath::Object(&mutex));
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -6469,7 +6506,7 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                lockSpinningTracked(mutex);
+                lockSpinningTracked(mutex, criticalRelease);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -6492,7 +6529,7 @@ void GpuMutexType::lock() {
         const auto* initialOwner = waitBegin != 0 ? owner.load(std::memory_order_acquire) : nullptr;
 #endif
         const auto start = std::chrono::steady_clock::now();
-        lockSpinningTracked(mutex);
+        lockSpinningTracked(mutex, criticalRelease);
         acquired();
         if (depth == 1) stats.holdSite = site;
         const auto now = std::chrono::steady_clock::now();

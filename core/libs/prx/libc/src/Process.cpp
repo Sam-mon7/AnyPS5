@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libc/include/Api.hpp"
 #include <csignal>
 #include <cstdint>
@@ -184,6 +185,7 @@ extern "C" {
             std::fputs("[libc] host exit drain failed\n", stderr);
         }
     }
+    CriticalPath::Shutdown();
     LibcRunReportFinishExit_nid_no_patch(code);
     LibcRunEndFlush_nid_no_patch();
 #ifdef _WIN32

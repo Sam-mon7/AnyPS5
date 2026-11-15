@@ -6531,8 +6531,24 @@ void verifyImageTableBitScanKeyShader() {
     const auto lanePlan = GetResourcePlan(request(laneCode, 0x3b000u));
     require(lanePlan->descriptorSources.at(lanePlan->info.images.at(0).source).tableColumn->bitScanKeys == 0u, "bit-scan key shader: a lane key was bounded");
 
+    const auto capturedWords = [](const auto& regions) {
+        std::map<std::uint64_t, std::uint32_t> words;
+        for (const auto& region : regions) {
+            require(region.bytes.size() % sizeof(std::uint32_t) == 0u, "capture policy: unaligned captured region");
+            for (std::size_t offset = 0; offset < region.bytes.size(); offset += sizeof(std::uint32_t)) {
+                std::uint32_t value;
+                std::memcpy(&value, region.bytes.data() + offset, sizeof(value));
+                const auto [found, inserted] = words.emplace(region.guestAddress + offset, value);
+                require(inserted || found->second == value, "capture policy: conflicting overlapping reads");
+            }
+        }
+        return words;
+    };
+    struct OwnedTableCompiled : TableCompiled {
+        std::map<std::uint64_t, std::uint32_t> captured;
+    };
     const auto compile = [&](bool bounded, ImageTableSnapshotCounts& counts) {
-        TableCompiled out;
+        OwnedTableCompiled out;
         AgcDriver::ShaderMemory memory({});
         memory.SetImageTableBitScanKeys(bounded);
         memory.SetImageTableSnapshotReuse(false, &counts);
@@ -6541,11 +6557,26 @@ void verifyImageTableBitScanKeyShader() {
         out.regions = memory.Regions();
         made.context.memory = out.regions;
         out.result = Recompile(made, *out.capture);
+        out.captured = capturedWords(out.regions);
         return out;
     };
     ImageTableSnapshotCounts fullCounts, boundedCounts;
     const auto full = compile(false, fullCounts);
     const auto bounded = compile(true, boundedCounts);
+    const auto& boundedWords = bounded.captured;
+    const auto& fullWords = full.captured;
+    if (std::getenv("APS5_VERIFY_IMAGE_TABLE_BITSCAN_KEYS") == nullptr) {
+        require(fullWords.size() > boundedWords.size(), "capture policy: full capture did not add fresh-only addresses");
+        for (const auto& [address, value] : boundedWords) {
+            const auto found = fullWords.find(address);
+            require(found != fullWords.end() && found->second == value, "capture policy: bounded read set or bytes differ from full capture");
+        }
+    }
+    ImageTableSnapshotCounts freshBoundedCounts;
+    const auto freshBounded = compile(true, freshBoundedCounts);
+    require(freshBounded.captured == boundedWords, "capture policy: independent matching-policy capture changed read coverage or bytes");
+    verifyResult(*bounded.result, *freshBounded.result);
+    require(bounded.result->variantId == freshBounded.result->variantId && bounded.result->runtimeAbiVersion == freshBounded.result->runtimeAbiVersion, "capture policy: independent matching-policy capture changed compiled identity");
     const auto& fullColumn = full.capture->snapshot.tables.tables.at(0);
     const auto& boundedColumn = bounded.capture->snapshot.tables.tables.at(0);
     require(fullColumn.keys == Abi::MaxKeys && boundedColumn.keys == 32u && boundedColumn.outside && boundedCounts.bitScanBounded == 1u && fullCounts.bitScanBounded == 0u, "bit-scan key shader: the capture was not bounded");

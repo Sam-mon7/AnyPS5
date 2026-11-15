@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -63,6 +64,89 @@
 namespace AgcDriver::Graphics {
 
 namespace {
+
+struct CriticalBatchState {
+    std::uint64_t recorder = 0, serial = 0, begin = 0, end = 0, observed = 0;
+    bool captured = false;
+};
+struct CriticalRecorderState {
+    std::mutex mutex;
+    std::uint64_t next = 0;
+    std::map<std::uint64_t, CriticalBatchState> batches;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> submissions;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t> pending;
+    std::map<std::uint64_t, std::uint64_t> sources;
+    bool evicted = false;
+};
+CriticalRecorderState& CriticalRecorder() {
+    static CriticalRecorderState state;
+    return state;
+}
+std::uint64_t CriticalBatch(std::uint64_t& token) try {
+    if (!CriticalPath::Capturing()) return 0;
+    if (token != 0) return token;
+    auto& state = CriticalRecorder();
+    std::lock_guard lock(state.mutex);
+    token = ++state.next;
+    if (state.batches.size() >= 8192) {
+        const auto first = state.batches.begin();
+        if (!state.evicted && (first->second.begin || first->second.captured)) state.evicted = CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.evicted") != 0;
+        const auto submission = state.submissions.find({first->second.recorder, first->second.serial});
+        if (submission != state.submissions.end() && submission->second == first->first) {
+            state.pending.erase(submission->first);
+            state.submissions.erase(submission);
+        }
+        state.batches.erase(first);
+    }
+    state.batches.emplace(token, CriticalBatchState{});
+    return token;
+} catch (...) {
+    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.unavailable");
+    token = 0;
+    return 0;
+}
+void CriticalSubmit(std::uint64_t token, std::uint64_t recorder, std::uint64_t serial, bool begin, bool success = false) try {
+    if (!token || !CriticalPath::Capturing()) return;
+    auto& state = CriticalRecorder();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.batches.find(token);
+    if (found == state.batches.end()) return;
+    auto& batch = found->second;
+    if (begin) {
+        batch.recorder = recorder;
+        batch.serial = serial;
+        batch.begin = CriticalPath::Emit(CriticalPath::Kind::GpuSubmitBegin, "gpu.host.submit.begin", token, serial);
+    } else if (success) {
+        batch.end = CriticalPath::Emit(CriticalPath::Kind::GpuSubmitEnd, "gpu.host.submit.end", token, serial, batch.begin);
+        state.submissions.insert_or_assign({recorder, serial}, token);
+        state.pending.insert_or_assign({recorder, serial}, token);
+    } else {
+        CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.host.submit.failed", token, serial);
+    }
+} catch (...) {
+    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.unavailable");
+}
+std::uint64_t CriticalObserve(std::uint64_t recorder, std::uint64_t serial, bool through) try {
+    if (!CriticalPath::Capturing()) return 0;
+    auto& state = CriticalRecorder();
+    std::lock_guard lock(state.mutex);
+    for (auto it = state.pending.lower_bound({recorder, through ? 0 : serial});
+         it != state.pending.end() && it->first.first == recorder && it->first.second <= serial;) {
+        const auto found = state.batches.find(it->second);
+        if (found != state.batches.end()) {
+            auto& batch = found->second;
+            if (!batch.observed && batch.begin && batch.end) batch.observed = CriticalPath::Emit(CriticalPath::Kind::GpuObserved, "gpu.completion.cpu_observed", it->second, batch.serial, batch.begin);
+        }
+        it = state.pending.erase(it);
+    }
+    const auto target = state.submissions.find({recorder, serial});
+    if (target == state.submissions.end()) return 0;
+    const auto found = state.batches.find(target->second);
+    return found == state.batches.end() ? 0 : found->second.observed;
+} catch (...) {
+    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.unavailable");
+    return 0;
+}
 
 Recorder* activeRecorder = nullptr;
 bool& computeSyncEnabledThreadState() {
@@ -1592,8 +1676,8 @@ struct Recorder::ProgressWatcher {
     std::atomic<std::uint32_t> wakes{0};
     std::thread thread;
 
-    ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
-        thread = std::thread([this, device, timeline, waitSemaphores, counterValue] {
+    ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue, std::uint64_t recorderId) {
+        thread = std::thread([this, device, timeline, waitSemaphores, counterValue, recorderId] {
             CpuTopology::PinHelperThread("GPU progress watcher");
             std::uint64_t seen = 0;
             for (;;) {
@@ -1617,6 +1701,7 @@ struct Recorder::ProgressWatcher {
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
+                CriticalObserve(recorderId, seen, true);
                 KernelWakeSleepers_nid_no_patch();
             }
         });
@@ -1808,6 +1893,37 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
     return labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
 }
 
+std::uint64_t Recorder::CriticalLabelSource(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    if (!CriticalPath::Capturing() || bytes.empty() || bytes.size() % 4 != 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes.size()) return 0;
+    std::lock_guard lock(labelTableMutex);
+    if (!labelTableOwner) return 0;
+    std::uint64_t source = 0;
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
+        const auto found = labelTableOwner->labels.find(address + offset);
+        if (found == labelTableOwner->labels.end()) return 0;
+        const auto& entry = found->second;
+        std::uint32_t value = 0;
+        std::memcpy(&value, bytes.data() + offset, 4);
+        if (entry.stamp != stamp || entry.queue != queue || entry.value != value || entry.overwritten || !entry.criticalSource) return 0;
+        if (offset && source != entry.criticalSource) return 0;
+        source = entry.criticalSource;
+    }
+    return source;
+}
+
+std::uint64_t Recorder::CriticalLabelObserved(std::uint64_t source) try {
+    if (!CriticalPath::Enabled() || !source) return 0;
+    auto& state = CriticalRecorder();
+    std::lock_guard lock(state.mutex);
+    const auto mapping = state.sources.find(source);
+    if (mapping == state.sources.end()) return 0;
+    const auto found = state.batches.find(mapping->second);
+    return found == state.batches.end() ? 0 : found->second.observed;
+} catch (...) {
+    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.unavailable");
+    return 0;
+}
+
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
     std::lock_guard tableLock(labelTableMutex);
     return labelTableOwner != nullptr && labelTableOwner->wideLabelInLocked(address, bytes);
@@ -1901,13 +2017,27 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
     auto& recorded = labelTableOwner->labels;
+    std::unordered_map<std::uint64_t, std::uint64_t> criticalCloses;
     for (const auto& [dword, stamp] : group) {
         // Only an entry still ours (stamps are unique): a later note of the dword has its own group.
         // And only while its batch is unsubmitted: a submitted one (a drain or APS5_LABEL_SUBMIT_NOW
         // inside the group) may have landed the value already, and a CPU store between that and
         // this close is not newer than the generation.
         const auto found = recorded.find(dword);
-        if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitted) found->second.generation = trackerGeneration;
+        if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitted) {
+            found->second.generation = trackerGeneration;
+            if (CriticalPath::Capturing() && found->second.criticalSource) {
+                try {
+                    const auto source = found->second.criticalSource;
+                    auto [close, inserted] = criticalCloses.try_emplace(source, 0);
+                    if (inserted) close->second = CriticalPath::Emit(CriticalPath::Kind::Handoff, "label.table.closed", source, trackerGeneration, source);
+                    found->second.criticalClose = close->second;
+                } catch (...) {
+                    found->second.criticalClose = 0;
+                    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.unavailable");
+                }
+            }
+        }
     }
     // A poller that refused the group as unclosed re-consults the table on the next generation.
     writeGeneration.fetch_add(1, std::memory_order_release);
@@ -5277,7 +5407,9 @@ std::uint64_t Recorder::PendingLeaseSerial(std::uint64_t address, std::size_t by
 }
 
 bool Recorder::signaled(const Batch& batch) const {
-    return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
+    const bool ready = batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
+    if (ready) CriticalObserve(id, batch.serial, false);
+    return ready;
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {
@@ -5308,6 +5440,17 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     if (open != nullptr) scan(*open);
     for (const auto& batch : inFlight) scan(*batch);
     return newest;
+}
+
+bool Recorder::PendingCpuWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto overlaps = [&](const Batch& batch) {
+        if (std::none_of(batch.writes.begin(), batch.writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) return false;
+        if (batch.completions.size() > batch.checkOnlyCompletions + batch.copiedWriterCompletions.size()) return true;
+        return std::any_of(batch.copiedWriterCompletions.begin(), batch.copiedWriterCompletions.end(), [&](const ShaderResources* resources) { return resources->CopiedWritesOverlap(address, bytes); });
+    };
+    if (open != nullptr && overlaps(*open)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return overlaps(*batch); });
 }
 
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
@@ -5483,7 +5626,7 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
         const auto* range = firstOverlap(**it);
         if (range == nullptr) continue;
         // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
-        const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
+        const bool signaled = this->signaled(**it);
         if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
         return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
     }
@@ -5513,6 +5656,26 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         LabelGroupDwords().emplace_back(dword, stamp);
     }
     recordedLabels.store(labels.size(), std::memory_order_relaxed);
+    if (CriticalPath::Enabled()) {
+        const auto source = CriticalPath::Emit(CriticalPath::Kind::Release, "label.table.publish", address, stamp);
+        for (std::size_t offset = 0; offset + 4 <= bytes.size(); offset += 4) labels.at(address + offset).criticalSource = source;
+        const auto token = CriticalBatch(batch.criticalBatch);
+        if (source && token) {
+            try {
+                auto& state = CriticalRecorder();
+                std::lock_guard lock(state.mutex);
+                if (state.sources.size() >= 65536) {
+                    if (!state.evicted) state.evicted = CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.evicted") != 0;
+                    state.sources.erase(state.sources.begin());
+                }
+                state.sources.emplace(source, token);
+                if (const auto found = state.batches.find(token); found != state.batches.end()) found->second.captured = true;
+                CriticalPath::Emit(CriticalPath::Kind::LabelBatch, "label.recorded.batch", source, token);
+            } catch (...) {
+                CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.provenance.unavailable");
+            }
+        }
+    }
 }
 
 void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std::uint64_t end) {
@@ -5621,6 +5784,13 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             Timeline::LabelStamps()[offset / 4] = entry->stamp;
             Timeline::LabelQueues()[offset / 4] = entry->queue;
         }
+        if (offset == 0) {
+            hit.criticalSource = entry->criticalSource;
+            hit.criticalClose = entry->criticalClose;
+        } else {
+            if (hit.criticalSource != entry->criticalSource) hit.criticalSource = 0;
+            if (hit.criticalClose != entry->criticalClose) hit.criticalClose = 0;
+        }
         hit.value |= static_cast<std::uint64_t>(entry->value) << (offset * 8u);
         if (offset == 0) {
             hit.queue = entry->queue;
@@ -5628,13 +5798,14 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
         }
     }
     if (!hit.late) hit.generation = 0;
+
     if (queued) queuedLabelHits.fetch_add(1, std::memory_order_relaxed);
     return hit;
 }
 
 bool Recorder::unsignaled(std::uint64_t serial) const {
     for (const auto& batch : inFlight) {
-        if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
+        if (batch->serial == serial) return !signaled(*batch);
     }
     return false;
 }
@@ -5847,8 +6018,10 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     Timeline::Emit(Timeline::Kind::SubmitBegin, serial, id, 0, 0, batch->timelineId);
+    CriticalSubmit(CriticalBatch(batch->criticalBatch), id, serial, true);
     batch->submitStarted.store(true, std::memory_order_release);
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    CriticalSubmit(batch->criticalBatch, id, serial, false, result == VK_SUCCESS);
     Timeline::Emit(Timeline::Kind::SubmitEnd, serial, id, 0, 0, batch->timelineId, static_cast<std::uint32_t>(result));
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
@@ -5879,7 +6052,7 @@ void Recorder::Submit() {
     if (timeline != VK_NULL_HANDLE) {
         if (!progressWatcher) {
             progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
-                                                                context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
+                                                                context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"), id);
         }
         progressWatcher->Submitted(batch->serial);
     }
@@ -5922,6 +6095,8 @@ struct RestoreSyncSite {
 // leave after completing every batch, so the handles stay valid until this returns).
 VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial, std::uint64_t recorderId) {
     Timeline::GpuWaitScope timelineWait(serial, recorderId);
+    CriticalPath::Wait critical("gpu.timeline.external", recorderId);
+    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.timeline.target", recorderId, serial);
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -5933,6 +6108,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
         result = waitSemaphores(device, &wait, 5'000'000'000ull);
     }
     timelineWait.result = static_cast<std::uint32_t>(result);
+    critical.End(result == VK_SUCCESS ? CriticalObserve(recorderId, serial, true) : 0, result == VK_SUCCESS ? "gpu.timeline.observed" : "gpu.timeline.failure");
     return result;
 }
 
@@ -5966,8 +6142,11 @@ bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
     Timeline::GpuWaitScope timelineWait(serial, id);
+    CriticalPath::Wait critical("gpu.timeline.external", id);
+    CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.timeline.target", id, serial);
     const auto result = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR")(context.device, &wait, timeoutNanos);
     timelineWait.result = static_cast<std::uint32_t>(result);
+    critical.End(result == VK_SUCCESS ? CriticalObserve(id, serial, true) : 0, result == VK_SUCCESS ? "gpu.timeline.observed" : result == VK_TIMEOUT ? "gpu.timeline.timeout" : "gpu.timeline.failure");
     if (profile) {
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         if (GuestMemory::GpuMutex().HeldByThisThread()) GuestMemory::NoteLockedGpuWait(ms);
@@ -6072,7 +6251,7 @@ bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
         ArchB::Recorder::Count("fix_csync_refused_batch");
         return false;
     }
-    if (fenceStatus((*target)->fence) == VK_SUCCESS) {
+    if (signaled(**target)) {
         ArchB::Recorder::Count("fix_csync_refused_signaled");
         return false;
     }
@@ -6100,12 +6279,15 @@ bool Recorder::FinishComputeSyncUnlocked(std::uint64_t serial) {
         start = std::chrono::steady_clock::now();
         try {
             Timeline::GpuWaitScope timelineWait(serial, myId);
+            CriticalPath::Wait critical("gpu.fence.external", myId);
+            CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.fence.batch", myId, serial);
             result = waitFences(device, 1, &fence, VK_TRUE, 5'000'000'000ull);
             for (int seconds = 5; result == VK_TIMEOUT; seconds += 5) {
                 std::fprintf(stderr, "[gpu] compute sync batch %llu still running after %d s\n", static_cast<unsigned long long>(serial), seconds);
                 result = waitFences(device, 1, &fence, VK_TRUE, 5'000'000'000ull);
             }
             timelineWait.result = static_cast<std::uint32_t>(result);
+            critical.End(result == VK_SUCCESS ? CriticalObserve(myId, serial, false) : 0, result == VK_SUCCESS ? "gpu.fence.observed" : "gpu.fence.failure");
         } catch (...) {
             failure = std::current_exception();
         }
@@ -6398,7 +6580,7 @@ bool Recorder::Reap() {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        if (!signaled(*inFlight.front())) break;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);
@@ -6516,6 +6698,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             censusSite.start = std::chrono::steady_clock::now();
         }
         Timeline::GpuWaitScope timelineWait(batch->serial, id, batch->timelineId);
+        CriticalPath::Wait critical("gpu.fence.external", id);
+        CriticalPath::Emit(CriticalPath::Kind::Point, "gpu.fence.batch", id, batch->serial);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
@@ -6524,6 +6708,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
         timelineWait.result = static_cast<std::uint32_t>(result);
+        critical.End(result == VK_SUCCESS ? CriticalObserve(id, batch->serial, false) : 0, result == VK_SUCCESS ? "gpu.fence.observed" : "gpu.fence.failure");
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
@@ -6533,6 +6718,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(result, "vkWaitForFences recorder");
         }
     }
+    CriticalObserve(id, batch->serial, false);
     Timeline::Emit(Timeline::Kind::Complete, batch->serial, 0, 0, 0, batch->timelineId);
     readGpuTiming(*batch);
     if (DrawProfiled()) {
