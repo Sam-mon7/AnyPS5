@@ -164,9 +164,15 @@ std::size_t GuestWtFaultWatch_nid_no_patch(std::uintptr_t address, std::size_t b
 std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes);
 std::size_t GuestWtFaultUnwatch_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestWtFaultWatchLazyCauses_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* causes);
 std::size_t GuestWtFaultWatchedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestWtFaultLazyPages_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestWtFaultSetLazyService_nid_no_patch(void (*service)(std::uintptr_t page, bool write));
 void GuestWtFaultServeLazyRange_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+enum class WtLazyCause : std::uint8_t { Fault, Range, Hold, Open, Unwatch };
+WtLazyCause GuestWtFaultLazyServiceCause_nid_no_patch();
+void GuestWtFaultSetLazyPreservation_nid_no_patch(bool (*predicate)(std::uintptr_t, std::size_t));
+bool GuestWtFaultLazyPreservationEnabled_nid_no_patch();
 void GuestWtFaultLazyCounters_nid_no_patch(std::uint64_t* services, std::uint64_t* nested);
 // APS5_ARCHB_C_WATCH_SPLIT: a watch run one VirtualProtect refuses (it spans allocations) is protected
 // one VirtualQuery region at a time; the counters are the runs split and the pieces protected.

@@ -14,6 +14,11 @@
 #include <memory>
 #include <vector>
 
+namespace AgcDriver::DriverDetail {
+struct GatherDrawPlan;
+struct GatherCommitTemplate;
+}
+
 namespace AgcDriver::Graphics {
 
 struct VkDrawCounts {
@@ -37,6 +42,12 @@ struct DrawSlotStage {
 struct DrawSlotIdentity {
     std::shared_ptr<const void> state;
     std::vector<DrawSlotStage> stages;
+    std::shared_ptr<DriverDetail::GatherCommitTemplate> gatherTemplate;
+    const DriverDetail::GatherDrawPlan* gather = nullptr;
+    const DriverDetail::GatherDrawPlan* learning = nullptr;
+    std::span<const CompiledShader> referenceStages;
+    std::span<const DrawReferenceMasks> referenceMasks;
+    const Pm4::DrawParameters* referenceDraw = nullptr;
 };
 
 struct DrawTraceContext {
@@ -215,7 +226,7 @@ struct DrawRecipeOutcome {
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing.
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr, DrawPreparation* preparation = nullptr, bool pipelineStateReuse = false);
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr, DrawPreparation* preparation = nullptr, bool pipelineStateReuse = false, const DrawSlotIdentity* identity = nullptr);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 

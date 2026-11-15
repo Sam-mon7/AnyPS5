@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -454,7 +455,9 @@ bool PartialSnapshotVerifyEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_ARCHB_FIX_PARTIAL_SNAPSHOT_VERIFY");
         const char* prewait = std::getenv("APS5_ARCHB_FIX_COMPUTE_SNAPSHOT_WAIT_VERIFY");
-        return (value != nullptr && std::string_view(value) == "1") || (prewait != nullptr && std::string_view(prewait) == "1");
+        const char* gpu = std::getenv("APS5_ARCHB_FIX_SAMPLED_ARRAY_GPU_VERIFY");
+        const char* depthArray = std::getenv("APS5_VERIFY_DEPTH_ARRAY_GPU");
+        return (value != nullptr && std::string_view(value) == "1") || (prewait != nullptr && std::string_view(prewait) == "1") || (gpu != nullptr && std::string_view(gpu) == "1") || (depthArray != nullptr && std::string_view(depthArray) == "1");
     }();
     return enabled;
 }
@@ -943,7 +946,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
     }
 }
 
-void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached) {
+void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached, bool gpu) {
     GuestMemory::AssertGpuLockHeld("Texture::UpdateSnapshotLayers");
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr && image != VK_NULL_HANDLE && owned != nullptr && storageSource == nullptr && source == nullptr && !srgbExpand && perUseCopy == PerUseCopy::None, "sampled snapshot cannot be updated in place");
@@ -953,9 +956,9 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
     Require(geometry.layerBytes <= std::numeric_limits<std::size_t>::max() / layers.size() && geometry.sliceLinearBytes <= std::numeric_limits<std::size_t>::max() / layers.size(), "partial sampled snapshot buffers overflow");
     const auto tiledBytes = static_cast<std::size_t>(geometry.layerBytes) * layers.size();
     const auto linearBytes = static_cast<std::size_t>(geometry.sliceLinearBytes) * layers.size();
-    auto staging = std::make_shared<Buffer>(context, tiledBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    auto staging = gpu ? nullptr : std::make_shared<Buffer>(context, tiledBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     Require(cached.empty() || cached.size() == geometry.guestBytes, "cached sampled snapshot size changed");
-    {
+    if (!gpu) {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
         for (std::size_t index = 0; index < layers.size(); ++index) {
             Require(layers[index] < geometry.layers && (index == 0 || layers[index - 1] < layers[index]), "partial sampled snapshot layers are invalid");
@@ -968,13 +971,25 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
     auto tiled = std::make_shared<DeviceBuffer>(context, tiledBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     auto linear = std::make_shared<DeviceBuffer>(context, linearBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     const auto commands = recorder->Commands();
-    recorder->Keep(staging, tiledBytes);
+    if (staging != nullptr) recorder->Keep(staging, tiledBytes);
     recorder->Keep(tiled, tiledBytes);
     recorder->Keep(linear, linearBytes);
     recorder->Keep(owned);
     detiler.BeginBatch();
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, tiledBytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | (gpu ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : 0u), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | (gpu ? VK_ACCESS_MEMORY_WRITE_BIT : 0u), VK_ACCESS_TRANSFER_READ_BIT);
+    if (gpu) {
+        Require(cached.empty(), "a GPU sampled snapshot cannot retain CPU texel bytes");
+        for (std::size_t index = 0; index < layers.size(); ++index) {
+            Require(layers[index] < geometry.layers && (index == 0 || layers[index - 1] < layers[index]), "GPU sampled snapshot layers are invalid");
+            const auto address = descriptor.baseAddress + geometry.GuestLayerOffset(layers[index]);
+            const auto* import = ExistingHostImportFor(context, address, static_cast<std::size_t>(geometry.layerBytes));
+            Require(import != nullptr, "GPU sampled snapshot lost its imported layer");
+            CopyBuffer(context, commands, import->buffer, HostImportOffset(*import, address), tiled->Handle(), index * geometry.layerBytes, static_cast<std::size_t>(geometry.layerBytes));
+            recorder->NotePendingRead(address, static_cast<std::size_t>(geometry.layerBytes), Recorder::ReadKind::StorageUpload);
+        }
+    } else {
+        CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, tiledBytes);
+    }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imageInfo.imageType = ImageTypeFor(descriptor.dimension);
@@ -1057,7 +1072,53 @@ void Texture::UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureRe
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(toTransfer.size()), toTransfer.data());
 }
 
-void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor) const {
+bool Texture::AcceptsDepthArray(const GuestTextureResource& descriptor) const {
+    return image != VK_NULL_HANDLE && owned != nullptr && storageSource == nullptr && source == nullptr && !srgbExpand && perUseCopy == PerUseCopy::None && !snapshotRows && snapshotFirstLevel == 0u && snapshotAspect == VK_IMAGE_ASPECT_DEPTH_BIT && viewFormat == VK_FORMAT_D32_SFLOAT && layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && descriptor.baseAddress == sourceDescriptor.baseAddress && descriptor.width == sourceDescriptor.width && descriptor.height == sourceDescriptor.height && descriptor.depthOrLastArray == sourceDescriptor.depthOrLastArray && descriptor.baseArray == sourceDescriptor.baseArray && descriptor.mipCount == sourceDescriptor.mipCount && descriptor.tileMode == sourceDescriptor.tileMode && descriptor.dimension == sourceDescriptor.dimension && descriptor.format == sourceDescriptor.format && descriptor.pipeBankXor == sourceDescriptor.pipeBankXor;
+}
+
+void Texture::UpdateDepthArrayLayers(const GuestTextureResource& descriptor, std::span<const std::pair<VkImage, std::uint32_t>> layers) {
+    GuestMemory::AssertGpuLockHeld("Texture::UpdateDepthArrayLayers");
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr && AcceptsDepthArray(descriptor) && !layers.empty(), "depth array snapshot cannot be refreshed");
+    const auto commands = recorder->Commands();
+    recorder->Keep(owned);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    std::vector<VkImageMemoryBarrier> barriers(layers.size());
+    for (std::size_t index = 0; index < layers.size(); ++index) {
+        Require(layers[index].first != VK_NULL_HANDLE && layers[index].second <= descriptor.depthOrLastArray, "invalid depth array layer");
+        auto& barrier = barriers[index];
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image;
+        barrier.subresourceRange = {snapshotBarrierAspect, 0, 1, layers[index].second, 1};
+    }
+    const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
+    barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
+    const auto copy = context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage");
+    for (const auto& [from, layer] : layers) {
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, layer, 1};
+        region.extent = {descriptor.width, descriptor.height, 1};
+        copy(commands, from, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
+    for (auto& entry : barriers) {
+        entry.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        entry.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        entry.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        entry.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+    barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::Copy, 4);
+}
+
+void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor, const char* mismatchCounter, std::atomic<std::uint64_t>* strictMismatches) const {
     GuestMemory::AssertGpuLockHeld("Texture::VerifySnapshot");
     auto* recorder = Recorder::Active();
     Require(PartialSnapshotVerifyEnabled() && recorder != nullptr && image != VK_NULL_HANDLE && reference.image != VK_NULL_HANDLE && owned != nullptr && reference.owned != nullptr, "sampled snapshot verification is unavailable");
@@ -1127,7 +1188,7 @@ void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResourc
     }
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, static_cast<std::uint32_t>(barriers.size()), barriers.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    recorder->OnComplete([actual, expected, ranges = std::move(ranges), actualOwner = owned, expectedOwner = reference.owned] {
+    recorder->OnComplete([actual, expected, ranges = std::move(ranges), actualOwner = owned, expectedOwner = reference.owned, mismatchCounter, strictMismatches] {
         actual->Invalidate();
         expected->Invalidate();
         const auto actualBytes = actual->Bytes();
@@ -1135,8 +1196,12 @@ void Texture::VerifySnapshot(const Texture& reference, const GuestTextureResourc
         std::uint64_t mismatches = 0;
         for (const auto& [offset, size] : ranges) mismatches += std::memcmp(actualBytes.data() + offset, expectedBytes.data() + offset, size) != 0;
         PartialSnapshotMismatches().fetch_add(mismatches, std::memory_order_relaxed);
-        AgcDriver::ArchB::Recorder::Count("fix_psnap_verify_mismatches", static_cast<double>(mismatches));
-    });
+        AgcDriver::ArchB::Recorder::Count(mismatchCounter, static_cast<double>(mismatches));
+        if (strictMismatches != nullptr) {
+            strictMismatches->fetch_add(mismatches, std::memory_order_relaxed);
+            Require(mismatches == 0u, "depth array GPU verification texels disagree");
+        }
+    }, true);
 }
 
 std::uint64_t Texture::PartialSnapshotVerifyMismatches() {
@@ -4652,6 +4717,12 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         // shadowed ones reach it through a publish, which notes its own.
         if (!imported.empty()) recorder->NotePendingWrites(imported);
     }
+    if (GpuAuthorityCensus::Enabled()) {
+        const auto* reason = flushReasonThreadState();
+        const bool depth = reason != nullptr && (std::strstr(reason, "depth plane") || std::strstr(reason, "stencil plane"));
+        for (const auto& range : shadowed) GpuAuthorityCensus::Published(range.begin, range.end, depth ? GpuAuthorityCensus::Kind::DepthPlane : GpuAuthorityCensus::Kind::StorageShadow, recorder, recorder ? recorder->OpenSerial() : 0, timing);
+        for (const auto& [begin, end] : imported) GpuAuthorityCensus::StoragePublished(begin, end, flushReasonThreadState(), recorder, recorder ? recorder->OpenSerial() : 0, timing);
+    }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
     return storedBytes;
@@ -4697,6 +4768,7 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
+    GpuAuthorityCensus::Produced(descriptor.baseAddress, descriptor.baseAddress + guestBytes, descriptor.baseAddress);
     // Write generations: the storage image's results stay on the GPU until flushed (the pending
     // registry), announced over its guest range.
     if (GuestMemory::Gen::Active() && guestBytes != 0) GuestMemory::Gen::NotePending(descriptor.baseAddress, descriptor.baseAddress + guestBytes, reinterpret_cast<std::uintptr_t>(this));
@@ -4720,6 +4792,7 @@ void StorageTexture::MarkSliceDirty(std::uint32_t slice, std::uint32_t count) {
         MarkDirty();
         return;
     }
+    GpuAuthorityCensus::Produced(layerBegin(first), layerBegin(last - 1) + layerBytes(last - 1), descriptor.baseAddress);
     markLayersPending(first, last - first);
 }
 
@@ -5157,6 +5230,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
         return storedBytes;
     }
     recorder->EndGpuTiming(timing, storedBytes);
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : stores) GpuAuthorityCensus::StoragePublished(begin, end, flushReasonThreadState(), recorder, recorder->OpenSerial(), timing);
     recorder->MarkShaderReadsCovered();
     recorder->NotePendingWrite(hullBegin, hullBytes);
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
@@ -5266,7 +5340,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     const auto* refreshing = Refreshing::Get();
     const bool profile = LookupOutcomes::Profiled();
     const auto depthStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::optional<ShadowConsumerScope> consumer;
+    if (LazyShadowPublishEnabled()) consumer.emplace(reason, address, bytes, scope);
     const auto depthRanges = FlushDepthPlanes(address, bytes);
+    consumer.reset();
     if (profile) {
         LookupOutcomes::Add(LookupOutcomes::FlushDepth, depthStart);
         ++ThreadLookupOutcomes().work[LookupOutcomes::FlushCalls];
@@ -5492,6 +5569,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
+        const PublishSiteScope site(reason);
         const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
         if (units != 0) waitForIdlePublish(reason);
         if (published != nullptr) *published = units != 0;
@@ -5689,6 +5767,7 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason, bool waited) {
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    const PublishSiteScope site(reason);
     if (PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited) == 0) return false;
     waitForIdlePublish(reason);
     return true;
@@ -6017,7 +6096,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     for (const auto& [address, bytes] : occasional) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device));
 }
 
-std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
+std::size_t StorageTexture::StoreDrawnLinear(const char* reason, PublishScope scope) {
     auto& pending = Pending();
     if (pending.drawnCount.load(std::memory_order_acquire) == 0 || Recorder::InCompletion()) return 0;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -6032,7 +6111,8 @@ std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
     }
     std::size_t stored = 0;
     for (const auto& [address, bytes] : ranges) {
-        if (FlushPending(address, bytes, nullptr, reason)) ++stored;
+        if (FlushPending(address, bytes, nullptr, reason, scope)) ++stored;
+        if (scope == PublishScope::None && LazyShadowPublishEnabled()) SettlePlaneStore(reason, address, address + bytes, scope);
     }
     return stored;
 }
@@ -7981,6 +8061,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             batch->SubmitAndWait();
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
+            if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : importStores) GpuAuthorityCensus::StoragePublished(begin, end, flushReasonThreadState(), recorder, recorder->OpenSerial(), timing);
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
@@ -8139,6 +8220,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
         const auto length = static_cast<std::size_t>(to - from);
         GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+        GpuAuthorityCensus::Published(from, to, GpuAuthorityCensus::Kind::CpuWriteBack);
         std::memcpy(original.data() + offset, current.data() + offset, length);
     }
     // The texels now hold the whole image, so later reads must see them rather than a fast clear

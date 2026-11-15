@@ -131,8 +131,10 @@ public:
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
-    void UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached);
-    void VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor) const;
+    void UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached, bool gpu = false);
+    bool AcceptsDepthArray(const GuestTextureResource& descriptor) const;
+    void UpdateDepthArrayLayers(const GuestTextureResource& descriptor, std::span<const std::pair<VkImage, std::uint32_t>> layers);
+    void VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor, const char* mismatchCounter = "fix_psnap_verify_mismatches", std::atomic<std::uint64_t>* strictMismatches = nullptr) const;
     static std::uint64_t PartialSnapshotVerifyMismatches();
 
 private:
@@ -359,7 +361,7 @@ public:
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason, VkDevice device = VK_NULL_HANDLE);
     static void PrepareReadbackBeforeLabel(bool computeSync = false);
-    static std::size_t StoreDrawnLinear(const char* reason);
+    static std::size_t StoreDrawnLinear(const char* reason, PublishScope scope = PublishScope::Whole);
     static void NoteFlip();
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();

@@ -21,6 +21,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_archb_fix_alloc_churn_switch COMMAND agc_archb_c01_switches_tests --toggle AllocChurn)
     add_test(NAME agc_archb_fix_slab_alloc_switch COMMAND agc_archb_c01_switches_tests --toggle FixHostSlabAlloc)
     add_test(NAME agc_archb_fix_cheap_timers_switch COMMAND agc_archb_c01_switches_tests --toggle FixCheapTimers)
+    add_test(NAME agc_archb_depth_array_gpu_switch COMMAND agc_archb_c01_switches_tests --toggle DepthArrayGpu)
     set_tests_properties(agc_archb_fix_slab_alloc_switch agc_archb_fix_cheap_timers_switch PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_archb_fix_slab_alloc_switch agc_archb_fix_cheap_timers_switch PROPERTIES ENVIRONMENT_MODIFICATION
