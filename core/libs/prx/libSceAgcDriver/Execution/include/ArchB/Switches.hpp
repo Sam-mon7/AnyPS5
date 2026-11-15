@@ -110,6 +110,16 @@ enum class Feature : std::uint8_t {
     ReplayRecognize,
     FixStatePacketFast,
     FixDrawRelocNested,
+    FixSampledArrayGpu,
+    DrawGatherShadow,
+    DrawTemplates,
+    DrawTemplatesLive,
+    GpuAuthorityCensus,
+    LazyShadowPublish,
+    DepthRunRepeat,
+    DispatchAddressReuse,
+    DispatchUploadReuse,
+    DispatchPartialReproof,
     Count
 };
 
@@ -135,6 +145,8 @@ public:
     static std::span<const SwitchInfo> Table();
     static void CountUpperBoundHit(Feature feature);
 };
+
+bool DirectDrawEnabled() noexcept;
 
 // FIX_ALLOC_CHURN is sampled once per draw or dispatch into the calling thread (AllocChurnScope);
 // the allocation sites below it read AllocChurnActive(), so a runtime toggle changes their path only

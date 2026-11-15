@@ -302,6 +302,7 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    std::shared_ptr<void>& ParameterArenaHolder() { return parameterArena; }
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -317,6 +318,7 @@ public:
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    bool PendingCpuWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -1214,6 +1216,7 @@ private:
     void dropCarries(const ReadList& ranges, const char* source);
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    std::shared_ptr<void> parameterArena;
     std::unique_ptr<PipelineStateReuse> pipelineStateReuse;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
