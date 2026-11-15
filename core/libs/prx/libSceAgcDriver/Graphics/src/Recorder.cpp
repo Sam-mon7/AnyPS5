@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "ThreadOwned.hpp"
 #include <algorithm>
@@ -4756,8 +4757,14 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
     const bool tabled = bytes.size() <= LabelTableBytes;
+    AgcDriver::ArchB::LabelCensus::Steps census;
+    struct CensusNote {
+        AgcDriver::ArchB::LabelCensus::Steps& steps;
+        ~CensusNote() { steps.Step("c9_nl_write_ns"); }
+    } censusNote{census};
     if (tabled) {
         noteLabelOn(*open, address, bytes, stamp, queue);
+        census.Step("c9_nl_table_ns");
     } else {
         std::lock_guard tableLock(labelTableMutex);
         labels.erase(labels.lower_bound(address), labels.lower_bound(address + bytes.size()));
@@ -5605,13 +5612,33 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
 }
 
 bool Recorder::Reap() {
+    // Label chain 2 census: reaps that retired nothing (only the fence poll) against those that finished a batch.
+    const bool census = AgcDriver::ArchB::LabelCensus::On();
+    const auto censusStart = census ? AgcDriver::ArchB::LabelCensus::Now() : 0;
+    std::uint64_t censusPollNs = 0;
+    std::uint64_t retired = 0;
+    struct CensusReap {
+        bool on;
+        std::uint64_t start;
+        const std::uint64_t& pollNs;
+        const std::uint64_t& retired;
+        ~CensusReap() {
+            if (!on) return;
+            const auto ns = static_cast<double>(AgcDriver::ArchB::LabelCensus::Now() - start);
+            AgcDriver::ArchB::Recorder::Count(retired == 0 ? "c9_reap_empty_n" : "c9_reap_work_n");
+            AgcDriver::ArchB::Recorder::Count(retired == 0 ? "c9_reap_empty_ns" : "c9_reap_work_ns", ns);
+            AgcDriver::ArchB::Recorder::Count("c9_reap_poll_ns", static_cast<double>(pollNs));
+        }
+    } censusReap{census, censusStart, censusPollNs, retired};
     PerformanceTimer frameTiming("Recorder.Reap");
     dropStaleHoldKept();
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::uint64_t retired = 0;
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        const auto pollStart = census ? AgcDriver::ArchB::LabelCensus::Now() : 0;
+        const bool signaled = fenceStatus(inFlight.front()->fence) == VK_SUCCESS;
+        if (census) censusPollNs += AgcDriver::ArchB::LabelCensus::Now() - pollStart;
+        if (!signaled) break;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);

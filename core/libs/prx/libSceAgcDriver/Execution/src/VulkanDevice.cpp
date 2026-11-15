@@ -2789,6 +2789,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         census.Step("c9_wl_record_ns");
         // The table entry and the label's own pending-write note (Recorder::NoteLabel).
         recorder.NoteLabel(address, bytes, stamp, queue);
+        census.Step("c9_wl_notelabel_ns");
         GuestMemory::MarkWritten(address, bytes.size());
         census.Step("c9_wl_note_ns");
         // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
