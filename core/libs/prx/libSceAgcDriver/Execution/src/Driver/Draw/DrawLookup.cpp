@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -224,8 +225,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         ++compared;
                         const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
                         auto& hit = stageData[i];
+                        auto* gatherLog = GatherValidationLog();
+                        const bool gatherPending = gatherLog != nullptr && GatherRunsPending(*variant);
                         auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases, GuestMemory::Gen::Consumer::DrawValidate, &hit.words);
                         if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases, GuestMemory::Gen::Consumer::DrawValidate, &hit.words);
+                        if (gatherLog != nullptr) gatherLog->push_back({static_cast<std::uint32_t>(i), variant, result, false, gatherPending});
                         const auto genVerdict = genShadow ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore, VariantValidationExact()) : GuestMemory::Gen::Verdict::Unknown;
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
@@ -239,7 +243,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         }
                         if (result == EntryOutcome::EqualData) {
                             hit.compiled = patchDataWords(*variant, hit.words, bufferBases);
-                            if (hit.compiled == nullptr) { ArchB::Recorder::Count("fix_buffer_base_refused_patch"); hit.words.clear(); continue; }
+                            if (hit.compiled == nullptr) {
+                                ArchB::Recorder::Count("fix_buffer_base_refused_patch");
+                                hit.words.clear();
+                                if (gatherLog != nullptr) gatherLog->back().refused = true;
+                                continue;
+                            }
                             hit.bufferBaseHit = bufferBases && std::any_of(liveData.begin(), liveData.end(), [&](const auto& word) { return WordMask(variant->bufferBaseMasks, word.first) != 0; });
                             if (hit.bufferBaseHit) ArchB::Recorder::Count("fix_buffer_base_hits");
                             ++dataStages;
