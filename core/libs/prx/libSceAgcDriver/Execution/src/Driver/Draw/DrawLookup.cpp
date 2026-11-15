@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawHitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -11,7 +12,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, std::uint64_t& shapeKey, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask, bool bufferBases) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, std::uint64_t& shapeKey, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask, bool bufferBases, std::span<const std::uint32_t> packet) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
@@ -171,6 +172,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         bool genAllClean = true;
         if (entry == nullptr && genShadow) GuestMemory::Gen::NoteDrawLookup(genQueue0, false, false);
         if (entry != nullptr) {
+            DrawHitCensus hitCensus(entry, registerKey, packet, drawParameters, graphics, programs);
+            bool exactHit = true;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
@@ -245,6 +248,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             ++dataStages;
                             dataWords += liveData.size();
                         }
+                        if (hitCensus.Active()) exactHit = exactHit && result == EntryOutcome::Equal && VariantValidationExact() && !userFeedback && !memoryFeedback && hit.words.empty();
                         stageData[i].feedbackHit = userFeedback || memoryFeedback;
                         matched[i] = variant;
                         ranks[i] = rank;
@@ -260,6 +264,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            hitCensus.Finish(drawHit, exactHit && drawHit, matched);
             if (genShadow) GuestMemory::Gen::NoteDrawLookup(genQueue0, drawHit, drawHit && genAllClean);
             const bool feedbackHit = drawHit && std::any_of(stageData.begin(), stageData.end(), [](const auto& stage) { return stage.feedbackHit; });
             if (feedbackHit) ArchB::Recorder::Count("fix_tsharp_mask_hits");
