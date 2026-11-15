@@ -7044,6 +7044,24 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out, bool checked
 #endif
 }
 
+Compare CopyMappedGuarded(std::uint64_t address, std::span<std::byte> out, bool& owned) {
+    owned = false;
+#ifdef _WIN32
+    if (out.empty()) return Compare::Equal;
+    if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, out.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, out.size());
+    if (GuestArena::GuestArenaCopyOwned_nid_no_patch(static_cast<std::uintptr_t>(address), out.data(), out.size())) {
+        owned = true;
+        return Compare::Equal;
+    }
+    if (address > userAddressLimit() || out.size() - 1 > userAddressLimit() - address) return Compare::Unmapped;
+    return readPages(out.data(), address, out.size()) ? Compare::Equal : Compare::Unmapped;
+#else
+    return CopyMapped(address, out, true);
+#endif
+}
+
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {

@@ -14,6 +14,11 @@
 #include <memory>
 #include <vector>
 
+namespace AgcDriver::DriverDetail {
+struct GatherDrawPlan;
+struct GatherCommitTemplate;
+}
+
 namespace AgcDriver::Graphics {
 
 struct VkDrawCounts {
@@ -37,6 +42,12 @@ struct DrawSlotStage {
 struct DrawSlotIdentity {
     std::shared_ptr<const void> state;
     std::vector<DrawSlotStage> stages;
+    std::shared_ptr<DriverDetail::GatherCommitTemplate> gatherTemplate;
+    const DriverDetail::GatherDrawPlan* gather = nullptr;
+    const DriverDetail::GatherDrawPlan* learning = nullptr;
+    std::span<const CompiledShader> referenceStages;
+    std::span<const DrawReferenceMasks> referenceMasks;
+    const Pm4::DrawParameters* referenceDraw = nullptr;
 };
 
 struct DrawTraceContext {
