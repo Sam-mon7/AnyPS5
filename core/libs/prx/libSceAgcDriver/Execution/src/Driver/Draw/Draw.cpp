@@ -155,6 +155,7 @@ struct DrawTail {
     bool imageTableSnapshotReuse = false;
     bool imageTableBitScanKeys = false;
     bool bufferBases = false;
+    bool q0WriterInvalidate = false;
     bool allocChurn = false;
     bool partialSnapshot = false;
     bool hostSlabAlloc = false;
@@ -480,6 +481,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.imageTableSnapshotReuse = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableSnapshotReuse);
     tail.imageTableBitScanKeys = ArchB::Switches::Enabled(ArchB::Feature::FixImageTableBitScanKeys);
     tail.bufferBases = ArchB::Switches::Enabled(ArchB::Feature::FixBufferBaseRefresh);
+    tail.q0WriterInvalidate = ArchB::Switches::Enabled(ArchB::Feature::FixQ0WriterInvalidate);
     // APS5_ARCHB_FIX_ALLOC_CHURN, once per draw: this thread's allocation sites follow it for the rest
     // of the draw, and the finisher and pipelined commits take the same value from the tail.
     tail.allocChurn = ArchB::Switches::Enabled(ArchB::Feature::FixAllocChurn);
@@ -916,7 +918,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         censusMisses = drawEntryCounters.misses;
     }
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, shapeKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.feedbackMask, tail.bufferBases);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, shapeKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, drawParameters, tail.ubPointerFree, tail.feedbackMask, tail.bufferBases, tail.q0WriterInvalidate);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;

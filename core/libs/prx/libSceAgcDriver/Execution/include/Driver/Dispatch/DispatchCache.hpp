@@ -27,6 +27,10 @@ struct IrResourcePlan;
 struct ResourceCapture;
 }
 
+namespace AgcDriver::GuestMemory {
+struct Q0WriterProof;
+}
+
 namespace AgcDriver::DriverDetail {
 
 inline constexpr std::size_t MaxDispatchVariants = 8;
@@ -89,6 +93,16 @@ struct DispatchVariant {
     // checks at that ticket or an older one need no sweep (GEN_DRAW_VALIDATION). Any since paired
     // with any proven ticket is evidence: both come from readings that found the words.
     mutable std::atomic<std::uint64_t> genProvenTicket{0};
+    mutable std::atomic<std::uint64_t> q0Epoch{0};
+    mutable std::atomic<std::uint64_t> q0Mapping{0};
+    mutable std::atomic<std::uint64_t> q0Write{0};
+    mutable std::atomic<std::uint64_t> q0RecorderWrite{0};
+    mutable std::atomic<std::uint64_t> q0Forget{0};
+    mutable std::atomic<std::uint64_t> q0Publication{0};
+    mutable std::atomic<std::uint64_t> q0Pending{0};
+    mutable std::atomic<std::uint64_t> q0Unwatch{0};
+    mutable std::atomic<std::uint64_t> q0ComparedBytes{0};
+    mutable std::atomic<std::shared_ptr<GuestMemory::Q0WriterProof>> q0WriterProof;
 };
 
 struct DispatchEntry {
@@ -159,6 +173,7 @@ GuestMemory::Gen::Verdict ShadowValidatedVariant(GuestMemory::Gen::Consumer cons
 // variant's words exactly (Equal with no live data word, no masked feedback bit, no pending GPU write
 // over a run): only then may a since move.
 bool VariantValidationExact();
+bool VariantValidationCompared();
 // Raises the variant's since to `since` and its proven ticket to `ticket` (never lowers either).
 void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::uint64_t ticket = 0);
 // Whether a GPU write announced over any region is still pending (a capture over it may hold known

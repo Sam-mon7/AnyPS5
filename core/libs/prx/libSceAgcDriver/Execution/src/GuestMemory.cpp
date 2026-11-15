@@ -31,6 +31,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -56,6 +57,86 @@
 #endif
 
 namespace AgcDriver::GuestMemory {
+
+namespace {
+
+struct Q0WriterRegistry {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::vector<std::weak_ptr<Q0WriterProof>>> pages;
+    std::atomic<bool> active{false};
+    std::uint64_t registrations = 0;
+};
+
+Q0WriterRegistry& q0WriterRegistry() {
+    static auto* registry = new Q0WriterRegistry();
+    return *registry;
+}
+
+}
+
+std::shared_ptr<Q0WriterProof> RegisterQ0WriterProof(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    auto proof = std::make_shared<Q0WriterProof>();
+    proof->runs.assign(runs.begin(), runs.end());
+    auto& registry = q0WriterRegistry();
+    std::lock_guard lock(registry.mutex);
+    if (++registry.registrations % 256 == 0) {
+        for (auto page = registry.pages.begin(); page != registry.pages.end();) {
+            std::erase_if(page->second, [](const auto& entry) { return entry.expired(); });
+            if (page->second.empty()) page = registry.pages.erase(page);
+            else ++page;
+        }
+    }
+    constexpr std::uint64_t PageBytes = 4096;
+    for (const auto& [begin, end] : runs) {
+        if (end <= begin) continue;
+        const auto first = begin & ~(PageBytes - 1);
+        const auto last = (end - 1) & ~(PageBytes - 1);
+        for (auto page = first;; page += PageBytes) {
+            registry.pages[page].push_back(proof);
+            if (page == last) break;
+        }
+    }
+    registry.active.store(true, std::memory_order_release);
+    return proof;
+}
+
+void InvalidateQ0WriterProofs(std::uint64_t address, std::size_t bytes, Q0WriterReason reason) {
+    if (bytes == 0) return;
+    const bool overflow = address > std::numeric_limits<std::uint64_t>::max() - bytes;
+    constexpr std::uint64_t PageBytes = 4096;
+    const auto first = overflow ? 0 : address & ~(PageBytes - 1);
+    const auto end = overflow ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    const auto last = (end - 1) & ~(PageBytes - 1);
+    auto& registry = q0WriterRegistry();
+    if (!registry.active.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(registry.mutex);
+    auto page = registry.pages.lower_bound(first);
+    std::vector<std::shared_ptr<Q0WriterProof>> invalidated;
+    while (page != registry.pages.end() && page->first <= last) {
+        auto& entries = page->second;
+        for (auto entry = entries.begin(); entry != entries.end();) {
+            auto proof = entry->lock();
+            if (proof == nullptr) {
+                entry = entries.erase(entry);
+                continue;
+            }
+            ++entry;
+            if (!overflow && std::ranges::none_of(proof->runs, [&](const auto& run) { return address < run.second && run.first < end; })) continue;
+            if (std::ranges::any_of(invalidated, [&](const auto& existing) { return existing.get() == proof.get(); })) continue;
+            invalidated.push_back(std::move(proof));
+        }
+        if (entries.empty()) page = registry.pages.erase(page);
+        else ++page;
+    }
+    for (const auto& proof : invalidated) {
+        switch (reason) {
+        case Q0WriterReason::Write: proof->write.fetch_add(1, std::memory_order_release); break;
+        case Q0WriterReason::QueuedWrite: proof->queuedWrite.fetch_add(1, std::memory_order_release); break;
+        case Q0WriterReason::Publication: proof->publication.fetch_add(1, std::memory_order_release); break;
+        case Q0WriterReason::PendingImage: proof->pendingImage.fetch_add(1, std::memory_order_release); break;
+        }
+    }
+}
 namespace {
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC driver: ") + reason);
@@ -4953,6 +5034,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
+    InvalidateQ0WriterProofs(address, bytes, Q0WriterReason::Write);
     return storeOwn(address, bytes, [&] {
         store();
         return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
@@ -4969,6 +5051,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
+    InvalidateQ0WriterProofs(address, bytes, Q0WriterReason::Write);
     BreakProofs();
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
@@ -6315,6 +6398,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     BreakProofs();
     if (current.empty()) return;
+    InvalidateQ0WriterProofs(address, current.size(), Q0WriterReason::Write);
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
     const ReadSiteScope site(ReadSite::Store);

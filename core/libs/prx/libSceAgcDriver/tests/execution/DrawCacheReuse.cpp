@@ -6,6 +6,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -18,6 +20,8 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -810,10 +814,133 @@ void PipelineStateReusePath(const std::filesystem::path& control) {
     Require(BrightestColorByte() == 255, "pipeline reuse retained stale push or resource bytes");
 }
 
+double Q0WriterCount(const std::map<std::string, double>& counters, const char* name) {
+    const auto found = counters.find(name);
+    return found == counters.end() ? 0.0 : found->second;
+}
+
+void Q0WriterRanges() {
+    using namespace AgcDriver::GuestMemory;
+    const std::array runs{std::pair<std::uint64_t, std::uint64_t>{0x10000, 0x10100}, std::pair<std::uint64_t, std::uint64_t>{0x12000, 0x12100}};
+    const auto proof = RegisterQ0WriterProof(runs);
+    InvalidateQ0WriterProofs(0x11000, 4, Q0WriterReason::Write);
+    Require(proof->write.load() == 1, "a non-overlapping guest write invalidated the range proof");
+    InvalidateQ0WriterProofs(0x10080, 4, Q0WriterReason::Write);
+    InvalidateQ0WriterProofs(0x12080, 4, Q0WriterReason::QueuedWrite);
+    InvalidateQ0WriterProofs(0x10040, 4, Q0WriterReason::Publication);
+    InvalidateQ0WriterProofs(0x12040, 4, Q0WriterReason::PendingImage);
+    Require(proof->write.load() == 2 && proof->queuedWrite.load() == 2 && proof->publication.load() == 2 && proof->pendingImage.load() == 2, "an overlapping writer did not advance its range-proof generation");
+    InvalidateQ0WriterProofs(std::numeric_limits<std::uint64_t>::max() - 1, 4, Q0WriterReason::Write);
+    Require(proof->write.load() == 3, "an overflowing write range did not conservatively invalidate the range proof");
+}
+
+void Q0WriterPath(std::string_view mode) {
+    using R = AgcDriver::ArchB::Recorder;
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    Require(Switches::Enabled(Feature::FixQ0WriterInvalidate), "the queue-0 writer invalidation switch is off");
+    R::Boundary(true, 0, R::Clock::now());
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    ColorMemory.fill(std::byte{0});
+    PixelConstant[0] = 0.25f;
+    SubmitConstantDraws(8);
+    Require(BrightestColorByte() == 64, "the queue-0 proof warmup rendered the wrong value");
+    const auto warm = R::Collect(R::Clock::now()).counters;
+    Require(Q0WriterCount(warm, "fix_q0_writer_hits") > 0 && Q0WriterCount(warm, "fix_q0_writer_avoided_bytes") > 0, "a proven queue-0 hit still compared captured memory");
+    if (mode == "hit") return;
+    if (mode == "toggle") {
+        const auto change = [&](unsigned sequence, bool on) {
+            std::ofstream(std::getenv("APS5_ARCHB_CONTROL_FILE"), std::ios::trunc) << sequence << " FIX_Q0_WRITER_INVALIDATE=" << on << '\n';
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            Switches::PollControl();
+            Require(Switches::Enabled(Feature::FixQ0WriterInvalidate) == on, "the queue-0 writer switch toggle was not applied");
+        };
+        change(1, false);
+        SubmitConstantDraws(2);
+        Require(BrightestColorByte() == 64, "the switch-off path changed rendered output");
+        const auto disabled = R::Collect(R::Clock::now()).counters;
+        Require(Q0WriterCount(disabled, "fix_q0_writer_hits") == 0, "the switch-off path consumed a queue-0 proof");
+        change(2, true);
+        SubmitConstantDraws(2);
+        Require(BrightestColorByte() == 64, "the re-enabled queue-0 proof changed rendered output");
+        const auto toggled = R::Collect(R::Clock::now()).counters;
+        Require(Q0WriterCount(toggled, "fix_q0_writer_full_validations") > 0 && Q0WriterCount(toggled, "fix_q0_writer_hits") > 0, "the re-enabled queue-0 path did not validate then reuse its proof");
+        return;
+    }
+
+    const char* refusal = nullptr;
+    if (mode == "guest") {
+        PixelConstant[0] = 1.0f;
+        SubmitConstantDraws(1);
+        Require(BrightestColorByte() == 255, "a guest write retained stale captured bytes");
+        refusal = "fix_q0_writer_refused_ordering";
+    } else if (mode == "mapping") {
+        constexpr std::size_t bytes = 4096;
+        auto mapped = std::make_unique<std::byte[]>(bytes);
+        {
+            GuestAllocations::Mutation mapping;
+            mapping.RequireAvailable(mapped.get(), bytes);
+            mapping.Add(mapped.get(), bytes, true, true, false);
+        }
+        SubmitConstantDraws(1);
+        {
+            GuestAllocations::Mutation mapping;
+            mapping.Remove(mapped.get());
+        }
+        refusal = "fix_q0_writer_refused_mapping";
+    } else if (mode == "queued") {
+        const auto constant = reinterpret_cast<std::uintptr_t>(PixelConstant.data());
+        std::vector<std::uint32_t> commands;
+        Append(commands, 0x37, {0x00100200u, static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u), std::bit_cast<std::uint32_t>(1.0f)});
+        const std::vector<std::vector<std::uint32_t>> words(1, {static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)});
+        auto draws = Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, words);
+        commands.insert(commands.end(), draws.begin(), draws.end());
+        Submit(std::move(commands));
+        Require(BrightestColorByte() == 255, "a queued write retained stale captured bytes");
+        refusal = "fix_q0_writer_refused_queued_write";
+    } else if (mode == "pending") {
+        AgcDriver::GuestMemory::InvalidateQ0WriterProofs(reinterpret_cast<std::uintptr_t>(PixelConstant.data()), sizeof(PixelConstant), AgcDriver::GuestMemory::Q0WriterReason::PendingImage);
+        AgcDriver::Graphics::StorageTexture::BumpPendingSerial();
+        SubmitConstantDraws(1);
+        refusal = "fix_q0_writer_refused_pending_image";
+    } else {
+        Require(false, "unknown queue-0 writer invalidation mode");
+    }
+    const auto counters = R::Collect(R::Clock::now()).counters;
+    Require(Q0WriterCount(counters, "fix_q0_writer_full_validations") > 0, "an invalidated queue-0 proof did not run full validation");
+    Require(Q0WriterCount(counters, refusal) > 0, "the queue-0 proof refusal reason was not counted");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--q0-writer-ranges") {
+            Q0WriterRanges();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--q0-writer-")) {
+            struct Control {
+                std::filesystem::path path;
+                ~Control() { if (!path.empty()) std::filesystem::remove(path); }
+            } control;
+            if (std::string_view(argv[1]) == "--q0-writer-toggle") {
+                control.path = std::filesystem::temp_directory_path() / ("agc-f1q0-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+#ifdef _WIN32
+                _putenv_s("APS5_ARCHB_GATE_RUN", "1");
+                _putenv_s("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str());
+#else
+                setenv("APS5_ARCHB_GATE_RUN", "1", 1);
+                setenv("APS5_ARCHB_CONTROL_FILE", control.path.string().c_str(), 1);
+#endif
+            }
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            Q0WriterPath(std::string_view(argv[1]).substr(std::string_view("--q0-writer-").size()));
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-base-proof") {
             BufferBaseProofs();
             return 0;

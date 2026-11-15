@@ -872,7 +872,10 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
     // source, as they see a write-back; Arch C P3b's pending-scan tokens see it as a pending insert over the units.
     StorageTexture::BumpPendingSerial();
-    for (const auto& [begin, end] : fresh) ArchC::ImageEpochs::Note(begin, end, ArchC::EpochSource::PendingInsert, nullptr);
+    for (const auto& [begin, end] : fresh) {
+        GuestMemory::InvalidateQ0WriterProofs(begin, static_cast<std::size_t>(end - begin), GuestMemory::Q0WriterReason::PendingImage);
+        ArchC::ImageEpochs::Note(begin, end, ArchC::EpochSource::PendingInsert, nullptr);
+    }
 }
 
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {

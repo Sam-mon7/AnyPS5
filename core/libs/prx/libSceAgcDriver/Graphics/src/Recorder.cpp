@@ -1629,6 +1629,7 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    GuestMemory::InvalidateQ0WriterProofs(address, bytes.size(), GuestMemory::Q0WriterReason::QueuedWrite);
     Timeline::Store(Timeline::Kind::LabelDeferred, address, bytes, stamp);
     if (bytes.size() < 4 || address % 4 != 0) return;
     // The range before the table: the hook covers the group whether or not a table exists to
@@ -4203,6 +4204,7 @@ void Recorder::OnComplete(std::function<void()> action, bool checkOnly, const Sh
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    GuestMemory::InvalidateQ0WriterProofs(address, bytes, GuestMemory::Q0WriterReason::QueuedWrite);
     ArchC::LazyCensus::UsedByGpu(address, address + bytes, ownLabel ? ArchC::LazyCensus::GpuUse::LabelStore : ArchC::LazyCensus::GpuUse::Write);
     dropCarries(address, address + bytes, ownLabel ? "c_gpu_staging_carry_drop_label" : "c_gpu_staging_carry_drop_write");
     ArchC::ImageEpochs::Note(address, address + bytes, ArchC::EpochSource::GpuNote, ArchC::SelfScope::Current());
@@ -4242,6 +4244,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
+    GuestMemory::InvalidateQ0WriterProofs(address, bytes, GuestMemory::Q0WriterReason::QueuedWrite);
     ArchC::ImageEpochs::Note(address, address + bytes, ArchC::EpochSource::GpuNote, ArchC::SelfScope::Current());
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
@@ -4304,6 +4307,7 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
+    for (const auto& [begin, end] : additions) if (end > begin) GuestMemory::InvalidateQ0WriterProofs(begin, static_cast<std::size_t>(end - begin), GuestMemory::Q0WriterReason::Publication);
     if (activeRecorder != this) {
         publishedWriteRangesValid = false;
         return;

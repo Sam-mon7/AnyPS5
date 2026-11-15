@@ -127,6 +127,10 @@ bool VariantValidationExact() {
     return variantExact();
 }
 
+bool VariantValidationCompared() {
+    return variantCompared();
+}
+
 void RestampVariant(const DispatchVariant& variant, std::uint64_t since, std::uint64_t ticket) {
     const auto raise = [](std::atomic<std::uint64_t>& field, std::uint64_t value) {
         auto current = field.load(std::memory_order_relaxed);

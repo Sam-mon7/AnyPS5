@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <source_location>
 #include <span>
@@ -15,6 +16,19 @@
 #include <vector>
 
 namespace AgcDriver::GuestMemory {
+
+enum class Q0WriterReason : std::uint8_t { Write, QueuedWrite, Publication, PendingImage };
+
+struct Q0WriterProof {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::atomic<std::uint64_t> write{1};
+    std::atomic<std::uint64_t> queuedWrite{1};
+    std::atomic<std::uint64_t> publication{1};
+    std::atomic<std::uint64_t> pendingImage{1};
+};
+
+std::shared_ptr<Q0WriterProof> RegisterQ0WriterProof(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+void InvalidateQ0WriterProofs(std::uint64_t address, std::size_t bytes, Q0WriterReason reason);
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.

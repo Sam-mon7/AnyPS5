@@ -3,12 +3,116 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <bit>
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::uint64_t& shapeKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask, bool bufferBases) {
+namespace {
+
+struct Q0WriterVersions {
+    std::uint64_t epoch;
+    std::uint64_t mapping;
+    std::uint64_t write;
+    std::uint64_t recorderWrite;
+    std::uint64_t forget;
+    std::uint64_t publication;
+    std::uint64_t pending;
+    std::uint64_t unwatch;
+    bool operator==(const Q0WriterVersions&) const = default;
+};
+
+enum class Q0WriterRefusal {
+    None,
+    Queue,
+    Address,
+    Dynamic,
+    Unproven,
+    Mapping,
+    Write,
+    QueuedWrite,
+    Forget,
+    Publication,
+    PendingImage,
+    Ordering,
+    Unstable
+};
+
+Q0WriterVersions q0WriterVersions(const GuestMemory::Q0WriterProof& proof) {
+    return {
+        GuestMemory::ThreadCollectEpoch(),
+        GuestAllocations::GuestAllocationsGeneration_nid_postfix(),
+        proof.write.load(std::memory_order_acquire),
+        proof.queuedWrite.load(std::memory_order_acquire),
+        GuestMemory::ForgetSerial(),
+        proof.publication.load(std::memory_order_acquire),
+        proof.pendingImage.load(std::memory_order_acquire),
+        GuestMemory::UnwatchSerial()
+    };
+}
+
+Q0WriterRefusal q0WriterEligible(const DispatchVariant& variant, std::uint32_t queue) {
+    if (queue != 0) return Q0WriterRefusal::Queue;
+    if (variant.compiled == nullptr || variant.compiled->bdaAbiVersion != 0) return Q0WriterRefusal::Address;
+    if (!variant.dataPositions.empty() || !variant.bufferBaseMasks.empty() || !variant.feedback.memory.empty()) return Q0WriterRefusal::Dynamic;
+    return Q0WriterRefusal::None;
+}
+
+Q0WriterRefusal q0WriterProof(const DispatchVariant& variant, std::uint32_t queue, std::uint64_t& comparedBytes) {
+    const auto eligible = q0WriterEligible(variant, queue);
+    if (eligible != Q0WriterRefusal::None) return eligible;
+    const auto proof = variant.q0WriterProof.load(std::memory_order_acquire);
+    if (proof == nullptr) return Q0WriterRefusal::Unproven;
+    const auto epoch = variant.q0Epoch.load(std::memory_order_acquire);
+    if (epoch == 0) return Q0WriterRefusal::Unproven;
+    const auto current = q0WriterVersions(*proof);
+    if (variant.q0Mapping.load(std::memory_order_relaxed) != current.mapping || variant.q0Unwatch.load(std::memory_order_relaxed) != current.unwatch) return Q0WriterRefusal::Mapping;
+    if (variant.q0Write.load(std::memory_order_relaxed) != current.write) return Q0WriterRefusal::Write;
+    if (variant.q0RecorderWrite.load(std::memory_order_relaxed) != current.recorderWrite) return Q0WriterRefusal::QueuedWrite;
+    if ((current.forget & 1u) != 0 || variant.q0Forget.load(std::memory_order_relaxed) != current.forget) return Q0WriterRefusal::Forget;
+    if (variant.q0Publication.load(std::memory_order_relaxed) != current.publication) return Q0WriterRefusal::Publication;
+    if (variant.q0Pending.load(std::memory_order_relaxed) != current.pending) return Q0WriterRefusal::PendingImage;
+    if (epoch != current.epoch) return Q0WriterRefusal::Ordering;
+    comparedBytes = variant.q0ComparedBytes.load(std::memory_order_relaxed);
+    return variant.q0Epoch.load(std::memory_order_acquire) == epoch ? Q0WriterRefusal::None : Q0WriterRefusal::Unstable;
+}
+
+const char* q0WriterRefusalCounter(Q0WriterRefusal refusal) {
+    switch (refusal) {
+    case Q0WriterRefusal::Queue: return "fix_q0_writer_refused_queue";
+    case Q0WriterRefusal::Address: return "fix_q0_writer_refused_address";
+    case Q0WriterRefusal::Dynamic: return "fix_q0_writer_refused_dynamic";
+    case Q0WriterRefusal::Unproven: return "fix_q0_writer_refused_unproven";
+    case Q0WriterRefusal::Mapping: return "fix_q0_writer_refused_mapping";
+    case Q0WriterRefusal::Write: return "fix_q0_writer_refused_write";
+    case Q0WriterRefusal::QueuedWrite: return "fix_q0_writer_refused_queued_write";
+    case Q0WriterRefusal::Forget: return "fix_q0_writer_refused_forget";
+    case Q0WriterRefusal::Publication: return "fix_q0_writer_refused_publication";
+    case Q0WriterRefusal::PendingImage: return "fix_q0_writer_refused_pending_image";
+    case Q0WriterRefusal::Ordering: return "fix_q0_writer_refused_ordering";
+    case Q0WriterRefusal::Unstable: return "fix_q0_writer_refused_unstable";
+    case Q0WriterRefusal::None: break;
+    }
+    return "fix_q0_writer_refused_unknown";
+}
+
+void publishQ0WriterProof(const DispatchVariant& variant, const Q0WriterVersions& versions, std::uint64_t comparedBytes) {
+    variant.q0Epoch.store(0, std::memory_order_release);
+    variant.q0Mapping.store(versions.mapping, std::memory_order_relaxed);
+    variant.q0Write.store(versions.write, std::memory_order_relaxed);
+    variant.q0RecorderWrite.store(versions.recorderWrite, std::memory_order_relaxed);
+    variant.q0Forget.store(versions.forget, std::memory_order_relaxed);
+    variant.q0Publication.store(versions.publication, std::memory_order_relaxed);
+    variant.q0Pending.store(versions.pending, std::memory_order_relaxed);
+    variant.q0Unwatch.store(versions.unwatch, std::memory_order_relaxed);
+    variant.q0ComparedBytes.store(comparedBytes, std::memory_order_relaxed);
+    variant.q0Epoch.store(versions.epoch, std::memory_order_release);
+}
+
+}
+
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::uint64_t& shapeKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, const Pm4::DrawParameters& drawParameters, bool pointerFree, bool feedbackMask, bool bufferBases, bool q0WriterInvalidate) {
     PerformanceTimer recorderTiming("Driver.DrawLookup", ArchB::Recorder::Phase::Proof);
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
@@ -194,11 +298,49 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         auto& regions = matchedRegions[i];
                         regions.clear();
                         appendEntryRegions(*variant, regions);
-                        ++compared;
+                        bool q0Hit = false;
+                        std::uint64_t avoidedBytes = 0;
+                        auto q0Before = Q0WriterVersions{};
+                        auto q0After = Q0WriterVersions{};
+                        auto result = EntryOutcome::Differing;
                         const auto genBefore = genShadow ? GuestMemory::Gen::CaptureSince() : 0;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
-                        const auto genVerdict = genShadow ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore, VariantValidationExact()) : GuestMemory::Gen::Verdict::Unknown;
+                        if (q0WriterInvalidate) {
+                            const auto refusal = q0WriterProof(*variant, submission.queue, avoidedBytes);
+                            if (refusal == Q0WriterRefusal::None) {
+                                q0Hit = true;
+                                result = EntryOutcome::Equal;
+                                liveData.clear();
+                                ArchB::Recorder::Count("fix_q0_writer_hits");
+                                ArchB::Recorder::Count("fix_q0_writer_avoided_bytes", avoidedBytes);
+                            } else {
+                                ArchB::Recorder::Count(q0WriterRefusalCounter(refusal));
+                                auto proof = variant->q0WriterProof.load(std::memory_order_acquire);
+                                if (proof == nullptr && q0WriterEligible(*variant, submission.queue) == Q0WriterRefusal::None) {
+                                    auto registered = GuestMemory::RegisterQ0WriterProof(variant->runs);
+                                    if (variant->q0WriterProof.compare_exchange_strong(proof, registered, std::memory_order_release, std::memory_order_acquire)) proof = std::move(registered);
+                                }
+                                if (proof != nullptr) q0Before = q0WriterVersions(*proof);
+                                ++compared;
+                                ArchB::Recorder::Count("fix_q0_writer_full_validations");
+                                result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
+                                if (proof != nullptr) q0After = q0WriterVersions(*proof);
+                                if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
+                                    if (proof != nullptr) q0Before = q0WriterVersions(*proof);
+                                    ArchB::Recorder::Count("fix_q0_writer_full_validations");
+                                    result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
+                                    if (proof != nullptr) q0After = q0WriterVersions(*proof);
+                                }
+                                std::uint64_t comparedBytes = 0;
+                                for (const auto& region : regions) comparedBytes += region.bytes.size();
+                                if (proof != nullptr && result == EntryOutcome::Equal && VariantValidationCompared() && VariantValidationExact() && q0WriterEligible(*variant, submission.queue) == Q0WriterRefusal::None && q0Before == q0After && q0After.epoch != 0 && (q0After.forget & 1u) == 0) publishQ0WriterProof(*variant, q0After, comparedBytes);
+                                else if (q0Before != q0After) ArchB::Recorder::Count("fix_q0_writer_refused_unstable");
+                            }
+                        } else {
+                            ++compared;
+                            result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
+                            if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, feedbackMask, &memoryFeedback, bufferBases);
+                        }
+                        const auto genVerdict = genShadow && !q0Hit ? ShadowValidatedVariant(GuestMemory::Gen::Consumer::DrawValidate, *variant, result, genBefore, VariantValidationExact()) : GuestMemory::Gen::Verdict::Unknown;
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;

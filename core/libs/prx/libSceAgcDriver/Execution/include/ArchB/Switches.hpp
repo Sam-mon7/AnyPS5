@@ -20,6 +20,7 @@ enum class Feature : std::uint8_t {
     UbPointerFreeDrawKeys,
     UbSkipCpuIndirect,
     UbSkipDispatchProofWalk,
+    FixQ0WriterInvalidate,
     FixTsharpFeedbackMask,
     FixPipelineStateReuse,
     FixVqMemo,

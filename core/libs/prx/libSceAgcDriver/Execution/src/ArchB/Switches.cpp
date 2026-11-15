@@ -77,6 +77,7 @@ constexpr std::array<SwitchInfo, static_cast<std::size_t>(Feature::Count)> Entri
     {Feature::UbPointerFreeDrawKeys, "UB_POINTER_FREE_DRAW_KEYS", false, true, {}},
     {Feature::UbSkipCpuIndirect, "UB_SKIP_CPU_INDIRECT", false, true, {}},
     {Feature::UbSkipDispatchProofWalk, "UB_SKIP_DISPATCH_PROOF_WALK", false, true, {}},
+    {Feature::FixQ0WriterInvalidate, "FIX_Q0_WRITER_INVALIDATE", false, true, {}},
     {Feature::FixTsharpFeedbackMask, "FIX_TSHARP_FEEDBACK_MASK", false, true, {}},
     {Feature::FixPipelineStateReuse, "FIX_PIPELINE_STATE_REUSE", false, true, {}},
     {Feature::FixVqMemo, "FIX_VQ_MEMO", false, true, {}},

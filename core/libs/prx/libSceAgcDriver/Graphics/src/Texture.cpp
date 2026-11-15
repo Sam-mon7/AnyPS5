@@ -5610,6 +5610,7 @@ void StorageTexture::BumpPendingSerial() {
 }
 
 void StorageTexture::notePendingChange() const {
+    GuestMemory::InvalidateQ0WriterProofs(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), GuestMemory::Q0WriterReason::PendingImage);
     ArchC::ImageEpochs::Note(descriptor.baseAddress, descriptor.baseAddress + guestBytes, ArchC::EpochSource::Pending, this);
 }
 
