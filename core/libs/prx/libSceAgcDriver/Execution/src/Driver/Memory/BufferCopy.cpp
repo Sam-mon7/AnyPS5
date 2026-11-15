@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -371,6 +372,7 @@ bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::sp
     const auto ticket = GuestMemory::Gen::Required();
     NoteCopyItem(CopyItemEnqueued);
     DrawPipeline::Queue0().Enqueue([this, localDevice, source, destination, bytes, programAddress, queueId, record, recordWords, epoch, ticket] {
+        CommitCensus::SetKind(CommitCensus::Kind::Copy);
         PerformanceTimer recorderTiming("Driver.CopyCommit");
         DrawPipeline::FollowEpoch(epoch, ticket);
         GuestMemory::SetCurrentPacket(0x15, queueId);

@@ -1,0 +1,7 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_label_handoff_gpu_reference_paired COMMAND agc_driver_label_handoff_gpu_reference_tests --j3-label-handoff)
+    set_tests_properties(agc_driver_label_handoff_gpu_reference_paired PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_RECORDER=1;APS5_ARCHB_PIPE_Q0_COMMITTER=1;APS5_ARCHB_FIX_STATE_PACKET_FAST=1;APS5_ARCHB_C_LABEL_WAKE=1;APS5_ARCHB_FIX_LABEL_HANDOFF=0;APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY=0")
+    if(WIN32)
+        set_property(TEST agc_driver_label_handoff_gpu_reference_paired APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

@@ -152,6 +152,45 @@ unsigned BrightestColorByte() {
     return brightest;
 }
 
+void DrawHitCensusPath() {
+    AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto unchanged = Submit(32.0f, {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f});
+    Require(unchanged.hits == 4, "census changed the ordinary repeated-draw hit count");
+    auto commands = Draws(32.0f, VertexCode.data(), 1, PixelCode.data(), 1, {{std::bit_cast<std::uint32_t>(1.0f)}});
+    commands[commands.size() - 2] = 6;
+    const auto changed = Submit(std::move(commands));
+    Require(changed.hits == 5, "census changed ordinary validation after a packet change");
+    const auto snapshot = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now());
+    const auto& counts = snapshot.counters;
+    const auto count = [&](const char* name) { const auto it = counts.find(name); return it == counts.end() ? 0.0 : it->second; };
+    const bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::DrawHitCensus);
+    Require(count("j3_old_hits") == (enabled ? 5 : 0), "census did not observe each ordinary hit exactly once");
+    Require(count("j3_prediction_mismatch") == 0, "census prediction disagreed with the actual draw-cache lookup");
+    Require(count("j3b_draw_nonindirect") == (enabled ? 7 : 0), "attribution did not count the draw population");
+    Require(count("j3b_finish_hit") == (enabled ? 5 : 0), "attribution did not count finishing cache hits");
+    const auto phase = [&](const char* name) {
+        double total = 0;
+        for (const auto& [thread, phases] : snapshot.phases) {
+            if (const auto found = phases.find(name); found != phases.end()) total += found->second;
+        }
+        return total;
+    };
+    for (const char* name : {"Driver.Draw.j3_prologue_precheck", "Driver.Draw.j3_prepare_keys_nonindirect", "Driver.Draw.j3_prepare_decode_programs", "Driver.Draw.j3_setup_before_lookup", "Driver.Draw.j3_stage_assembly_hit_nonindirect", "Shader.J3PrimaryStage.j3_capture_invocation"}) {
+        Require((phase(name) > 0) == enabled, "attribution phase missing when enabled or present when disabled");
+    }
+    if (AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeQ0Committer)) {
+        Require((phase("J3.EnqueueReclaim") > 0) == enabled, "enqueue reclamation attribution is missing");
+        const auto committedDraws = count("j3c_replayed_count") + count("j3c_recipe_count") + count("j3c_legacy_count");
+        Require(committedDraws == (enabled ? 7 : 0), "committer census changed or omitted the draw population");
+        Require((count("j3c_replayed_commit_ns") + count("j3c_recipe_commit_ns") + count("j3c_legacy_commit_ns") > 0) == enabled, "committer draw timing is missing");
+        Require(count("j3c_failed_commits") == 0, "committer census observed a failed draw");
+        Require(count("j3b_enqueue_draw_calls") == (enabled ? 7 : 0), "enqueue attribution changed the draw population: " + std::to_string(count("j3b_enqueue_draw_calls")));
+    }
+    std::cout << "Draw-hit census preserves repeated-draw and changed-packet results\n";
+}
+
 void ThirdDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -1150,6 +1189,13 @@ int main(int argc, char** argv) {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
             PipelineStateReusePath(control.path);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--j3-census") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            DrawHitCensusPath();
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
