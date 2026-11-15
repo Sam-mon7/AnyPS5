@@ -252,6 +252,7 @@ private:
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
     DrawVerdict finishDraw(DrawTail& tail, PerformanceTimer& timing);
+    void enqueueGatherDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
@@ -266,7 +267,7 @@ private:
     void noteLabelIssue(std::span<const std::uint32_t> packet, std::uint32_t queue);
     void retireLabelTakes(std::uint32_t queue, std::uint64_t received);
     bool findWaitProducer(std::uint64_t address, std::size_t bytes, std::uint64_t& token);
-    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t queue, std::uint32_t* writer = nullptr, std::optional<std::uint64_t>* seenGeneration = nullptr);
+    bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t queue, std::uint32_t* writer = nullptr, std::optional<std::uint64_t>* seenGeneration = nullptr, std::uint64_t* criticalSource = nullptr, std::uint64_t* criticalGpuSource = nullptr);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
     static std::array<WriteRecord, 16384>& writeHistory();
     static std::size_t& writeCursor();
@@ -368,15 +369,17 @@ private:
     static bool pollReapAll();
     static bool pollTryEach();
     static bool traceLateLabels();
-    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false, bool epochCovered = false);
+    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false, bool epochCovered = false, std::uint64_t criticalGpuSource = 0);
     static bool skipHeldWaitEpoch(const Submission& submission, std::size_t cursor);
     struct PendingWait {
         std::array<std::uint32_t, 9> words;
         std::size_t count;
         std::uint64_t received;
+        std::uint64_t criticalSource = 0;
+        std::uint64_t criticalGpuSource = 0;
     };
     static std::vector<PendingWait>& pendingWaits();
-    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
+    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, std::uint64_t criticalSource = 0, std::uint64_t criticalGpuSource = 0);
     void landPendingWaits(std::uint32_t queue);
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0, forgetAtCapture = 0, genAtCapture = 0, feedbackKey = 0;

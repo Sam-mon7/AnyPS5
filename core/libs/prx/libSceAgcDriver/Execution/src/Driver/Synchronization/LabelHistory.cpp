@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -12,13 +13,20 @@ namespace AgcDriver::DriverDetail {
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     Timeline::Store(Timeline::Kind::LabelHistory, address, bytes, stamp);
     if (!KeepsLabelStore(address, bytes.size())) return;
+    const auto gpuSource = CriticalPath::Enabled() ? Graphics::Recorder::CriticalLabelSource(address, bytes, stamp, queue) : 0;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
         auto& history = labelStores[address + offset];
         std::shift_right(history.begin(), history.end(), 1);
+        history[0].criticalSource = 0;
+        history[0].criticalGpuSource = gpuSource;
         history[0].stamp = stamp;
         history[0].queue = queue;
         std::memcpy(&history[0].value, bytes.data() + offset, 4);
+    }
+    if (CriticalPath::Enabled()) {
+        const auto source = CriticalPath::Emit(gpuSource ? CriticalPath::Kind::Handoff : CriticalPath::Kind::Release, "label.history.publish", address, stamp, gpuSource);
+        for (std::size_t offset = 0; offset < bytes.size(); offset += 4) labelStores[address + offset][0].criticalSource = source;
     }
     labelStoresGeneration.store(labelStoresGeneration.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 }
@@ -105,7 +113,9 @@ bool Driver::findWaitProducer(std::uint64_t address, std::size_t bytes, std::uin
     return found;
 }
 
-bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t queue, std::uint32_t* writer, std::optional<std::uint64_t>* seenGeneration) {
+bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t queue, std::uint32_t* writer, std::optional<std::uint64_t>* seenGeneration, std::uint64_t* criticalSource, std::uint64_t* criticalGpuSource) {
+    if (criticalSource != nullptr) *criticalSource = 0;
+    if (criticalGpuSource != nullptr) *criticalGpuSource = 0;
     static const bool reuse = std::getenv("APS5_NO_WAIT_HISTORY_REUSE") == nullptr;
     if (reuse && seenGeneration != nullptr && *seenGeneration == labelStoresGeneration.load(std::memory_order_acquire)) return false;
     std::lock_guard lock(labelStoresMutex);
@@ -119,10 +129,14 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
     for (const auto& store : low->second) {
         if (store.stamp <= received || (store.queue != queue && store.stamp <= taken)) continue;
         std::uint64_t value = store.value;
+        std::uint64_t source = store.criticalSource;
+        std::uint64_t gpuSource = store.criticalGpuSource;
         if (bytes == 8) {
             const auto upper = std::find_if(high->second.begin(), high->second.end(), [&](const LabelStore& other) { return other.stamp == store.stamp; });
             if (upper == high->second.end()) continue;
             value |= static_cast<std::uint64_t>(upper->value) << 32u;
+            if (source != upper->criticalSource) source = 0;
+            if (gpuSource != upper->criticalGpuSource) gpuSource = 0;
         }
         if (Pm4::WaitComparesValue(packet, value)) {
             if (reuse && seenGeneration != nullptr) seenGeneration->reset();
@@ -131,6 +145,8 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
                     address + offset, (value >> (offset * 8u)) & 0xffffffffu, store.stamp, 4, 0, store.queue);
             }
             if (writer != nullptr) *writer = store.queue;
+            if (criticalSource != nullptr) *criticalSource = source;
+            if (criticalGpuSource != nullptr) *criticalGpuSource = gpuSource;
             return true;
         }
     }

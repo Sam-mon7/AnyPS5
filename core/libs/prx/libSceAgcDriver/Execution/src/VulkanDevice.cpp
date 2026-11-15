@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -1251,6 +1252,7 @@ struct VulkanDevice::State {
     // Blocks on the fence, or polls it every 50 us with APS5_PRESENT_POLL_FENCE=1 (the difference
     // in the wait is the presenter's wake-up latency).
     void WaitPresentFence(VkFence fence) {
+        CriticalPath::Wait critical("present.fence.external", CriticalPath::Object(fence));
         static const bool poll = std::getenv("APS5_PRESENT_POLL_FENCE") != nullptr;
         if (!poll) {
             check(DeviceFunction<PFN_vkWaitForFences>("vkWaitForFences")(device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences present");
@@ -3082,7 +3084,10 @@ void VulkanDevice::WaitIdle() {
     }
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
-    check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    {
+        CriticalPath::Wait critical("gpu.device_idle.external", CriticalPath::Object(state->device));
+        check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    }
     Graphics::CheckPixelFunctionLds(graphicsContext());
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
@@ -4372,7 +4377,9 @@ bool VulkanDevice::AcquireImage() {
     std::uint32_t index = 0;
     timing.Mark("fence_reset");
     // An out-of-date swapchain (the window changed) drops this frame; the next Resize recreates it.
+    CriticalPath::Wait criticalAcquire("present.acquire.external", CriticalPath::Object(state->swapchain));
     const auto acquired = state->DeviceFunction<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR")(state->device, state->swapchain, AgcDriver::SwapchainAcquireTimeoutNs, VK_NULL_HANDLE, state->acquireFence, &index);
+    criticalAcquire.End(0, acquired == VK_TIMEOUT ? "present.acquire.timeout" : "present.acquire.observed");
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
         presentationCounters.Acquire(acquired);
         ArchB::Recorder::Count("acquire_out_of_date");
@@ -4388,7 +4395,10 @@ bool VulkanDevice::AcquireImage() {
     if (acquired != VK_SUBOPTIMAL_KHR) check(acquired, "vkAcquireNextImageKHR");
     timing.Mark("acquire_image");
     APS5_LOG_OUT_DEBUG("vkAcquireNextImageKHR index=%u imageCount=%zu", index, state->images.size());
-    check(wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences acquire");
+    {
+        CriticalPath::Wait critical("present.acquire_fence.external", CriticalPath::Object(state->acquireFence));
+        check(wait(state->device, 1, &state->acquireFence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()), "vkWaitForFences acquire");
+    }
     timing.Mark("acquire_fence_wait");
     APS5_LOG_OUT_DEBUG("Acquire fence complete index=%u", index);
     require(index < state->images.size() && index < state->rendered.size(), "acquired image index is out of range");
@@ -4804,7 +4814,9 @@ void VulkanDevice::QueuePresent() {
     present.pImageIndices = &index;
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
+    CriticalPath::Wait criticalPresent("present.queue.external", CriticalPath::Object(state->swapchain));
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->presentQueue != VK_NULL_HANDLE ? state->presentQueue : state->queue, &present);
+    criticalPresent.End(0, "present.queue_return");
     presentationCounters.Present(presented);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR) state->extent = {0, 0};
     else if (presented != VK_SUBOPTIMAL_KHR) check(presented, "vkQueuePresentKHR");

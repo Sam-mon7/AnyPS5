@@ -4,7 +4,9 @@
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -416,6 +418,121 @@ void MovedForwardedWordReachesStageDataHit(bool libraries) {
     Require(moved.empty(), mode + ": a relocated stage data hit did not draw with the moved user word: " + moved);
 }
 
+void LiveNestedDraws(const std::filesystem::path& control) {
+    using R = AgcDriver::ArchB::Recorder;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    alignas(256) static constexpr std::array<std::uint32_t, 16> code{
+        0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu,
+        0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u,
+        0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+    alignas(8) static Header header{};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, 2> descriptors{};
+    alignas(16) static std::array<std::uint64_t, 2> root{};
+    static const TiledTarget target;
+    static const TiledTarget data;
+    static const TiledTarget arguments;
+    static const TiledTarget otherTarget;
+    static const TiledTarget firstDepth;
+    static const TiledTarget secondDepth;
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code.data(), sizeof(code), 1);
+    const auto dataAddress = reinterpret_cast<std::uintptr_t>(data.Data());
+    const auto args = reinterpret_cast<std::uintptr_t>(arguments.Data());
+    const std::array<std::uint32_t, 4> record{3, 1, 0, 0};
+    AgcDriver::GuestMemory::Write(args, std::as_bytes(std::span(record)));
+    const auto value = [&](std::uint64_t address, float number) { AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(&number, 1))); };
+    value(dataAddress, 0.25f);
+    value(dataAddress + 256, 0.75f);
+    for (std::size_t i = 0; i < descriptors.size(); ++i) {
+        const auto address = dataAddress + i * 256;
+        descriptors[i] = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32), 64, 0x30016facu};
+    }
+    root[0] = reinterpret_cast<std::uintptr_t>(descriptors[0].data());
+    unsigned sequence = 0;
+    const auto enable = [&](bool on) {
+        std::ofstream(control, std::ios::trunc) << ++sequence << " DRAW_TEMPLATES_LIVE=" << on << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        S::PollControl();
+        Require(S::Enabled(F::DrawTemplatesLive) == on, "the live switch did not apply");
+        R::Boundary(true, sequence, R::Clock::now());
+    };
+    const auto draw = [&](const void* destination = nullptr, std::uint64_t depth = 0) {
+        auto commands = DrawFrom({root.data()}, TriangleVertexCode.data(), code.data(), destination != nullptr ? destination : target.Data(), RenderTargetAttrib3);
+        commands.resize(commands.size() - 3);
+        Append(commands, 0x69, {0x000, 0});
+        Append(commands, 0x69, {0x002, 0x01000000});
+        Append(commands, 0x69, {0x007, 63u | (63u << 16u)});
+        Append(commands, 0x69, {0x00b, std::bit_cast<std::uint32_t>(1.0f)});
+        Append(commands, 0x69, {0x010, depth != 0 ? 3u | (24u << 4u) | (1u << 20u) : 0u});
+        Append(commands, 0x69, {0x011, 0});
+        Append(commands, 0x69, {0x012, static_cast<std::uint32_t>(depth >> 8u)});
+        Append(commands, 0x69, {0x014, static_cast<std::uint32_t>(depth >> 8u)});
+        Append(commands, 0x69, {0x01a, static_cast<std::uint32_t>(depth >> 40u)});
+        Append(commands, 0x69, {0x01c, static_cast<std::uint32_t>(depth >> 40u)});
+        Append(commands, 0x69, {0x200, depth != 0 ? 0x72u : 0u});
+        Append(commands, 0x11, {1, static_cast<std::uint32_t>(args), static_cast<std::uint32_t>(args >> 32)});
+        Append(commands, 0x24, {0, 0x8c, 0, 2});
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the live nested draw failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    };
+    const AgcDriver::Graphics::ColorTarget color{reinterpret_cast<std::uintptr_t>(target.Data()), {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, TiledTargetBytes, 0xe4, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4};
+    const auto pixels = [&] {
+        std::vector<std::byte> image(64 * 64 * 4);
+        AgcDriver::Graphics::ReadColorTarget(color, image);
+        Require(std::any_of(image.begin(), image.end(), [](auto byte) { return byte != std::byte{0}; }), "the live nested draw wrote no pixels");
+        return image;
+    };
+    enable(false);
+    for (int repeat = 0; repeat < 10; ++repeat) draw();
+    const auto first = pixels();
+    for (int repeat = 0; repeat < 6; ++repeat) draw();
+    R::Collect(R::Clock::now());
+    enable(true);
+    root[0] = reinterpret_cast<std::uintptr_t>(descriptors[1].data());
+    const auto lookupsBefore = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().lookups;
+    for (int repeat = 0; repeat < 12; ++repeat) draw();
+    const auto changed = pixels();
+    Require(changed != first, "moving the nested V# and its value left the old pixels");
+    const auto counts = R::Collect(R::Clock::now()).counters;
+    for (const auto& [name, count] : counts) if (name.starts_with("draw_templates_live") || name.starts_with("archc_replay_refused") || name.starts_with("archc_replay_hits")) std::cout << name << " " << count << "\n";
+    const auto taken = counts.find("draw_templates_live_q0_taken");
+    const auto committed = counts.find("draw_templates_live_commits");
+    Require(taken != counts.end() && taken->second > 0 && committed != counts.end() && committed->second > 0, "the nested draw did not take and commit a live plan");
+    if (const auto* period = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_LIVE_VERIFY"); period == nullptr || std::strtoull(period, nullptr, 10) == 0) {
+        const auto lookups = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().lookups - lookupsBefore;
+        Require(lookups + static_cast<std::uint64_t>(taken->second) == 12, "a live queue-0 draw also ran the old lookup");
+    }
+    for (const auto& [name, count] : counts) Require(!name.starts_with("draw_templates_live_verify_mismatch_") || count == 0, "the live draw differs from the old committed draw");
+    enable(false);
+    draw();
+    Require(pixels() == changed, "the live nested draw's exact pixels differ from the old path");
+    enable(true);
+    descriptors[1][2] = 32;
+    R::Collect(R::Clock::now());
+    draw();
+    const auto structural = R::Collect(R::Clock::now()).counters;
+    const auto live = structural.find("draw_templates_live_q0_taken");
+    Require(live == structural.end() || live->second == 0, "a changed V# record count took the old structural template");
+    descriptors[1][2] = 64;
+    for (int repeat = 0; repeat < 8; ++repeat) draw();
+    R::Collect(R::Clock::now());
+    draw(otherTarget.Data());
+    const auto retargeted = R::Collect(R::Clock::now()).counters;
+    const auto targetTaken = retargeted.find("draw_templates_live_q0_taken");
+    Require(targetTaken == retargeted.end() || targetTaken->second == 0, "a target change took the previous target's live template");
+    const auto depth1 = reinterpret_cast<std::uintptr_t>(firstDepth.Data());
+    const auto depth2 = reinterpret_cast<std::uintptr_t>(secondDepth.Data());
+    for (int repeat = 0; repeat < 8; ++repeat) draw(nullptr, depth1);
+    R::Collect(R::Clock::now());
+    draw(nullptr, depth2);
+    const auto redepthed = R::Collect(R::Clock::now()).counters;
+    const auto depthTaken = redepthed.find("draw_templates_live_q0_taken");
+    Require(depthTaken == redepthed.end() || depthTaken->second == 0, "a depth change took the previous depth's live template");
+}
+
 void NestedSpeculationRefusesProtectionChanges() {
     constexpr std::size_t bytes = 65536;
 #ifdef _WIN32
@@ -564,7 +681,7 @@ int main(int argc, char** argv) {
             NestedSpeculationRefusesProtectionChanges();
             return 0;
         }
-        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels")) {
+        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels" || std::string(argv[1]) == "--live")) {
             struct Control {
                 std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-nested-relocation-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
                 ~Control() { std::filesystem::remove(path); }
@@ -578,8 +695,18 @@ int main(int argc, char** argv) {
 #endif
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
-            NestedRelocationPath(control.path);
+            const bool traceLive = std::string(argv[1]) == "--live" && CriticalPath::Enabled();
+            if (traceLive) {
+                CriticalPath::Name("j11 live draw fixture");
+                CriticalPath::Present(0);
+            }
+            if (std::string(argv[1]) == "--live") LiveNestedDraws(control.path);
+            else NestedRelocationPath(control.path);
             AgcDriverShutdown_nid_postfix();
+            if (traceLive) {
+                CriticalPath::Present(1);
+                CriticalPath::Shutdown();
+            }
             std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";
             return 0;
         }

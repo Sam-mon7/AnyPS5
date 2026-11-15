@@ -9,6 +9,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -17,6 +19,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/CriticalPathTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include <atomic>
 #include <array>
 #include <algorithm>
@@ -33,6 +38,7 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -125,8 +131,34 @@ std::string_view TrimmedReason(std::string_view reason) {
 }
 
 
+struct GatherLiveEntry {
+    struct Register {
+        Graphics::RegisterBank bank;
+        std::uint32_t offset;
+        std::uint32_t value;
+    };
+    std::vector<Register> registers;
+    std::shared_ptr<const DrawDecode> decode;
+    std::vector<std::shared_ptr<DispatchVariant>> variants;
+    std::shared_ptr<GatherCommitTemplate> link;
+    Pm4::DrawParameters packet;
+    Pm4::DrawParameters derived;
+    GatherOptions options;
+    bool derivedReady = false;
+    std::uint64_t allocationGeneration = 0;
+};
+
+struct GatherLiveDraw {
+    std::shared_ptr<GatherLiveEntry> entry;
+    std::shared_ptr<GatherDrawPlan> plan;
+    Pm4::DrawParameters parameters;
+    std::vector<Graphics::CompiledShader> stages;
+    bool verify = false;
+};
+
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
+    std::weak_ptr<DrawTail> self;
     ArchB::Recorder::Key recorderKey;
     bool profile = false;
     DrawCacheOutcome cacheOutcome = CacheNotLookedUp;
@@ -161,6 +193,15 @@ struct DrawTail {
     bool partialSnapshot = false;
     bool hostSlabAlloc = false;
     bool cheapTimers = false;
+    bool gatherShadow = false;
+    std::shared_ptr<GatherDrawPlan> gatherPlan;
+    std::shared_ptr<GatherLiveDraw> live;
+    std::shared_ptr<GatherLiveEntry> liveEntry;
+    std::uint64_t liveKey = 0;
+    Pm4::DrawParameters livePacket;
+    bool liveEnabled = false;
+    bool liveVerify = false;
+    GatherOptions liveOptions;
     std::uint64_t drawKey = 0;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
@@ -406,6 +447,303 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     return held;
 }
 
+GatherIndirectPlan GatherIndirectOf(const Pm4::DrawParameters& parameters) {
+    GatherIndirectPlan plan;
+    if (!parameters.indirect) return plan;
+    const auto& indirect = *parameters.indirect;
+    plan.present = true;
+    plan.arguments = indirect.arguments;
+    plan.countIndirect = indirect.countIndirect;
+    plan.countAddress = indirect.countIndirect ? indirect.countAddress : 0;
+    plan.count = indirect.count;
+    plan.recordBytes = indirect.recordBytes;
+    plan.rangeBytes = std::max<std::uint64_t>(indirect.RangeBytes(), indirect.recordBytes);
+    return plan;
+}
+
+std::uint64_t GatherTargetAddress(const Graphics::State& graphics) {
+    return graphics.hasColorTarget ? graphics.color.MemoryAddress() : 0;
+}
+
+GatherBufferLimits GatherLimitsOf(VulkanDevice& device, const Graphics::State& graphics) {
+    thread_local std::uint64_t serial = 0;
+    thread_local GatherBufferLimits limits;
+    if (serial != device.Serial() || limits.maxRange == 0) {
+        const auto context = device.graphicsContext();
+        limits.maxRange = context.limits.maxStorageBufferRange;
+        limits.alignment = static_cast<std::uint32_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
+        limits.wholeDwords = context.exactRobustLoads;
+        serial = device.Serial();
+    }
+    auto result = limits;
+    result.targetAddress = GatherTargetAddress(graphics);
+    return result;
+}
+
+std::uint64_t LiveMix(std::uint64_t key, std::uint64_t value) {
+    return (key ^ value) * 0x100000001b3ull;
+}
+
+std::uint64_t LivePacketKey(const Pm4::DrawParameters& draw) {
+    auto key = LiveMix(0xcbf29ce484222325ull, draw.indexed);
+    for (const auto value : {draw.indexCount, draw.indexSize, draw.instanceCount, draw.flags, draw.firstVertex, draw.firstInstance}) key = LiveMix(key, value);
+    if (!draw.indirect) return LiveMix(key, 0);
+    const auto& args = *draw.indirect;
+    for (const auto value : {args.opcode, args.recordBytes, args.stride, args.count, static_cast<std::uint32_t>(args.countIndirect), args.baseVertexLocation, args.startInstanceLocation, args.drawIndexLocation, static_cast<std::uint32_t>(args.drawIndexEnabled), args.indxOffset, static_cast<std::uint32_t>(args.indexLimitKnown)}) key = LiveMix(key, value);
+    return key;
+}
+
+bool LivePacketMatches(const Pm4::DrawParameters& a, const Pm4::DrawParameters& b) {
+    if (a.indexCount != b.indexCount || a.indexSize != b.indexSize || a.instanceCount != b.instanceCount || a.flags != b.flags || a.indexed != b.indexed || a.firstVertex != b.firstVertex || a.firstInstance != b.firstInstance || a.indirect.has_value() != b.indirect.has_value()) return false;
+    if (!a.indirect) return true;
+    const auto& x = *a.indirect;
+    const auto& y = *b.indirect;
+    return x.opcode == y.opcode && x.recordBytes == y.recordBytes && x.stride == y.stride && x.count == y.count && x.countIndirect == y.countIndirect && x.baseVertexLocation == y.baseVertexLocation && x.startInstanceLocation == y.startInstanceLocation && x.drawIndexLocation == y.drawIndexLocation && x.drawIndexEnabled == y.drawIndexEnabled && x.indxOffset == y.indxOffset && x.indexLimitKnown == y.indexLimitKnown;
+}
+
+const Registers& LiveBank(const QueueState& queue, Graphics::RegisterBank bank) {
+    if (bank == Graphics::RegisterBank::Context) return queue.context;
+    if (bank == Graphics::RegisterBank::Shader) return queue.shader;
+    return queue.userConfig;
+}
+
+std::uint32_t LiveRegister(const QueueState& queue, Graphics::RegisterBank bank, std::uint32_t offset) {
+    const auto& registers = LiveBank(queue, bank);
+    const auto found = registers.find(offset);
+    return found != registers.end() ? found->second : 0;
+}
+
+bool LiveStateMatches(const GatherLiveEntry& entry, const QueueState& queue) {
+    return std::all_of(entry.registers.begin(), entry.registers.end(), [&](const auto& value) { return LiveRegister(queue, value.bank, value.offset) == value.value; });
+}
+
+struct GatherLiveIndex {
+    std::unordered_map<std::uint64_t, std::vector<std::shared_ptr<GatherLiveEntry>>> entries;
+    std::unordered_map<std::uint64_t, std::size_t> cursors;
+};
+
+constexpr std::size_t LiveWays = 8;
+
+GatherLiveIndex& LiveIndex() {
+    thread_local GatherLiveIndex index;
+    return index;
+}
+
+GatherOptions LiveOptions(const DrawTail& tail) {
+    return tail.liveOptions;
+}
+
+bool LiveVerifyNext() {
+    static const auto period = [] {
+        const char* text = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_LIVE_VERIFY");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+    }();
+    thread_local std::uint64_t draws = 0;
+    return period != 0 && ++draws % period == 0;
+}
+
+void MergeIgnoredWords(Graphics::DrawReferenceMasks::Words& into, std::span<const std::pair<std::uint32_t, std::uint32_t>> from) {
+    if (from.empty()) return;
+    into.insert(into.end(), from.begin(), from.end());
+    std::sort(into.begin(), into.end());
+    std::size_t kept = 0;
+    for (std::size_t index = 1; index < into.size(); ++index) {
+        if (into[index].first == into[kept].first) into[kept].second |= into[index].second;
+        else into[++kept] = into[index];
+    }
+    into.resize(kept + 1);
+}
+
+bool LiveViewsCurrent(GatherLiveEntry& entry) {
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (entry.allocationGeneration == generation) return true;
+    for (const auto& stage : entry.link->stages) if (stage.registeredViews != nullptr && !Graphics::ShaderResources::RegisteredViewsCurrent(*stage.registeredViews)) {
+        entry.link->valid.store(false, std::memory_order_release);
+        return false;
+    }
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) return false;
+    entry.allocationGeneration = generation;
+    return true;
+}
+
+std::shared_ptr<GatherLiveEntry> LearnLive(const QueueState& queue, const DrawTail& tail) {
+    if (tail.liveKey == 0 || !tail.drawHit || tail.entry == nullptr || tail.decode == nullptr || !tail.drawParameters.indirect || tail.matched.size() != tail.decode->programs.size()) return {};
+    if (tail.decode->state.stages.path != Graphics::ShaderPath::Vertex || tail.decode->state.stages.mesh || tail.decode->state.stages.tessellation || tail.decode->state.rectList) return {};
+    std::vector<std::shared_ptr<DispatchVariant>> donors;
+    for (const auto& variant : tail.matched) {
+        if (variant == nullptr || variant->compiled == nullptr) return {};
+        donors.push_back(variant->donor != nullptr ? variant->donor : variant);
+    }
+    auto& index = LiveIndex().entries;
+    if (index.size() >= 4096 && !index.contains(tail.liveKey)) {
+        index.clear();
+        LiveIndex().cursors.clear();
+    }
+    auto& bucket = index[tail.liveKey];
+    const auto options = LiveOptions(tail);
+    for (const auto& known : bucket) if (known->link->valid.load(std::memory_order_acquire) && known->variants == donors && known->options == options && LivePacketMatches(known->packet, tail.livePacket) && LiveViewsCurrent(*known) && LiveStateMatches(*known, queue)) return known;
+    auto entry = std::make_shared<GatherLiveEntry>();
+    entry->decode = tail.entry->decode;
+    entry->variants = std::move(donors);
+    entry->packet = tail.livePacket;
+    entry->allocationGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    entry->options = options;
+    entry->link = std::make_shared<GatherCommitTemplate>();
+    const auto stateOwner = tail.decode->stateOrigin != nullptr ? tail.decode->stateOrigin : tail.decode;
+    entry->link->state = {stateOwner, &stateOwner->state};
+    for (std::size_t stage = 0; stage < entry->variants.size(); ++stage) {
+        const auto& variant = entry->variants[stage];
+        const auto& program = entry->decode->programs[stage];
+        if (program.merged || program.binary.stage != ShaderRecompiler::ShaderStage::Vertex && program.binary.stage != ShaderRecompiler::ShaderStage::Fragment) return {};
+        GatherCommitStage bound;
+        bound.compiled = variant->compiled;
+        bound.variant = variant;
+        bound.stage = program.binary.stage;
+        bound.pushOffset = variant->compiled->pushConstants.empty() ? 0u : variant->pushOffset;
+        bound.registeredViews = variant->registeredViews;
+        entry->link->stages.push_back(std::move(bound));
+    }
+    static const bool exactRegisters = std::getenv("APS5_DRAW_TEMPLATES_LIVE_EXACT_REGISTERS") != nullptr;
+    const auto keyedRuntime = [&](std::uint32_t offset, bool& runtime) {
+        runtime = true;
+        if (offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u) return true;
+        for (const auto& [base, limit] : {std::pair{0x00cu, 32u}, std::pair{0x04cu, 16u}, std::pair{0x08cu, 32u}, std::pair{0x10cu, 32u}}) {
+            if (offset - base >= limit) continue;
+            const auto resources = queue.shader.find(base - 1);
+            const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
+            return offset - base < std::min(count, limit);
+        }
+        runtime = false;
+        return false;
+    };
+    for (const auto& range : Graphics::DrawKeyRegisters) for (std::uint32_t offset = range.first; offset < range.first + range.count; ++offset) {
+        const bool user = range.bank == Graphics::RegisterBank::Shader && std::any_of(entry->decode->programs.begin(), entry->decode->programs.end(), [&](const auto& program) { return offset >= program.userDataBase && offset - program.userDataBase < program.userData.size() - program.hiddenUserWords; });
+        if (user) continue;
+        bool runtime = false;
+        const bool keyed = range.bank == Graphics::RegisterBank::Shader && keyedRuntime(offset, runtime);
+        if (exactRegisters || keyed) entry->registers.push_back({range.bank, offset, LiveRegister(queue, range.bank, offset)});
+    }
+    if (bucket.size() >= LiveWays) {
+        const auto stale = std::find_if(bucket.begin(), bucket.end(), [](const auto& known) { return !known->link->valid.load(std::memory_order_acquire); });
+        bucket.erase(stale != bucket.end() ? stale : bucket.begin());
+        ArchB::Recorder::Count("draw_templates_live_bucket_evictions");
+    }
+    bucket.push_back(entry);
+    ArchB::Recorder::Count("draw_templates_live_templates_learned");
+    return entry;
+}
+
+std::shared_ptr<GatherLiveDraw> SelectLive(const QueueState& queue, const Submission& submission, DrawTail& tail) {
+    CriticalPath::Scope selectTiming("draw_live_select_q0");
+    const auto started = std::chrono::steady_clock::now();
+    const auto found = LiveIndex().entries.find(tail.liveKey);
+    if (found == LiveIndex().entries.end()) { ArchB::Recorder::Count("draw_templates_live_q0_refused_no_template"); return {}; }
+    const auto options = LiveOptions(tail);
+    thread_local std::vector<DrawProgram> programs;
+    static const bool refuseFeedback = std::getenv("APS5_DRAW_TEMPLATES_LIVE_NO_FEEDBACK") != nullptr;
+    bool ready = false, feedback = false;
+    auto& cursor = LiveIndex().cursors[tail.liveKey];
+    const auto ways = found->second.size();
+    for (std::size_t step = 0; step < ways; ++step) {
+        const auto way = (cursor + step) % ways;
+        const auto& entry = found->second[way];
+        if (!entry->link->valid.load(std::memory_order_acquire) || !entry->link->ready.load(std::memory_order_acquire) || !entry->derivedReady) continue;
+        ready = true;
+        if (const char* skipped = !LivePacketMatches(entry->packet, tail.livePacket) ? "draw_templates_live_q0_skip_packet" : entry->options != options ? "draw_templates_live_q0_skip_options" : !LiveStateMatches(*entry, queue) ? "draw_templates_live_q0_skip_state" : !LiveViewsCurrent(*entry) ? "draw_templates_live_q0_skip_views" : !DecodeProgramsCurrent(*entry->decode, *submission.shaders) ? "draw_templates_live_q0_skip_decode" : nullptr) {
+            ArchB::Recorder::Count(skipped);
+            continue;
+        }
+        if (refuseFeedback && options.feedback && std::any_of(entry->variants.begin(), entry->variants.end(), [](const auto& variant) {
+            return !variant->feedback.memory.empty() || !variant->feedback.userData.empty();
+        })) {
+            feedback = true;
+            continue;
+        }
+        programs = entry->decode->programs;
+        for (auto& program : programs) ReadUserWords(queue, program, false);
+        GatherShadowDraw candidate;
+        candidate.programs = programs;
+        DrawEntry donor;
+        donor.decode = entry->decode;
+        candidate.entry = &donor;
+        candidate.matched = entry->variants;
+        candidate.hit = true;
+        candidate.keyed = true;
+        candidate.options = options;
+        candidate.indirect = GatherIndirectOf(tail.drawParameters);
+        candidate.limits = GatherLimitsOf(*tail.localDevice, *entry->link->state);
+        candidate.live = true;
+        candidate.commitTemplate = entry->link;
+        ArchB::Recorder::Count("draw_templates_live_q0_gathers");
+        auto plan = [&] {
+            CriticalPath::Scope gatherTiming("draw_live_gather_q0");
+            return RunGatherShadow(candidate);
+        }();
+        if (plan == nullptr || !plan->complete || entry->allocationGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+            if (plan != nullptr) {
+                if (plan->incomplete & GatherPendingWords) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_words");
+                if (plan->incomplete & GatherPendingVsharp) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_vsharp");
+                if (plan->incomplete & GatherPendingIndirect) ArchB::Recorder::Count("draw_templates_live_q0_refused_pending_indirect");
+                if (plan->incomplete & GatherGenerationMoved) ArchB::Recorder::Count("draw_templates_live_q0_refused_generation");
+                if (plan->incomplete & GatherBindingShape) ArchB::Recorder::Count("draw_templates_live_q0_refused_binding_shape");
+                if (plan->incomplete & GatherNotTemplatable) ArchB::Recorder::Count("draw_templates_live_q0_refused_feedback");
+                if (plan->differ != GatherDiffer::None) {
+                    static const auto names = [] {
+                        std::array<std::string, static_cast<std::size_t>(GatherDiffer::Count)> values;
+                        for (std::size_t kind = 0; kind < values.size(); ++kind) values[kind] = std::string("draw_templates_live_q0_differ_") + GatherDifferName(static_cast<GatherDiffer>(kind));
+                        return values;
+                    }();
+                    ArchB::Recorder::Count(names[static_cast<std::size_t>(plan->differ)].c_str());
+                    static const bool trace = std::getenv("APS5_DRAW_TEMPLATES_LIVE_TRACE_DIFFER") != nullptr;
+                    static std::atomic<unsigned> traced{0};
+                    if (trace && traced.fetch_add(1, std::memory_order_relaxed) % 37u == 0 && traced.load(std::memory_order_relaxed) < 37u * 120u) {
+                        const auto& differing = entry->decode->programs[std::min<std::size_t>(plan->differStage, entry->decode->programs.size() - 1)];
+                        std::fprintf(stderr, "[draw-templates-live] differ %s stage %u program 0x%llx index %u old %08x new %08x mask %08x ways %zu\n", GatherDifferName(plan->differ), plan->differStage, static_cast<unsigned long long>(differing.snapshot->CodeDigest()), plan->differIndex, plan->differOld, plan->differNew, plan->differMask, ways);
+                    }
+                }
+            }
+            continue;
+        }
+        auto live = std::make_shared<GatherLiveDraw>();
+        live->entry = entry;
+        live->plan = std::move(plan);
+        live->parameters = entry->derived;
+        live->parameters.indexAddress = tail.drawParameters.indexAddress;
+        live->parameters.indirect->arguments = tail.drawParameters.indirect->arguments;
+        live->parameters.indirect->countAddress = tail.drawParameters.indirect->countAddress;
+        const auto& front = programs.front();
+        const auto& compiled = *entry->link->stages.front().compiled;
+        const auto constant = [&](std::int32_t sgpr, std::uint32_t base, std::uint32_t& out) {
+            std::uint32_t value = 0;
+            if (sgpr >= 0) {
+                const auto index = static_cast<std::int64_t>(sgpr) - front.firstUserSgpr;
+                if (index < 0 || static_cast<std::size_t>(index) >= front.userData.size()) return false;
+                value = front.userData[static_cast<std::size_t>(index)];
+            }
+            if (value > std::numeric_limits<std::uint32_t>::max() - base) return false;
+            out = base + value;
+            return true;
+        };
+        auto& args = *live->parameters.indirect;
+        using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+        if ((args.vertexRule == Rule::Constant && !constant(compiled.vertexOffsetSgpr, live->parameters.indexed ? 0u : args.indxOffset, args.vertexConstant)) || (args.instanceRule == Rule::Constant && !constant(compiled.instanceOffsetSgpr, 0, args.instanceConstant)) || (!tail.localDevice->DrawIndirectSupport().firstInstance && (args.instanceRule == Rule::InPlace || args.instanceConstant != 0))) {
+            ArchB::Recorder::Count("draw_templates_live_q0_refused_arguments");
+            continue;
+        }
+
+        for (const auto& stage : entry->link->stages) live->stages.push_back({stage.stage, stage.compiled.get(), stage.pushOffset, stage.registeredViews.get()});
+        live->verify = tail.liveVerify;
+        cursor = (way + 1) % ways;
+        ArchB::Recorder::Count("draw_templates_live_q0_taken");
+        ArchB::Recorder::Count("draw_templates_live_q0_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+        return live;
+    }
+    if (feedback) ArchB::Recorder::Count("draw_templates_live_q0_refused_feedback");
+    else if (ready) ArchB::Recorder::Count("draw_templates_live_q0_refused_structure");
+    else ArchB::Recorder::Count("draw_templates_live_q0_refused_not_ready");
+    return {};
+}
+
 bool EmptyIndirectSkip() {
     static const bool enabled = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return enabled;
@@ -476,6 +814,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
+    tail.self = tailHolder;
     tail.feedbackMask = ArchB::Switches::Enabled(ArchB::Feature::FixTsharpFeedbackMask);
     tail.pipelineStateReuse = ArchB::Switches::Enabled(ArchB::Feature::FixPipelineStateReuse);
     tail.memoVirtualQuery = ArchB::Switches::Enabled(ArchB::Feature::FixVqMemo);
@@ -621,6 +960,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.ubSkipCpuIndirect = ArchB::Switches::Enabled(ArchB::Feature::UbSkipCpuIndirect);
     tail.registerKey = useDrawEntries && registerKeyEnabled() && !tail.ubPointerFree;
     const bool registerKey = tail.registerKey;
+    tail.liveOptions = {drawStageDataHits(), drawStageDataHits() && tail.bufferBases && !validateLegacy(), tail.feedbackMask && !validateLegacy(), tail.nestedRelocation};
+    tail.liveEnabled = ArchB::Switches::Enabled(ArchB::Feature::DrawTemplatesLive);
+    tail.liveVerify = tail.liveEnabled && LiveVerifyNext();
+    tail.livePacket = drawParameters;
+    if (ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && registerKey && pipelined && submission.queue == 0 && drawParameters.indirect && !lockedPrepare && traceToken == 0 && deferredLabels().labels.empty()) {
+        tail.liveKey = LiveMix(LiveMix(LiveMix(RegisterStructureKey(queue), DrawShaderSetKey(queue, *submission.shaders)), localDevice->Serial()), LivePacketKey(drawParameters));
+        if (tail.liveEnabled) tail.live = SelectLive(queue, submission, tail);
+        if (tail.live != nullptr && !tail.liveVerify) {
+            tail.programs = &tail.live->entry->decode->programs;
+            tail.submissionQueue = submission.queue;
+            tail.packetOpcode = (packet[0] >> 8u) & 0xffu;
+            enqueueGatherDraw(tail);
+            timing.Mark("draw_enqueued");
+            return drawn();
+        }
+    }
+
     auto& drawKey = tail.drawKey;
     std::array<std::uint64_t, 5> drawKeyComponents{};
     auto& entry = tail.entry;
@@ -944,6 +1300,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         missesBefore = drawEntryCounters.misses;
         censusMisses = drawEntryCounters.misses;
     }
+    tail.gatherShadow = stageEntries && ArchB::Switches::Enabled(ArchB::Feature::DrawGatherShadow) && (!tail.liveEnabled || tail.liveVerify);
+    struct GatherLogScope {
+        bool armed;
+        explicit GatherLogScope(bool on) : armed(on) {
+            if (armed) ArmGatherValidationLog(true);
+        }
+        ~GatherLogScope() {
+            if (armed) ArmGatherValidationLog(false);
+        }
+    } gatherLogScope(tail.gatherShadow);
     try {
         lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, shapeKey, drawParameters, tail.ubPointerFree, tail.feedbackMask, tail.bufferBases);
     } catch (...) {
@@ -1028,6 +1394,27 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (matched[i] == nullptr || (matched[i]->shaderDataPatches.empty() && matched[i]->descriptorPatches.empty())) continue;
         applyShaderDataPatches(*matched[i]);
         if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words, stageData[i].bufferBaseHit);
+    }
+    tail.liveEntry = LearnLive(queue, tail);
+    if (tail.gatherShadow || (tail.liveEntry != nullptr && !tail.liveEntry->link->ready.load(std::memory_order_acquire))) {
+        GatherShadowDraw shadow;
+        shadow.programs = programs;
+        shadow.entry = entry.get();
+        shadow.matched = matched;
+        shadow.hit = drawHit || verifyHit;
+        shadow.keyed = registerKey;
+        shadow.options = {drawStageDataHits(), drawStageDataHits() && tail.bufferBases && !validateLegacy(), tail.feedbackMask && !validateLegacy(), tail.nestedRelocation};
+        shadow.indirect = GatherIndirectOf(drawParameters);
+        shadow.limits = GatherLimitsOf(*localDevice, graphics);
+        shadow.live = tail.liveEnabled && !tail.liveVerify;
+        shadow.commitTemplate = tail.liveEntry != nullptr ? tail.liveEntry->link : nullptr;
+        {
+            std::optional<CriticalPath::Scope> gatherTiming;
+            if (shadow.live && submission.queue == 0) gatherTiming.emplace("draw_live_gather_q0");
+            tail.gatherPlan = RunGatherShadow(shadow);
+        }
+        ArmGatherValidationLog(false);
+        gatherLogScope.armed = false;
     }
     const auto relocatedDecode = decode;
     if (!userPatches.empty()) {
@@ -1141,6 +1528,71 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.rejected = &rejected;
     tail.gpuLock = &gpuLock;
     return finishDraw(tail, timing);
+}
+
+void Driver::enqueueGatherDraw(DrawTail& tail) {
+    CriticalPath::Scope enqueueTiming("draw_live_enqueue");
+    const auto live = tail.live;
+    const auto link = live->entry->link;
+    auto writes = queuedDrawWrites(tail, *link->state, live->stages);
+    auto reads = QueuedDrawReadRanges(live->parameters, live->stages);
+    for (const auto& stage : live->plan->stages) {
+        for (const auto& range : stage.reads) reads.push_back(range);
+        for (const auto& value : stage.vsharps) reads.push_back({value.address - value.adjustment, value.address - value.adjustment + value.viewBytes});
+    }
+    const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    const auto ticket = GuestMemory::Gen::Required();
+    auto reference = live->verify ? tail.self.lock() : nullptr;
+    auto commit = [this, live, link, reference, localDevice = tail.localDevice, commitQueue = tail.submissionQueue, commitPacket = tail.packetOpcode, epoch, ticket, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, recorderKey = tail.recorderKey] {
+        CriticalPath::Scope commitTiming("draw_live_commit");
+        const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
+        const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
+        const ArchB::AllocChurnScope allocChurnScope(allocChurn);
+        const ArchB::PartialSnapshotScope partialSnapshotScope(partialSnapshot);
+        ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);
+        PerformanceTimer timing("Driver.DrawCommit");
+        DrawPipeline::FollowEpoch(epoch, ticket);
+        GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+        Graphics::DrawSlotIdentity identity;
+        identity.state = link->state;
+        identity.gatherTemplate = link;
+        identity.gather = live->plan.get();
+        for (const auto& stage : link->stages) {
+            Graphics::DrawSlotStage owner;
+            owner.owner = stage.compiled;
+            owner.variant = stage.variant;
+            identity.stages.push_back(std::move(owner));
+        }
+        std::vector<Graphics::DrawReferenceMasks> referenceMasks;
+        if (reference != nullptr) {
+            referenceMasks.resize(link->stages.size());
+            for (std::size_t i = 0; i < referenceMasks.size(); ++i) {
+                const auto add = [&](const DispatchVariant* variant) {
+                    if (variant == nullptr) return;
+                    auto& masks = referenceMasks[i];
+                    if (masks.bindings.size() < variant->feedback.bindings.size()) masks.bindings.resize(variant->feedback.bindings.size());
+                    for (std::size_t binding = 0; binding < variant->feedback.bindings.size(); ++binding) MergeIgnoredWords(masks.bindings[binding], variant->feedback.bindings[binding]);
+                    MergeIgnoredWords(masks.push, variant->feedback.pushConstants);
+                };
+                if (i < live->entry->variants.size()) add(live->entry->variants[i].get());
+                if (i < reference->matched.size() && reference->matched[i] != nullptr) {
+                    add(reference->matched[i].get());
+                    add(reference->matched[i]->donor.get());
+                }
+            }
+            identity.referenceMasks = referenceMasks;
+            identity.referenceStages = reference->stages;
+            identity.referenceDraw = &reference->drawParameters;
+            for (std::size_t i = 0; i < live->plan->stages.size() && i < reference->stages.size(); ++i) live->plan->stages[i].program = reference->stages[i].program;
+            CheckGatherDrawPlan(*live->plan, reference->stages, GatherTargetAddress(*link->state), GatherIndirectOf(reference->drawParameters));
+        }
+        const auto commitStarted = std::chrono::steady_clock::now();
+        commitDraw(localDevice, commitQueue, *link->state, live->parameters, live->stages, {}, nullptr, {}, 0, nullptr, {}, 0, pipelineStateReuse, memoVirtualQuery, nullptr, &identity);
+        ArchB::Recorder::Count("draw_commit_live_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
+        ArchB::Recorder::Count("draw_commit_live_n");
+    };
+    auto held = std::make_shared<decltype(commit)>(std::move(commit));
+    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true, DrawPipeline::ItemKind::Draw);
 }
 
 DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
@@ -1343,6 +1795,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect, vertexInfos.front());
+            if (tail.liveEntry != nullptr && !indirectCpu && !tail.liveEntry->derivedReady) {
+                tail.liveEntry->derived = drawParameters;
+                tail.liveEntry->derivedReady = true;
+            }
             if (tail.ubSkipCpuIndirect && indirectCpu) {
                 ArchB::Switches::CountUpperBoundHit(ArchB::Feature::UbSkipCpuIndirect);
                 return drawn();
@@ -1559,7 +2015,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         phaseTiming.Phase(DrawRowLabels);
     };
     if (drawParameters.indirect && indirectCpu) {
-
+        if (tail.gatherPlan != nullptr) {
+            CountGatherPlanUnchecked("gather_shadow_plan_unchecked_cpu_indirect");
+            tail.gatherPlan = nullptr;
+        }
         const auto indirect = *drawParameters.indirect;
         results.reserve(programs.size() + 2u);
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -1718,6 +2177,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     const RecaptureScope recapture;
                     return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
                 }
+                CriticalPath::Scope enqueueTiming("draw_enqueue");
                 phaseTiming.Phase(DrawRowVectors);
                 auto writes = queuedDrawWrites(tail, graphics, stages);
                 if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
@@ -1795,12 +2255,18 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             std::fprintf(stderr, "[drawvariant] 0x%llx stage %d code 0x%llx\n", static_cast<unsigned long long>(stages[i].program->variantId), static_cast<int>(stages[i].stage), static_cast<unsigned long long>(programs[i].binary.codeAddress));
         }
     }
+    if (tail.live != nullptr && !indirectCpu) {
+        enqueueGatherDraw(tail);
+        timing.Mark("draw_enqueued");
+        return drawn();
+    }
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
         runCaptureCheckHook();
         if (tail.queue != nullptr && capturedMemoryChanged(memory)) {
             const RecaptureScope recapture;
             return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
         }
+        CriticalPath::Scope enqueueTiming("draw_enqueue");
         phaseTiming.Phase(DrawRowVectors);
         auto writes = queuedDrawWrites(tail, graphics, stages);
         if (PipeWriteDiag()) NoteDrawWriteTags(graphics, stages);
@@ -1813,7 +2279,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         // closure with `resolving` set (ResolveDraw into `resolution`, on the committer or a resolver),
         // and the commit hands `resolution` to its preparation.
         const bool resolveSplit = DrawPipeline::ResolveSplitActive() && Graphics::DrawPrelockEnabled();
-        auto commit = [this, pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
+        if (tail.gatherPlan != nullptr) {
+            for (std::size_t i = 0; i < tail.gatherPlan->stages.size() && i < programResults.size(); ++i) tail.gatherPlan->stages[i].program = programResults[i];
+        }
+        auto commit = [this, gatherPlan = std::move(tail.gatherPlan), pipelineStateReuse = tail.pipelineStateReuse, memoVirtualQuery = tail.memoVirtualQuery, allocChurn = tail.allocChurn, partialSnapshot = tail.partialSnapshot, hostSlabAlloc = tail.hostSlabAlloc, cheapTimers = tail.cheapTimers, recorderKey = tail.recorderKey, identity = ProgramIdentity(tail.programs), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, ticket, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), nostageWhy, resolution = Graphics::DrawPreparation{}](bool resolving, std::vector<DrawPipeline::Range>* resolveReads) mutable -> std::uint64_t {
             const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
             const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             if (resolving) {
@@ -1864,9 +2333,17 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     slotIdentity.stages.push_back(std::move(entry));
                 }
             }
+            if (gatherPlan != nullptr) {
+                slotIdentity.gatherTemplate = gatherPlan->commitTemplate;
+                slotIdentity.learning = gatherPlan.get();
+            }
+            if (gatherPlan != nullptr) CheckGatherDrawPlan(*gatherPlan, stages, GatherTargetAddress(decode->state), GatherIndirectOf(drawParameters));
             const bool nostageCensus = nostageWhy >= 0 && Graphics::ArchcNostageCensus();
             if (nostageCensus) Graphics::ArchcNostageArm(nostageWhy);
+            const auto commitStarted = std::chrono::steady_clock::now();
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, pipelineStateReuse, memoVirtualQuery, resolution.resolved ? &resolution : nullptr, identified ? &slotIdentity : nullptr);
+            ArchB::Recorder::Count("draw_commit_old_ns", static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - commitStarted).count()));
+            ArchB::Recorder::Count("draw_commit_old_n");
             if (nostageCensus) Graphics::ArchcNostageArm(-1);
             if (identity.programs != 0) addDrawCommit(identity, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - committing).count());
             return 0;
@@ -1892,6 +2369,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
     }
     noteDrawWriters(stages, submission.queue);
+    if (tail.gatherPlan != nullptr) {
+        for (std::size_t i = 0; i < tail.gatherPlan->stages.size() && i < programResults.size(); ++i) tail.gatherPlan->stages[i].program = programResults[i];
+        CheckGatherDrawPlan(*tail.gatherPlan, stages, GatherTargetAddress(graphics), GatherIndirectOf(drawParameters));
+        tail.gatherPlan = nullptr;
+    }
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, &lockTiming.preparation, tail.pipelineStateReuse) == RecipeOutcome::Recorded) {
@@ -1990,7 +2472,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawLockTiming lockTiming{profile};
     GuestMemory::HoldLogMark(GuestMemory::HoldMark::PrelockBegin);
-    const bool replayLikely = identity != nullptr && recipe == nullptr && Graphics::ArchcReplayLikely(localDevice->Device(), graphics, drawParameters, stages, identity, pipelineStateReuse);
+    const bool replayLikely = identity != nullptr && recipe == nullptr && (identity->gather != nullptr || Graphics::ArchcReplayLikely(localDevice->Device(), graphics, drawParameters, stages, identity, pipelineStateReuse));
     const bool nostageTimed = Graphics::ArchcNostageArmed();
     const auto nostageNow = [] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
     std::array<std::uint64_t, 6> nostageAt{};

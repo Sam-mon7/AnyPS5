@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -339,11 +340,15 @@ void Driver::holdFlipBehindWorker(const Submission& submission, bool cpuFlip) {
     }
     if (!flips) return;
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
+    CriticalPath::Wait criticalFlipAhead("queue.flips_ahead", CriticalPath::Object(this));
     changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    criticalFlipAhead.End();
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
     if (cpuFlip || failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) != 0) return;
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
+    CriticalPath::Wait criticalFlipWork("queue.flip_work", CriticalPath::Object(this));
     changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipWorkOpen.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    criticalFlipWork.End();
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
     if (failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipWorkOpen.load(std::memory_order_acquire) != 0) return;
     const auto workSerial = flipWorkSerial.load(std::memory_order_acquire);
@@ -483,6 +488,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
             std::uint32_t queue;
             ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
         } blocked{*this, stalled.queue};
+        CriticalPath::Wait criticalWait("queue.rewind", CriticalPath::Object(stalled.rewindTail));
         StallWatch stall(stalled.queue);
         while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
             CheckFailure();
@@ -808,11 +814,13 @@ void Driver::enqueue(Submission submission) {
     submission.waitFree = waitFree(submission);
     auto& worker = workers[queue];
     for (const auto dword : submission.labelWrites) ++worker.unfinishedWrites[dword];
+    submission.criticalQueued = CriticalPath::Emit(CriticalPath::Kind::Release, "queue.submission", CriticalPath::Object(&worker), submission.serial);
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
     if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] {
         char role[32];
         std::snprintf(role, sizeof(role), "queue 0x%x worker", queue);
+        CriticalPath::Name(role);
         try {
             RaiseWorkerThreadPriority(role);
         } catch (...) {

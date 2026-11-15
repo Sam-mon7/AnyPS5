@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -67,7 +68,9 @@ bool paceFlip(FlipRequest& req) {
     if (!pacer) return true;
     const auto clock = [] { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     const auto sleep = [&](std::int64_t nanos) {
+        CriticalPath::Wait criticalWait("video.frame_pace", CriticalPath::Object(req.cfg.get()));
         PreciseSleepUs(static_cast<unsigned long long>((nanos + 999) / 1000));
+        criticalWait.End();
         std::lock_guard lock(req.cfg->mutex);
         return !req.cfg->Closed() && !req.cfg->failure;
     };
@@ -165,6 +168,18 @@ void resolveFlipBuffer(FlipRequest& request, const VideoOutConfig& cfg) {
     request.height = request.group.attribute.height;
 }
 
+void releaseCriticalRendering(VideoOutConfig& cfg, std::uint64_t source) {
+    auto& waits = cfg.criticalRenderingWaits;
+    for (auto it = waits.begin(); it != waits.end();) {
+        const auto token = it->source.lock();
+        if (!token) it = waits.erase(it);
+        else if (cfg.bufferReuse[it->index].IsComplete(it->ticket)) {
+            *token = source;
+            it = waits.erase(it);
+        } else ++it;
+    }
+}
+
 class RenderingWait final : public AgcDriver::IRenderingWait {
     std::shared_ptr<VideoOutConfig> _config;
     std::uint32_t _index;
@@ -174,10 +189,21 @@ public:
         : _config(std::move(config)), _index(index), _ticket(ticket) {}
     void Wait() override {
         std::unique_lock lock(_config->mutex);
+        std::shared_ptr<std::uint64_t> source;
+        if (CriticalPath::Enabled() && !_config->failure && !_config->Closed() && !_config->shutdownToken.stop_requested() && !_config->bufferReuse[_index].IsComplete(_ticket)) {
+            auto& waits = _config->criticalRenderingWaits;
+            std::erase_if(waits, [](const auto& wait) { return wait.source.expired(); });
+            if (waits.size() < 1024) {
+                source = std::make_shared<std::uint64_t>(0);
+                waits.push_back({_index, _ticket, source});
+            } else CriticalPath::Emit(CriticalPath::Kind::Point, "video.wait_metadata_full", CriticalPath::Object(_config.get()), waits.size());
+        }
+        CriticalPath::Wait criticalWait("video.rendering", CriticalPath::Object(_config.get()));
         _config->vblankCond.wait(lock, _config->shutdownToken, [&] {
             return _config->failure || _config->Closed() ||
                 _config->bufferReuse[_index].IsComplete(_ticket);
         });
+        criticalWait.End(source && !_config->failure && !_config->Closed() && !_config->shutdownToken.stop_requested() ? *source : 0, "buffer_reuse_complete");
         _config->CheckAlive();
     }
 };
@@ -195,9 +221,11 @@ public:
 
     void WaitForFlipRoom() override {
         std::unique_lock queueLock(queue->mutex);
+        CriticalPath::Wait criticalWait("video.flip_room", CriticalPath::Object(queue.get()));
         const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {
             return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
         });
+        criticalWait.End();
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         require(room, "flip queue stayed full for 60 s: the presenter is not completing flips");
@@ -275,6 +303,7 @@ void FlipRequest::ReleaseLocked() noexcept {
         --cfg->bufferPending[index];
         cfg->bufferReuse[index].Complete(reuseTicket);
     }
+    releaseCriticalRendering(*cfg, CriticalPath::Emit(CriticalPath::Kind::Release, "video.cancel", CriticalPath::Object(this)));
     terminal = true;
     cfg->vblankCond.notify_all();
 }
@@ -306,6 +335,7 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
         resolveFlipBuffer(*this, *cfg);
         readiness.Mark("locks_validate");
         queuedAt = AgcDriver::FrameTiming::Clock::now();
+        criticalQueued = CriticalPath::Emit(CriticalPath::Kind::Release, "video.flip_queued", CriticalPath::Object(this));
         queue->requests.push_back(shared_from_this());
         ready = true;
     }
@@ -318,7 +348,9 @@ void FlipRequest::GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameT
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     if (!syncFlip) return;
     std::unique_lock lock(cfg->mutex);
+    CriticalPath::Wait criticalWait("video.sync_flip", CriticalPath::Object(this));
     cfg->vblankCond.wait(lock, cfg->shutdownToken, [&] { return gpuComplete || cfg->failure || cfg->closing; });
+    criticalWait.End(gpuComplete && !cfg->failure && !cfg->closing && !cfg->shutdownToken.stop_requested() ? criticalGpuDone : 0, "gpu_complete");
     checkConfig(*cfg);
     require(gpuComplete, "flip preparation did not complete on GPU");
 }
@@ -363,19 +395,22 @@ VideoOutDriver::VideoOutDriver() {
             }
             presentLoop(token, started);
         });
-        attached.get();
+        {
+            CriticalPath::Wait criticalWait("video.startup", CriticalPath::Object(this));
+            attached.get();
+        }
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
             flipQueue->changed.NotifyAll();
-            vblankThread.join();
+            { CriticalPath::Wait criticalWait("video.vblank_join", CriticalPath::Object(this)); vblankThread.join(); }
         }
         if (presentThread.joinable()) {
             presentThread.request_stop();
             flipQueue->changed.NotifyAll();
-            presentThread.join();
+            { CriticalPath::Wait criticalWait("video.presenter_join", CriticalPath::Object(this)); presentThread.join(); }
         }
         OnMainThread([] { SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER); });
         throw;
@@ -398,8 +433,8 @@ void VideoOutDriver::Shutdown() {
     presentThread.request_stop();
     vblankThread.request_stop();
     flipQueue->changed.NotifyAll();
-    presentThread.join();
-    vblankThread.join();
+    { CriticalPath::Wait criticalWait("video.presenter_join", CriticalPath::Object(this)); presentThread.join(); }
+    { CriticalPath::Wait criticalWait("video.vblank_join", CriticalPath::Object(this)); vblankThread.join(); }
     {
         std::lock_guard lock(mutex);
         for (int handle = 1; handle < VIDEO_OUT_NUM_MAX; ++handle) {
@@ -639,7 +674,9 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
+        CriticalPath::Wait criticalWait("video.vblank", CriticalPath::Object(req.cfg.get()));
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
+        criticalWait.End();
         timing.Mark("vblank_wait");
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
@@ -654,6 +691,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         req.cfg->CheckAlive();
         if (!req.cfg->Closed()) {
             require(!req.terminal && !req.gpuComplete, "invalid GPU completion transition");
+            req.criticalGpuDone = CriticalPath::Emit(CriticalPath::Kind::Release, "video.gpu_ready", CriticalPath::Object(&req));
             req.gpuComplete = true;
         }
     } else {
@@ -676,6 +714,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             request.cfg->CheckAlive();
             if (request.cfg->Closed()) return;
             require(!request.terminal && !request.gpuComplete, "invalid GPU completion transition");
+            request.criticalGpuDone = CriticalPath::Emit(CriticalPath::Kind::Release, "video.gpu_ready", CriticalPath::Object(&request));
             request.gpuComplete = true;
             request.cfg->vblankCond.notify_all();
         };
@@ -719,6 +758,11 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         --req.cfg->bufferPending[req.index];
         req.cfg->bufferReuse[req.index].Complete(req.reuseTicket);
     }
+    static std::atomic<std::uint64_t> criticalFrameSequence{0};
+    const auto criticalPresented = !CriticalPath::Enabled() ? 0 : req.cfg->busType == VIDEO_OUT_BUS_TYPE_OVERLAY
+        ? CriticalPath::Emit(CriticalPath::Kind::Release, "video.overlay_ready", CriticalPath::Object(&req))
+        : CriticalPath::Present(criticalFrameSequence.fetch_add(1, std::memory_order_relaxed) + 1);
+    releaseCriticalRendering(*req.cfg, criticalPresented);
     req.terminal = true;
     req.cfg->vblankCond.notify_all();
     KernelWakeSleepers_nid_no_patch();
@@ -740,6 +784,7 @@ std::optional<AgcDriver::DisplayBuffer> VideoOutDriver::overlayPlane() {
 }
 
 void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& started) {
+    CriticalPath::Name("presenter");
     try {
         OnMainThread([&] {
             window.Ensure(VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT);
@@ -783,11 +828,16 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
-                flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
+                CriticalPath::Wait criticalWait("video.presenter_idle", CriticalPath::Object(flipQueue.get()));
+                const bool signaled = flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
+                const bool hasRequest = !token.stop_requested() && !flipQueue->failure && !flipQueue->requests.empty();
+                criticalWait.End(hasRequest ? flipQueue->requests.front()->criticalQueued : 0,
+                    hasRequest ? "flip_queued" : token.stop_requested() ? "presenter_stop" : flipQueue->failure ? "presenter_failure" : !signaled ? "presenter_poll_timeout" : "presenter_unknown");
                 if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
                 if (token.stop_requested()) break;
                 if (!flipQueue->requests.empty()) {
                     current = std::move(flipQueue->requests.front());
+                    CriticalPath::Emit(CriticalPath::Kind::Handoff, "video.flip_dequeue", CriticalPath::Object(current.get()), 0, current->criticalQueued);
                     flipQueue->requests.pop_front();
                 }
             }
@@ -895,13 +945,17 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
 }
 
 void VideoOutDriver::vblankLoop(std::stop_token token) {
+    CriticalPath::Name("vblank");
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 120000>>;
     const auto start = std::chrono::steady_clock::now();
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
             const auto next = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(Frame(frame));
             const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - std::chrono::steady_clock::now()).count();
-            if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+            if (remaining > 0) {
+                CriticalPath::Wait criticalWait("video.vblank_clock", CriticalPath::Object(this));
+                PreciseSleepUs(static_cast<unsigned long long>(remaining));
+            }
             {
                 std::lock_guard lock(flipQueue->mutex);
                 if (token.stop_requested() || flipQueue->failure) return;

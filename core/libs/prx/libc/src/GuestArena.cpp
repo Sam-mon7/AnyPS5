@@ -708,13 +708,20 @@ bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expe
 bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     const auto code = record->ExceptionCode;
-    if ((code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR) || record->NumberParameters < 2 || record->ExceptionInformation[0] != 0) return false;
+    const bool guard = code == STATUS_GUARD_PAGE_VIOLATION;
+    if ((code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR && !guard) || record->NumberParameters < 2 || record->ExceptionInformation[0] != 0) return false;
     auto* context = exception->ContextRecord;
     const auto at = reinterpret_cast<const char*>(context->Rip);
     const bool avx2 = at == GuardedCopyAvx2Load || at == GuardedCopyAvx2HighLoad || at == GuardedCompareAvx2Load || at == GuardedCompareAvx2HighLoad;
     if (!avx2 && at != GuardedCopyWideLoad && at != GuardedCopyByteLoad && at != GuardedCompareWideLoad && at != GuardedCompareByteLoad) return false;
     const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
     if (address < context->Rcx || address >= context->R9) return false;
+    if (guard) {
+        const auto page = address & ~static_cast<std::uintptr_t>(0xfff);
+        MEMORY_BASIC_INFORMATION memory{};
+        DWORD previous = 0;
+        if (VirtualQuery(reinterpret_cast<const void*>(page), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && (memory.Protect & PAGE_GUARD) == 0) VirtualProtect(reinterpret_cast<void*>(page), 0x1000, memory.Protect | PAGE_GUARD, &previous);
+    }
     context->Rip = reinterpret_cast<DWORD64>(avx2 ? GuardedReadFailedAvx2 : GuardedReadFailed);
     return true;
 }

@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -6282,7 +6283,21 @@ std::chrono::nanoseconds GpuLockPriorityWindow() {
 }
 
 // LockSpinning with the Stage 4 wait scope (M1/M4) around a contended acquisition.
-static void lockSpinningTracked(Mutex& mutex) {
+static void lockSpinningTracked(Mutex& mutex, const std::uint64_t& criticalRelease) {
+    if (CriticalPath::Enabled()) {
+        if (mutex.try_lock()) return;
+        CriticalPath::Wait critical("GpuMutex", CriticalPath::Object(&mutex));
+        if (!Stage4::Tracking()) LockSpinning(mutex, HandoffSpinWindow());
+        else {
+            Stage4::WaitScope wait(Stage4::Wait::GpuMutex, true);
+            if (!SpinUntil(HandoffSpinWindow(), [&] { return mutex.try_lock(); })) {
+                wait.Blocking();
+                mutex.lock();
+            }
+        }
+        critical.End(criticalRelease, "mutex.release");
+        return;
+    }
     if (!Stage4::Tracking()) {
         LockSpinning(mutex, HandoffSpinWindow());
         return;
@@ -6295,7 +6310,7 @@ static void lockSpinningTracked(Mutex& mutex) {
 }
 
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) lockSpinningTracked(mutex);
+    if (!HeldByThisThread()) lockSpinningTracked(mutex, criticalRelease);
 }
 
 bool GpuMutexType::tryEnter() {
@@ -6305,6 +6320,7 @@ bool GpuMutexType::tryEnter() {
 void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
+        if (CriticalPath::Enabled()) CriticalPath::Emit(CriticalPath::Kind::Point, "mutex.acquire", CriticalPath::Object(&mutex));
 #ifdef _WIN32
         if (HoldLog::Instance() != nullptr) holdLogBegin = HoldLog::Now();
 #endif
@@ -6424,6 +6440,7 @@ void GpuMutexType::unlock() {
             holdLogBegin = 0;
         }
 #endif
+        if (CriticalPath::Enabled()) criticalRelease = CriticalPath::Emit(CriticalPath::Kind::Release, "mutex.release", CriticalPath::Object(&mutex));
         mutex.unlock();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
@@ -6469,7 +6486,7 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                lockSpinningTracked(mutex);
+                lockSpinningTracked(mutex, criticalRelease);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -6492,7 +6509,7 @@ void GpuMutexType::lock() {
         const auto* initialOwner = waitBegin != 0 ? owner.load(std::memory_order_acquire) : nullptr;
 #endif
         const auto start = std::chrono::steady_clock::now();
-        lockSpinningTracked(mutex);
+        lockSpinningTracked(mutex, criticalRelease);
         acquired();
         if (depth == 1) stats.holdSite = site;
         const auto now = std::chrono::steady_clock::now();
@@ -7041,6 +7058,24 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out, bool checked
     return readPages(out.data(), address, out.size()) ? Compare::Equal : Compare::Unmapped;
 #else
     return GuestCopyIn_nid_no_patch(out.data(), reinterpret_cast<const void*>(address), out.size()) ? Compare::Equal : Compare::Unmapped;
+#endif
+}
+
+Compare CopyMappedGuarded(std::uint64_t address, std::span<std::byte> out, bool& owned) {
+    owned = false;
+#ifdef _WIN32
+    if (out.empty()) return Compare::Equal;
+    if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    if (const auto hook = lazyStoreHook.load(std::memory_order_acquire)) hook(address, out.size());
+    if (const auto fence = deferredFenceHook.load(std::memory_order_acquire)) fence(address, out.size());
+    if (GuestArena::GuestArenaCopyOwned_nid_no_patch(static_cast<std::uintptr_t>(address), out.data(), out.size())) {
+        owned = true;
+        return Compare::Equal;
+    }
+    if (address > userAddressLimit() || out.size() - 1 > userAddressLimit() - address) return Compare::Unmapped;
+    return readPages(out.data(), address, out.size()) ? Compare::Equal : Compare::Unmapped;
+#else
+    return CopyMapped(address, out, true);
 #endif
 }
 

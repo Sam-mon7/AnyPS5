@@ -1,3 +1,4 @@
+#include "prx/libc/include/CriticalPathTrace.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/CommandBuffer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -16,6 +17,7 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -58,13 +60,13 @@ struct DriverTestAccess {
         Driver::Get().noteLabelStore(address, std::as_bytes(words), stamp, queue);
     }
 
-    static bool Stored(std::span<const std::uint32_t> packet, std::uint64_t received, std::optional<std::uint64_t>& seen, std::uint32_t& writer, bool holdLock = false) {
+    static bool Stored(std::span<const std::uint32_t> packet, std::uint64_t received, std::optional<std::uint64_t>& seen, std::uint32_t& writer, bool holdLock = false, std::uint64_t* source = nullptr, std::uint64_t* gpuSource = nullptr) {
         auto& driver = Driver::Get();
         std::unique_lock lock(driver.labelStoresMutex, std::defer_lock);
         if (holdLock) lock.lock();
         const auto bytes = Pm4::WaitAwaitedBytes(packet);
         const auto address = (packet[2] & (bytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
-        return driver.storedSince(packet, address, bytes, received, 0, &writer, &seen);
+        return driver.storedSince(packet, address, bytes, received, 0, &writer, &seen, source, gpuSource);
     }
 };
 
@@ -81,6 +83,57 @@ struct alignas(64) LabelState {
 
 void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void CheckCriticalMutex() {
+    Require(CriticalPath::Capturing(), "critical mutex fixture requires APS5_TRACE_FRAMES=0:1");
+    CriticalPath::Name("critical mutex main");
+    auto& mutex = AgcDriver::GuestMemory::GpuMutex();
+    {
+        CriticalPath::Scope phase("fixture.mutex.recursive");
+        std::unique_lock outer(mutex);
+        Require(mutex.DepthOnThisThread() == 1, "outer mutex lock has incorrect depth");
+        {
+            std::lock_guard nested(mutex);
+            Require(mutex.DepthOnThisThread() == 2, "recursive mutex lock has incorrect depth");
+            std::unique_lock nestedTry(mutex, std::try_to_lock);
+            Require(nestedTry.owns_lock() && mutex.DepthOnThisThread() == 3, "recursive mutex try_lock failed");
+        }
+        Require(mutex.DepthOnThisThread() == 1, "recursive mutex unlock released the outer hold");
+        bool failedTryAcquired = false;
+        std::thread failedTry([&] {
+            CriticalPath::Name("critical mutex failed try");
+            CriticalPath::Scope attempt("fixture.mutex.failed_try");
+            std::unique_lock lock(mutex, std::try_to_lock);
+            failedTryAcquired = lock.owns_lock();
+        });
+        failedTry.join();
+        Require(!failedTryAcquired, "another thread acquired an owned mutex with try_lock");
+    }
+    Require(!mutex.HeldByThisThread(), "outer mutex unlock retained ownership");
+    {
+        CriticalPath::Scope phase("fixture.mutex.outer_try");
+        std::unique_lock outer(mutex, std::try_to_lock);
+        Require(outer.owns_lock() && mutex.DepthOnThisThread() == 1, "uncontended outer try_lock failed");
+    }
+    {
+        CriticalPath::Scope phase("fixture.mutex.contention");
+        std::unique_lock holder(mutex);
+        std::atomic<bool> attempting{false}, acquired{false};
+        std::thread contender([&] {
+            CriticalPath::Name("critical mutex contender");
+            CriticalPath::Scope attempt("fixture.mutex.contender");
+            attempting.store(true, std::memory_order_release);
+            std::lock_guard lock(mutex);
+            acquired.store(true, std::memory_order_release);
+        });
+        while (!attempting.load(std::memory_order_acquire)) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        const bool premature = acquired.load(std::memory_order_acquire);
+        holder.unlock();
+        contender.join();
+        Require(!premature && acquired.load(std::memory_order_acquire), "contended mutex acquisition violated ownership");
+    }
 }
 
 void CheckWaitHistory() {
@@ -111,12 +164,18 @@ void CheckWaitHistory() {
     producerThread.join();
     Require(Access::Stored(packet, 10, seen, writer) && writer == producer, "a published satisfying store or its queue was missed");
     Require(Access::Stored(packet, 10, seen, writer), "a successful history lookup was cached as a miss");
+    std::uint64_t source = 0, gpuSource = 1;
+    Require(Access::Stored(packet, 10, seen, writer, false, &source, &gpuSource) && !gpuSource, "CPU history invented a GPU identity");
+    if (CriticalPath::Capturing()) Require(source != 0, "history publication lost its critical source");
+    const auto originalSource = source;
     seen.reset();
     store(6, 14);
-    Require(Access::Stored(packet, 10, seen, writer), "a retained older satisfying store was ignored");
+    Require(Access::Stored(packet, 10, seen, writer, false, &source, &gpuSource), "a retained older satisfying store was ignored");
+    Require(source == originalSource, "new mismatched write replaced old satisfying provenance");
     for (std::uint64_t stamp = 15; stamp < 15 + AgcDriver::DriverDetail::LabelStoreHistory; ++stamp) store(6, stamp);
     seen.reset();
-    Require(!Access::Stored(packet, 10, seen, writer), "an evicted satisfying store was reused");
+    Require(!Access::Stored(packet, 10, seen, writer, false, &source, &gpuSource), "an evicted satisfying store was reused");
+    Require(!source && !gpuSource, "failed history lookup retained stale provenance");
 
     constexpr std::uint64_t wideAddress = address + 64;
     std::array<std::uint32_t, 9> wide{0xc0079300u, 0x13u, wideAddress, 0, 7, 1, 0xffffffffu, 0xffffffffu, 0x19u};
@@ -129,6 +188,14 @@ void CheckWaitHistory() {
     Require(!Access::Stored(wide, 10, seen, writer, reuse), "unchanged partial wide history satisfied a wait");
     Access::History(wideAddress, pair, 22, 0);
     Require(Access::Stored(wide, 10, seen, writer) && writer == 0, "a wide store did not invalidate the history miss");
+    if (CriticalPath::Capturing()) {
+        seen.reset();
+        Require(Access::Stored(wide, 10, seen, writer, false, &source, &gpuSource) && source && !gpuSource, "wide history lost its single publication identity");
+        Access::History(wideAddress, std::span(pair).first(1), 23, producer);
+        Access::History(wideAddress + 4, std::span(pair).last(1), 23, producer);
+        seen.reset();
+        Require(Access::Stored(wide, 22, seen, writer, false, &source, &gpuSource) && !source && !gpuSource, "mixed history publications invented a single identity");
+    }
     wide[2] = static_cast<std::uint32_t>(address + 32);
     wide[4] = unrelated;
     wide[5] = 0;
@@ -357,6 +424,15 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
+        if (CriticalPath::Enabled()) { CriticalPath::Name("wait shutdown fixture"); CriticalPath::Present(0); }
+        if (argc == 2 && std::strcmp(argv[1], "--critical-mutex") == 0) {
+            CheckCriticalMutex();
+            CriticalPath::Present(1);
+            CriticalPath::Shutdown();
+            LibcRunShutdown_nid_postfix();
+            std::puts("critical mutex tracing tests passed");
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--wait-history") == 0) {
             CheckWaitHistory();
             LibcRunShutdown_nid_postfix();
@@ -371,6 +447,7 @@ int main(int argc, char** argv) {
         }
         CheckCommandBufferSubmission();
         CheckShutdownCancellation();
+        if (CriticalPath::Enabled()) CriticalPath::Shutdown();
         std::puts("unsatisfied label waits cancelled cleanly at shutdown");
         return 0;
     } catch (const std::exception& error) {
