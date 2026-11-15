@@ -20,17 +20,34 @@ struct BdaFaultChunk;
 class BdaResources {
 public:
     explicit BdaResources(const Context& context, bool reportOnly = false);
-    BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly = false);
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly = false, bool dispatchReuse = false);
     ~BdaResources();
     BdaResources(const BdaResources&) = delete;
     BdaResources& operator=(const BdaResources&) = delete;
     VkDescriptorBufferInfo Table() const;
     std::span<const std::byte> TableBytes() const;
+    void VerifyTableContents(const Context& context, const GuestBufferMemory& memory) const;
+    struct AddressTableReuseStats {
+        std::uint64_t builds = 0;
+        std::uint64_t cacheHits = 0;
+        std::uint64_t fills = 0;
+        std::uint64_t logicalBytesWritten = 0;
+        std::uint64_t storageBytesRequested = 0;
+        std::uint64_t paddingBytes = 0;
+        std::uint64_t paddedBuilds = 0;
+        std::uint64_t verified = 0;
+        std::uint64_t verifyBytesWritten = 0;
+        std::uint64_t failures = 0;
+        std::uint64_t handleReuses = 0;
+    };
+    static AddressTableReuseStats AddressTableReuseCounts();
     bool TableGuardCurrent(VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges);
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
     void CheckUse(const BdaResources* record) const;
     void NoteUse(std::uint64_t serial);
+    void PinFaultSlot();
+    void UnpinFaultSlot();
     bool TakeFaultSlot(const Context& context);
     bool HoldsFaultSlot() const { return faultChunk != nullptr; }
     static void NoteFinished(VkDevice device, std::uint64_t serial);
@@ -87,7 +104,9 @@ private:
     std::shared_ptr<BdaFaultChunk> faultChunk;
     VkDeviceSize faultOffset = 0;
     bool reportOnly = false;
+    bool dispatchReuse = false;
     std::uint64_t lastUse = 0;
+    std::size_t faultPins = 0;
     std::size_t tableBytes = 0;
     std::uint64_t tableGuardSerial = 0;
     std::vector<ImageTableFaults> imageTables;

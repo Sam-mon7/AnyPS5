@@ -14,6 +14,7 @@ public:
     Buffer& operator=(const Buffer&) = delete;
     static std::shared_ptr<Buffer> WithinDeviceLocalHeadroom(const Context& context, std::size_t size, VkBufferUsageFlags usage);
     VkBuffer Handle() const;
+    bool ReusedHandle() const { return reusedHandle; }
     VkDeviceAddress DeviceAddress() const;
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
@@ -35,6 +36,7 @@ private:
     // Fully made (or taken from the pool), so release returns it to the pool instead of destroying
     // the handles a failed construction left.
     bool ready = false;
+    bool reusedHandle = false;
     VkDeviceSize allocationBytes = 0;
     VkDeviceSize offset = 0;
     bool slab = false;

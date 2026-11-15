@@ -77,6 +77,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
 #ifdef __APPLE__
         ClearPooledTail(mapping, size, std::min<VkDeviceSize>(capacity, allocationBytes), properties);
 #endif
+        reusedHandle = allocation->bufferBytes == size;
         if (allocation->bufferBytes != size) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
