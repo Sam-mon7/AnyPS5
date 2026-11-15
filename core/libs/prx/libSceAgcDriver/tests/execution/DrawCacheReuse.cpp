@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -150,6 +151,107 @@ unsigned BrightestColorByte() {
     unsigned brightest = 0;
     for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(value));
     return brightest;
+}
+
+void LabelHandoffPath() {
+    using namespace AgcDriver;
+    ArchB::Recorder::Boundary(true, 0, ArchB::Recorder::Clock::now());
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    alignas(256) static std::array<std::uint32_t, 32> labels{};
+    alignas(256) static std::uint32_t acknowledged = 0;
+    alignas(256) static volatile std::uint32_t hostGate = 0;
+    labels.fill(0);
+    acknowledged = 0;
+    hostGate = 0;
+    ColorMemory.fill(std::byte{0});
+    PixelConstant.fill(0.0f);
+    PixelConstant[0] = 1.0f;
+    const auto constant = reinterpret_cast<std::uintptr_t>(PixelConstant.data());
+    const auto ack = reinterpret_cast<std::uintptr_t>(&acknowledged);
+    const auto gate = reinterpret_cast<std::uintptr_t>(&hostGate);
+    const auto low = [](std::uintptr_t address) { return static_cast<std::uint32_t>(address); };
+    const auto high = [](std::uintptr_t address) { return static_cast<std::uint32_t>(address >> 32u); };
+    std::vector<std::uint32_t> producer, consumer;
+    for (std::uint32_t index = 0; index < 16; ++index) {
+        const auto label = reinterpret_cast<std::uintptr_t>(labels.data() + index * 2);
+        const auto draw = Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, {{low(constant), high(constant)}});
+        producer.insert(producer.end(), draw.begin(), draw.end());
+        Append(producer, 0x49, {0x514u, (2u << 29u) | (2u << 24u), low(label), high(label), index + 1, 0x12340000u + index, 0u});
+        Append(producer, 0x3c, {0x13u, low(ack), high(ack), index + 1, 0xffffffffu, 0x19u});
+        Append(producer, 0x3c, {0x13u, low(gate), high(gate), index + 1, 0xffffffffu, 0x19u});
+        Append(consumer, 0x3c, {0x13u, low(label), high(label), index + 1, 0xffffffffu, 0x19u});
+        Append(consumer, 0x37, {0x00100200u, low(ack), high(ack), index + 1});
+    }
+    Packet consumerPacket{consumer.data(), static_cast<std::uint32_t>(consumer.size()), 0, {}};
+    Require(sceAgcDriverSubmitAcb(0x20, &consumerPacket) == 0, "label handoff consumer submit failed");
+    Packet producerPacket{producer.data(), static_cast<std::uint32_t>(producer.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&producerPacket) == 0, "label handoff producer submit failed");
+    for (std::uint32_t index = 0; index < 16; ++index) {
+        const auto start = std::chrono::steady_clock::now();
+        const volatile auto* label = labels.data() + index * 2;
+        while (*label != index + 1) {
+            Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "gated label did not become visible");
+            std::this_thread::yield();
+        }
+        bool drawn = false;
+        const volatile auto* color = ColorMemory.data();
+        for (std::size_t byte = 0; byte < ColorMemory.size(); ++byte) drawn |= color[byte] != std::byte{0};
+        Require(drawn, "label became visible before its preceding draw result without a forced flush");
+        ColorMemory.fill(std::byte{0});
+        hostGate = index + 1;
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    for (std::uint32_t index = 0; index < 16; ++index) {
+        Require(labels[index * 2] == index + 1 && labels[index * 2 + 1] == 0x12340000u + index, "draw label bytes or gated FIFO order changed");
+    }
+    Require(acknowledged == 16, "other-queue label waiter did not make bounded progress");
+    const auto snapshot = ArchB::Recorder::Collect(ArchB::Recorder::Clock::now());
+    const auto count = [&](const char* name) { const auto found = snapshot.counters.find(name); return found == snapshot.counters.end() ? 0.0 : found->second; };
+    const bool enabled = ArchB::Switches::Enabled(ArchB::Feature::FixLabelHandoff);
+    Require((count("label_handoff_consumed") > 0) == enabled, "real draw-to-label handoff was not exercised or was enabled unexpectedly");
+    const auto* verify = std::getenv("APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY");
+    if (enabled && verify != nullptr && std::strcmp(verify, "0") != 0) Require(count("label_handoff_store_verified") + count("label_handoff_store_inconclusive") > 0 && count("label_handoff_plan_verified") > 0, "label handoff verification did not classify the store route and check FIFO inputs");
+    std::cout << "Draw-to-label handoffs " << count("label_handoff_consumed") << ", recorded-store checks " << count("label_handoff_store_verified") << ", inconclusive CPU routes " << count("label_handoff_store_inconclusive") << ", other-queue gated values and preceding draw visibility preserved\n";
+}
+
+void DrawHitCensusPath() {
+    AgcDriver::ArchB::Recorder::Boundary(true, 0, AgcDriver::ArchB::Recorder::Clock::now());
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto unchanged = Submit(32.0f, {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f});
+    Require(unchanged.hits == 4, "census changed the ordinary repeated-draw hit count");
+    auto commands = Draws(32.0f, VertexCode.data(), 1, PixelCode.data(), 1, {{std::bit_cast<std::uint32_t>(1.0f)}});
+    commands[commands.size() - 2] = 6;
+    const auto changed = Submit(std::move(commands));
+    Require(changed.hits == 5, "census changed ordinary validation after a packet change");
+    const auto snapshot = AgcDriver::ArchB::Recorder::Collect(AgcDriver::ArchB::Recorder::Clock::now());
+    const auto& counts = snapshot.counters;
+    const auto count = [&](const char* name) { const auto it = counts.find(name); return it == counts.end() ? 0.0 : it->second; };
+    const bool enabled = AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::DrawHitCensus);
+    Require(count("j3_old_hits") == (enabled ? 5 : 0), "census did not observe each ordinary hit exactly once");
+    Require(count("j3_prediction_mismatch") == 0, "census prediction disagreed with the actual draw-cache lookup");
+    Require(count("j3b_draw_nonindirect") == (enabled ? 7 : 0), "attribution did not count the draw population");
+    Require(count("j3b_finish_hit") == (enabled ? 5 : 0), "attribution did not count finishing cache hits");
+    const auto phase = [&](const char* name) {
+        double total = 0;
+        for (const auto& [thread, phases] : snapshot.phases) {
+            if (const auto found = phases.find(name); found != phases.end()) total += found->second;
+        }
+        return total;
+    };
+    for (const char* name : {"Driver.Draw.j3_prologue_precheck", "Driver.Draw.j3_prepare_keys_nonindirect", "Driver.Draw.j3_prepare_decode_programs", "Driver.Draw.j3_setup_before_lookup", "Driver.Draw.j3_stage_assembly_hit_nonindirect", "Shader.J3PrimaryStage.j3_capture_invocation"}) {
+        Require((phase(name) > 0) == enabled, "attribution phase missing when enabled or present when disabled");
+    }
+    if (AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::PipeQ0Committer)) {
+        Require((phase("J3.EnqueueReclaim") > 0) == enabled, "enqueue reclamation attribution is missing");
+        const auto committedDraws = count("j3c_replayed_count") + count("j3c_recipe_count") + count("j3c_legacy_count");
+        Require(committedDraws == (enabled ? 7 : 0), "committer census changed or omitted the draw population");
+        Require((count("j3c_replayed_commit_ns") + count("j3c_recipe_commit_ns") + count("j3c_legacy_commit_ns") > 0) == enabled, "committer draw timing is missing");
+        Require(count("j3c_failed_commits") == 0, "committer census observed a failed draw");
+        Require(count("j3b_enqueue_draw_calls") == (enabled ? 7 : 0), "enqueue attribution changed the draw population: " + std::to_string(count("j3b_enqueue_draw_calls")));
+    }
+    std::cout << "Draw-hit census preserves repeated-draw and changed-packet results\n";
 }
 
 void ThirdDrawHitsTheCache(bool libraries) {
@@ -1150,6 +1252,20 @@ int main(int argc, char** argv) {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
             PipelineStateReusePath(control.path);
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--j3-label-handoff") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            LabelHandoffPath();
+            AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--j3-census") {
+            const auto probe = OpenVulkanTestDevice();
+            if (!probe) return VulkanTestSkipped;
+            DrawHitCensusPath();
             AgcDriverShutdown_nid_postfix();
             return 0;
         }

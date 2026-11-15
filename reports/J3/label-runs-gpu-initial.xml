@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="4"
+	failures="0"
+	disabled="0"
+	skipped="0"
+	hostname=""
+	time="2"
+	timestamp="2026-11-11T08:07:09"
+	>
+	<testcase name="agc_driver_label_run_visibility" classname="agc_driver_label_run_visibility" time="1.02722" status="run">
+		<properties/>
+		<system-out>[time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+[src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+[archb] switches GATE_RUN=0(default) GATE_NOOP=0(default)(rt) RECORDER=1(env)(rt) UB_TRUST_PROOFS=0(default)(rt) UB_NO_LOCK_INVALIDATION=0(default)(rt) UB_POINTER_FREE_DRAW_KEYS=0(default)(rt) UB_SKIP_CPU_INDIRECT=0(default)(rt) UB_SKIP_DISPATCH_PROOF_WALK=0(default)(rt) FIX_TSHARP_FEEDBACK_MASK=0(default)(rt) FIX_PIPELINE_STATE_REUSE=0(default)(rt) FIX_VQ_MEMO=0(default)(rt) FIX_IMAGE_TABLE_SNAPSHOT_REUSE=0(default)(rt) FIX_IMAGE_TABLE_BITSCAN_KEYS=0(default)(rt) FIX_BUFFER_BASE_REFRESH=0(default)(rt) FIX_ALLOC_CHURN=0(default)(rt) FIX_COMPUTE_SYNC_UNLOCKED=0(default)(rt) FIX_WRITE_TRACKIN...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="agc_driver_label_run_visibility_off" classname="agc_driver_label_run_visibility_off" time="0.434605" status="run">
+		<properties/>
+		<system-out>[time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+[src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+[archb] switches GATE_RUN=0(default) GATE_NOOP=0(default)(rt) RECORDER=1(env)(rt) UB_TRUST_PROOFS=0(default)(rt) UB_NO_LOCK_INVALIDATION=0(default)(rt) UB_POINTER_FREE_DRAW_KEYS=0(default)(rt) UB_SKIP_CPU_INDIRECT=0(default)(rt) UB_SKIP_DISPATCH_PROOF_WALK=0(default)(rt) FIX_TSHARP_FEEDBACK_MASK=0(default)(rt) FIX_PIPELINE_STATE_REUSE=0(default)(rt) FIX_VQ_MEMO=0(default)(rt) FIX_IMAGE_TABLE_SNAPSHOT_REUSE=0(default)(rt) FIX_IMAGE_TABLE_BITSCAN_KEYS=0(default)(rt) FIX_BUFFER_BASE_REFRESH=0(default)(rt) FIX_ALLOC_CHURN=0(default)(rt) FIX_COMPUTE_SYNC_UNLOCKED=0(default)(rt) FIX_WRITE_TRACKIN...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="agc_driver_label_run_visibility_on" classname="agc_driver_label_run_visibility_on" time="0.435466" status="run">
+		<properties/>
+		<system-out>[time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+[src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+[archb] switches GATE_RUN=0(default) GATE_NOOP=0(default)(rt) RECORDER=1(env)(rt) UB_TRUST_PROOFS=0(default)(rt) UB_NO_LOCK_INVALIDATION=0(default)(rt) UB_POINTER_FREE_DRAW_KEYS=0(default)(rt) UB_SKIP_CPU_INDIRECT=0(default)(rt) UB_SKIP_DISPATCH_PROOF_WALK=0(default)(rt) FIX_TSHARP_FEEDBACK_MASK=0(default)(rt) FIX_PIPELINE_STATE_REUSE=0(default)(rt) FIX_VQ_MEMO=0(default)(rt) FIX_IMAGE_TABLE_SNAPSHOT_REUSE=0(default)(rt) FIX_IMAGE_TABLE_BITSCAN_KEYS=0(default)(rt) FIX_BUFFER_BASE_REFRESH=0(default)(rt) FIX_ALLOC_CHURN=0(default)(rt) FIX_COMPUTE_SYNC_UNLOCKED=0(default)(rt) FIX_WRITE_TRACKIN...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="agc_driver_label_run_visibility_verify" classname="agc_driver_label_run_visibility_verify" time="0.451504" status="run">
+		<properties/>
+		<system-out>[time] scheduler tick raised to 0.5 ms (was 0.50 ms, now 0.50 ms, timed waits fine)
+[src\HostCpu.cpp:220 operator()] host CPU AMD Ryzen 5 5600 6-Core Processor: has SSE, SSE2, SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT, LZCNT, BMI1, BMI2, MOVBE, CMPXCHG16B, LAHF/SAHF, AVX, AVX2, FMA, F16C, AES, PCLMULQDQ, RDRAND, RDSEED, ADX, SHA, CLFLUSHOPT, CLWB, RDPID, XSAVEOPT, XSAVEC, SSE4A, PREFETCHW, CLZERO, OS AVX state (XCR0); lacks none
+[archb] switches GATE_RUN=0(default) GATE_NOOP=0(default)(rt) RECORDER=1(env)(rt) UB_TRUST_PROOFS=0(default)(rt) UB_NO_LOCK_INVALIDATION=0(default)(rt) UB_POINTER_FREE_DRAW_KEYS=0(default)(rt) UB_SKIP_CPU_INDIRECT=0(default)(rt) UB_SKIP_DISPATCH_PROOF_WALK=0(default)(rt) FIX_TSHARP_FEEDBACK_MASK=0(default)(rt) FIX_PIPELINE_STATE_REUSE=0(default)(rt) FIX_VQ_MEMO=0(default)(rt) FIX_IMAGE_TABLE_SNAPSHOT_REUSE=0(default)(rt) FIX_IMAGE_TABLE_BITSCAN_KEYS=0(default)(rt) FIX_BUFFER_BASE_REFRESH=0(default)(rt) FIX_ALLOC_CHURN=0(default)(rt) FIX_COMPUTE_SYNC_UNLOCKED=0(default)(rt) FIX_WRITE_TRACKIN...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+</testsuite>

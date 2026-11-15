@@ -1,5 +1,8 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/LabelCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -429,10 +432,11 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         if (copy.bytes > gpuStoreLimit) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            DrawPipeline::LabelHandoffTail labelHandoff;
             if (const auto localDevice = device.Load()) {
                 recordDeferredLabels(localDevice.get(), queue);
                 const auto outcome = localDevice->CopyBuffer(copy.destination, copy.source, copy.bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, queue, [](std::span<const std::byte>, std::uint64_t) {});
-                if (outcome.path == 1 || outcome.path == 3) return;
+                if (outcome.path == 1 || outcome.path == 3) { labelHandoff.armed = true; return; }
                 if (outcome.path == 2 && !Graphics::RegisteredReadableCovers(copy.destination, copy.bytes)) {
                     auto* recorder = Graphics::Recorder::Active();
                     if (recorder != nullptr && localDevice->StoresPendingOver(copy.destination, copy.bytes)) recorder->SyncThrough(copy.destination, copy.bytes);
@@ -467,29 +471,48 @@ bool Driver::enqueueConstantRamDump(std::span<const std::uint32_t> packet, std::
 }
 
 void Driver::commitStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
+    std::optional<PerformanceTimer> census;
+    if (CommitCensus::LabelActive()) census.emplace("J3.LabelStore");
     constexpr std::size_t gpuStoreLimit = 65536;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    DrawPipeline::LabelHandoffTail labelHandoff;
+    if (census) census->Mark("acquired");
     const auto localDevice = device.Load();
     Graphics::StorageTexture::FlushPending(address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+    if (census) census->Mark("flush_pending");
     recordDeferredLabels(localDevice.get(), queue);
+    if (census) census->Mark("deferred_labels");
     int reason = 4;
     std::uint64_t stamp = 0;
     if (bytes.size() <= gpuStoreLimit && localDevice != nullptr) {
         stamp = ++eventSerial;
         reason = localDevice->WriteLabelOnGpu(address, bytes, stamp, queue);
     }
+    if (census) {
+        census->Mark("write_label");
+        static constexpr const char* reasons[]{"j3c_label_reason_0", "j3c_label_reason_1", "j3c_label_reason_2", "j3c_label_reason_3", "j3c_label_reason_4", "j3c_label_reason_5", "j3c_label_reason_6"};
+        ArchB::Recorder::Count(reasons[std::clamp(reason, 0, 6)]);
+        ArchB::Recorder::Count("j3c_label_bytes", static_cast<double>(bytes.size()));
+    }
     if (reason == 0 || reason == 5 || reason == 6) {
         noteLabelStore(address, bytes, stamp, queue);
         if (reason == 0) ++storesOnGpu;
         else ++storesBehindCompletions;
     } else {
-        if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+        if (reason != 1 && localDevice != nullptr) {
+            if (census) ArchB::Recorder::Count("j3c_label_wait_idle");
+            localDevice->WaitIdle();
+        }
+        if (census) census->Mark("wait_idle");
         GuestMemory::Write(address, bytes, 1);
+        if (census) { census->Mark("cpu_write"); ArchB::Recorder::Count("j3c_label_cpu_writes"); }
         noteLabelStore(address, bytes, stamp != 0 ? stamp : ++eventSerial, queue);
         ++storesOnCpu;
     }
     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+    if (census) census->Mark("bookkeeping");
+    labelHandoff.armed = true;
 }
 
 bool Driver::labelPacketQueues(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
@@ -546,38 +569,69 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 }
 
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt) {
+    std::optional<PerformanceTimer> census;
+    if (CommitCensus::LabelActive()) census.emplace("J3.LabelEop");
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    if (DrawPipeline::ConsumeLabelGpuMutex(queue, address, bytes)) gpuLock = std::unique_lock(GuestMemory::GpuMutex(), std::adopt_lock);
+    else gpuLock.lock();
+    DrawPipeline::LabelHandoffTail labelHandoff;
+    if (census) census->Mark("acquired");
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
+    if (census) census->Mark("deferred_labels");
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
         if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        if (census) census->Mark("store_drawn_linear");
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        if (census) {
+            census->Mark("write_label");
+            static constexpr const char* reasons[]{"j3c_label_reason_0", "j3c_label_reason_1", "j3c_label_reason_2", "j3c_label_reason_3", "j3c_label_reason_4", "j3c_label_reason_5", "j3c_label_reason_6"};
+            ArchB::Recorder::Count(reasons[std::clamp(reason, 0, 6)]);
+            ArchB::Recorder::Count("j3c_label_bytes", static_cast<double>(bytes.size()));
+        }
         if (reason != 0 && reason != 5 && reason != 6) {
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (reason != 1 && localDevice != nullptr) {
+                if (census) ArchB::Recorder::Count("j3c_label_wait_idle");
+                localDevice->WaitIdle();
+            }
+            if (census) census->Mark("wait_idle");
             GuestMemory::Write(address, bytes, 4);
+            if (census) { census->Mark("cpu_write"); ArchB::Recorder::Count("j3c_label_cpu_writes"); }
         }
         noteLabelStore(address, bytes, stamp, queue);
         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+        static const bool verify = [] { const auto* value = std::getenv("APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY"); return value != nullptr && std::strcmp(value, "0") != 0; }();
+        if (verify && ArchB::Switches::Enabled(ArchB::Feature::FixLabelHandoff) && reason != 0 && reason != 5) ArchB::Recorder::Count("label_handoff_store_inconclusive");
         countLabelOutcome(reason);
         ++immediateLabels;
     } else {
         ++noOpLabels;
+        if (census) ArchB::Recorder::Count("j3c_label_empty");
     }
+    if (census) census->Mark("bookkeeping");
     if (interrupt.has_value()) {
+        if (census) ArchB::Recorder::Count("j3c_label_interrupts");
         const auto context = *interrupt;
         bool deferred = false;
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue, context] { deliverGuestEopInterrupt(queue, context); }, queue == 0);
-            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+            if (deferred && workOpen) {
+                if (census) ArchB::Recorder::Count("j3c_label_interrupt_submits");
+                localDevice->SubmitRecorded(queue == 0);
+            }
         }
+        if (census) ArchB::Recorder::Count(deferred ? "j3c_label_interrupt_deferred" : "j3c_label_interrupt_immediate");
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
+    if (census) census->Mark("interrupt");
     submitDueAfterCommit(localDevice.get());
+    if (census) census->Mark("submit_due");
+    labelHandoff.armed = true;
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
@@ -585,7 +639,10 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    if (due || capped) {
+        if (CommitCensus::LabelActive()) ArchB::Recorder::Count("j3c_label_due_submits");
+        localDevice->SubmitRecorded(true);
+    }
 }
 
 }

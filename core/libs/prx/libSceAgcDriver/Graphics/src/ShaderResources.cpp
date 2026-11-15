@@ -960,6 +960,93 @@ PendingLookup pendingLookupSource(const Context& context, const GuestTextureReso
     return lookup;
 }
 
+std::shared_ptr<Texture> gpuSampledArray(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare, bool layerRows) {
+    const auto refuse = [](const char* reason) -> std::shared_ptr<Texture> {
+        ArchB::Recorder::Count(reason);
+        return nullptr;
+    };
+    ArchB::Recorder::Count("fix_sampled_array_gpu_candidates");
+    if (!ArchB::PartialSnapshotActive()) return refuse("fix_sampled_array_gpu_refused_partial_off");
+    if (!depthCompare || layerRows || resource.dimension != TextureDimension::k2DArray || resource.depthOrLastArray == 0 || resource.baseArray != 0 || resource.baseLevel != 0) return refuse("fix_sampled_array_gpu_refused_shape");
+    if (resource.dccAddress != 0) return refuse("fix_sampled_array_gpu_refused_dcc");
+    if (Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) == VK_FORMAT_UNDEFINED) return refuse("fix_sampled_array_gpu_refused_format");
+    if (sampledCacheHeldThreadState() != 0 || storageCacheHeldThreadState() != 0 || ImportsHeldByThisThread()) return refuse("fix_sampled_array_gpu_refused_locks");
+    auto* recorder = Recorder::Active();
+    const auto address = resource.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (recorder == nullptr || recorder->Device() != context.device || Recorder::InCompletion() || context.detiler == nullptr) return refuse("fix_sampled_array_gpu_refused_recorder");
+    if (recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes)) return refuse("fix_sampled_array_gpu_refused_queued_store");
+    if (recorder->PendingCpuWritesOverlap(address, bytes) || recorder->CompletionLabelIn(address, bytes)) return refuse("fix_sampled_array_gpu_refused_cpu_store");
+    if (recorder->PendingLeaseSerial(address, bytes) != 0) return refuse("fix_sampled_array_gpu_refused_lease");
+    if (AnyShadowedOverlaps(address, bytes)) return refuse("fix_sampled_array_gpu_refused_shadow");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+    if (StorageTexture::AnyPendingOverlaps(range)) return refuse("fix_sampled_array_gpu_refused_storage");
+    const auto pending = recorder->PendingWritesOver(address, bytes);
+    if (pending.empty()) return refuse("fix_sampled_array_gpu_refused_writer");
+    const auto geometry = DescribeSurface(resource);
+    if (geometry.thick || geometry.levelMajor || geometry.imageDepth != 1u || geometry.imageLayers != geometry.layers || geometry.layerBytes == 0 || geometry.GuestLayerOffset(geometry.layers) != guestBytes) return refuse("fix_sampled_array_gpu_refused_layout");
+    auto generation = GuestMemory::CollectWrites(address, bytes);
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    if (generation == 0) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        generation = GuestMemory::CollectCommittedWrites(address, bytes, ranges);
+        if (generation != 0) committed = std::move(ranges);
+    }
+    if (generation == 0) return refuse("fix_sampled_array_gpu_refused_generation");
+    const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    auto& cache = Textures();
+    std::lock_guard lock(cache.mutex);
+    const CacheHold held(sampledCacheHeldThreadState());
+    const auto it = findTexture(cache, key);
+    if (it == cache.entries.end()) return refuse("fix_sampled_array_gpu_refused_cache");
+    if (it->source != nullptr || it->texture->ViewsStorageImage() || it->texture->Released() || it->surfaceBytes != guestBytes || it->keys != DccKeys::Uncompressed) return refuse("fix_sampled_array_gpu_refused_snapshot");
+    if (it->generation == 0 || it->untracked[0] != 0 || it->committed != committed) return refuse("fix_sampled_array_gpu_refused_proof");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+    if (!GuestMemory::ChangedPages(address, bytes, it->generation, changed)) return refuse("fix_sampled_array_gpu_refused_pages");
+    for (const auto& write : pending) changed.emplace_back(write.begin, write.end);
+    std::vector<bool> selected(geometry.layers, false);
+    for (const auto& [from, to] : changed) {
+        const auto begin = std::max(from, address);
+        const auto end = std::min(to, address + bytes);
+        if (begin >= end) continue;
+        const auto first = static_cast<std::uint32_t>((begin - address) / geometry.layerBytes);
+        const auto last = static_cast<std::uint32_t>((end - 1u - address) / geometry.layerBytes);
+        if (last >= geometry.layers) return refuse("fix_sampled_array_gpu_refused_layout");
+        for (auto layer = first; layer <= last; ++layer) selected[layer] = true;
+    }
+    std::vector<std::uint32_t> layers;
+    for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+        if (!selected[layer]) continue;
+        if (ExistingHostImportFor(context, address + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes)) == nullptr) return refuse("fix_sampled_array_gpu_refused_import");
+        layers.push_back(layer);
+    }
+    if (layers.empty() || layers.size() * 2u > geometry.layers) return refuse("fix_sampled_array_gpu_refused_majority");
+    parkSnapshot(cache, it->bytes);
+    it->texture->UpdateSnapshotLayers(*context.detiler, resource, layers, {}, true);
+    it->generation = generation;
+    it->committed = std::move(committed);
+    it->untracked = {};
+    ArchB::Recorder::Count("fix_sampled_array_gpu_taken");
+    ArchB::Recorder::Count("fix_sampled_array_gpu_layers", static_cast<double>(layers.size()));
+    ArchB::Recorder::Count("fix_sampled_array_gpu_bytes", static_cast<double>(geometry.layerBytes * layers.size()));
+    ArchB::Recorder::Count("fix_compute_snapshot_prewait_waits", 0);
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_ARCHB_FIX_SAMPLED_ARRAY_GPU_VERIFY");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    static std::atomic<std::uint64_t> samples{0};
+    if (verify && (samples.fetch_add(1, std::memory_order_relaxed) & 63u) == 0u) {
+        std::vector<std::byte> snapshot(bytes);
+        ReadTextureSurface(resource, DccKeys::Uncompressed, snapshot);
+        const auto reference = std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare, layerRows);
+        it->texture->VerifySnapshot(*reference, resource, "fix_sampled_array_gpu_verify_mismatches");
+        ArchB::Recorder::Count("fix_sampled_array_gpu_verified");
+    }
+    touchTexture(cache, it);
+    logTextureLookup(*it, resource, generation);
+    return it->texture;
+}
+
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, bool layerRows = false, bool snapshotWait = true) {
     const GuestMemory::Gen::ConsumerScope genConsumer(GuestMemory::Gen::Consumer::TextureLookup);
@@ -1059,6 +1146,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto bytes = static_cast<std::size_t>(guestBytes);
     if (profile) StorageTexture::ProfilePendingAccess(resource, guestBytes, StorageTexture::PendingAccess::Read);
     static_cast<void>(FlushDepthPlanes(address, bytes));
+    if (snapshotWait && ArchB::Switches::Enabled(ArchB::Feature::FixSampledArrayGpu) && depthCompare && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+        if (auto texture = gpuSampledArray(context, words, resource, components, guestBytes, depthCompare, layerRows)) return texture;
+    }
     if (snapshotWait && ArchB::PartialSnapshotActive() && Recorder::ComputeSyncEnabled() && ArchB::Switches::Enabled(ArchB::Feature::FixComputeSnapshotWait) && sampledCacheHeldThreadState() == 0 && storageCacheHeldThreadState() == 0 && !ImportsHeldByThisThread() && (depthCompare || !SampledFromStorageEligible(context, resource, guestBytes)) && Recorder::SnapshotWriteOverlaps(address, bytes)) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr) {
             const auto target = recorder->PendingWriterSerial(address, bytes);

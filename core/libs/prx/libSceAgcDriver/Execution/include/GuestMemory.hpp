@@ -362,6 +362,7 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    bool IsContended() const noexcept { return mutex.IsContended(); }
 
 private:
     void enter();
@@ -402,6 +403,8 @@ void SetGpuLockPriorityHook(bool (*queued)());
 std::chrono::nanoseconds GpuLockPriorityWindow();
 std::uint64_t GpuHoldSerial();
 std::uint64_t ThreadGpuHeldNs();
+std::uint64_t ThreadGpuMutexAcquireNs();
+bool SetGpuMutexCensusForThread(bool enabled);
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
