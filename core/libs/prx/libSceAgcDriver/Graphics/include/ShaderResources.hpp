@@ -26,9 +26,16 @@
 
 namespace AgcDriver { class VulkanDevice; }
 
+namespace AgcDriver::DriverDetail {
+struct GatherDrawPlan;
+struct GatherCommitTemplate;
+}
+
 namespace AgcDriver::Graphics {
 
 class Recorder;
+class ParameterArena;
+struct ParameterLease;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
@@ -190,7 +197,7 @@ public:
     // then no other member may be used. `compute` and `snapshots` must outlive Complete(). An
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
-    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt, bool allowDispatchSpaceReuse = true);
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -259,6 +266,8 @@ public:
         std::vector<VkDeviceSize> slotOffsets;
         std::vector<std::size_t> slotSizes;
         std::uint64_t serial = 0;
+        bool captureDescriptors = false;
+        std::vector<VkDescriptorBufferInfo> capturedDescriptors;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -266,6 +275,7 @@ public:
         std::uint64_t address;
         std::size_t size;
         std::span<const std::uint32_t> words;
+        std::size_t viewBytes = 0;
     };
     struct DrawUse {
         DrawUse() = default;
@@ -279,17 +289,74 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr, bool captureDescriptors = false) const;
+    bool BoundElementBytes(const MovedBuffer& entry, const DrawBindings* bound, VkDescriptorBufferInfo& descriptor, std::vector<std::byte>& bytes) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
+    std::vector<const DrawReferenceMasks::Words*> MovedIgnoredWords(std::span<const CompiledShader> shaders, std::span<const DrawReferenceMasks> masks, std::span<const MovedBuffer> moved) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
+    struct FailureDetail {
+        const char* check = "not-recorded";
+        const char* role = "unknown";
+        std::size_t binding = std::numeric_limits<std::size_t>::max();
+        std::size_t element = std::numeric_limits<std::size_t>::max();
+        std::optional<std::uint64_t> priorAddress, currentAddress, priorBytes, currentBytes, priorIdentity, currentIdentity;
+    };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
         std::size_t buffers = 0;
         std::size_t bytes = 0;
+        FailureDetail detail;
     };
     static const char* MoveRefusalName(MoveRefusal refusal);
+    static bool RegisteredViewsCurrent(std::span<const ShaderRecompiler::RegisteredImageView> views);
+    bool GatherBindings(DriverDetail::GatherCommitTemplate& target, const DriverDetail::GatherDrawPlan& plan, std::span<const MovedBuffer> moved) const;
+    std::optional<std::vector<MovedBuffer>> GatherBuffers(const DriverDetail::GatherDrawPlan& plan, Recorder& recorder, MoveRefusal& refusal) const;
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
+    std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData, MoveRefusal* refusal) const;
+    static constexpr std::size_t TemplateFlights = 3;
+    struct TemplateElement {
+        std::size_t allocation = 0;
+        std::size_t bytes = 0;
+        VkDeviceSize offset = 0;
+        bool words = false;
+        bool inPlace = false;
+    };
+    struct TemplateSets {
+        TemplateSets() = default;
+        TemplateSets(const TemplateSets&) = delete;
+        TemplateSets& operator=(const TemplateSets&) = delete;
+        ~TemplateSets();
+        DescriptorCache* cache = nullptr;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
+        std::vector<DescriptorCache::SetAllocation> allocations;
+        std::vector<DescriptorCache::SetAllocation> fragmentAllocations;
+        std::vector<std::vector<VkDescriptorBufferInfo>> buffers;
+        std::vector<VkDescriptorImageInfo> images;
+        std::vector<TemplateElement> elements;
+        std::vector<std::size_t> streamed;
+        HostImportsProof proof{};
+        std::size_t sets = 0;
+        std::size_t writes = 0;
+        const void* recorder = nullptr;
+        std::shared_ptr<ParameterArena> arena;
+        std::vector<std::shared_ptr<ParameterLease>> leases;
+        std::array<std::byte, PipelinePushConstantBytes> push{};
+        std::shared_ptr<void> accounting;
+    };
+    std::shared_ptr<TemplateSets> MakeTemplateSets(std::span<const TemplateElement> elements, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const;
+    void AddTemplateFlights(TemplateSets& sets, std::span<const std::pair<VkBuffer, VkDeviceSize>> flights) const;
+    std::size_t StreamBytes(const MovedBuffer& entry) const;
+    void StreamElement(const MovedBuffer& entry, std::byte* destination) const;
+    bool ExpectedElementBytes(const MovedBuffer& entry, std::vector<std::byte>& out) const;
+    std::size_t TemplateStaticMismatches(const TemplateSets& sets, std::size_t flight) const;
+    void KeepTemplateSets(std::shared_ptr<TemplateSets> sets) const;
+    std::pair<std::size_t, std::size_t> UpdateTemplateFlight(TemplateSets& sets, std::size_t flight, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> inPlace) const;
+    std::pair<std::uint64_t, std::size_t> MovedView(const MovedBuffer& entry) const;
+    VkDescriptorBufferInfo TemplateDescriptor(VkDescriptorBufferInfo info) const { return wholeDwordRange(info); }
+    void RequireGuestBuffers(std::span<const MovedBuffer> moved) const { requireGuestBuffers(moved); }
+    void DropTemplateSets(const TemplateSets* sets) const;
     static std::size_t MaxDrawSnapshotBytes();
     // APS5_ARCHB_PIPE_DRAW_REUSE: a "[draw-reuse]" summary of the slot counters.
     static std::string DrawReuseText();
@@ -334,8 +401,11 @@ public:
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool SpaceReuse() const { return spaceReuse; }
     static bool SpaceReuseDisabled();
+    static bool DispatchSpaceReuseEnabled();
+    const char* CompareDispatchSpace(const ShaderResources& fresh) const;
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
     bool RetakeSpace() { return guestMemory.RetakeSpace(); }
+    bool ShadowAddressesCurrent() { return guestMemory.RebindShadowAddresses(); }
     bool SpaceHeld() const { return guestMemory.SpaceHeld(); }
     SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const { return guestMemory.SnapshotsServedInPlace(snapshots); }
     std::shared_ptr<const void> ReleaseSpace() { return guestMemory.ReleaseSpace(); }
@@ -396,6 +466,7 @@ public:
     // The ranges PrecollectSurfaces collects, appended as [begin, end) (Stage 4.1 resolve read set).
     void DescribedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     bool Reusable() const { return reusable; }
+    const char* ReuseBlockReason() const { return reuseBlockReason; }
     // APS5_ARCHB_PIPE_DRAW_LOOKUP_MEMO: a serial unique to this object's insertion into the shared
     // resource cache while the cache holds it, 0 once it left (ResourceCache sets it under its mutex),
     // so a memo of a Find result stays exactly what Find would return while the serial holds.
@@ -426,6 +497,7 @@ public:
         bool stampReused = false;
         std::array<double, 6> stageMs{};
         std::array<double, 6> stageWaitMs{};
+        FailureDetail detail;
     };
     static const char* FastFailName(std::size_t reason);
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
@@ -478,6 +550,8 @@ public:
         double descriptorsMs = 0;
         double prepareMs = 0;
         double completeMs = 0;
+        double imagesMs = 0;
+        double bdaMs = 0;
     };
     const BuildTiming& Timing() const { return timing; }
     // The image surfaces (address, bytes) whose stage-B lookup reads guest memory on the CPU and so
@@ -727,6 +801,15 @@ private:
     bool usesBda = false;
     bool bdaReadOnly = true;
     bool spaceReuse = false;
+    bool allowDispatchSpaceReuse = true;
+    struct DispatchUse {
+        std::shared_ptr<const void> space;
+        std::shared_ptr<const void> faultPin;
+        std::atomic<bool> completed{false};
+    };
+    std::weak_ptr<DispatchUse> dispatchUse;
+    std::atomic<bool> dispatchSpacePoisoned{false};
+    static std::shared_ptr<const void> pinDispatchFaultSlot(const std::shared_ptr<ShaderResources>& resources);
     bool faultReportOnly = true;
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
@@ -788,7 +871,8 @@ private:
     std::shared_ptr<DrawSetPool> drawSetPool;
     struct MovedSetCache;
     mutable std::shared_ptr<MovedSetCache> movedSetCache;
-    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
+    mutable std::vector<std::shared_ptr<TemplateSets>> templateSetsHeld;
+    std::shared_ptr<DrawBindings> cachedMovedBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool captureDescriptors) const;
 
 public:
     // Arch C P3b (C_REPLAY_SLOT_BINDINGS): the conditions of MovedReadOnlyBuffers that do not depend only on the
@@ -835,6 +919,7 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    const char* reuseBlockReason = "uncompleted";
     mutable std::atomic<std::uint64_t> cacheMembership{0};
     bool provedOnce = false;
     std::vector<DirectRegion> directRegions;
