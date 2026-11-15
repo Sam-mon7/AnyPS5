@@ -14,13 +14,17 @@ namespace ShaderRecompiler::Detail {
 class SrtTape {
 public:
     static const SrtTape* For(const IrResourcePlan& plan);
+    static std::shared_ptr<const SrtTape> CompileStrict(const IrResourcePlan& plan);
     static bool Enabled();
     static bool Verified();
     static bool FastEnabled();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
+    bool RunStrict(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<std::uint32_t>* structure = nullptr) const;
+
     std::size_t Nodes() const { return nodes.size(); }
+    std::uint64_t UserDataMask() const { return userDataMask; }
 
 private:
     friend class SrtTapeCompiler;
@@ -48,6 +52,7 @@ private:
         const IrValue* parentRead = nullptr;
     };
     struct Frame;
+    bool run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, bool strict, std::vector<std::uint32_t>* structure = nullptr) const;
     bool evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const;
     bool compute(Frame& frame, const Node& node, std::uint64_t& result) const;
 
@@ -59,6 +64,8 @@ private:
     std::vector<std::uint8_t> initialActiveFlat;
     std::size_t activityEntries = 0;
     bool needsCleanMemory = false;
+    bool strictProgram = false;
+    std::uint64_t userDataMask = 0;
 };
 
 }
