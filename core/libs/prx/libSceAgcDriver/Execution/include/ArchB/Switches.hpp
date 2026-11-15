@@ -8,6 +8,7 @@
 namespace AgcDriver::ArchB {
 
 enum class Feature : std::uint8_t {
+    DispatchGatherShadow,
     GateRun,
     GateNoop,
     Recorder,
@@ -110,6 +111,7 @@ enum class Feature : std::uint8_t {
     ReplayRecognize,
     FixStatePacketFast,
     FixDrawRelocNested,
+    FixSampledArrayGpu,
     Count
 };
 
