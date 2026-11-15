@@ -33,6 +33,10 @@
 // generations (GuestWtFaultClock), so a page stamp compares directly with a generation.
 namespace GuestArena {
 
+#ifdef _WIN32
+void RefreshFaultStacks(std::uintptr_t address, std::size_t bytes);
+#endif
+
 enum class WtFaultAnswer : std::uint8_t { Unchanged, Changed, Untracked };
 
 struct WtFaultCounters {

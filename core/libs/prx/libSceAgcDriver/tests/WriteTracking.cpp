@@ -6,6 +6,10 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteFault.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
+#ifdef _WIN32
+#include "prx/libSceFiber/include/Api.hpp"
+#endif
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -2520,6 +2524,254 @@ void CheckCommittedRanges() {
 // open for one flip; a host import holds its pages open; resident direct memory that is mapped a
 // second time leaves the tracker (its views are the shared-mapping tracker's), so a store through the
 // read-write alias of the view never faults into the fault tracker.
+extern "C" void WtStackCall_nid_no_patch(void* top, void (*body)(void*), void* argument);
+
+asm(".text\n"
+    ".globl WtStackCall_nid_no_patch\n"
+    "WtStackCall_nid_no_patch:\n"
+    "push %rbx\n"
+    "mov %rsp, %rbx\n"
+    "mov %rcx, %rsp\n"
+    "and $-16, %rsp\n"
+    "sub $32, %rsp\n"
+    "mov %r8, %rcx\n"
+    "call *%rdx\n"
+    "mov %rbx, %rsp\n"
+    "pop %rbx\n"
+    "ret\n");
+
+struct WtStackWork {
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE proceed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    std::uintptr_t first;
+    std::size_t bytes;
+    bool guard = false;
+    bool pointerOnly = false;
+
+    ~WtStackWork() {
+        CloseHandle(ready);
+        CloseHandle(proceed);
+    }
+};
+
+void WtStackDepth(WtStackWork& work, unsigned depth) {
+    volatile std::uint8_t frame[4096];
+    frame[0] = static_cast<std::uint8_t>(depth);
+    frame[4095] = static_cast<std::uint8_t>(depth + 1);
+    if (depth != 0) WtStackDepth(work, depth - 1);
+    else if (work.guard) {
+        for (unsigned repeat = 0; repeat < 8; ++repeat) {
+            GuestArena::GuestWtFaultArm_nid_no_patch(nullptr, 0);
+            GuestArena::GuestWtFaultWatch_nid_no_patch(work.first, work.bytes);
+            GuestArena::GuestWtFaultWatchLazy_nid_no_patch(work.first, work.bytes);
+            MEMORY_BASIC_INFORMATION memory{};
+            for (auto page = work.first; page < work.first + work.bytes; page += 4096) {
+                if (VirtualQuery(reinterpret_cast<void*>(page), &memory, sizeof(memory)) != sizeof(memory) || memory.Protect != PAGE_READWRITE) std::abort();
+            }
+        }
+    } else {
+        SetEvent(work.ready);
+        if (WaitForSingleObject(work.proceed, 10000) != WAIT_OBJECT_0) std::abort();
+    }
+    frame[0] = frame[4095];
+}
+
+void WtStackBody(void* opaque) {
+    auto& work = *static_cast<WtStackWork*>(opaque);
+    if (work.pointerOnly) {
+        const auto page = work.first + work.bytes - 4096;
+        GuestArena::GuestWtFaultArm_nid_no_patch(nullptr, 0);
+        GuestArena::GuestWtFaultWatch_nid_no_patch(page, 4096);
+        GuestArena::GuestWtFaultWatchLazy_nid_no_patch(page, 4096);
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<void*>(page), &memory, sizeof(memory)) != sizeof(memory) || memory.Protect != PAGE_READWRITE) std::abort();
+    } else WtStackDepth(work, 5);
+}
+
+void WtRunStack(WtStackWork& work) {
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    const auto base = tib->StackBase;
+    const auto limit = tib->StackLimit;
+    auto* deallocation = reinterpret_cast<void**>(reinterpret_cast<std::uint8_t*>(tib) + 0x1478);
+    const auto previous = *deallocation;
+    if (!work.pointerOnly) {
+        tib->StackBase = reinterpret_cast<void*>(work.first + work.bytes);
+        tib->StackLimit = reinterpret_cast<void*>(work.first);
+        *deallocation = reinterpret_cast<void*>(work.first);
+    }
+    WtStackCall_nid_no_patch(reinterpret_cast<void*>(work.first + work.bytes), WtStackBody, &work);
+    tib->StackBase = base;
+    tib->StackLimit = limit;
+    *deallocation = previous;
+}
+
+void APS5_VABI WtStackFiber(std::uint64_t argument, std::uint64_t) {
+    WtStackBody(reinterpret_cast<void*>(argument));
+    if (sceFiberReturnToThread(17, nullptr) != 0) std::abort();
+    std::abort();
+}
+
+void CheckWtFaultStack(std::string_view mode) {
+    using namespace GuestArena;
+    constexpr std::size_t Page = 4096;
+    if (mode == "cost") {
+        Require(WriteWatched() && GuestWtFaultEnabled_nid_no_patch(), "the arm cost fixture needs fault tracking");
+        constexpr std::size_t Bytes = 16 * 1024 * 1024;
+        void* memory = GuestArenaAllocate_nid_postfix(Bytes, Block);
+        Require(memory != nullptr, "cannot allocate the arm cost fixture");
+        GuestArenaCommit_nid_postfix(memory, Bytes, PAGE_READWRITE, Bytes);
+        const auto base = reinterpret_cast<std::uintptr_t>(memory);
+        for (auto page = base; page < base + Bytes; page += 2 * Page) GuestWtFaultTrack_nid_no_patch(page, Page);
+        GuestWtFaultArm_nid_no_patch(nullptr, 0);
+        std::vector<std::uint64_t> times, scans;
+        for (unsigned repeat = 0; repeat < 96; ++repeat) {
+            GuestWtFaultOpen_nid_no_patch(base, Bytes);
+            WtFaultCounters before{}, after{};
+            GuestWtFaultCounters_nid_no_patch(&before);
+            GuestWtFaultArm_nid_no_patch(nullptr, 0);
+            GuestWtFaultCounters_nid_no_patch(&after);
+            Require(after.armedPages - before.armedPages == Bytes / (2 * Page) && after.armQueries == before.armQueries,
+                    "the warmed arm cost fixture did not arm every run without queries");
+            times.push_back(after.armNs - before.armNs);
+            scans.push_back(after.armScanNs - before.armScanNs);
+        }
+        std::sort(times.begin(), times.end());
+        std::sort(scans.begin(), scans.end());
+        std::cout << "2048 runs, 96 arms: median arm_ns=" << times[times.size() / 2] << " scan_ns=" << scans[scans.size() / 2] << '\n';
+        GuestArenaReset_nid_postfix(memory, Bytes);
+        GuestArenaRelease_nid_postfix(memory, Bytes);
+        return;
+    }
+    PartlyCommitted range;
+    const auto base = range.Address();
+    constexpr auto Bytes = 2 * Block;
+    constexpr auto Allocation = 16384;
+    GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(base), Bytes, PAGE_READWRITE, Allocation);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base, Bytes);
+    int owner = 0;
+    struct Unregister {
+        const void* owner;
+        ~Unregister() { GuestStacks::GuestStackUnregister_nid_no_patch(owner); }
+    } unregister{&owner};
+    if (mode == "before-enable") {
+        Require(!GuestWtFaultEnabled_nid_no_patch(), "the before-enable fixture enabled tracking too early");
+        GuestStacks::GuestStackSet_nid_no_patch(&owner, reinterpret_cast<void*>(base), Bytes);
+    }
+    Require(WriteWatched(), "the stack fixture needs write watching");
+    const bool enabled = mode != "off";
+    Require(GuestWtFaultEnabled_nid_no_patch() == enabled, "the stack fixture has the wrong fault mode");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    auto since = CollectWrittenBlocks(base, Bytes, 0, written);
+    const auto arm = [] { GuestWtFaultArm_nid_no_patch(nullptr, 0); };
+    if (mode == "replaced") {
+        range.Commit(2);
+        const auto old = range.Address(2);
+        CollectWrittenBlocks(old, Block, 0, written);
+        GuestStacks::GuestStackSet_nid_no_patch(&owner, reinterpret_cast<void*>(old), Block);
+        arm();
+        Require((GuestWtFaultWord_nid_no_patch(old) & WtFaultStateMask) == WtFaultOpen, "the original context stack was protected");
+    }
+    const auto writable = [&] {
+        for (auto page = base; page < base + Bytes; page += Page) {
+            MEMORY_BASIC_INFORMATION info{};
+            Require(VirtualQuery(reinterpret_cast<void*>(page), &info, sizeof(info)) == sizeof(info) && info.Protect == PAGE_READWRITE,
+                    "a stack page lost read or write access");
+        }
+    };
+    const auto exact = [&] {
+        std::array<void*, Bytes / Page> pages{};
+        ULONG_PTR count = 0;
+        for (auto allocation = base; allocation < base + Bytes; allocation += Allocation) {
+            ULONG_PTR found = pages.size() - count;
+            DWORD granularity = 0;
+            Require(GetWriteWatch(0, reinterpret_cast<void*>(allocation), Allocation, pages.data() + count, &found, &granularity) == 0 && granularity == Page,
+                    "cannot query the expected stored stack pages");
+            count += found;
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> expected;
+        for (ULONG_PTR index = 0; index < count; ++index) {
+            const auto page = reinterpret_cast<std::uint64_t>(pages[index]);
+            if (!expected.empty() && expected.back().second == page) expected.back().second += Page;
+            else expected.emplace_back(page, page + Page);
+        }
+        since = CollectWrittenBlocks(base, Bytes, since, written);
+        Require(written == expected, "the capture walk differs from OS write watching on stack pages");
+        return count;
+    };
+    if (mode == "guard" || mode == "guard-pointer") {
+        WtStackWork work{.first = base, .bytes = Bytes, .guard = true, .pointerOnly = mode == "guard-pointer"};
+        GuestWtFaultForget_nid_no_patch(base, Bytes);
+        GuestWtFaultTrack_nid_no_patch(work.pointerOnly ? base + Bytes - Page : base, work.pointerOnly ? Page : Bytes);
+        WtRunStack(work);
+        exact();
+        return;
+    }
+    FiberObject fiber{};
+    if (mode == "armed" || mode == "watched" || mode == "lazy" || mode == "fiber") {
+        arm();
+        Require((GuestWtFaultWord_nid_no_patch(base) & WtFaultStateMask) == WtFaultArmed, "the stack was not armed before registration");
+        if (mode == "watched") Require(GuestWtFaultWatch_nid_no_patch(base, Bytes) == Bytes / Page, "the pre-registration watch failed");
+        if (mode == "lazy") Require(GuestWtFaultWatchLazy_nid_no_patch(base, Bytes) == Bytes / Page, "the pre-registration lazy watch failed");
+    }
+    WtStackWork work{.first = base, .bytes = Bytes};
+    if (mode == "fiber") {
+        Require(_sceFiberInitializeImpl_nid_postfix(&fiber, "tracked-stack", WtStackFiber, reinterpret_cast<std::uint64_t>(&work),
+                                                   reinterpret_cast<void*>(base), Bytes, nullptr, 0) == 0, "cannot initialize a fiber on tracked memory");
+    } else {
+        GuestStacks::GuestStackSet_nid_no_patch(&owner, reinterpret_cast<void*>(base), Bytes);
+    }
+    if (mode == "overlap") {
+        GuestStacks::GuestStackSet_nid_no_patch(&fiber, reinterpret_cast<void*>(base + 1), Bytes - 2);
+        GuestStacks::GuestStackUnregister_nid_no_patch(&owner);
+    }
+    if (mode != "registered") writable();
+    GuestWtFaultSetCold_nid_no_patch(base, Bytes, true);
+    std::thread thread([&] {
+        if (mode == "fiber") {
+            std::uint64_t returned = 0;
+            if (sceFiberRun_nid_postfix(&fiber, 0, &returned) != 0 || returned != 17) std::abort();
+        } else WtRunStack(work);
+    });
+    if (WaitForSingleObject(work.ready, 10000) != WAIT_OBJECT_0) std::abort();
+    bool safe = true;
+    try {
+        for (unsigned repeat = 0; repeat < 32; ++repeat) {
+            arm();
+            GuestWtFaultWatch_nid_no_patch(base, Bytes);
+            GuestWtFaultWatchLazy_nid_no_patch(base, Bytes);
+            writable();
+            const auto count = exact();
+            Require(repeat == 0 ? count >= 6 && count < Bytes / Page : count == 0, "a repeated capture rewrote untouched stack pages");
+        }
+    } catch (...) {
+        safe = false;
+    }
+    SetEvent(work.proceed);
+    thread.join();
+    Require(safe, "concurrent arming or a capture walk mishandled the active stack");
+    exact();
+    Require(exact() == 0, "a drained stack was reported stored again");
+    GuestStacks::GuestStackUnregister_nid_no_patch(&owner);
+    if (mode == "fiber") Require(sceFiberFinalize(&fiber) == 0, "cannot finalize the stack fixture fiber");
+    if (mode == "overlap") GuestStacks::GuestStackUnregister_nid_no_patch(&fiber);
+    arm();
+    if (mode == "replaced") Require((GuestWtFaultWord_nid_no_patch(range.Address(2)) & WtFaultStateMask) == WtFaultArmed,
+                                    "replacing a context stack left its previous pages pinned");
+    if (enabled) {
+        Require((GuestWtFaultWord_nid_no_patch(base) & WtFaultStateMask) == WtFaultArmed, "unregistered stack pages did not arm again");
+        WtFaultCounters before{}, after{};
+        GuestWtFaultCounters_nid_no_patch(&before);
+        const auto clock = GuestWtFaultClock_nid_no_patch();
+        *reinterpret_cast<volatile std::uint8_t*>(base + 8) = 0x51;
+        GuestWtFaultCounters_nid_no_patch(&after);
+        Require(after.faults == before.faults + 1 && GuestWtFaultChangedSince_nid_no_patch(base, Page, clock) == WtFaultAnswer::Changed,
+                "a store after stack unregistration was not fault tracked");
+        Require((GuestWtFaultWord_nid_no_patch(base) >> WtFaultStampShift) >= clock, "the reopened stack page has no store stamp");
+        Require(exact() == 1, "the unregistered stack store was not collected exactly once");
+    }
+    GuestWtFaultSetCold_nid_no_patch(base, Bytes, false);
+}
+
 void CheckWtFault() {
     using namespace GuestArena;
     using AgcDriver::ArchB::Feature;
@@ -4707,6 +4959,13 @@ void CheckMarkPossiblyWrittenOrder() {
 
 int main(int argc, char** argv) {
     try {
+#ifdef _WIN32
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--wt-stack-")) {
+            CheckWtFaultStack(std::string_view(argv[1]).substr(11));
+            std::cout << "fault tracking stack test passed\n";
+            return 0;
+        }
+#endif
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(MetadataCommitMode)) {
             return CheckMetadataCommit() ? 0 : 77;

@@ -4,6 +4,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/general/AsmMacros.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -215,12 +216,12 @@ static void SetBounds(const StackBounds& bounds) {
     *reinterpret_cast<void**>(teb + 0x1478) = bounds.deallocation;
 }
 
-static void PinStack(const void* context, std::uint64_t bytes) {
-    GuestArena::GuestArenaPinWritable_nid_postfix(context, static_cast<std::size_t>(bytes));
+static void PinStack(const void* owner, const void* context, std::uint64_t bytes) {
+    GuestStacks::GuestStackSet_nid_no_patch(owner, context, static_cast<std::size_t>(bytes));
 }
 
-static void UnpinStack(const void* context, std::uint64_t bytes) {
-    GuestArena::GuestArenaUnpinWritable_nid_postfix(context, static_cast<std::size_t>(bytes));
+static void UnpinStack(const void* owner, const void*, std::uint64_t) {
+    GuestStacks::GuestStackUnregister_nid_no_patch(owner);
 }
 
 #else
@@ -283,17 +284,17 @@ static StackBounds CurrentBounds() {
 static void SetBounds(const StackBounds&) {}
 
 #ifdef __APPLE__
-static void PinStack(const void* context, std::uint64_t bytes) {
+static void PinStack(const void*, const void* context, std::uint64_t bytes) {
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(context, static_cast<std::size_t>(bytes));
 }
 
-static void UnpinStack(const void* context, std::uint64_t bytes) {
+static void UnpinStack(const void*, const void* context, std::uint64_t bytes) {
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(context, static_cast<std::size_t>(bytes));
 }
 #else
-static void PinStack(const void*, std::uint64_t) {}
+static void PinStack(const void*, const void*, std::uint64_t) {}
 
-static void UnpinStack(const void*, std::uint64_t) {}
+static void UnpinStack(const void*, const void*, std::uint64_t) {}
 #endif
 
 #endif
@@ -440,16 +441,16 @@ static void AttachStack(Fiber* fiber, void* addr_context, uint64_t size_context)
     fiber->context = static_cast<std::uint8_t*>(addr_context);
     fiber->contextSize = size_context;
     if (size_context < FIBER_GUEST_STACK_MIN) AllocateHostStack(fiber);
+    PinStack(fiber, addr_context, size_context);
     if (fiber->contextSizeCheck) {
         auto* words = SizedWindow(fiber);
         std::fill(words, words + size_context / sizeof(std::uint64_t), FIBER_CONTEXT_FILL);
     }
-    PinStack(addr_context, size_context);
 }
 
 static void DetachStack(Fiber* fiber) {
     if (!fiber->context) return;
-    UnpinStack(fiber->context, fiber->contextSize);
+    UnpinStack(fiber, fiber->context, fiber->contextSize);
     ReleaseHostStack(fiber);
 }
 

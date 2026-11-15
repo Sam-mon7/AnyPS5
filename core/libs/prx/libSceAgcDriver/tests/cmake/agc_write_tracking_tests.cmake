@@ -3,6 +3,9 @@ add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_write_tracking_tests PRIVATE libSceAgcDriver libc)
+if(WIN32)
+    target_link_libraries(agc_write_tracking_tests PRIVATE libSceFiber)
+endif()
 set_target_properties(agc_write_tracking_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_write_tracking_tests)
 
@@ -52,6 +55,18 @@ if(BUILD_TESTING)
         SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     set_tests_properties(agc_archb_fix_unstamped_alias_tracker_on agc_archb_fix_unstamped_alias_suite PROPERTIES ENVIRONMENT "APS5_ARCHB_FIX_UNSTAMPED_ALIAS=1")
     add_test(NAME agc_archb_wt_fault COMMAND agc_write_tracking_tests --wt-fault)
+    if(WIN32)
+        foreach(stackCase IN ITEMS registered armed watched lazy fiber before-enable overlap replaced guard guard-pointer off cost)
+            add_test(NAME agc_archb_wt_fault_stack_${stackCase} COMMAND agc_write_tracking_tests --wt-stack-${stackCase})
+            set(stackFault 1)
+            if(stackCase STREQUAL "off")
+                set(stackFault 0)
+            endif()
+            set_tests_properties(agc_archb_wt_fault_stack_${stackCase} PROPERTIES TIMEOUT 30
+                ENVIRONMENT "APS5_ARCHB_WT_FAULT=${stackFault};APS5_ARCHB_WT_FAULT_VERIFY=${stackFault};APS5_ARCHB_WT_FAULT_CONSUMERS=${stackFault};APS5_ARCHB_WT_SYNC_SKIP=${stackFault};APS5_WT_FAULT_GUEST_HOT=0;APS5_ARCHB_WT_FAULT_DIRTY_ARM=0"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endforeach()
+    endif()
     add_test(NAME agc_archb_wt_fault_verify COMMAND agc_write_tracking_tests --wt-fault)
     add_test(NAME agc_archb_wt_fault_suite COMMAND agc_write_tracking_tests)
     set_tests_properties(agc_archb_wt_fault agc_archb_wt_fault_verify agc_archb_wt_fault_suite PROPERTIES

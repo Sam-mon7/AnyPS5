@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestWriteFault.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +39,7 @@ struct Leaf {
     std::atomic<std::uint64_t> storedLast[LeafPages / 64];
     std::atomic<std::uint64_t> watch[LeafPages / 64];
     std::atomic<std::uint64_t> lazy[LeafPages / 64];
+    std::uint64_t stacks[LeafPages / 64]{};
     // Hint: may hold open pages (an arm scans the leaf). Set by every transition to Open.
     std::atomic<std::uint32_t> open{0};
     // Pages not armed (any state but Armed): 0 with `newest` at most a clock answers a whole leaf.
@@ -67,7 +69,7 @@ struct State {
     bool verify = false;
     bool driverHot = true;
     bool guestHot = true;
-    std::mutex mutex;
+    std::mutex& mutex = GuestStacks::RegistryMutex();
     Leaf* allocated = nullptr;
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> held;
     struct Run {
@@ -246,6 +248,12 @@ Leaf& leafFor(State& state, std::uintptr_t address) {
     for (auto& bits : leaf->watch) bits.store(0, std::memory_order_relaxed);
     for (auto& bits : leaf->lazy) bits.store(0, std::memory_order_relaxed);
     leaf->base = state.base + (((address - state.base) >> LeafShift) << LeafShift);
+    if (GuestStacks::OverlapsRegistered(leaf->base, leaf->base + (std::uintptr_t{1} << LeafShift))) {
+        for (std::size_t index = 0; index < LeafPages; ++index) {
+            const auto page = leaf->base + (index << PageShift);
+            if (GuestStacks::OverlapsRegistered(page, page + PageBytes)) leaf->stacks[index / 64] |= std::uint64_t{1} << (index % 64);
+        }
+    }
     leaf->next = state.allocated;
     state.allocated = leaf;
     state.counters.leaves.fetch_add(1, std::memory_order_relaxed);
@@ -369,6 +377,32 @@ bool heldPage(const State& state, std::uintptr_t page) {
     return false;
 }
 
+struct CurrentStack {
+    std::uintptr_t first = reinterpret_cast<std::uintptr_t>(reinterpret_cast<NT_TIB*>(NtCurrentTeb())->StackLimit);
+    std::uintptr_t stop = reinterpret_cast<std::uintptr_t>(reinterpret_cast<NT_TIB*>(NtCurrentTeb())->StackBase);
+    std::uintptr_t pointer;
+
+    CurrentStack() {
+        asm volatile("mov %%rsp, %0" : "=r"(pointer));
+        pointer &= ~(PageBytes - 1);
+    }
+
+    bool Contains(std::uintptr_t page) const {
+        return (first < stop && page < stop && page + PageBytes > first) || page == pointer;
+    }
+
+    std::uint64_t Mask(std::uintptr_t group) const {
+        std::uint64_t mask = 0;
+        if (first < stop && group < stop && group + 64 * PageBytes > first) {
+            const auto low = (std::max(group, first) - group) / PageBytes;
+            const auto high = (std::min(group + 64 * PageBytes, stop) - group + PageBytes - 1) / PageBytes;
+            mask = (~std::uint64_t{0} << low) & (~std::uint64_t{0} >> (64 - high));
+        }
+        if (pointer >= group && pointer < group + 64 * PageBytes) mask |= std::uint64_t{1} << ((pointer - group) / PageBytes);
+        return mask;
+    }
+};
+
 std::atomic<bool> g_watchEver{false};
 
 DWORD trackedProtection(std::uint64_t word) {
@@ -476,12 +510,34 @@ std::size_t unwatchRange(State& state, std::uintptr_t first, std::uintptr_t stop
 
 }
 
+void RefreshFaultStacks(std::uintptr_t address, std::size_t bytes) {
+    if (!g_enabled.load(std::memory_order_acquire)) return;
+    auto& state = *g_state;
+    std::uintptr_t first = 0;
+    std::uintptr_t stop = 0;
+    if (!clamp(state, address, bytes, first, stop)) return;
+    for (auto page = first; page < stop; page += PageBytes) {
+        auto* leaf = leafAt(state, page);
+        if (leaf == nullptr) continue;
+        const auto index = (page >> PageShift) & (LeafPages - 1);
+        const auto bit = std::uint64_t{1} << (index % 64);
+        if (GuestStacks::OverlapsRegistered(page, page + PageBytes)) {
+            leaf->stacks[index / 64] |= bit;
+            unwatchRange(state, page, page + PageBytes, WtWatchHold);
+            openRange(state, page, page + PageBytes, WtFaultLogHold);
+        } else {
+            leaf->stacks[index / 64] &= ~bit;
+        }
+    }
+}
+
 void GuestWtFaultEnable_nid_no_patch(bool verify, std::uint64_t clockAbove) {
     auto clock = g_clock.load(std::memory_order_relaxed);
     while (clock < clockAbove && !g_clock.compare_exchange_weak(clock, clockAbove, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
     if (g_enabled.load(std::memory_order_acquire)) return;
     static std::once_flag once;
     std::call_once(once, [verify] {
+        std::lock_guard lock(GuestStacks::RegistryMutex());
         auto* state = new State();
         std::size_t bytes = 0;
         GuestArenaRange_nid_postfix(&state->base, &bytes);
@@ -687,6 +743,7 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
     const auto start = ticks();
     std::lock_guard lock(state.mutex);
     const auto locked = ticks();
+    const CurrentStack currentStack;
     auto& runs = state.runs;
     runs.clear();
     std::uint64_t kept = 0;
@@ -698,11 +755,12 @@ std::size_t arm(std::uintptr_t* reported, std::size_t capacity, std::uintptr_t* 
         bool stillOpen = false;
         for (std::size_t group = 0; group < LeafPages / 64; ++group) {
             const auto hot = leaf->hot[group].exchange(0, std::memory_order_acq_rel);
+            const auto stacks = leaf->stacks[group] | currentStack.Mask(leaf->base + group * 64 * PageBytes);
             for (std::size_t bit = 0; bit < 64; ++bit) {
                 const auto index = group * 64 + bit;
                 const auto page = leaf->base + (index << PageShift);
                 if (stateOf(leaf->words[index].load(std::memory_order_acquire)) != WtFaultOpen) continue;
-                if (watchedPage(*leaf, page)) {
+                if (((stacks >> bit) & 1) != 0 || watchedPage(*leaf, page)) {
                     ++kept;
                     stillOpen = true;
                     continue;
@@ -1309,6 +1367,7 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
     if (!clamp(state, address, bytes, first, stop)) return 0;
     std::lock_guard lock(state.mutex);
     g_watchEver.store(true, std::memory_order_release);
+    const CurrentStack currentStack;
     std::vector<WatchClaim> claims;
     const auto skip = [&](std::size_t cause, std::uint64_t pages) {
         if (causes != nullptr) causes[cause] += pages;
@@ -1327,7 +1386,8 @@ std::size_t GuestWtFaultWatchCauses_nid_no_patch(std::uintptr_t address, std::si
             skip(WtWatchSkipWatched, 1);
             continue;
         }
-        if (heldPage(state, page)) {
+        const auto stackIndex = (page >> PageShift) & (LeafPages - 1);
+        if (((leaf->stacks[stackIndex / 64] >> (stackIndex % 64)) & 1) != 0 || currentStack.Contains(page) || heldPage(state, page)) {
             skip(WtWatchSkipHeld, 1);
             continue;
         }
@@ -1406,6 +1466,7 @@ std::size_t GuestWtFaultWatchLazy_nid_no_patch(std::uintptr_t address, std::size
     std::uintptr_t first = 0;
     std::uintptr_t stop = 0;
     if (!clamp(state, address, bytes, first, stop)) return watched;
+    std::lock_guard lock(state.mutex);
     std::size_t marked = 0;
     for (auto page = first; page < stop; page += PageBytes) {
         auto* leaf = leafAt(state, page);

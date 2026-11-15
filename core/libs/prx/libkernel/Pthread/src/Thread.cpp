@@ -13,6 +13,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteFault.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -102,6 +103,9 @@ static std::atomic<get_thread_atexit_count_func_t> threadAtexitCount{nullptr};
 static std::atomic<thread_atexit_report_func_t> threadAtexitReport{nullptr};
 
 struct GuestThreadState {
+#ifdef _WIN32
+    ~GuestThreadState();
+#endif
     PthreadPrivate* current = nullptr;
     bool finishing = false;
     bool exiting = false;
@@ -447,6 +451,7 @@ static void RegisterStack(PthreadPrivate* self) {
     if (!CurrentStack(&low, &high))
         throw std::runtime_error("Cannot query guest thread stack");
     std::lock_guard lock(stackLock);
+    GuestStacks::GuestStackSet_nid_no_patch(self, reinterpret_cast<const void*>(low), high - low);
     liveStacks[self] = {low, high};
 }
 
@@ -528,8 +533,15 @@ static void UnregisterStack(PthreadPrivate* self) {
             }
         }
     }
+    GuestStacks::GuestStackUnregister_nid_no_patch(self);
     liveStacks.erase(self);
 }
+
+#ifdef _WIN32
+GuestThreadState::~GuestThreadState() {
+    if (current) UnregisterStack(current);
+}
+#endif
 
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end) {
     std::uintptr_t low = 0;
@@ -1424,6 +1436,7 @@ Pthread APS5_VABI scePthreadSelf() {
         TimedWait::BindThreadWaitState(&adopted->waitCount);
         SetStackFromHost(adopted.get());
         CurrentGuestState().current = adopted.release();
+        RegisterStack(CurrentGuestState().current);
     }
 #else
     if (!CurrentGuestState().current) {

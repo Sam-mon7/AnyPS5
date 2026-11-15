@@ -75,6 +75,7 @@ void APS5_VABI makecontext_nid_postfix(UserUcontext* context, void (APS5_VABI* s
         return;
     }
     const auto top = (reinterpret_cast<std::uintptr_t>(context->stackPointer) + context->stackSize) & ~static_cast<std::uintptr_t>(15);
+    GuestStacks::GuestStackSet_nid_no_patch(context, context->stackPointer, context->stackSize);
     auto* arguments = reinterpret_cast<std::uint64_t*>(top) - MaximumArguments;
     auto* stack = arguments - 1;
 #ifdef _WIN32
@@ -98,7 +99,6 @@ void APS5_VABI makecontext_nid_postfix(UserUcontext* context, void (APS5_VABI* s
     machine.rbx = reinterpret_cast<std::uint64_t>(stack);
     machine.rsp = reinterpret_cast<std::uint64_t>(stack);
     machine.rip = reinterpret_cast<std::uint64_t>(&Aps5MakecontextStart_nid_no_patch);
-    GuestStacks::GuestStackRegister_nid_no_patch(context->stackPointer, context->stackSize);
 }
 
 }

@@ -2,9 +2,12 @@
 
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
+#include <algorithm>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <windows.h>
 #endif
 
@@ -20,8 +23,9 @@ struct StackBounds {
 
 constexpr std::size_t DeallocationStackOffset = 0x1478;
 
-std::mutex rangesLock;
-std::map<std::uintptr_t, std::uintptr_t> ranges;
+auto& rangesLock = *new std::mutex();
+auto& changesLock = *new std::mutex();
+auto& ranges = *new std::map<const void*, std::pair<std::uintptr_t, std::uintptr_t>>();
 
 StackBounds CurrentBounds() {
     auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
@@ -40,12 +44,13 @@ void ApplyBounds(const StackBounds& bounds) {
 
 bool RegisteredBounds(std::uintptr_t stackPointer, StackBounds& bounds) {
     std::lock_guard lock(rangesLock);
-    const auto next = ranges.upper_bound(stackPointer);
-    if (next == ranges.begin()) return false;
-    const auto& [low, high] = *std::prev(next);
-    if (stackPointer >= high) return false;
-    bounds = {high, low, low};
-    return true;
+    for (const auto& [owner, range] : ranges) {
+        const auto [low, high] = range;
+        if (stackPointer < low || stackPointer >= high) continue;
+        bounds = {high, low, low};
+        return true;
+    }
+    return false;
 }
 
 bool HostBounds(std::uintptr_t stackPointer, StackBounds& bounds) {
@@ -60,32 +65,62 @@ bool HostBounds(std::uintptr_t stackPointer, StackBounds& bounds) {
 }
 
 void GuestStackRegister_nid_no_patch(const void* pointer, std::size_t bytes) {
+    GuestStackSet_nid_no_patch(pointer, pointer, bytes);
+}
+
+void GuestStackUnregister_nid_no_patch(const void* owner) {
+    GuestStackSet_nid_no_patch(owner, nullptr, 0);
+}
+
+void GuestStackSet_nid_no_patch(const void* owner, const void* pointer, std::size_t bytes) {
 #ifdef _WIN32
     const auto low = reinterpret_cast<std::uintptr_t>(pointer);
     const auto high = low + bytes;
-    std::lock_guard lock(rangesLock);
-    const auto same = ranges.find(low);
-    if (same != ranges.end() && same->second == high) return;
-    auto overlap = ranges.upper_bound(low);
-    if (overlap != ranges.begin() && std::prev(overlap)->second > low) --overlap;
-    while (overlap != ranges.end() && overlap->first < high) {
-        GuestArena::GuestArenaUnpinWritable_nid_postfix(reinterpret_cast<const void*>(overlap->first), overlap->second - overlap->first);
-        overlap = ranges.erase(overlap);
+    if (high < low) throw std::invalid_argument("Guest stack range overflows");
+    std::lock_guard change(changesLock);
+    std::pair<std::uintptr_t, std::uintptr_t> previous{};
+    {
+        std::lock_guard lock(rangesLock);
+        const auto same = ranges.find(owner);
+        if (same != ranges.end() && same->second == std::pair{low, high}) return;
+        if (same != ranges.end()) previous = same->second;
     }
-    GuestArena::GuestArenaPinWritable_nid_postfix(pointer, bytes);
-    ranges.emplace(low, high);
+    if (bytes != 0) GuestArena::GuestArenaPinWritable_nid_postfix(pointer, bytes);
+    {
+        std::lock_guard lock(rangesLock);
+        if (bytes != 0) ranges[owner] = {low, high};
+        else ranges.erase(owner);
+        if (bytes != 0) GuestArena::RefreshFaultStacks(low, bytes);
+        if (previous.second > previous.first) GuestArena::RefreshFaultStacks(previous.first, previous.second - previous.first);
+    }
+    if (previous.second > previous.first) GuestArena::GuestArenaUnpinWritable_nid_postfix(reinterpret_cast<const void*>(previous.first), previous.second - previous.first);
 #else
+    (void)owner;
     (void)pointer;
     (void)bytes;
 #endif
 }
+
+#ifdef _WIN32
+std::mutex& RegistryMutex() { return rangesLock; }
+
+bool OverlapsRegistered(std::uintptr_t first, std::uintptr_t stop) {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const auto& entry) {
+        return first < entry.second.second && stop > entry.second.first;
+    });
+}
+#endif
 
 void APS5_VABI GuestStackSwitch_nid_no_patch(std::uintptr_t stackPointer) {
 #ifdef _WIN32
     const auto current = CurrentBounds();
     if (stackPointer >= current.deallocation && stackPointer < current.base) return;
     StackBounds target{};
-    if (RegisteredBounds(stackPointer, target) || HostBounds(stackPointer, target)) ApplyBounds(target);
+    if (RegisteredBounds(stackPointer, target)) ApplyBounds(target);
+    else if (HostBounds(stackPointer, target)) {
+        GuestStackRegister_nid_no_patch(reinterpret_cast<const void*>(target.limit), target.base - target.limit);
+        ApplyBounds(target);
+    }
 #else
     (void)stackPointer;
 #endif

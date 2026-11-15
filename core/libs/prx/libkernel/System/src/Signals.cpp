@@ -3,9 +3,11 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/JumpBuffer.hpp"
+#include "prx/libc/include/GuestStacks.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Pthread/Posix/Common.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libkernel/Pthread/include/WindowsThreadLocal.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <atomic>
@@ -588,7 +590,14 @@ static_assert(sizeof(GuestStack) == 24 && offsetof(GuestStack, flags) == 16);
 namespace {
 constexpr int SsDisable = 4;
 constexpr std::size_t MinSignalStackSize = 2048;
+#ifdef _WIN32
+struct AlternateStackState {
+    GuestStack stack{nullptr, 0, SsDisable};
+    ~AlternateStackState() { GuestStacks::GuestStackUnregister_nid_no_patch(&stack); }
+};
+#else
 thread_local GuestStack alternateStack{nullptr, 0, SsDisable};
+#endif
 }
 
 namespace {
@@ -723,6 +732,9 @@ int APS5_VABI pthread_kill_nid_postfix(Pthread thread, int guest) {
     return 0;
 }
 int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previous) {
+#ifdef _WIN32
+    auto& alternateStack = WindowsThreadLocal<AlternateStackState>::Get().stack;
+#endif
     GuestStack replacement = alternateStack;
     GuestStack requested{};
     if (stack != nullptr) {
@@ -734,6 +746,8 @@ int APS5_VABI sigaltstack_nid_postfix(const GuestStack* stack, GuestStack* previ
         else replacement = {stack->sp, stack->size, 0};
     }
     const GuestStack old = alternateStack;
+    if (stack != nullptr) GuestStacks::GuestStackSet_nid_no_patch(&alternateStack, (replacement.flags & SsDisable) != 0 ? nullptr : replacement.sp,
+                                                               (replacement.flags & SsDisable) != 0 ? 0 : replacement.size);
     alternateStack = replacement;
     if (previous != nullptr && !GuestCopyOut_nid_no_patch(previous, &old, sizeof(old))) { *__error_nid_postfix() = 14; return -1; }
     return 0;
