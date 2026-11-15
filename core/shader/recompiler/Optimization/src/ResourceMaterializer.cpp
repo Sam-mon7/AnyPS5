@@ -2930,6 +2930,7 @@ void ownPlanValues(IrResourcePlan& plan) {
     }
     for (auto& read : plan.srtReads) roots.push_back(&read.value);
     for (auto& value : plan.uniformFill.values) roots.push_back(&value);
+    for (auto& block : plan.controlFlow) roots.push_back(&block.removedCondition);
     const auto closures = roots.size();
     for (auto& block : plan.controlFlow) roots.push_back(&block.condition);
 
@@ -3146,12 +3147,19 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.uniformFill = source.uniformFill;
     std::unordered_map<const IrValue*, bool> decided;
     for (auto& block : plan.controlFlow) {
-        if (block.condition != nullptr && !Detail::Evaluator::MayDecide(source, block.condition, decided)) block.condition = nullptr;
+        if (block.condition != nullptr && !Detail::Evaluator::MayDecide(source, block.condition, decided)) {
+            block.removedCondition = block.condition;
+            block.condition = nullptr;
+            block.conditionRemoval = ConditionRemoval::Undecidable;
+        }
     }
     if (Detail::DropItemFreeConditions()) {
         const auto guards = Detail::ResourceGuardingConditions(plan);
         for (std::size_t index = 0; index < plan.controlFlow.size(); ++index) {
-            if (guards[index] == 0u) plan.controlFlow[index].condition = nullptr;
+            if (guards[index] == 0u && plan.controlFlow[index].condition != nullptr) {
+                plan.controlFlow[index].condition = nullptr;
+                plan.controlFlow[index].conditionRemoval = ConditionRemoval::ItemFree;
+            }
         }
     }
     const auto addSource = [&plan](std::uint32_t index) {

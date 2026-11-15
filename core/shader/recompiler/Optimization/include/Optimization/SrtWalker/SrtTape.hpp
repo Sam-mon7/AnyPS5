@@ -14,13 +14,19 @@ namespace ShaderRecompiler::Detail {
 class SrtTape {
 public:
     static const SrtTape* For(const IrResourcePlan& plan);
+    enum class StrictFailure : std::uint8_t { None, Unsupported, NonInvariantPhi, PredicateMissing, PredicateUnsupported, PredicateGpuValue, PredicateNonInvariantPhi };
+    static std::shared_ptr<const SrtTape> CompileStrict(const IrResourcePlan& plan, StrictFailure* failure = nullptr, bool restoreUndecidable = false);
     static bool Enabled();
     static bool Verified();
     static bool FastEnabled();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
+    bool RunStrict(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<std::uint32_t>* structure = nullptr) const;
+
     std::size_t Nodes() const { return nodes.size(); }
+    std::uint64_t UserDataMask() const { return userDataMask; }
+    const std::vector<std::uint8_t>& AddressFlatSlots() const { return addressFlatSlots; }
 
 private:
     friend class SrtTapeCompiler;
@@ -48,6 +54,7 @@ private:
         const IrValue* parentRead = nullptr;
     };
     struct Frame;
+    bool run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, bool strict, std::vector<std::uint32_t>* structure = nullptr) const;
     bool evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const;
     bool compute(Frame& frame, const Node& node, std::uint64_t& result) const;
 
@@ -55,10 +62,13 @@ private:
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
+    std::vector<std::uint8_t> addressFlatSlots;
     std::vector<std::uint8_t> initialActive;
     std::vector<std::uint8_t> initialActiveFlat;
     std::size_t activityEntries = 0;
     bool needsCleanMemory = false;
+    bool strictProgram = false;
+    std::uint64_t userDataMask = 0;
 };
 
 }

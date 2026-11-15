@@ -2270,7 +2270,7 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.controlFlow.size(); ++index) {
         const auto& a = left.controlFlow[index];
         const auto& b = right.controlFlow[index];
-        if (!sameValue(a.condition, b.condition) || a.successors != b.successors || a.sources != b.sources || a.images != b.images || a.flatSlots != b.flatSlots) return false;
+        if (!sameValue(a.condition, b.condition) || a.successors != b.successors || a.sources != b.sources || a.images != b.images || a.flatSlots != b.flatSlots || a.conditionRemoval != b.conditionRemoval || !sameValue(a.removedCondition, b.removedCondition)) return false;
     }
     for (std::size_t index = 0; index < left.srtReads.size(); ++index) {
         if (!sameValue(left.srtReads[index].value, right.srtReads[index].value) || left.srtReads[index].flatOffset != right.srtReads[index].flatOffset) return false;
@@ -2476,6 +2476,10 @@ void verifyMalformedPlans() {
         IrResourcePlan decoded;
         require(!ShaderDiskCache::DecodePlan(bytes, decoded), "malformed plan: " + what + " decodes");
     };
+    rejects("a removed predicate without provenance", [](IrResourcePlan& plan) { plan.controlFlow[0].removedCondition = plan.controlFlow[0].condition; });
+    rejects("an unknown condition-removal provenance", [](IrResourcePlan& plan) { plan.controlFlow[1].conditionRemoval = static_cast<ConditionRemoval>(255u); });
+    rejects("an item-free removal with a retained condition", [](IrResourcePlan& plan) { plan.controlFlow[0].conditionRemoval = ConditionRemoval::ItemFree; });
+    rejects("an undecidable removal with a retained condition", [](IrResourcePlan& plan) { plan.controlFlow[0].conditionRemoval = ConditionRemoval::Undecidable; });
     rejects("a branch with one successor", [](IrResourcePlan& plan) { plan.controlFlow[0].successors.pop_back(); });
     rejects("a successor past the blocks", [](IrResourcePlan& plan) { plan.controlFlow[1].successors[0] = 3u; });
     rejects("a block source past the sources", [](IrResourcePlan& plan) { plan.controlFlow[0].sources[0] = 4u; });
@@ -2535,7 +2539,29 @@ void verifySharedPlans() {
     require(again != nullptr && samePlan(*again, expected), "a released shared plan did not load again");
 }
 
+void verifyConditionRemovalDiskRoundTrip() {
+    struct EntryFile {
+        std::filesystem::path path = std::filesystem::current_path() / ("aps5-condition-removal-" + std::to_string(std::random_device{}()) + ".bin");
+        ~EntryFile() { std::error_code error; std::filesystem::remove(path, error); }
+    } file;
+    const std::array<std::byte, 2> key{std::byte{0x14}, std::byte{0x62}};
+    for (const auto removal : {ConditionRemoval::None, ConditionRemoval::Undecidable, ConditionRemoval::ItemFree}) {
+        auto plan = handBuiltPlan();
+        plan.controlFlow[0].removedCondition = removal == ConditionRemoval::Undecidable ? plan.controlFlow[0].condition : nullptr;
+        plan.controlFlow[0].condition = nullptr;
+        plan.controlFlow[0].conditionRemoval = removal;
+        const auto entry = ShaderDiskCache::EncodePlanEntry(key, plan);
+        require(!entry.empty() && WriteFileAtomically(file.path, entry), "condition removal: cannot store the plan fixture");
+        std::vector<std::byte> bytes;
+        require(ReadWholeFile(file.path, bytes) && bytes == entry, "condition removal: stored plan bytes changed");
+        IrResourcePlan decoded;
+        require(ShaderDiskCache::DecodePlanEntry(bytes, key, decoded) == ShaderDiskCache::LoadStatus::Loaded, "condition removal: stored plan was refused");
+        require(decoded.controlFlow[0].conditionRemoval == removal && decoded.controlFlow[0].condition == nullptr && samePlan(plan, decoded), "condition removal: disk round trip lost provenance");
+    }
+}
+
 void verifyPlanRoundTrip() {
+    verifyConditionRemovalDiskRoundTrip();
     const auto handBuilt = handBuiltPlan();
     const auto handBytes = encodedPlan(handBuilt);
     IrResourcePlan handDecoded;

@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -131,8 +132,8 @@ public:
     void MarkRefreshedPerUse() { perUseCopy = PerUseCopy::RemadePerUse; }
     bool Released() const { return released.load(std::memory_order_acquire); }
     void MarkReleased() { released.store(true, std::memory_order_release); }
-    void UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached);
-    void VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor) const;
+    void UpdateSnapshotLayers(TextureDetiler& detiler, const GuestTextureResource& descriptor, std::span<const std::uint32_t> layers, std::span<std::byte> cached, bool gpu = false);
+    void VerifySnapshot(const Texture& reference, const GuestTextureResource& descriptor, const char* mismatchCounter = "fix_psnap_verify_mismatches") const;
     static std::uint64_t PartialSnapshotVerifyMismatches();
 
 private:
@@ -307,7 +308,37 @@ public:
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
-    void MarkDirty();
+    struct DispatchWritePublication {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::uintptr_t owner = 0;
+        bool noted = false;
+        ArchC::EpochPublication disposition = ArchC::EpochPublication::NoRecipients;
+    };
+    struct DispatchWriteObservation {
+        DispatchWritePublication generation;
+        DispatchWritePublication pendingEpoch;
+        DispatchWritePublication insertEpoch;
+        std::uint64_t nanoseconds = 0;
+        std::uint32_t first = 0;
+        std::uint32_t count = 0;
+        std::uint32_t expectedCount = 0;
+        bool generationExpected = false;
+        std::uint64_t versionBefore = 0;
+        std::uint64_t versionAfter = 0;
+        std::uint64_t serialBefore = 0;
+        std::uint64_t serialAfter = 0;
+        bool dirtyBefore = false;
+        bool dirtyAfter = false;
+        bool lentBefore = false;
+        bool allPending = false;
+        bool registered = false;
+        bool changedEpoch = false;
+        bool insertedEpoch = false;
+        bool observed = false;
+    };
+    const char* DispatchWriteRefusal(const char** shapeDetail = nullptr) const;
+    void MarkDirty(DispatchWriteObservation* observation = nullptr);
     void MarkWholeWritten();
     void MarkUnitsWritten(const std::vector<bool>& units);
     std::vector<VkRect2D> UnitRects(const std::vector<bool>& units) const;
@@ -370,8 +401,8 @@ public:
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
-    void notePendingChange() const;
-    void notePendingInsert() const;
+    void notePendingChange(DispatchWriteObservation* observation = nullptr) const;
+    void notePendingInsert(DispatchWriteObservation* observation = nullptr) const;
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -736,7 +767,7 @@ private:
     bool otherPendingOverlaps() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
-    void markLayersPending(std::uint32_t first, std::uint32_t count);
+    void markLayersPending(std::uint32_t first, std::uint32_t count, DispatchWriteObservation* observation = nullptr);
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock
