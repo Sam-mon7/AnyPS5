@@ -1897,6 +1897,16 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
     if (LabelGroupDwords().empty()) return;
     auto group = std::move(LabelGroupDwords());
     LabelGroupDwords().clear();
+    struct ReuseDwords {
+        decltype(group)& values;
+        bool enabled;
+        ~ReuseDwords() {
+            if (!enabled) return;
+            values.clear();
+            auto& scratch = LabelGroupDwords();
+            if (scratch.empty()) scratch.swap(values);
+        }
+    } reuse{group, ArchB::Switches::Enabled(ArchB::Feature::FixLabelHandoff)};
     if (trackerGeneration == 0) return;
     std::lock_guard tableLock(labelTableMutex);
     if (labelTableOwner == nullptr) return;
@@ -5310,6 +5320,17 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newest;
 }
 
+bool Recorder::PendingCpuWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto overlaps = [&](const Batch& batch) {
+        if (std::none_of(batch.writes.begin(), batch.writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) return false;
+        if (batch.completions.size() > batch.checkOnlyCompletions + batch.copiedWriterCompletions.size()) return true;
+        return std::any_of(batch.copiedWriterCompletions.begin(), batch.copiedWriterCompletions.end(), [&](const ShaderResources* resources) { return resources->CopiedWritesOverlap(address, bytes); });
+    };
+    if (open != nullptr && overlaps(*open)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return overlaps(*batch); });
+}
+
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
     std::vector<PendingWrite> found;
     if (bytes == 0) return found;
@@ -5512,6 +5533,7 @@ void Recorder::noteLabelOn(Batch& batch, std::uint64_t address, std::span<const 
         batch.labelDwords.push_back(dword);
         LabelGroupDwords().emplace_back(dword, stamp);
     }
+    verifyLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
     recordedLabels.store(labels.size(), std::memory_order_relaxed);
 }
 
@@ -5547,6 +5569,24 @@ std::optional<Recorder::LabelHit> Recorder::PendingLabel(std::uint64_t address, 
     // Under the GPU mutex; the table mutex is taken too so this one path serves both lock regimes.
     std::lock_guard tableLock(labelTableMutex);
     return lookupLabel(address, bytes, afterStamp, refusal);
+}
+
+void Recorder::verifyLabelOn(const Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion) const {
+    static const bool verify = [] { const auto* value = std::getenv("APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY"); return value != nullptr && std::strcmp(value, "0") != 0; }();
+    if (!verify || !ArchB::Switches::Enabled(ArchB::Feature::FixLabelHandoff)) return;
+    if ((bytes.size() != 4 && bytes.size() != 8) || address % 4 != 0) {
+        ArchB::Recorder::Count("label_handoff_store_inconclusive");
+        return;
+    }
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
+        std::uint32_t expected = 0;
+        std::memcpy(&expected, bytes.data() + offset, 4);
+        const auto found = labels.find(address + offset);
+        Require(found != labels.end(), "label handoff missing recorded dword");
+        const auto& entry = found->second;
+        Require(entry.value == expected && entry.queue == queue && entry.stamp == stamp && entry.batch == &batch && entry.behindCompletion == behindCompletion, "label handoff value, FIFO stamp or batch dependency mismatch");
+    }
+    ArchB::Recorder::Count("label_handoff_store_verified");
 }
 
 std::size_t Recorder::PendingLabels() const {

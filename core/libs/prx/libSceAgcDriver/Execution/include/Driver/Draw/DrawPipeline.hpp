@@ -160,6 +160,8 @@ public:
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false, ItemKind itemKind = ItemKind::Other, std::shared_ptr<ResolveSlot> resolve = nullptr);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
+    static void RetainGpuMutexForLabel();
+    static bool ConsumeLabelGpuMutex(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
     // Waits until every queued item has committed. A caller holding the GPU mutex must drain before
     // taking it; if one does not, the wait runs with its hold given up (counted, see LockedDrains).
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100, DrainCause cause = DrainCause::None);
@@ -199,6 +201,7 @@ private:
         bool store = false;
         CommitKind commitKind = CommitKind::Other;
         ItemKind kind = ItemKind::Other;
+        std::uint8_t censusArrival = 0;
         // APS5_COLLECT_AHEAD_CENSUS: when queue 0 enqueued the item, and the collect clock then.
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;

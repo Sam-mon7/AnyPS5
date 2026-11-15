@@ -70,6 +70,8 @@ struct DrawRecipeRecord {
     bool Expired() const;
 };
 
+struct DrawHitObservation;
+
 struct DrawEntry {
 
     std::shared_ptr<const DrawDecode> decode;
@@ -77,6 +79,7 @@ struct DrawEntry {
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
+    AtomicSharedPtr<const DrawHitObservation> hitObservation;
     std::uint64_t touched = 0;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;

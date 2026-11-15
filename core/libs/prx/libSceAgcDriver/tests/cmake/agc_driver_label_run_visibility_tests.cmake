@@ -1,0 +1,24 @@
+if(BUILD_TESTING)
+    foreach(labelRunMode IN ITEMS off on verify)
+        set(labelRunTest agc_driver_label_run_visibility_${labelRunMode})
+        add_test(NAME ${labelRunTest} COMMAND agc_driver_label_run_visibility_tests ${labelRunMode})
+        set_tests_properties(${labelRunTest} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation;APS5_ARCHB_RECORDER=1;APS5_ARCHB_DRAW_HIT_CENSUS=1;APS5_PIPELINED_DRAWS=32"
+            ENVIRONMENT_MODIFICATION "APS5_ARCHB_FIX_LABEL_HANDOFF=set:0;APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY=unset:;APS5_ARCHB_CONTROL_FILE=unset:;APS5_ARCHB_PIPE_RESOLVE_POOL=set:0;APS5_DRAIN_ALL=unset:;APS5_CPU_STORES=unset:;APS5_PIPELINE_DRAIN_LABELS=unset:;APS5_PIPELINE_DRAIN_FILLS=unset:;APS5_LABEL_SUBMIT_NOW=unset:")
+        if(NOT labelRunMode STREQUAL "off")
+            set_property(TEST ${labelRunTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_ARCHB_FIX_LABEL_HANDOFF=set:1")
+        endif()
+        if(labelRunMode STREQUAL "verify")
+            set_property(TEST ${labelRunTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY=set:1")
+        endif()
+        if(WIN32)
+            set_property(TEST ${labelRunTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_tests_properties(agc_driver_label_run_visibility PROPERTIES TIMEOUT 30
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation;APS5_ARCHB_RECORDER=1;APS5_ARCHB_DRAW_HIT_CENSUS=1;APS5_PIPELINED_DRAWS=32"
+        ENVIRONMENT_MODIFICATION "APS5_ARCHB_FIX_LABEL_HANDOFF=set:0;APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY=unset:;APS5_ARCHB_CONTROL_FILE=unset:;APS5_ARCHB_PIPE_RESOLVE_POOL=set:0;APS5_DRAIN_ALL=unset:;APS5_CPU_STORES=unset:;APS5_PIPELINE_DRAIN_LABELS=unset:;APS5_PIPELINE_DRAIN_FILLS=unset:;APS5_LABEL_SUBMIT_NOW=unset:")
+    if(WIN32)
+        set_property(TEST agc_driver_label_run_visibility APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

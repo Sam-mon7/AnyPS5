@@ -1,5 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -22,8 +26,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -47,6 +53,7 @@ struct Shape {
     std::uint32_t layers;
     std::uint32_t mips;
     bool array;
+    std::uint32_t tile = 0;
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 9> StoreHalfCode{
@@ -76,37 +83,37 @@ std::span<float> Output;
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t bytes = BlockBytes) : bytes(bytes) {
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, BlockBytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + BlockBytes != begin + BlockBytes + alignment) munmap(reinterpret_cast<void*>(aligned + BlockBytes), begin + alignment - aligned);
+            if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
 #endif
         Require(block != nullptr, "depth compare copy: cannot allocate the guest block");
-        Require(AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(block), BlockBytes), "depth compare copy: the guest block is not write-watched");
-        std::memset(block, 0, BlockBytes);
-        GuestAllocations::Mutation().Add(block, BlockBytes, true, true, true);
-        AgcDriver::GuestMemory::CollectWritesUncached(reinterpret_cast<std::uintptr_t>(block), BlockBytes);
+        Require(AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(block), bytes), "depth compare copy: the guest block is not write-watched");
+        std::memset(block, 0, bytes);
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        AgcDriver::GuestMemory::CollectWritesUncached(reinterpret_cast<std::uintptr_t>(block), bytes);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 #else
-        munmap(block, BlockBytes);
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, BlockBytes);
+        munmap(block, bytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
     }
 
@@ -117,6 +124,7 @@ public:
 
 private:
     std::uint8_t* block = nullptr;
+    std::size_t bytes;
 };
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
@@ -130,7 +138,7 @@ std::array<std::uint32_t, 8> TextureDescriptor(const void* data, const Shape& sh
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (shape.format << 20u) | (((shape.width - 1u) & 3u) << 30u),
         ((shape.width - 1u) >> 2u) | ((shape.height - 1u) << 14u),
-        0xfacu | ((shape.mips - 1u) << 16u) | ((shape.array ? Type2DArray : Type2D) << 28u),
+        0xfacu | ((shape.mips - 1u) << 16u) | (shape.tile << 20u) | ((shape.array ? Type2DArray : Type2D) << 28u),
         shape.array ? shape.layers - 1u : 0u,
         (shape.mips - 1u) << 4u,
         0u, 0u,
@@ -294,15 +302,105 @@ void LayersAndMipsCase(AgcDriver::VulkanDevice& device) {
     RequireCounts(0, 1, name + ": comparison samples after a second store");
 }
 
+void GpuArrayCase(AgcDriver::VulkanDevice& device, std::string_view mode) {
+    namespace Graphics = AgcDriver::Graphics;
+    namespace Memory = AgcDriver::GuestMemory;
+    using Counters = AgcDriver::ArchB::Recorder;
+    Require(mode == "on" || mode == "off" || mode == "cpu" || mode == "queued", "unknown GPU sampled array mode");
+    const Shape shape{Format32Float, 512, 512, 8, 1, true, 0x18};
+    Graphics::SetHostImportWindow(1u << 20u);
+    Graphics::SetHostImportRangeWindow(1u << 20u);
+    GuestBlock block(16u << 20u);
+    const auto address = reinterpret_cast<std::uintptr_t>(block.Data());
+    const auto resource = Graphics::DecodeTextureResource(TextureDescriptor(block.Data(), shape));
+    const auto geometry = Graphics::DescribeSurface(resource);
+    Require(geometry.layerBytes == (1u << 20u) && geometry.guestBytes == (8u << 20u), "GPU sampled array geometry is invalid");
+    std::fill_n(reinterpret_cast<float*>(block.Data()), geometry.guestBytes / sizeof(float), 0.25f);
+    const AgcDriver::ArchB::PartialSnapshotScope partial(true);
+    std::lock_guard gpu(Memory::GpuMutex());
+    const auto context = device.graphicsContext();
+    auto* recorder = Graphics::Recorder::Active();
+    Require(recorder != nullptr && recorder->Device() == device.Device(), "GPU sampled array recorder is unavailable");
+    std::array<ShaderRecompiler::RecompileResult, 4> programs;
+    for (std::uint32_t layer = 0; layer < programs.size(); ++layer) programs[layer] = SampleProgram(device, block.Data(), shape, layer);
+    const auto sample = [&](std::uint32_t layer, float depth) {
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            Input[tid * 3u] = (tid & 1u) != 0u ? depth - 0.0625f : depth + 0.0625f;
+            Input[tid * 3u + 1u] = (static_cast<float>(tid) + 0.5f) / shape.width;
+            Input[tid * 3u + 2u] = 0.5f / shape.height;
+        }
+        std::fill(Output.begin(), Output.end(), -1.0f);
+        Memory::BumpCollectEpoch();
+        device.Dispatch(programs.at(layer), 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(SampleLayerMipCode.data()));
+        device.WaitIdle();
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) Require(Output[tid] == ((tid & 1u) != 0u ? 1.0f : 0.0f), "GPU sampled array comparison differs at layer " + std::to_string(layer) + " thread " + std::to_string(tid));
+    };
+    sample(0, 0.25f);
+    Require(!Graphics::HostImportCovers(context, address, static_cast<std::size_t>(geometry.guestBytes)), "GPU sampled array was covered by a whole-array import");
+    Counters::BindThread("sampled array test");
+    Counters::Boundary(true, 1, Counters::Clock::now());
+    Counters::Collect(Counters::Clock::now());
+    const auto fill = [&](std::uint32_t layer, float value) {
+        const std::array<std::uint32_t, 4> pattern{Bits(value), Bits(value), Bits(value), Bits(value)};
+        const auto source = address + geometry.guestBytes + geometry.GuestLayerOffset(layer);
+        Require(device.FillBuffer(source, static_cast<std::size_t>(geometry.layerBytes), pattern), "GPU sampled array source fill was refused");
+        const auto copied = device.CopyBuffer(address + geometry.GuestLayerOffset(layer), source, static_cast<std::size_t>(geometry.layerBytes), 0, BlockBytes, 0, 0, 0, [](std::span<const std::byte>, std::uint64_t) {});
+        Require(copied.path == 1 && !copied.synced, "GPU sampled array depth values were not copied on the GPU");
+        Require(Graphics::ExistingHostImportFor(context, address + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes)) != nullptr, "GPU sampled array layer has no GPU source");
+    };
+    fill(1, 0.75f);
+    fill(3, 0.125f);
+    bool landed = false;
+    if (mode == "cpu") {
+        const auto destination = address + geometry.GuestLayerOffset(1);
+        recorder->NotePendingWrite(destination, static_cast<std::size_t>(geometry.layerBytes));
+        recorder->OnComplete([destination, bytes = geometry.layerBytes, &landed] {
+            Memory::StoreOwnBytes(destination, static_cast<std::size_t>(bytes), [&] { std::fill_n(reinterpret_cast<float*>(destination), bytes / sizeof(float), 0.375f); });
+            landed = true;
+        });
+    } else if (mode == "queued") {
+        const auto destination = address + geometry.GuestLayerOffset(1);
+        const auto* import = Graphics::ExistingHostImportFor(context, destination, static_cast<std::size_t>(geometry.layerBytes));
+        const std::vector<std::uint32_t> values(65536u / sizeof(std::uint32_t), Bits(0.375f));
+        recorder->RecordStore(import->buffer, Graphics::HostImportOffset(*import, destination), std::as_bytes(std::span(values)), destination);
+        Require(recorder->QueuedStoreOverlaps(destination, static_cast<std::size_t>(geometry.layerBytes)), "GPU sampled array did not queue its label store");
+    }
+    Require(recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(geometry.guestBytes)), "GPU sampled array writer completed before the lookup");
+    const auto mismatches = Graphics::Texture::PartialSnapshotVerifyMismatches();
+    sample(1, mode == "cpu" || mode == "queued" ? 0.375f : 0.75f);
+    sample(3, 0.125f);
+    sample(2, 0.25f);
+    auto counts = Counters::Collect(Counters::Clock::now());
+    for (const auto& [name, value] : counts.counters) if (name.starts_with("fix_sampled_array_gpu")) std::printf("%s %.0f\n", name.c_str(), value);
+    std::printf("GPU sampled array %s: taken %.0f, refused CPU %.0f, verified %.0f, mismatches %.0f\n", std::string(mode).c_str(), counts.counters["fix_sampled_array_gpu_taken"], counts.counters["fix_sampled_array_gpu_refused_cpu_store"], counts.counters["fix_sampled_array_gpu_verified"], counts.counters["fix_sampled_array_gpu_verify_mismatches"]);
+    Require((counts.counters["fix_sampled_array_gpu_taken"] == 1.0) == (mode == "on"), "GPU sampled array did not take its selected path");
+    if (mode == "cpu") Require(landed && counts.counters["fix_sampled_array_gpu_refused_cpu_store"] >= 1.0, "GPU sampled array accepted a pending CPU completion store");
+    if (mode == "queued") Require(counts.counters["fix_sampled_array_gpu_refused_queued_store"] >= 1.0, "GPU sampled array accepted an unrecorded label store");
+    Require(Graphics::Texture::PartialSnapshotVerifyMismatches() == mismatches, "GPU sampled array bytes differ from the old snapshot");
+    for (const auto layer : {1u, 3u}) {
+        const auto* values = reinterpret_cast<const float*>(block.Data() + geometry.GuestLayerOffset(layer));
+        for (std::size_t index = 0; index < geometry.layerBytes / sizeof(float); ++index) {
+            const auto expected = layer == 3u ? 0.125f : mode == "cpu" || (mode == "queued" && index < 65536u / sizeof(float)) ? 0.375f : 0.75f;
+            Require(values[index] == expected, "GPU sampled array changed guest publication");
+        }
+    }
+    Counters::Boundary(false, 2, Counters::Clock::now());
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         GuestBlock buffers;
         Input = std::span<float>(reinterpret_cast<float*>(buffers.Data()), Threads * 3u);
         Output = std::span<float>(reinterpret_cast<float*>(buffers.Data() + 4096u), Threads);
+        if (argc == 3 && std::string_view(argv[1]) == "--gpu-array") {
+            if (device->graphicsContext().hostImportAlignment == 0) return VulkanTestSkipped;
+            GpuArrayCase(*device, argv[2]);
+            return 0;
+        }
         SingleLevelCase(*device, {Format32Float, 512, 512, 1, 1, false}, "R32F 512x512");
         SingleLevelCase(*device, {Format16Unorm, 1024, 512, 1, 1, false}, "R16 unorm 1024x512");
         LayersAndMipsCase(*device);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -41,6 +42,23 @@ std::string ResolvePipelineText();
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+struct LabelHandoffState {
+    DrawPipeline* pipeline = nullptr;
+    std::uint64_t serial = 0, expectedSerial = 0, address = 0;
+    std::array<std::byte, 8> bytes{};
+    std::size_t size = 0;
+    bool currentDraw = false, held = false;
+    void Release(const char* reason) {
+        if (!held) return;
+        held = false;
+        GuestMemory::GpuMutex().unlock();
+        ArchB::Recorder::Count(reason);
+    }
+    ~LabelHandoffState() { Release("label_handoff_scope_release"); }
+};
+struct LabelHandoffSlot {};
+using CurrentLabelHandoff = HostThreadSlot<LabelHandoffState*, LabelHandoffSlot>;
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission", "transition"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainCounterNames{"pipe_drains_packet", "pipe_drains_flush", "pipe_drains_labels", "pipe_drains_capture", "pipe_drains_indirect", "pipe_drains_submission", "pipe_drains_transition"};
@@ -222,7 +240,13 @@ void runResolveSlot(DrawPipeline::ResolveSlot& slot) {
 template<typename TItem>
 struct ClearOnExit {
     std::vector<TItem>& items;
-    ~ClearOnExit() { items.clear(); }
+    bool census = false;
+    ~ClearOnExit() {
+        if (!census) { items.clear(); return; }
+        PerformanceTimer timing("J3.EnqueueReclaim");
+        ArchB::Recorder::Count("j3b_enqueue_reclaimed_items", static_cast<double>(items.size()));
+        items.clear();
+    }
 };
 
 }
@@ -895,11 +919,18 @@ void DrawPipeline::enqueue(Item item) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
-    const ClearOnExit<Item> clearReclaim{reclaim};
-    const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool census = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
+    const ClearOnExit<Item> clearReclaim{reclaim, census};
+    const auto lockStart = profile || census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::unique_lock lock(mutex);
+    const auto lockNs = profile || census ? elapsedNs(lockStart) : 0;
     if (!retired.empty()) std::swap(retired, reclaim);
     if (profile) lockWaitNs += elapsedNs(lockStart);
+    if (census) {
+        ArchB::Recorder::Count("j3b_enqueue_mutex_wait_ns", static_cast<double>(lockNs));
+        ArchB::Recorder::Count("j3b_enqueue_calls");
+        if (item.kind == ItemKind::Draw) ArchB::Recorder::Count("j3b_enqueue_draw_calls");
+    }
     rethrowFailure();
     if (closing) {
         lock.unlock();
@@ -941,6 +972,7 @@ void DrawPipeline::enqueue(Item item) {
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
     countWrites(item.writes, true);
     const bool pooledResolve = item.resolve != nullptr && ResolvePoolActive();
+    if (census) item.censusArrival = items.empty() ? 1 : 2;
     items.push_back(std::move(item));
     static const bool aheadCensus = GuestMemory::CollectAheadCensus();
     if (aheadCensus && items.back().kind == ItemKind::Draw) {
@@ -1093,7 +1125,57 @@ void countAheadWindow(std::uint64_t enqueuedNs, std::uint64_t enqueueClock, std:
 }
 }
 
+void DrawPipeline::RetainGpuMutexForLabel() {
+    if (!ArchB::Switches::Enabled(ArchB::Feature::FixLabelHandoff) || std::uncaught_exceptions() != 0) return;
+    auto* state = CurrentLabelHandoff::Get();
+    if (state == nullptr || !state->currentDraw || state->held || GuestMemory::GpuMutex().DepthOnThisThread() != 1) return;
+    auto& pipeline = *state->pipeline;
+    std::unique_lock lock(pipeline.mutex, std::try_to_lock);
+    if (!lock.owns_lock()) { ArchB::Recorder::Count("label_handoff_peek_busy"); return; }
+    if (pipeline.closing || pipeline.stopped || pipeline.items.size() < 2) { ArchB::Recorder::Count("label_handoff_no_successor"); return; }
+    const auto& next = pipeline.items[1];
+    if (next.kind != ItemKind::Label || next.commitKind != CommitKind::EndOfPipe || next.resolve != nullptr || (next.labelBytes.size() != 4 && next.labelBytes.size() != 8) || next.labelAddress % 4 != 0) {
+        ArchB::Recorder::Count("label_handoff_other_successor");
+        return;
+    }
+    state->expectedSerial = state->serial + 1;
+    state->address = next.labelAddress;
+    state->size = next.labelBytes.size();
+    std::copy(next.labelBytes.begin(), next.labelBytes.end(), state->bytes.begin());
+    GuestMemory::GpuMutex().lock();
+    state->held = true;
+    ArchB::Recorder::Count("label_handoff_retained");
+}
+
+bool DrawPipeline::ConsumeLabelGpuMutex(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
+    auto* state = CurrentLabelHandoff::Get();
+    if (state == nullptr || !state->held) return false;
+    const bool match = queue == 0 && !state->currentDraw && state->serial == state->expectedSerial && address == state->address && bytes.size() == state->size && std::equal(bytes.begin(), bytes.end(), state->bytes.begin()) && GuestMemory::GpuMutex().DepthOnThisThread() == 1;
+    if (!match || !ArchB::Switches::Enabled(ArchB::Feature::FixLabelHandoff)) {
+        state->Release("label_handoff_refused");
+        return false;
+    }
+    ArchB::Recorder::Count("label_handoff_consumed");
+    static const bool verify = [] { const auto* value = std::getenv("APS5_ARCHB_FIX_LABEL_HANDOFF_VERIFY"); return value != nullptr && std::strcmp(value, "0") != 0; }();
+    if (verify) ArchB::Recorder::Count("label_handoff_plan_verified");
+    state->held = false;
+    return true;
+}
+
 void DrawPipeline::run() {
+    CommitCensus::Sequence sequence;
+    LabelHandoffState handoff;
+    handoff.pipeline = this;
+    CurrentLabelHandoff::Set(&handoff);
+    struct ClearCurrentHandoff {
+        ~ClearCurrentHandoff() { CurrentLabelHandoff::Set(nullptr); }
+    } clearCurrentHandoff;
+    const auto lockQueue = [&] {
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (handoff.held && !lock.try_lock()) handoff.Release("label_handoff_queue_contended");
+        if (!lock.owns_lock()) lock.lock();
+        return lock;
+    };
     PerformanceTrace::BindThread("draw committer");
     GuestMemory::MarkCommitterThread();
     Stage4::BindRole(Stage4::Role::Committer);
@@ -1110,12 +1192,17 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         bool isDraw = false;
         ItemKind kind = ItemKind::Other;
+        CommitKind commitKind = CommitKind::Other;
         std::uint64_t enqueuedNs = 0;
         std::uint64_t enqueueClock = 0;
         std::shared_ptr<ResolveSlot> resolveSlot;
         std::uint64_t serial = 0;
+        std::uint8_t arrival = 0;
+        bool onlyItem = false;
+        bool census = false;
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTop);
         // pipe_committer_idle_ms: from the end of one item until the next is taken (recorder only).
+        if (handoff.held && outstanding.load(std::memory_order_acquire) == 0) handoff.Release("label_handoff_idle_release");
         const bool idleBefore = ArchB::Recorder::Enabled() && outstanding.load(std::memory_order_acquire) == 0;
         const auto idleStart = idleBefore ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // Stage 4 M1: the committer idles (spins, then sleeps until queue 0 enqueues).
@@ -1123,24 +1210,34 @@ void DrawPipeline::run() {
         if (Stage4::Tracking() && outstanding.load(std::memory_order_acquire) == 0) stage4Idle.emplace(Stage4::Wait::Idle, true);
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
-            std::unique_lock lock(mutex);
+            auto lock = lockQueue();
+            if (handoff.held && (items.empty() || stopped || closing || items.front().kind != ItemKind::Label || items.front().commitKind != CommitKind::EndOfPipe || items.front().resolve != nullptr || retiredItems.load(std::memory_order_relaxed) != handoff.expectedSerial)) {
+                lock.unlock();
+                handoff.Release("label_handoff_successor_release");
+                lock.lock();
+            }
             if (stage4Idle && items.empty() && !closing) stage4Idle->Blocking();
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (items.empty()) break;
+            census = ArchB::Switches::Enabled(ArchB::Feature::DrawHitCensus);
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             kind = items.front().kind;
+            commitKind = items.front().commitKind;
             enqueuedNs = items.front().enqueuedNs;
             enqueueClock = items.front().enqueueClock;
             resolveSlot = items.front().resolve;
             serial = retiredItems.load(std::memory_order_relaxed);
+            if (census) { arrival = items.front().censusArrival; onlyItem = items.size() == 1; }
             if (Stage4::ResolveCensus()) {
                 stage4Reads.assign(items.front().reads.begin(), items.front().reads.end());
                 stage4Writes.assign(items.front().writes.begin(), items.front().writes.end());
             }
         }
+        handoff.serial = serial;
+        handoff.currentDraw = kind == ItemKind::Draw;
         stage4Idle.reset();
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::ItemTaken);
         if (Stage4::ResolveCensus()) Stage4::BeginItem(static_cast<std::uint8_t>(kind), stage4Reads, stage4Writes, Graphics::StorageTexture::PendingSerial());
@@ -1156,9 +1253,23 @@ void DrawPipeline::run() {
         static const bool collectCensus = GuestMemory::CommitterCollectCensus();
         if (collectCensus) GuestMemory::BeginCommitterCensusItem(static_cast<std::uint8_t>(kind));
         GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitBegin);
+        std::optional<CommitCensus> commitCensus;
         try {
-            if (commit != nullptr && resolveSlot != nullptr) resolveForApply(*resolveSlot, serial);
-            if (commit != nullptr) (*commit)();
+            if (commit == nullptr || resolveSlot != nullptr) handoff.Release("label_handoff_skipped_release");
+            if (commit != nullptr && resolveSlot != nullptr) {
+                std::optional<PerformanceTimer> resolveTiming;
+                if (census) resolveTiming.emplace("J3.CommitResolve");
+                resolveForApply(*resolveSlot, serial);
+            }
+            if (commit != nullptr) {
+                using Kind = CommitCensus::Kind;
+                const auto classified = kind == ItemKind::Draw ? Kind::Legacy : kind == ItemKind::Label ? Kind::Label : commitKind == CommitKind::DmaCopy ? Kind::Copy : (commitKind == CommitKind::DmaFill || commitKind == CommitKind::DmaWrite || commitKind == CommitKind::BufferFill) ? Kind::Fill : kind == ItemKind::Dispatch ? Kind::Dispatch : Kind::Other;
+                commitCensus.emplace(classified);
+                if (census && kind == ItemKind::Label) ArchB::Recorder::Count(commitKind == CommitKind::Store ? "j3c_label_store_items" : "j3c_label_eop_items");
+                if (census && commitKind == CommitKind::DmaWrite) ArchB::Recorder::Count("j3c_inline_dma_writes");
+                (*commit)();
+                commitCensus->Finish();
+            } else if (census) ArchB::Recorder::Count("j3c_stopped_items");
             GuestMemory::HoldLogMark(GuestMemory::HoldMark::CommitEnd);
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
@@ -1170,6 +1281,10 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
+        if (fatal != nullptr || !handoff.currentDraw) handoff.Release("label_handoff_unused_release");
+        if (commitCensus) commitCensus->Finish(fatal != nullptr);
+        if (census && commitCensus) commitCensus->RecordSequence(sequence, arrival, onlyItem, fatal != nullptr);
+        else sequence.predecessor = CommitCensus::Kind::Count;
         const auto spent = elapsedNs(start);
         if (resolveSlot != nullptr) {
             resolveCounters().applyNs.fetch_add(spent, std::memory_order_relaxed);
@@ -1181,7 +1296,7 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
+        auto lock = lockQueue();
         countWrites(items.front().writes, false);
         if (!resolvers.empty()) noteApplied(items.front(), serial);
         const auto kindIndex = static_cast<std::size_t>(items.front().commitKind);
@@ -1189,6 +1304,7 @@ void DrawPipeline::run() {
         kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
         retired.push_back(std::move(items.front()));
         items.pop_front();
+        sequence.emptyAfterPredecessor = items.empty();
         retiredItems.fetch_add(1, std::memory_order_release);
         ++commits;
         recorderCommits.fetch_add(1, std::memory_order_relaxed);
