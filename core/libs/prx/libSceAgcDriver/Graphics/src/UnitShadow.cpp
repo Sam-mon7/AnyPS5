@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageEpochs.hpp"
@@ -9,9 +10,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,7 +23,10 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include "prx/libSceAgcDriver/Graphics/include/LazyCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LazyPublish.hpp"
+#include "prx/libc/include/GuestWriteFault.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -83,6 +90,15 @@ Statistics& Stats() {
     return statistics;
 }
 
+struct ShadowAddressCollectStatistics {
+    std::atomic<std::uint64_t> calls{0}, spanPages{0}, walkedPages{0}, runs{0}, verified{0}, mismatches{0};
+};
+
+ShadowAddressCollectStatistics& AddressCollectStats() {
+    static ShadowAddressCollectStatistics statistics;
+    return statistics;
+}
+
 struct UnitShadow {
     Context context;
     // The import's range, buffer and lead (taken at creation: a publish under the import table's
@@ -97,6 +113,8 @@ struct UnitShadow {
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
     std::vector<std::uint8_t> addressed;
+    std::vector<std::uint64_t> lazyTicket;
+    std::vector<std::uint8_t> lazySettled;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -126,6 +144,8 @@ struct Shadows {
     std::uint32_t liveSlabs = 0;
     // Counted for the [storage] segment: shadows retired and the slab bytes they returned.
     std::uint64_t retired = 0;
+    std::uint64_t lazySerial = 0;
+    std::map<std::uint64_t, std::vector<std::pair<std::uint64_t, std::uint64_t>>> publishing;
 };
 
 Shadows& Registry() {
@@ -188,6 +208,8 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    shadow->lazyTicket.assign(static_cast<std::size_t>(units), 0);
+    shadow->lazySettled.assign(static_cast<std::size_t>(units), 0);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (ShadowAddressEnabled() && profile) shadow->addressed.assign(static_cast<std::size_t>(units), 0);
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
@@ -259,6 +281,87 @@ bool& publishOnCpu() {
     return HostThreadLocal<bool, PublishOnCpuStorage>();
 }
 
+struct LazyCounters {
+    std::atomic<std::uint64_t> lazyStores{0}, eagerStores{0}, leftBytes{0}, enrolled{0}, enrolledBytes{0}, unwatchable{0}, unwatchableBytes{0}, verifyChecks{0}, verifyMismatches{0}, verifySkipped{0}, staleReads{0}, staleChecks{0}, publishedUnits{0};
+    std::atomic<std::uint64_t> avoided{0}, avoidedBytes{0};
+    LazyCounters() {
+        const auto add = [](const char* name, const std::atomic<std::uint64_t>& counter) { AgcDriver::ArchB::Recorder::RegisterCounter(name, counter); };
+        add("n5a_lazy_stores", lazyStores);
+        add("n5a_eager_stores", eagerStores);
+        add("n5a_left_bytes", leftBytes);
+        add("n5a_enrolled", enrolled);
+        add("n5a_enrolled_bytes", enrolledBytes);
+        add("n5a_publications_avoided", avoided);
+        add("n5a_publication_bytes_avoided", avoidedBytes);
+        add("n5a_unwatchable", unwatchable);
+        add("n5a_unwatchable_bytes", unwatchableBytes);
+        add("n5a_verify_checks", verifyChecks);
+        add("n5a_verify_content_mismatches", verifyMismatches);
+        add("n5a_verify_skipped", verifySkipped);
+        add("n5a_verify_stale_reads", staleReads);
+        add("n5a_verify_read_checks", staleChecks);
+        add("n5a_published_units", publishedUnits);
+        add("n5a_lost_on_retire", Stats().lostOnRetire);
+        add("n5a_slab_lost", Stats().slabLost);
+        add("n5a_retired_discarded_units", Stats().droppedOnRetire);
+    }
+};
+
+LazyCounters& lazyCounters() {
+    static LazyCounters counters;
+    return counters;
+}
+
+struct PublishSiteStorage {};
+
+const char*& publishSite() {
+    return HostThreadLocal<const char*, PublishSiteStorage>();
+}
+
+struct SiteCounter {
+    std::string countName;
+    std::string bytesName;
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+struct SiteCounters {
+    std::mutex mutex;
+    std::map<std::string, std::unique_ptr<SiteCounter>> bySite;
+};
+
+SiteCounters& siteCounters() {
+    static SiteCounters counters;
+    return counters;
+}
+
+void countSite(const std::string& prefix, const char* site, std::uint64_t bytes) {
+    std::string key = prefix;
+    for (const char* at = site; *at != '\0'; ++at) key += std::isalnum(static_cast<unsigned char>(*at)) ? *at : '_';
+    auto& counters = siteCounters();
+    SiteCounter* counter = nullptr;
+    {
+        std::lock_guard lock(counters.mutex);
+        auto& slot = counters.bySite[key];
+        if (slot == nullptr) {
+            slot = std::make_unique<SiteCounter>();
+            slot->countName = key + "_n";
+            slot->bytesName = key + "_bytes";
+            AgcDriver::ArchB::Recorder::RegisterCounter(slot->countName.c_str(), slot->count);
+            AgcDriver::ArchB::Recorder::RegisterCounter(slot->bytesName.c_str(), slot->bytes);
+        }
+        counter = slot.get();
+    }
+    counter->count.fetch_add(1, std::memory_order_relaxed);
+    counter->bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+std::string siteOf(PublishReason reason) {
+    std::string site = publishSite() != nullptr ? publishSite() : ReasonNames[static_cast<std::size_t>(reason)];
+    if (reason == PublishReason::Hook || reason == PublishReason::Scanout) site += std::string("@") + GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite());
+    return site;
+}
+
 std::atomic<void (*)(std::uint64_t, std::uint64_t)> publishSelectedHook{nullptr};
 
 bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, std::uint64_t checked) {
@@ -292,6 +395,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     recorder->EndGpuTiming(timing, bytes);
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::Published(begin, end, GpuAuthorityCensus::Kind::ShadowPublish, recorder, recorder->OpenSerial(), timing);
     recorder->NotePendingWrites(ranges);
     recorder->OnComplete([host, pieces = std::move(pieces), checked] {
         host->Invalidate();
@@ -343,9 +447,11 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     Recorder::CountBarriers(CommandClass::ShadowPublish);
     if (batch) {
         batch->SubmitAndWait();
+        if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::Published(begin, end, GpuAuthorityCensus::Kind::ShadowPublish);
         return;
     }
     recorder->EndGpuTiming(timing, bytes);
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::Published(begin, end, GpuAuthorityCensus::Kind::ShadowPublish, recorder, recorder->OpenSerial(), timing);
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
@@ -384,6 +490,8 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t bytes = 0;
+    std::uint64_t forcedBytes = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> forced;
     std::size_t units = 0;
     const auto checked = GuestMemory::TrackerGeneration();
     {
@@ -415,6 +523,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             if (changed[k] == GuestMemory::BlockWritten) {
                 // Newer bytes reached the import since the retile: the slab's are dead.
                 shadow->generation[unit] = 0;
+                shadow->lazyTicket[unit] = 0;
                 ++ended;
                 (cpu[k] != 0 ? Stats().staleDroppedCpu : Stats().staleDroppedDriver).fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -423,6 +532,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             const auto& slab = shadow->slabs[slabIndex];
             if (slab == nullptr) {
                 shadow->generation[unit] = 0;
+                shadow->lazyTicket[unit] = 0;
                 ++ended;
                 continue;
             }
@@ -438,6 +548,10 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 ranges.emplace_back(begin, end);
             }
             shadow->published[unit] = 1;
+            if (shadow->lazyTicket[unit] != 0) {
+                forcedBytes += end - begin;
+                forced.emplace_back(unit, shadow->lazyTicket[unit]);
+            }
             ++ended;
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
@@ -447,6 +561,9 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         if (ShadowVerify() && shadow->liveUnits != shadow->CountLive()) throw std::runtime_error("unit-shadow live count differs after publish");
     }
     if (units == 0) return 0;
+    countSite("n5a_pub_", siteOf(reason).c_str(), bytes);
+    if (forcedBytes != 0) countSite("n5a_force_", siteOf(reason).c_str(), forcedBytes);
+    lazyCounters().publishedUnits.fetch_add(units, std::memory_order_relaxed);
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -464,6 +581,23 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const ArchC::LazyCensus::UseScope censusScope;
         for (const auto& [begin, end] : ranges) ArchC::LazyCensus::Published(begin, end, ArchC::LazyCensus::Kind::ShadowPublish, static_cast<std::uint8_t>(reason));
         if (!publishOnCpu() || !recordCopiesOnCpu(*shadow, copies, ranges, bytes, checked)) recordCopies(*shadow, copies, ranges, bytes);
+    }
+    if (!forced.empty()) {
+        std::uint64_t publication = 0;
+        {
+            std::lock_guard lock(Registry().mutex);
+            publication = ++Registry().lazySerial;
+            Registry().publishing.emplace(publication, ranges);
+        }
+        auto completed = [shadow, forced = std::move(forced), publication] {
+            std::lock_guard lock(Registry().mutex);
+            Registry().publishing.erase(publication);
+            for (const auto& [unit, ticket] : forced) {
+                if (shadow->lazyTicket[unit] == ticket) shadow->lazyTicket[unit] = 0;
+            }
+        };
+        if (auto* recorder = Recorder::Active()) recorder->OnComplete(std::move(completed));
+        else completed();
     }
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
@@ -606,6 +740,14 @@ PublishOnCpuScope::PublishOnCpuScope() : previous(std::exchange(publishOnCpu(), 
 
 PublishOnCpuScope::~PublishOnCpuScope() {
     publishOnCpu() = previous;
+}
+
+PublishSiteScope::PublishSiteScope(const char* site) : previous(publishSite()) {
+    if (previous == nullptr) publishSite() = site;
+}
+
+PublishSiteScope::~PublishSiteScope() {
+    publishSite() = previous;
 }
 
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, bool waited) {
@@ -871,7 +1013,12 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
     return result;
 }
 
-std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
+ShadowAddressCollectCounts ShadowAddressCollectTotals() {
+    auto& stats = AddressCollectStats();
+    return {stats.calls.load(), stats.spanPages.load(), stats.walkedPages.load(), stats.runs.load(), stats.verified.load(), stats.mismatches.load()};
+}
+
+std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end, bool uploadReuse) {
     std::vector<ShadowAddressRun> result;
     if (!ShadowAddressEnabled() || !context.bufferDeviceAddress || end <= begin) return result;
     Require(GuestMemory::GpuMutex().HeldByThisThread(), "shadow address sources require the GPU lock");
@@ -893,7 +1040,67 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
     }
     const auto walkBegin = shadow->UnitRange(first).first;
     const auto walkEnd = shadow->UnitRange(last).second;
-    GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    std::vector<std::uint8_t> boundedChanged, boundedCpu;
+    static const bool verify = [] {
+        const auto* value = std::getenv("APS5_VERIFY_DISPATCH_UPLOAD_REUSE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (uploadReuse) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> walks;
+        {
+            std::lock_guard lock(registry.mutex);
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto range = shadow->UnitRange(unit);
+                if (!walks.empty() && walks.back().second == range.first) walks.back().second = range.second;
+                else walks.push_back(range);
+            }
+        }
+        if (verify) {
+            std::lock_guard lock(registry.mutex);
+            std::size_t run = 0;
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto range = shadow->UnitRange(unit);
+                while (run < walks.size() && walks[run].second <= range.first) ++run;
+                if (run == walks.size() || walks[run].first > range.first || walks[run].second < range.second) {
+                    AddressCollectStats().mismatches.fetch_add(1, std::memory_order_relaxed);
+                    ArchB::Recorder::Count("dispatch_upload_shadow_verify_mismatch");
+                    throw std::runtime_error("dispatch upload bounded collection omits a live unit");
+                }
+            }
+        }
+        const auto pages = [](std::uint64_t from, std::uint64_t to) { return (to + 4095u) / 4096u - from / 4096u; };
+        std::uint64_t walked = 0;
+        for (const auto& [from, to] : walks) {
+            GuestMemory::CollectWritesUncached(from, static_cast<std::size_t>(to - from));
+            walked += pages(from, to);
+        }
+        auto& stats = AddressCollectStats();
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        stats.spanPages.fetch_add(pages(walkBegin, walkEnd), std::memory_order_relaxed);
+        stats.walkedPages.fetch_add(walked, std::memory_order_relaxed);
+        stats.runs.fetch_add(walks.size(), std::memory_order_relaxed);
+        ArchB::Recorder::Count("dispatch_upload_shadow_collect_calls");
+        ArchB::Recorder::Count("dispatch_upload_shadow_span_pages", static_cast<double>(pages(walkBegin, walkEnd)));
+        ArchB::Recorder::Count("dispatch_upload_shadow_walked_pages", static_cast<double>(walked));
+        ArchB::Recorder::Count("dispatch_upload_shadow_live_runs", static_cast<double>(walks.size()));
+        if (verify) {
+            {
+                std::lock_guard lock(registry.mutex);
+                changedUnits(*shadow, first, last, boundedChanged, boundedCpu);
+            }
+            GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+        }
+    } else {
+        GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    }
+    struct ReferenceSource {
+        std::uint64_t begin, end;
+        VkDeviceAddress address;
+        const ShadowSlab* slab;
+    };
+    std::vector<ReferenceSource> referenceSources;
     std::vector<std::uint8_t> fallback(static_cast<std::size_t>(last - first + 1), 0);
     bool publish = false;
     std::uint64_t bytes = 0, saved = 0, savedUnits = 0;
@@ -902,6 +1109,28 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
         std::lock_guard lock(registry.mutex);
         std::vector<std::uint8_t> changed, cpu;
         changedUnits(*shadow, first, last, changed, cpu);
+        if (uploadReuse && verify) {
+            for (auto unit = first; unit <= last; ++unit) {
+                if (!shadow->Live(unit)) continue;
+                const auto k = static_cast<std::size_t>(unit - first);
+                if (boundedChanged[k] != changed[k] || boundedCpu[k] != cpu[k]) {
+                    AddressCollectStats().mismatches.fetch_add(1, std::memory_order_relaxed);
+                    ArchB::Recorder::Count("dispatch_upload_shadow_verify_mismatch");
+                    throw std::runtime_error("dispatch upload shadow bounded collect disagrees with old span; intervening CPU write possible but unproven");
+                }
+            }
+            for (auto unit = first; unit <= last; ++unit) {
+                const auto k = static_cast<std::size_t>(unit - first);
+                if (!shadow->Live(unit) || boundedChanged[k] != 0) continue;
+                const auto& slab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
+                if (slab == nullptr || slab->address == 0) continue;
+                const auto range = shadow->UnitRange(unit);
+                const auto from = std::max(begin, range.first);
+                const auto to = std::min(end, range.second);
+                if (!referenceSources.empty() && referenceSources.back().end == from && referenceSources.back().slab == slab.get()) referenceSources.back().end = to;
+                else referenceSources.push_back({from, to, slab->address + SlabOffset(import, *slab, from), slab.get()});
+            }
+        }
         for (auto unit = first; unit <= last; ++unit) {
             if (!shadow->Live(unit)) continue;
             const auto k = static_cast<std::size_t>(unit - first);
@@ -930,6 +1159,21 @@ std::vector<ShadowAddressRun> ShadowAddressSources(const Context& context, const
                 }
             }
         }
+    }
+    if (uploadReuse && verify) {
+        bool same = referenceSources.size() == result.size();
+        for (std::size_t i = 0; same && i < result.size(); ++i) {
+            const auto& expected = referenceSources[i];
+            const auto& actual = result[i];
+            same = expected.begin == actual.begin && expected.end == actual.end && expected.address == actual.address && expected.slab == actual.pin->slab.get();
+        }
+        if (!same) {
+            AddressCollectStats().mismatches.fetch_add(1, std::memory_order_relaxed);
+            ArchB::Recorder::Count("dispatch_upload_shadow_verify_mismatch");
+            throw std::runtime_error("dispatch upload shadow sources disagree with old span");
+        }
+        AddressCollectStats().verified.fetch_add(1, std::memory_order_relaxed);
+        ArchB::Recorder::Count("dispatch_upload_shadow_verified");
     }
     if (publish) publishUnits(shadow, first, last, fallback, PublishReason::Address);
     if (profile && bytes != 0) {
@@ -970,6 +1214,8 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 if (!shadow->Live(unit)) ++shadow->liveUnits;
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
+                shadow->lazyTicket[unit] = shadow->lazyTicket[unit] != 0 ? ++registry.lazySerial : 0;
+                shadow->lazySettled[unit] = 0;
                 if (!shadow->addressed.empty()) shadow->addressed[unit] = 0;
                 current->lastUse = present;
             }
@@ -1068,6 +1314,260 @@ void DestroyShadows(VkDevice device) {
         }
         it = registry.byBase.erase(it);
     }
+}
+
+namespace {
+
+struct ConsumerStorage {};
+
+ShadowConsumerScope::State& consumerState() {
+    return HostThreadLocal<ShadowConsumerScope::State, ConsumerStorage>();
+}
+
+std::uint64_t lazyVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_ARCHB_LAZY_SHADOW_PUBLISH_VERIFY");
+        return text == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(text, nullptr, 10));
+    }();
+    return every;
+}
+
+bool consumerPublishes(const ShadowConsumerScope::State& consumer, std::uint64_t begin, std::uint64_t end) {
+    if (!consumer.set || consumer.scope == PublishScope::None || consumer.bytes == 0) return false;
+    const auto consumerEnd = consumer.bytes > std::numeric_limits<std::uint64_t>::max() - consumer.address ? std::numeric_limits<std::uint64_t>::max() : consumer.address + consumer.bytes;
+    if (!(begin < consumerEnd && consumer.address < end)) return false;
+    return consumer.scope == PublishScope::Whole || !(consumer.address <= begin && consumerEnd >= end);
+}
+
+struct LeftUnits {
+    std::shared_ptr<UnitShadow> shadow;
+    std::uint64_t first = 0;
+    std::uint64_t last = 0;
+    std::vector<std::uint8_t> selected;
+};
+
+void verifyLeft(const LeftUnits& left) {
+    auto& counters = lazyCounters();
+    const auto& shadow = left.shadow;
+    const auto& context = shadow->context;
+    auto* recorder = Recorder::Active();
+    if (recorder != nullptr) {
+        Recorder::CountSync(4);
+        recorder->Sync();
+    }
+    const auto walkBegin = std::max(shadow->UnitBegin(left.first), shadow->importBase);
+    const auto walkEnd = std::min(shadow->UnitBegin(left.last + 1), shadow->ImportEnd());
+    if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    struct Region {
+        std::shared_ptr<ShadowSlab> slab;
+        VkDeviceSize offset;
+        std::uint64_t address;
+        std::uint64_t size;
+    };
+    std::vector<Region> regions;
+    {
+        std::lock_guard lock(Registry().mutex);
+        std::vector<std::uint8_t> changed, cpu;
+        changedUnits(*shadow, left.first, left.last, changed, cpu);
+        for (auto unit = left.first; unit <= left.last; ++unit) {
+            const auto k = static_cast<std::size_t>(unit - left.first);
+            if (!left.selected[k] || !shadow->Live(unit) || changed[k] != 0) continue;
+            const auto& slab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
+            if (slab == nullptr) continue;
+            const auto [begin, end] = shadow->UnitRange(unit);
+            if (end <= begin) continue;
+            regions.push_back({slab, (unit - slab->firstUnit) * UnitBytes + (begin - shadow->UnitBegin(unit)), begin, end - begin});
+        }
+    }
+    std::vector<std::unique_ptr<Buffer>> scratch;
+    for (const auto& region : regions) {
+        scratch.push_back(std::make_unique<Buffer>(context, static_cast<std::size_t>(region.size), VK_BUFFER_USAGE_TRANSFER_DST_BIT));
+        CommandBatch batch(context);
+        CopyBuffer(context, batch.Handle(), region.slab->buffer, region.offset, scratch.back()->Handle(), 0, region.size);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        scratch.back()->Invalidate();
+    }
+    const PublishSiteScope site("verify");
+    GuestMemory::FlushGpuWrites(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));
+    if (recorder != nullptr) {
+        Recorder::CountSync(4);
+        recorder->Sync();
+    }
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        const auto& region = regions[i];
+        GuestArena::GuestWtFaultUnwatch_nid_no_patch(static_cast<std::uintptr_t>(region.address), static_cast<std::size_t>(region.size));
+        counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+        if (GuestArena::GuestWtFaultWatchedPages_nid_no_patch(static_cast<std::uintptr_t>(region.address), static_cast<std::size_t>(region.size)) != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(region.address), static_cast<std::size_t>(region.size))) {
+            counters.verifySkipped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        if (std::memcmp(reinterpret_cast<const void*>(region.address), scratch[i]->Bytes().data(), static_cast<std::size_t>(region.size)) == 0) continue;
+        counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[lazy-shadow] VERIFY mismatch: the forced publication of 0x%llx+0x%llx differs from the eager copy\n", static_cast<unsigned long long>(region.address), static_cast<unsigned long long>(region.size));
+        throw std::runtime_error("lazy shadow forced publication differs from eager bytes");
+    }
+}
+
+}
+
+namespace {
+
+bool needsLazyPreservation(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0) return false;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    if (anyOverlapping(registry, address, end, [&](const auto& shadow) {
+        const auto begin = std::max<std::uint64_t>(address, shadow->importBase);
+        const auto stop = std::min(end, shadow->ImportEnd());
+        for (auto unit = shadow->UnitOf(begin); unit <= shadow->UnitOf(stop - 1); ++unit) {
+            if (shadow->lazyTicket[unit] != 0) return true;
+        }
+        return false;
+    })) return true;
+    for (const auto& [ticket, ranges] : registry.publishing) {
+        for (const auto& [begin, stop] : ranges) {
+            if (begin < end && address < stop) return true;
+        }
+    }
+    return false;
+}
+
+}
+
+bool LazyShadowVerifyEnabled() {
+    return lazyVerifyEvery() != 0;
+}
+
+bool LazyShadowPublishEnabled() {
+    if (!UnitShadowEnabled() || !AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::LazyShadowPublish) || !ArchC::LazyPublish::Active()) return false;
+    static const bool installed = [] {
+        GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(&needsLazyPreservation);
+        return true;
+    }();
+    return installed;
+}
+
+ShadowConsumerScope::ShadowConsumerScope(const char* reason, std::uint64_t address, std::size_t bytes, PublishScope scope) : previous(consumerState()) {
+    consumerState() = {reason, address, bytes, scope, true};
+}
+
+ShadowConsumerScope::~ShadowConsumerScope() {
+    consumerState() = previous;
+}
+
+PublishScope PlaneStoreScope(const char* store) {
+    if (!LazyShadowPublishEnabled()) return PublishScope::Whole;
+    const auto& consumer = consumerState();
+    lazyCounters().lazyStores.fetch_add(1, std::memory_order_relaxed);
+    countSite("n5a_store_", consumer.reason != nullptr ? consumer.reason : store, 0);
+    return PublishScope::None;
+}
+
+void SettlePlaneStore(const char* store, std::uint64_t begin, std::uint64_t end, PublishScope used) {
+    if (used != PublishScope::None || end <= begin || !UnitShadowEnabled()) return;
+    auto& counters = lazyCounters();
+    const auto consumer = consumerState();
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    const auto every = lazyVerifyEvery();
+    const bool verify = every != 0 && Recorder::Presents() % every == 0;
+    std::vector<LeftUnits> lefts;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t leftBytes = 0;
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& shadow : overlapping(registry, begin, end)) {
+            if (shadow->liveUnits == 0) continue;
+            const auto from = std::max(begin, shadow->importBase);
+            const auto to = std::min(end, shadow->ImportEnd());
+            if (to <= from) continue;
+            LeftUnits left{shadow, shadow->UnitOf(from), shadow->UnitOf(to - 1), {}};
+            left.selected.assign(static_cast<std::size_t>(left.last - left.first + 1), 0);
+            bool any = false;
+            for (auto unit = left.first; unit <= left.last; ++unit) {
+                if (!shadow->Live(unit) || shadow->lazySettled[unit] != 0) continue;
+                const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+                if (unitEnd <= unitBegin || consumerPublishes(consumer, unitBegin, unitEnd)) continue;
+                if (shadow->lazyTicket[unit] == 0) shadow->lazyTicket[unit] = ++registry.lazySerial;
+                shadow->lazySettled[unit] = 1;
+                left.selected[static_cast<std::size_t>(unit - left.first)] = 1;
+                any = true;
+                leftBytes += unitEnd - unitBegin;
+                ranges.emplace_back(unitBegin, unitEnd);
+            }
+            if (any) lefts.push_back(std::move(left));
+        }
+    }
+    counters.leftBytes.fetch_add(leftBytes, std::memory_order_relaxed);
+    if (lefts.empty()) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fallback;
+    for (const auto& [rangeBegin, rangeEnd] : ranges) {
+        const auto bytes = static_cast<std::size_t>(rangeEnd - rangeBegin);
+        if (ArchC::LazyPublish::DeferShadowRange(rangeBegin, bytes)) {
+            counters.enrolled.fetch_add(1, std::memory_order_relaxed);
+            counters.enrolledBytes.fetch_add(bytes, std::memory_order_relaxed);
+            if (store != nullptr && (std::strcmp(store, "depth plane store") == 0 || std::strcmp(store, "stencil plane store") == 0 || std::strcmp(store, "address-based heaps") == 0)) {
+                counters.avoided.fetch_add(1, std::memory_order_relaxed);
+                counters.avoidedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
+            continue;
+        }
+        counters.unwatchable.fetch_add(1, std::memory_order_relaxed);
+        counters.unwatchableBytes.fetch_add(bytes, std::memory_order_relaxed);
+        counters.eagerStores.fetch_add(1, std::memory_order_relaxed);
+        if (!fallback.empty() && fallback.back().second == rangeBegin) fallback.back().second = rangeEnd;
+        else fallback.emplace_back(rangeBegin, rangeEnd);
+    }
+    for (const auto& [from, to] : fallback) static_cast<void>(StorageTexture::PublishShadowsOnly(from, static_cast<std::size_t>(to - from), PublishScope::Whole, store));
+    if (verify) for (const auto& left : lefts) verifyLeft(left);
+}
+
+std::size_t LazyLeftUnpublished(std::uint64_t address, std::size_t bytes) {
+    if (!UnitShadowEnabled() || bytes == 0) return 0;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    auto& registry = Registry();
+    std::lock_guard lock(registry.mutex);
+    std::size_t units = 0;
+    for (const auto& shadow : overlapping(registry, address, end)) {
+        if (shadow->liveUnits == 0) continue;
+        const auto from = std::max(address, shadow->importBase);
+        const auto to = std::min(end, shadow->ImportEnd());
+        if (to <= from) continue;
+        for (auto unit = shadow->UnitOf(from); unit <= shadow->UnitOf(to - 1); ++unit) {
+            if (shadow->Live(unit)) ++units;
+        }
+    }
+    return units;
+}
+
+void NoteLazyShadowRead(std::uint64_t address, std::size_t bytes, PublishScope scope) {
+    if (lazyVerifyEvery() == 0 || scope != PublishScope::Whole || bytes == 0) return;
+    auto& counters = lazyCounters();
+    counters.staleChecks.fetch_add(1, std::memory_order_relaxed);
+    const auto units = LazyLeftUnpublished(address, bytes);
+    if (units == 0) return;
+    counters.staleReads.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> reports{0};
+    if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[lazy-shadow] VERIFY: a CPU read of 0x%llx+0x%zx found %zu unpublished units a lazy plane store left (read site %s)\n", static_cast<unsigned long long>(address), bytes, units, GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()));
+    throw std::runtime_error("lazy shadow CPU reader found unpublished bytes");
+}
+
+LazyShadowCounts LazyShadowTotals() {
+    auto& counters = lazyCounters();
+    LazyShadowCounts counts;
+    counts.lazyStores = counters.lazyStores.load();
+    counts.eagerStores = counters.eagerStores.load();
+    counts.leftBytes = counters.leftBytes.load();
+    counts.enrolledBytes = counters.enrolledBytes.load();
+    counts.unwatchableBytes = counters.unwatchableBytes.load();
+    counts.verifyChecks = counters.verifyChecks.load();
+    counts.verifyMismatches = counters.verifyMismatches.load();
+    counts.staleReads = counters.staleReads.load();
+    counts.publishedUnits = counters.publishedUnits.load();
+    return counts;
 }
 
 std::string ShadowReport() {
