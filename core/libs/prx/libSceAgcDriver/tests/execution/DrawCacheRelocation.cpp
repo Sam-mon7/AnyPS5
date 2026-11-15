@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -416,6 +418,283 @@ void MovedForwardedWordReachesStageDataHit(bool libraries) {
     Require(moved.empty(), mode + ": a relocated stage data hit did not draw with the moved user word: " + moved);
 }
 
+void LiveNestedDraws(const std::filesystem::path& control, unsigned directKind = 0, bool requireFallback = false, bool allocations = false, bool reportOnly = false) {
+    using R = AgcDriver::ArchB::Recorder;
+    using S = AgcDriver::ArchB::Switches;
+    using F = AgcDriver::ArchB::Feature;
+    alignas(256) static constexpr std::array<std::uint32_t, 16> code{
+        0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu,
+        0xe0300000u, 0x80010000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u,
+        0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+    alignas(8) static Header header{};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, 2> descriptors{};
+    alignas(16) static std::array<std::uint64_t, 2> root{};
+    static const TiledTarget target;
+    static const TiledTarget data;
+    static const TiledTarget arguments;
+    static const TiledTarget indices;
+    static const TiledTarget movedIndices;
+    static const TiledTarget otherTarget;
+    static const TiledTarget firstDepth;
+    static const TiledTarget secondDepth;
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(header, code.data(), sizeof(code), 1);
+    const auto dataAddress = reinterpret_cast<std::uintptr_t>(data.Data());
+    const auto args = reinterpret_cast<std::uintptr_t>(arguments.Data());
+    const auto originalIndexAddress = reinterpret_cast<std::uintptr_t>(indices.Data());
+    auto indexAddress = originalIndexAddress;
+    const std::array<std::uint32_t, 6> indexValues{0, 1, 2, 0, 1, 2};
+    AgcDriver::GuestMemory::Write(indexAddress, std::as_bytes(std::span(indexValues)));
+    const std::array<std::uint32_t, 4> record{3, 1, 0, 0};
+    AgcDriver::GuestMemory::Write(args, std::as_bytes(std::span(record)));
+    const auto value = [&](std::uint64_t address, float number) { AgcDriver::GuestMemory::Write(address, std::as_bytes(std::span(&number, 1))); };
+    value(dataAddress, 0.25f);
+    value(dataAddress + 256, 0.75f);
+    for (std::size_t i = 0; i < descriptors.size(); ++i) {
+        const auto address = dataAddress + i * 256;
+        descriptors[i] = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32), 64, 0x30016facu};
+    }
+    root[0] = reinterpret_cast<std::uintptr_t>(descriptors[0].data());
+    unsigned sequence = 0;
+    double fallbackCount = 0;
+    double fallbackVerifyCount = 0;
+    const auto collect = [&] {
+        auto sample = R::Collect(R::Clock::now());
+        for (const auto& [name, count] : sample.counters) {
+            if (name == "draw_templates_live_commit_fallback_direct") fallbackCount += count;
+            if (name == "draw_templates_live_verify_fallback_checks") fallbackVerifyCount += count;
+        }
+        return sample;
+    };
+    const auto enable = [&](bool on, bool templates = true, bool replay = true) {
+        std::ofstream(control, std::ios::trunc) << ++sequence << " DRAW_TEMPLATES_LIVE=" << on << " DRAW_TEMPLATES=" << templates << " C_DRAW_REPLAY=" << replay << "\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        S::PollControl();
+        Require(S::Enabled(F::DrawTemplatesLive) == on, "the live switch did not apply");
+        R::Boundary(true, sequence, R::Clock::now());
+    };
+    const auto draw = [&](const void* destination = nullptr, std::uint64_t depth = 0, std::uint32_t count = 3, std::uint32_t firstVertex = 0) {
+        auto commands = DrawFrom({root.data()}, TriangleVertexCode.data(), code.data(), destination != nullptr ? destination : target.Data(), RenderTargetAttrib3);
+        commands.resize(commands.size() - 3);
+        Append(commands, 0x69, {0x000, 0});
+        Append(commands, 0x69, {0x002, 0x01000000});
+        Append(commands, 0x69, {0x007, 63u | (63u << 16u)});
+        Append(commands, 0x69, {0x00b, std::bit_cast<std::uint32_t>(1.0f)});
+        Append(commands, 0x69, {0x010, depth != 0 ? 3u | (24u << 4u) | (1u << 20u) : 0u});
+        Append(commands, 0x69, {0x011, 0});
+        Append(commands, 0x69, {0x012, static_cast<std::uint32_t>(depth >> 8u)});
+        Append(commands, 0x69, {0x014, static_cast<std::uint32_t>(depth >> 8u)});
+        Append(commands, 0x69, {0x01a, static_cast<std::uint32_t>(depth >> 40u)});
+        Append(commands, 0x69, {0x01c, static_cast<std::uint32_t>(depth >> 40u)});
+        Append(commands, 0x69, {0x200, depth != 0 ? 0x72u : 0u});
+        if (directKind == 0) {
+            Append(commands, 0x11, {1, static_cast<std::uint32_t>(args), static_cast<std::uint32_t>(args >> 32)});
+            Append(commands, 0x24, {0, 0x8c, 0, 2});
+        } else {
+            Append(commands, 0x79, {0x24a, firstVertex});
+            Append(commands, 0x2f, {directKind >= 3 ? 2u : 1u});
+            if (directKind == 2 || directKind == 4) {
+                Append(commands, 0x2a, {1});
+                Append(commands, 0x27, {6, static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32), count, 0});
+            } else Append(commands, 0x2d, {count, 2});
+        }
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the live nested draw failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    };
+    const AgcDriver::Graphics::ColorTarget color{reinterpret_cast<std::uintptr_t>(target.Data()), {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, TiledTargetBytes, 0xe4, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4};
+    const auto pixels = [&] {
+        std::vector<std::byte> image(64 * 64 * 4);
+        AgcDriver::Graphics::ReadColorTarget(color, image);
+        Require(std::any_of(image.begin(), image.end(), [](auto byte) { return byte != std::byte{0}; }), "the live nested draw wrote no pixels");
+        return image;
+    };
+    const bool directDisabled = directKind != 0 && std::getenv("APS5_ARCHB_DRAW_DIRECT") != nullptr && std::string(std::getenv("APS5_ARCHB_DRAW_DIRECT")) == "0";
+    enable(false, directKind == 0, directKind == 0);
+    const auto recipesBefore = AgcDriver::VulkanDevice::DrawRecipeHits();
+    for (int repeat = 0; repeat < 10; ++repeat) draw();
+    if (directKind != 0) Require(AgcDriver::VulkanDevice::DrawRecipeHits() > recipesBefore, "direct reference never warmed its recipe path");
+    const auto first = pixels();
+    if (directKind != 0) {
+        enable(false, false, true);
+        for (int repeat = 0; repeat < 12; ++repeat) draw();
+        Require(pixels() == first, "direct replay changed exact pixels");
+        const auto replay = collect().counters;
+        const auto counter = [](const auto& values, const char* name) {
+            const auto found = values.find(name);
+            return found == values.end() ? 0.0 : found->second;
+        };
+        Require(directDisabled ? counter(replay, "archc_replay_hits_direct") == 0 : counter(replay, "archc_replay_hits_direct") > 0, "direct replay path count differs from extension switch");
+        Require(directDisabled ? counter(replay, "archc_replay_captures_direct") == 0 : counter(replay, "archc_replay_captures_direct") > 0, "direct capture path count differs from extension switch");
+        if (!directDisabled && std::getenv("APS5_ARCHB_C_DRAW_REPLAY_VERIFY") != nullptr && std::string(std::getenv("APS5_ARCHB_C_DRAW_REPLAY_VERIFY")) != "0") Require(counter(replay, "archc_replay_verify_checks_direct") > 0 && counter(replay, "archc_replay_direct_inputs_verified") > 0, "direct replay command/binding VERIFY did not run");
+        Require(counter(replay, "archc_replay_verify_mismatches_direct") == 0, "direct replay VERIFY mismatch");
+        for (const auto& [name, count] : replay) if (name.starts_with("archc_") && count != 0) std::cout << name << " " << count << "\n";
+        enable(false, true, true);
+        for (int repeat = 0; repeat < 12; ++repeat) {
+            root[0] = reinterpret_cast<std::uintptr_t>(descriptors[repeat % 2].data());
+            draw();
+        }
+        const auto templated = pixels();
+        Require(templated != first, "direct template retained old moved values");
+        const auto templates = collect().counters;
+        Require(directDisabled ? counter(templates, "draw_templates_replays_direct") == 0 : requireFallback || counter(templates, "draw_templates_replays_direct") > 0, "direct template path count differs from extension switch");
+        if (!directDisabled && !requireFallback && std::getenv("APS5_ARCHB_DRAW_TEMPLATES_VERIFY") != nullptr && std::string(std::getenv("APS5_ARCHB_DRAW_TEMPLATES_VERIFY")) != "0") Require(counter(templates, "draw_templates_verify_checks_direct") > 0 && counter(templates, "draw_templates_direct_inputs_verified") > 0, "direct template command/binding VERIFY did not run");
+        for (const auto& [name, count] : templates) Require(name.find("mismatch") == std::string::npos || count == 0, "direct template mismatch counter is nonzero");
+        for (const auto& [name, count] : templates) if ((name.starts_with("draw_templates") || name.starts_with("archc_")) && count != 0) std::cout << name << " " << count << "\n";
+        enable(false, false, false);
+        draw();
+        Require(pixels() == templated, "direct template differs from exact old-path pixels");
+        root[0] = reinterpret_cast<std::uintptr_t>(descriptors[0].data());
+        enable(false);
+        draw();
+    }
+    for (int repeat = 0; repeat < 6; ++repeat) draw();
+    collect();
+    enable(true);
+    root[0] = reinterpret_cast<std::uintptr_t>(descriptors[1].data());
+    const auto lookupsBefore = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().lookups;
+    for (int repeat = 0; repeat < 12; ++repeat) draw();
+    const auto changed = pixels();
+    Require(changed != first, "moving the nested V# and its value left the old pixels");
+    const auto counts = collect().counters;
+    for (const auto& [name, count] : counts) if (name.starts_with("draw_templates_live") || name.starts_with("archc_replay_refused") || name.starts_with("archc_replay_hits")) std::cout << name << " " << count << "\n";
+    const auto taken = counts.find("draw_templates_live_q0_taken");
+    const auto committed = counts.find("draw_templates_live_commits");
+    if (directKind != 0 && !directDisabled) {
+        const auto directTaken = counts.find("draw_templates_live_q0_taken_direct");
+        const auto directCommitted = counts.find("draw_templates_live_commits_direct");
+        Require(directTaken != counts.end() && directTaken->second > 0 && (requireFallback || (directCommitted != counts.end() && directCommitted->second > 0)), "direct live counters did not prove the path");
+        if (const auto* verify = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_LIVE_VERIFY"); !requireFallback && verify != nullptr && std::strtoull(verify, nullptr, 10) != 0) {
+            const auto checks = counts.find("draw_templates_live_verify_checks_direct");
+            Require(checks != counts.end() && checks->second > 0, "direct live VERIFY did not run");
+        }
+    }
+    if (directDisabled) {
+        Require((taken == counts.end() || taken->second == 0) && (committed == counts.end() || committed->second == 0), "disabled direct extension took a live draw");
+    } else Require(taken != counts.end() && taken->second > 0 && (requireFallback || (committed != counts.end() && committed->second > 0)), "the nested draw did not take and commit a live plan");
+    if (const auto* period = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_LIVE_VERIFY"); !directDisabled && (period == nullptr || std::strtoull(period, nullptr, 10) == 0)) {
+        const auto lookups = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().lookups - lookupsBefore;
+        Require(lookups + static_cast<std::uint64_t>(taken->second) == 12, "a live queue-0 draw also ran the old lookup");
+    }
+    for (const auto& [name, count] : counts) Require(!name.starts_with("draw_templates_live_verify_mismatch_") || count == 0, "the live draw differs from the old committed draw");
+    if (allocations) {
+        Require(S::Enabled(F::FixHostSlabAlloc), "live draw worker allocation scopes are disabled");
+        auto& allocator = AgcDriver::HostAllocator::GetCounters();
+        root[0] = reinterpret_cast<std::uintptr_t>(descriptors[0].data());
+        root[1] = reinterpret_cast<std::uintptr_t>(descriptors[1].data());
+        std::uint64_t served = 0;
+        std::uint64_t exhausted = 0;
+        std::size_t calls = 0;
+        collect();
+        for (std::size_t round = 0; round < 28; ++round) {
+            const std::size_t batch = round < 16 ? 40 : round % 3 == 0 ? 1 : round % 3 == 1 ? 4 : 8;
+            auto commands = DrawFrom({root.data()}, TriangleVertexCode.data(), code.data(), target.Data(), RenderTargetAttrib3);
+            commands.resize(commands.size() - 3);
+            for (std::size_t call = 0; call < batch; ++call) {
+                const auto pointer = reinterpret_cast<std::uintptr_t>(&root[(call + round) % root.size()]);
+                Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(pointer)});
+                Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(pointer >> 32u)});
+                Append(commands, 0x11, {1, static_cast<std::uint32_t>(args), static_cast<std::uint32_t>(args >> 32u)});
+                Append(commands, 0x24, {0, 0x8c, 0, 2});
+            }
+            Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+            const auto before = allocator.served.load();
+            const auto fallback = allocator.fallbackExhausted.load();
+            {
+                const AgcDriver::HostAllocator::Scope scope(true);
+                Require(sceAgcDriverSubmitDcb(&packet) == 0, "the live allocation batch failed");
+                AgcDriverWaitIdle_nid_postfix();
+            }
+            if (round >= 16) {
+                calls += batch;
+                served += allocator.served.load() - before;
+                exhausted += allocator.fallbackExhausted.load() - fallback;
+            }
+            AgcDriver::GuestMemory::WtFaultFlip();
+            Require(pixels() == ((batch - 1 + round) % root.size() == 0 ? first : changed), "a queued live allocation batch retained another draw's nested descriptor");
+        }
+        const auto paths = collect().counters;
+        const auto admitted = paths.find("draw_templates_live_q0_taken");
+        const auto completed = paths.find("draw_templates_live_commits");
+        Require(admitted != paths.end() && admitted->second > 0 && completed != paths.end() && completed->second > 0, "allocation fixture did not issue and commit live draws");
+        std::printf("live draw allocations: calls=%zu served=%llu per_call=%.3f exhausted=%llu live=%g committed=%g\n", calls, static_cast<unsigned long long>(served), static_cast<double>(served) / calls, static_cast<unsigned long long>(exhausted), admitted->second, completed->second);
+        Require(served > 0 && exhausted == 0, "the live draw slab measurement was disabled or exhausted");
+        if (!reportOnly) Require(served <= calls * 40, "repeated live draw allocation bound exceeded");
+        return;
+    }
+    enable(false);
+    draw();
+    Require(pixels() == changed, "the live nested draw's exact pixels differ from the old path");
+    enable(true);
+    if (directKind == 2 || directKind == 4) {
+        const auto movedIndexAddress = reinterpret_cast<std::uintptr_t>(movedIndices.Data());
+        AgcDriver::GuestMemory::Write(movedIndexAddress, std::as_bytes(std::span(indexValues)));
+        const std::array<std::uint32_t, 6> staleIndices{};
+        AgcDriver::GuestMemory::Write(originalIndexAddress, std::as_bytes(std::span(staleIndices)));
+        indexAddress = movedIndexAddress;
+        root[0] = reinterpret_cast<std::uintptr_t>(descriptors[0].data());
+        collect();
+        draw();
+        const auto relocated = pixels();
+        Require(relocated == first, "direct relocated index address retained stale index bytes");
+        const auto relocationCounts = collect().counters;
+        double relocatedPaths = 0;
+        for (const auto& [name, count] : relocationCounts) {
+            if (name == "draw_templates_live_q0_taken_direct" || name.starts_with("draw_templates_live_q0_refused_") || name.starts_with("draw_templates_live_q0_skip")) relocatedPaths += count;
+            Require(name.find("mismatch") == std::string::npos || count == 0, "direct index relocation VERIFY mismatch");
+        }
+        if (!directDisabled) Require(relocatedPaths > 0, "direct index relocation had neither live admission nor explicit refusal");
+        enable(false, false, false);
+        draw();
+        Require(pixels() == relocated, "direct relocated index address differs from exact old-path pixels");
+        AgcDriver::GuestMemory::Write(originalIndexAddress, std::as_bytes(std::span(indexValues)));
+        indexAddress = originalIndexAddress;
+        root[0] = reinterpret_cast<std::uintptr_t>(descriptors[1].data());
+        enable(true);
+        for (int repeat = 0; repeat < 8; ++repeat) draw();
+    }
+    if (directKind != 0) {
+        collect();
+        draw(nullptr, 0, 6);
+        const auto changedCount = collect().counters;
+        const auto countTaken = changedCount.find("draw_templates_live_q0_taken");
+        Require(countTaken == changedCount.end() || countTaken->second == 0, "changed direct count took the previous live packet");
+        draw();
+        collect();
+        draw(nullptr, 0, 3, 1);
+        const auto changedFirst = collect().counters;
+        const auto firstTaken = changedFirst.find("draw_templates_live_q0_taken");
+        Require(firstTaken == changedFirst.end() || firstTaken->second == 0, "changed direct first vertex took the previous live packet");
+        for (int repeat = 0; repeat < 8; ++repeat) draw();
+    }
+    descriptors[1][2] = 32;
+    collect();
+    draw();
+    const auto structural = collect().counters;
+    const auto live = structural.find("draw_templates_live_q0_taken");
+    Require(live == structural.end() || live->second == 0, "a changed V# record count took the old structural template");
+    descriptors[1][2] = 64;
+    for (int repeat = 0; repeat < 8; ++repeat) draw();
+    collect();
+    draw(otherTarget.Data());
+    const auto retargeted = collect().counters;
+    const auto targetTaken = retargeted.find("draw_templates_live_q0_taken");
+    Require(targetTaken == retargeted.end() || targetTaken->second == 0, "a target change took the previous target's live template");
+    const auto depth1 = reinterpret_cast<std::uintptr_t>(firstDepth.Data());
+    const auto depth2 = reinterpret_cast<std::uintptr_t>(secondDepth.Data());
+    for (int repeat = 0; repeat < 8; ++repeat) draw(nullptr, depth1);
+    collect();
+    draw(nullptr, depth2);
+    const auto redepthed = collect().counters;
+    const auto depthTaken = redepthed.find("draw_templates_live_q0_taken");
+    Require(depthTaken == redepthed.end() || depthTaken->second == 0, "a depth change took the previous depth's live template");
+    if (requireFallback) {
+        Require(fallbackCount > 0 && fallbackVerifyCount > 0, "direct live fallback VERIFY was not exercised");
+        std::cout << "direct live fallback commits " << fallbackCount << " verified " << fallbackVerifyCount << "\n";
+    }
+}
+
 void NestedSpeculationRefusesProtectionChanges() {
     constexpr std::size_t bytes = 65536;
 #ifdef _WIN32
@@ -564,7 +843,7 @@ int main(int argc, char** argv) {
             NestedSpeculationRefusesProtectionChanges();
             return 0;
         }
-        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels")) {
+        if (argc == 2 && (std::string(argv[1]) == "--nested" || std::string(argv[1]) == "--nested-pixels" || std::string(argv[1]).starts_with("--live") || std::string(argv[1]).starts_with("--direct-"))) {
             struct Control {
                 std::filesystem::path path = std::filesystem::temp_directory_path() / ("agc-nested-relocation-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
                 ~Control() { std::filesystem::remove(path); }
@@ -578,7 +857,15 @@ int main(int argc, char** argv) {
 #endif
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;
-            NestedRelocationPath(control.path);
+            if (std::string(argv[1]).starts_with("--direct-")) {
+                std::string kind = argv[1];
+                const bool requireFallback = kind.ends_with("-fallback");
+                if (requireFallback) kind.resize(kind.size() - std::string_view("-fallback").size());
+                const unsigned directKind = kind == "--direct-auto" ? 1u : kind == "--direct-indexed" ? 2u : kind == "--direct-instanced" ? 3u : kind == "--direct-indexed-instanced" ? 4u : 0u;
+                Require(directKind != 0, "unknown direct draw case");
+                LiveNestedDraws(control.path, directKind, requireFallback);
+            } else if (std::string(argv[1]).starts_with("--live")) LiveNestedDraws(control.path, 0, false, std::string(argv[1]).starts_with("--live-allocations"), std::string(argv[1]) == "--live-allocations-report");
+            else NestedRelocationPath(control.path);
             AgcDriverShutdown_nid_postfix();
             std::cout << "Nested table relocation preserves material aliases, buffer bindings and rendered pixels\n";
             return 0;

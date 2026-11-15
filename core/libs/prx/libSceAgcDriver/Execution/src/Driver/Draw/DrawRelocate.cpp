@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PointerSet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Recorder.hpp"
@@ -71,7 +72,10 @@ std::uint64_t Driver::nestedContentKey(const RelocatableUserWord& word, std::uin
     std::uint64_t hash = 0x9e3779b97f4a7c15ull;
     const auto mix = [&](std::uint64_t mixed) { hash = (hash ^ mixed) * 0x100000001b3ull; };
     mix(value & 3u);
-    if (value == 0) readable = false;
+    if (value == 0) {
+        readable = false;
+        ArchB::Recorder::Count("draw_reloc_alias_value_zero");
+    }
     const auto wordMask = [&](std::size_t run, std::size_t index) {
         auto mask = relocationMask(variant, offsets[run] + index);
         for (const auto& child : variant.runParents) {
@@ -100,6 +104,7 @@ std::uint64_t Driver::nestedContentKey(const RelocatableUserWord& word, std::uin
             std::memcpy(&current, live.data() + position, sizeof(current));
             if (current == 0) {
                 readable = false;
+                ArchB::Recorder::Count("draw_reloc_alias_pointer_zero");
                 return false;
             }
             relative = static_cast<std::int64_t>(variant.runs[run].first - (old & 0x0000fffffffffffcull));
@@ -118,6 +123,7 @@ std::uint64_t Driver::nestedContentKey(const RelocatableUserWord& word, std::uin
         }
         if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(live).subspan(offsets[run], count)), true) != GuestMemory::Compare::Equal) {
             readable = false;
+            ArchB::Recorder::Count(parent.run == DispatchVariant::NoFlatBinding ? "draw_reloc_alias_root_copy_failed" : "draw_reloc_alias_child_copy_failed");
             return false;
         }
         for (std::size_t index = 0; index < count; ++index) mix(live[offsets[run] + index] & ~wordMask(run, index));
@@ -149,6 +155,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
             const auto address = (static_cast<std::uint64_t>(word.high) << 32u) + AlignedWord(value) + static_cast<std::uint64_t>(offset) + done * sizeof(std::uint32_t);
             if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content).first(count))) != GuestMemory::Compare::Equal) {
                 readable = false;
+                ArchB::Recorder::Count("draw_reloc_alias_flat_copy_failed");
                 return hash;
             }
             for (std::size_t i = 0; i < count; ++i) mix(content[i]);
@@ -932,7 +939,7 @@ std::shared_ptr<DispatchEntry> Driver::relocateDispatchEntry(std::unique_lock<Ag
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty()) return;
-    auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    auto rebased = CopyDrawProgram(*variant.compiled);
     for (const auto& [slot, value] : variant.shaderDataPatches) patchForwardedWord(*rebased, slot, value);
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
         if (binding < rebased->bindings.size() && word < rebased->bindings[binding].guestDescriptor.size()) rebased->bindings[binding].guestDescriptor[word] = value;

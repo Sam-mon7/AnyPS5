@@ -37,6 +37,15 @@ namespace GuestArena {
 namespace {
 std::atomic<std::uint64_t> queryProtectionSerial{1};
 std::atomic<std::uint32_t> queryProtectionWriters{0};
+
+struct LazyProtectionHold {
+    LazyProtectionHold(std::uintptr_t address, std::size_t bytes) : address(address), bytes(GuestWtFaultLazyPreservationEnabled_nid_no_patch() ? bytes : 0) {
+        if (this->bytes != 0) GuestWtFaultHold_nid_no_patch(address, this->bytes);
+    }
+    ~LazyProtectionHold() { if (bytes != 0) GuestWtFaultRelease_nid_no_patch(address, bytes); }
+    std::uintptr_t address;
+    std::size_t bytes;
+};
 }
 
 std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
@@ -46,6 +55,11 @@ std::uint64_t GuestArenaQueryProtectionSerial_nid_no_patch() {
 }
 
 BOOL GuestArenaVirtualProtect_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
+    const LazyProtectionHold hold(reinterpret_cast<std::uintptr_t>(address), bytes);
+    return GuestArenaVirtualProtectInternal_nid_no_patch(address, bytes, protection, previous);
+}
+
+BOOL GuestArenaVirtualProtectInternal_nid_no_patch(void* address, SIZE_T bytes, DWORD protection, DWORD* previous) {
     queryProtectionWriters.fetch_add(1, std::memory_order_acq_rel);
     const auto result = VirtualProtect(address, bytes, protection, previous);
     // The write tracker's pages take the new protection as the guest's (APS5_ARCHB_WT_FAULT).
@@ -708,18 +722,26 @@ bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expe
 bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     const auto code = record->ExceptionCode;
-    if ((code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR) || record->NumberParameters < 2 || record->ExceptionInformation[0] != 0) return false;
+    const bool guard = code == STATUS_GUARD_PAGE_VIOLATION;
+    if ((code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR && !guard) || record->NumberParameters < 2 || record->ExceptionInformation[0] != 0) return false;
     auto* context = exception->ContextRecord;
     const auto at = reinterpret_cast<const char*>(context->Rip);
     const bool avx2 = at == GuardedCopyAvx2Load || at == GuardedCopyAvx2HighLoad || at == GuardedCompareAvx2Load || at == GuardedCompareAvx2HighLoad;
     if (!avx2 && at != GuardedCopyWideLoad && at != GuardedCopyByteLoad && at != GuardedCompareWideLoad && at != GuardedCompareByteLoad) return false;
     const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
     if (address < context->Rcx || address >= context->R9) return false;
+    if (guard) {
+        const auto page = address & ~static_cast<std::uintptr_t>(0xfff);
+        MEMORY_BASIC_INFORMATION memory{};
+        DWORD previous = 0;
+        if (VirtualQuery(reinterpret_cast<const void*>(page), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT && (memory.Protect & PAGE_GUARD) == 0) VirtualProtect(reinterpret_cast<void*>(page), 0x1000, memory.Protect | PAGE_GUARD, &previous);
+    }
     context->Rip = reinterpret_cast<DWORD64>(avx2 ? GuardedReadFailedAvx2 : GuardedReadFailed);
     return true;
 }
 
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    const LazyProtectionHold hold(address, bytes);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
     GuestWtFaultForget_nid_no_patch(address, bytes);
     noteAccess(reinterpret_cast<const void*>(address), bytes);

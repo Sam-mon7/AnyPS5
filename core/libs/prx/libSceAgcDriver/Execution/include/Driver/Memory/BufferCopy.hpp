@@ -29,10 +29,10 @@ struct StreamCopy {
     std::size_t bytes = 0;
 };
 
-bool MatchesStreamCopyKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute);
-std::optional<StreamCopy> StreamCopyRange(const std::vector<std::uint32_t>& userData, std::uint32_t groups);
-bool MatchesIndexedCopyKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute);
-std::optional<StreamCopy> IndexedCopyRange(const std::vector<std::uint32_t>& userData, std::uint32_t groups, std::uint32_t count, std::uint32_t sourceOffset, std::uint32_t destinationOffset);
+bool MatchesStreamCopyKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute);
+std::optional<StreamCopy> StreamCopyRange(std::span<const std::uint32_t> userData, std::uint32_t groups);
+bool MatchesIndexedCopyKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute);
+std::optional<StreamCopy> IndexedCopyRange(std::span<const std::uint32_t> userData, std::uint32_t groups, std::uint32_t count, std::uint32_t sourceOffset, std::uint32_t destinationOffset);
 
 // The three copy kernels the driver copies itself (Driver::copyBuffer): counted (a count record of
 // {count, period}), indexed (a record of {count, source offset, destination offset}) and stream.
@@ -46,7 +46,7 @@ struct CopyKernelBounds {
     CopyRange destination{};
     CopyRange record{};
 };
-std::optional<CopyKernelBounds> CopyKernelRanges(CopyKernelKind kind, const std::vector<std::uint32_t>& userData, std::uint32_t groups);
+std::optional<CopyKernelBounds> CopyKernelRanges(CopyKernelKind kind, std::span<const std::uint32_t> userData, std::uint32_t groups);
 
 // APS5_ARCHB_PIPE_COPY_KERNEL_ITEMS: queue-0 copy kernels committed as pipeline items (recorder
 // counters pipe_copy_item_<name>): enqueued; copied by the committer; the committer's fallback copy

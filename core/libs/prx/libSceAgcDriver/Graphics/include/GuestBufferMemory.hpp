@@ -24,6 +24,22 @@ struct ShadowSlabPin;
 
 void ShutdownGuestBufferWorkers();
 
+struct DispatchUploadReuseStats {
+    std::uint64_t builds = 0;
+    std::uint64_t planBuilds = 0;
+    std::uint64_t planHits = 0;
+    std::uint64_t baseRegionsReused = 0;
+    std::uint64_t pendingHits = 0;
+    std::uint64_t pendingMisses = 0;
+    std::uint64_t pendingRegionsReused = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t verifiedRegions = 0;
+    std::uint64_t failures = 0;
+    std::uint64_t noSpace = 0;
+    std::uint64_t importEpochMoved = 0;
+};
+DispatchUploadReuseStats DispatchUploadReuseCounts();
+
 struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;
@@ -386,7 +402,7 @@ public:
     // and the recorder's pending-write note stays closed.
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
-    void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt, bool dispatchBuild = false);
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -462,6 +478,7 @@ public:
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
     bool SpaceOnly() const;
+    bool RebindShadowAddresses();
     std::shared_ptr<const void> ReleaseSpace();
     bool RetakeSpace();
     bool SpaceHeld() const;
@@ -469,6 +486,13 @@ public:
     bool ReleaseCompletedSpace(std::uint64_t recorder, std::uint64_t completedThrough);
     static void ReleaseRetainedSpaces(std::uint64_t recorder, std::uint64_t completedThrough);
     SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const;
+    struct UploadTraffic {
+        std::uint64_t cpuBytes = 0;
+        std::uint64_t gpuBytes = 0;
+        std::uint64_t retainedCpuBytes = 0;
+        std::uint64_t retainedGpuBytes = 0;
+    };
+    UploadTraffic Traffic() const { return uploadTraffic; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -608,6 +632,9 @@ private:
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
     void completeSpaceWrites() const;
+    void prepareUploadPlan();
+    void verifyUploadPlan() const;
+    std::vector<ShaderRecompiler::BdaAbi::Range> addressRanges(bool freshBase) const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
@@ -650,7 +677,7 @@ private:
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
-    void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    void recordGpuCopies(std::span<Region* const> copies, bool addressable, bool retained = false);
     void recordCarryVerify(Recorder& recorder, std::span<Region* const> carried, bool cross = false);
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;
@@ -660,6 +687,8 @@ private:
     bool addressStaging = true;
     bool adjustedRegions = false;
     bool shadowAddressReads = false;
+    bool uploadReuse = false;
+    bool uploadDispatch = false;
     GuestAllocations::Lease lease;
     // The cached address space this build maps through (its lease pins the ranges); `regions` then
     // holds only the regions outside it (V#s, snapshots, ranges copied per build).
@@ -690,6 +719,7 @@ private:
     std::vector<std::pair<std::uint64_t, std::shared_ptr<Buffer>>> heapReadbacks;
     std::vector<std::uint64_t> evictedRanges;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
+    UploadTraffic uploadTraffic{};
     bool prepared = false;
     bool uploaded = false;
     bool committed = false;

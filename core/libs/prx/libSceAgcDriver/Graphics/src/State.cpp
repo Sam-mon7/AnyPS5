@@ -1493,15 +1493,15 @@ static std::uint32_t NormalizedChannelMask(VkFormat format) {
 
 namespace {
 
-std::vector<std::uint32_t> ColorExportSlots(std::uint32_t shaderMask) {
-    std::vector<std::uint32_t> slots;
+std::span<const std::uint32_t> ColorExportSlots(std::uint32_t shaderMask, std::array<std::uint32_t, 8>& slots) {
+    std::size_t count = 0;
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
-        if (((shaderMask >> (4u * slot)) & 0xfu) != 0) slots.push_back(slot);
+        if (((shaderMask >> (4u * slot)) & 0xfu) != 0) slots[count++] = slot;
     }
-    return slots;
+    return {slots.data(), count};
 }
 
-std::uint32_t ColorExportCount(const Registers& context, std::uint32_t written, const std::vector<std::uint32_t>& slots) {
+std::uint32_t ColorExportCount(const Registers& context, std::uint32_t written, std::span<const std::uint32_t> slots) {
     const auto formatEntry = find(context, 0x1c5);
     const auto format = formatEntry == context.end() ? 0u : formatEntry->second;
     std::uint32_t count = 0;
@@ -1673,7 +1673,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     APS5_LOG_OUT_DEBUG("CB_TARGET_MASK=0x%x CB_SHADER_MASK=0x%x", targetMask, shaderMask);
     const auto exportFormatEntry = find(cx, 0x1c5);
     const auto exportFormat = exportFormatEntry == cx.end() ? 0u : exportFormatEntry->second;
-    const auto exportSlots = ColorExportSlots(shaderMask);
+    std::array<std::uint32_t, 8> exportSlotStorage;
+    const auto exportSlots = ColorExportSlots(shaderMask, exportSlotStorage);
     const auto exportCount = ColorExportCount(cx, targetMask, exportSlots);
     result.hasColorTarget = exportCount != 0;
     APS5_LOG_OUT_DEBUG("hasColorTarget=%u exports=%u", result.hasColorTarget ? 1u : 0u, exportCount);
@@ -2655,7 +2656,8 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (auto reason = nonzero(cx, 0x204, ClipControlMask, "a PA_CL_CLIP_CNTL flag"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;
     if (value(cx, 0x8e, targetMask) && value(cx, 0x8f, shaderMask) && value(cx, 0x202, word)) {
-        const auto slots = ColorExportSlots(shaderMask);
+        std::array<std::uint32_t, 8> slotStorage;
+        const auto slots = ColorExportSlots(shaderMask, slotStorage);
         if (!colorControlSupported(word, ColorExportCount(cx, ColorWriteMask(cx), slots) != 0)) return colorControlMessage(word);
     }
     if (auto reason = nonzero(cx, 0x1c4, zFormatSupported(zFormat) ? 0u : ~0u, "depth or sample-mask export"); !reason.empty()) return reason;

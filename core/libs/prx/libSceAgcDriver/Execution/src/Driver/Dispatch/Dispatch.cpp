@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -430,15 +431,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (profileSplit) splitMarks[2] = std::chrono::steady_clock::now();
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
-    std::vector<std::uint32_t> userData;
-    for (std::uint32_t i = 0; i < userCount; ++i) {
-        userData.push_back(readUserData(queue.shader, 0x240 + i));
-    }
+    std::array<std::uint32_t, 32> userWords{};
+    for (std::uint32_t i = 0; i < userCount; ++i) userWords[i] = readUserData(queue.shader, 0x240 + i);
+    const auto userData = std::span<const std::uint32_t>(userWords).first(userCount);
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
     if (!resolving && DrawShaderProfileEnabled()) pendingDispatchPhases().code = address;
-    std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
-    if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
+    const std::array<ShaderRecompiler::MemoryRegion, 2> memoryRegions{{
+        {snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))},
+        {snapshot.headerAddress, snapshot.header}
+    }};
+    const auto memory = std::span<const ShaderRecompiler::MemoryRegion>(memoryRegions).first(snapshot.header.empty() ? 1u : 2u);
 
     static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
@@ -455,6 +458,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         recorderWork.SetKey({ArchB::Recorder::Kind::Dispatch, digest});
         if (!resolving && DrawShaderProfileEnabled()) pendingDispatchPhases().digest = digest;
     }
+    const auto buildTraceDigest = DispatchBuildTrace::Enabled() ? (snapshot.CodeDigest() ^ codeOffset) * 0x100000001b3ull : 0;
+    const DispatchBuildTrace::Scope buildTrace(submission.queue, address, buildTraceDigest, currentPacketOffset(), submission.serial);
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
@@ -671,9 +676,34 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::shared_ptr<DispatchVariant> attachVariant;
 
     std::shared_ptr<ShaderMemory> shaderMemory;
-    std::vector<ShaderRecompiler::MemoryRegion> captured;
-
-    std::vector<std::uint32_t> liveWords;
+    struct Scratch {
+        std::vector<ShaderRecompiler::MemoryRegion> captured;
+        std::vector<ShaderRecompiler::MemoryRegion> reads;
+        std::vector<std::uint32_t> liveWords;
+        std::vector<Graphics::GuestMemorySnapshot> snapshots;
+        bool busy = false;
+        void Clear() {
+            captured.clear();
+            reads.clear();
+            liveWords.clear();
+            snapshots.clear();
+        }
+    };
+    struct ScratchStorage {};
+    auto& sharedScratch = AgcDriver::ThreadScratch<Scratch, ScratchStorage>();
+    Scratch localScratch;
+    auto& scratch = sharedScratch.busy ? localScratch : sharedScratch;
+    scratch.Clear();
+    scratch.busy = true;
+    struct ScratchScope {
+        Scratch& scratch;
+        ~ScratchScope() {
+            scratch.Clear();
+            scratch.busy = false;
+        }
+    } scratchScope{scratch};
+    auto& captured = scratch.captured;
+    auto& liveWords = scratch.liveWords;
     bool dataHit = false;
     bool cached = false;
     bool validated = false;
@@ -709,7 +739,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             ++reports;
             std::fprintf(stderr, "[dispatch-cache] 0x%llx key changed:%s\n", static_cast<unsigned long long>(address), what.c_str());
         }
-        previous.userData = userData;
+        previous.userData.assign(userData.begin(), userData.end());
         previous.shader = std::map<std::uint32_t, std::uint32_t>(queue.shader.begin(), queue.shader.end());
         previous.key = key;
     }
@@ -737,7 +767,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     // that entry's regions against queued writes.
     bool aliasEntry = false;
     if (pipelineCandidate) {
-        std::vector<ShaderRecompiler::MemoryRegion> reads;
+        auto& reads = scratch.reads;
         bool entryFound = false;
         bool aliasAvailable = false;
         {
@@ -800,7 +830,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     timing.Mark("lookup_cache");
     if (pipelineCandidate && fallbackCause == DrawPipeline::DrainCause::DispatchMiss && cached) NoteQ0Dispatch(Q0Dispatch::MissThenHit);
     if (submission.queue == 0 && !resolving && !noDispatchCache && MissDiagEnabled()) {
-        MissDiagKey diag{key, feedbackKey, packet[4] & 0x8000u, compute.partialThreads, {}, userData, reinterpret_cast<std::uintptr_t>(registeredShader.get())};
+        MissDiagKey diag{key, feedbackKey, packet[4] & 0x8000u, compute.partialThreads, {}, {userData.begin(), userData.end()}, reinterpret_cast<std::uintptr_t>(registeredShader.get())};
         constexpr std::array<std::uint32_t, 5> offsets{0x207u, 0x208u, 0x209u, 0x212u, 0x213u};
         for (std::size_t i = 0; i < offsets.size(); ++i) diag.registers[i] = readRegister(queue.shader, offsets[i]);
         NoteDispatchMissDiag(address, std::move(diag), cached, missedEntry != nullptr, pipelineCandidate);
@@ -946,7 +976,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
-    std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    auto& snapshots = scratch.snapshots;
+    snapshots.reserve(captured.size());
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {
@@ -998,7 +1029,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, buildTraceContext = DispatchBuildTrace::Current(), recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+            const DispatchBuildTrace::Scope buildTrace(buildTraceContext);
             const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
             const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);

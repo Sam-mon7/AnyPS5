@@ -23,7 +23,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
 // Whether a write set is the unbounded range (0, max).
 bool UnboundedWrites(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool ExactDrawWrites();
-std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::size_t extra = 0);
 
 // Diagnostics (APS5_PIPE_WRITE_DIAG=1, replay only): which part of a queued draw's write set a range
 // came from, to see why indirect arguments overlap queued draws' writes.

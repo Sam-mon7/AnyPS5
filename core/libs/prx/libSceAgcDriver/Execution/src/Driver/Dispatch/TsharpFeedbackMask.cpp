@@ -372,9 +372,33 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
         ArchB::Recorder::Count("fix_tsharp_build_skipped");
         return proof.outcome;
     }
-    struct TraceSlotStorage {};
-    auto& trace = AgcDriver::ThreadScratch<std::vector<std::pair<const ShaderRecompiler::IrValue*, std::uint64_t>>, TraceSlotStorage>();
-    trace.clear();
+    struct Scratch {
+        std::vector<std::pair<const ShaderRecompiler::IrValue*, std::uint64_t>> trace;
+        WordBitMasks flatMasks;
+        WordBitMasks shaderDataMasks;
+        std::vector<const MaskCandidate*> accepted;
+        bool busy = false;
+        void Clear() {
+            trace.clear();
+            flatMasks.clear();
+            shaderDataMasks.clear();
+            accepted.clear();
+        }
+    };
+    struct ScratchStorage {};
+    auto& sharedScratch = AgcDriver::ThreadScratch<Scratch, ScratchStorage>();
+    Scratch localScratch;
+    auto& scratch = sharedScratch.busy ? localScratch : sharedScratch;
+    scratch.Clear();
+    scratch.busy = true;
+    struct ScratchScope {
+        Scratch& scratch;
+        ~ScratchScope() {
+            scratch.Clear();
+            scratch.busy = false;
+        }
+    } scratchScope{scratch};
+    auto& trace = scratch.trace;
     for (const auto& [raw, address] : capture.readTrace.slotReads) {
         const auto source = std::lower_bound(proof.traceSources.begin(), proof.traceSources.end(), raw, [](const auto& entry, const auto* key) { return std::less<const ShaderRecompiler::IrValue*>{}(entry.first, key); });
         if (source == proof.traceSources.end() || source->first != raw) return BuildOutcome::Fallback;
@@ -383,8 +407,8 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
     ArchB::Recorder::Count("fix_tsharp_build_resolve_calls");
     ArchB::Recorder::Count("fix_tsharp_build_trace_reads", trace.size());
     const auto& plan = *capture.plan;
-    WordBitMasks flatMasks;
-    std::vector<const MaskCandidate*> accepted;
+    auto& flatMasks = scratch.flatMasks;
+    auto& accepted = scratch.accepted;
     const auto acceptedBits = [&](std::uint32_t source, std::uint32_t word) {
         const auto found = std::ranges::find_if(accepted, [&](const auto* entry) { return entry->source == source && entry->word == word; });
         return found == accepted.end() ? 0u : (*found)->bits;
@@ -434,7 +458,7 @@ BuildOutcome BuildCached(DispatchVariant& variant, const ShaderRecompiler::Resou
     std::sort(variant.feedback.memory.begin(), variant.feedback.memory.end());
     std::sort(variant.feedback.userData.begin(), variant.feedback.userData.end());
     std::sort(flatMasks.begin(), flatMasks.end());
-    WordBitMasks shaderDataMasks;
+    auto& shaderDataMasks = scratch.shaderDataMasks;
     for (std::uint32_t slot = 0; slot < variant.compiled->shaderDataUserWords.size(); ++slot) {
         const auto bits = WordMask(variant.feedback.userData, variant.compiled->shaderDataUserWords[slot]);
         if (bits != 0u) shaderDataMasks.emplace_back(slot, bits);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -1399,6 +1400,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             else recorder->SyncThrough(address, bytes, true);
         }
     }
+    if (LazyShadowVerifyEnabled() && LazyShadowPublishEnabled()) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        NoteLazyShadowRead(address, bytes, scope);
+    }
 }
 
 }
@@ -1832,7 +1838,10 @@ bool Recorder::storedBytesLocked(std::uint64_t address, std::span<std::byte> byt
     const auto end = address + bytes.size();
     if (const auto queued = queuedLabels.lower_bound(address); queued != queuedLabels.end() && queued->first < end) return false;
     const auto dwords = bytes.size() / 4;
-    std::vector<const std::pair<const std::uint64_t, WideLabel>*> newest(dwords, nullptr);
+    std::array<const std::pair<const std::uint64_t, WideLabel>*, 64> localNewest{};
+    std::vector<const std::pair<const std::uint64_t, WideLabel>*> largeNewest;
+    if (dwords > localNewest.size()) largeNewest.resize(dwords, nullptr);
+    const auto newest = dwords <= localNewest.size() ? std::span(localNewest).first(dwords) : std::span(largeNewest);
     for (auto it = wideLabels.lower_bound(address >= wideLabelBytes ? address - wideLabelBytes + 1 : 0); it != wideLabels.end() && it->first < end; ++it) {
         if (it->second.end <= address) continue;
         const auto from = std::max(it->first, address);
@@ -1841,7 +1850,10 @@ bool Recorder::storedBytesLocked(std::uint64_t address, std::span<std::byte> byt
             if (newest[dword] == nullptr || newest[dword]->second.sequence < it->second.sequence) newest[dword] = &*it;
         }
     }
-    std::vector<std::byte> composed(bytes.size());
+    std::array<std::byte, 256> localComposed;
+    std::vector<std::byte> largeComposed;
+    if (bytes.size() > localComposed.size()) largeComposed.resize(bytes.size());
+    const auto composed = bytes.size() <= localComposed.size() ? std::span(localComposed).first(bytes.size()) : std::span(largeComposed);
     for (std::size_t dword = 0; dword < dwords; ++dword) {
         const auto at = address + dword * 4;
         if (const auto found = labels.find(at); found != labels.end()) {
@@ -2575,6 +2587,10 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
+    if (GpuAuthorityCensus::Enabled()) {
+        const GpuAuthorityCensus::ProducerScope source(6);
+        GpuAuthorityCensus::Produced(begin, end, begin);
+    }
     EndComputeChain();
     ensureOpen();
     // A queued label store over the keys lands first (program order: the key store is later).
@@ -2633,6 +2649,7 @@ void Recorder::recordKeyStores(bool forWriter) {
             if (store.last > fillEnd) copies[copyCount++] = {0, fillEnd, store.last - fillEnd};
             if (copyCount != 0) copy(commands, static_cast<Buffer*>(store.seed.get())->Handle(), store.buffer, copyCount, copies);
         }
+        GpuAuthorityCensus::Published(store.begin, store.end, GpuAuthorityCensus::Kind::Dcc, this, OpenSerial(), timing);
         bytes += store.last - store.first;
     }
     recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
@@ -2706,6 +2723,10 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     flushDeferredDispatch();
     dropCarries(address, address + bytes.size(), "c_gpu_staging_carry_drop_label_store");
     ++open->gpuStores;
+    if (GpuAuthorityCensus::Enabled()) {
+        const GpuAuthorityCensus::ProducerScope source(5);
+        GpuAuthorityCensus::Produced(address, address + bytes.size(), address);
+    }
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -2749,6 +2770,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     } else if (run.buffer == buffer && !run.bytes.empty()) {
         const VkDeviceSize pendingEnd = run.offset + run.bytes.size();
         if (offset >= run.offset && end <= pendingEnd) {
+            GpuAuthorityCensus::Published(address, address + bytes.size(), GpuAuthorityCensus::Kind::Label, this, OpenSerial(), run.timing);
             std::memcpy(run.bytes.data() + (offset - run.offset), bytes.data(), bytes.size());
             storesReplaced.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -2757,6 +2779,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
             // A joined store shares the pending vkCmdUpdateBuffer, which no barrier precedes: one
             // that overlaps a store the run already recorded takes the WAW barrier below instead.
             if (!JoinWawCheck() || !overlapsRecorded()) {
+                GpuAuthorityCensus::Published(address, address + bytes.size(), GpuAuthorityCensus::Kind::Label, this, OpenSerial(), run.timing);
                 run.bytes.insert(run.bytes.end(), bytes.begin(), bytes.end());
                 storesJoined.fetch_add(1, std::memory_order_relaxed);
                 return;
@@ -2764,6 +2787,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
             storeJoinsRefused.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    GpuAuthorityCensus::Published(address, address + bytes.size(), GpuAuthorityCensus::Kind::Label, this, OpenSerial(), run.timing);
     flushPendingStore();
     const bool waw = overlapsRecorded();
     if (waw) {
@@ -2826,6 +2850,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         } else {
             recordBarrier(commands, LabelLeadingBarrier.srcStage, LabelLeadingBarrier.dstStage, LabelLeadingBarrier.srcAccess, LabelLeadingBarrier.dstAccess);
         }
+        for (const auto& store : stores) GpuAuthorityCensus::Published(store.address, store.End(), GpuAuthorityCensus::Kind::Label, this, OpenSerial(), run.timing);
         std::uint64_t storedBytes = 0;
         const auto update = function(cmdUpdateBuffer, "vkCmdUpdateBuffer");
         std::vector<QueuedWrite> writes;
@@ -3129,6 +3154,7 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
 }
 
 void Recorder::CountPresent() {
+    GpuAuthorityCensus::Flip();
     timingPresents.fetch_add(1, std::memory_order_relaxed);
     presentSerial.fetch_add(1, std::memory_order_relaxed);
     ReferenceStorage::Shared().ReleaseIdle();
@@ -3975,6 +4001,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::unique_lock lock(timingMutex);
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
         const auto ns = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period;
+        GpuAuthorityCensus::GpuTime(this, batch.serial, static_cast<std::uint32_t>(i), batch.timedKeys[i], ns, batch.timedBytes[i]);
         if (i == batch.batchTiming) {
             // The whole batch: apart from the per-program totals it contains.
             batch.gpuStartNs = static_cast<double>(stamps[i * 2]) * period;
@@ -5310,6 +5337,17 @@ std::uint64_t Recorder::NewestWriteNote(std::uint64_t address, std::size_t bytes
     return newest;
 }
 
+bool Recorder::PendingCpuWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto overlaps = [&](const Batch& batch) {
+        if (std::none_of(batch.writes.begin(), batch.writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; })) return false;
+        if (batch.completions.size() > batch.checkOnlyCompletions + batch.copiedWriterCompletions.size()) return true;
+        return std::any_of(batch.copiedWriterCompletions.begin(), batch.copiedWriterCompletions.end(), [&](const ShaderResources* resources) { return resources->CopiedWritesOverlap(address, bytes); });
+    };
+    if (open != nullptr && overlaps(*open)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return overlaps(*batch); });
+}
+
 std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t address, std::size_t bytes) const {
     std::vector<PendingWrite> found;
     if (bytes == 0) return found;
@@ -5335,6 +5373,7 @@ bool Recorder::ReadTracking() {
 }
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
+    if (bytes) GpuAuthorityCensus::GpuRead(address, address + bytes, 8u + static_cast<std::uint32_t>(kind));
     if (bytes != 0) ArchC::LazyCensus::UsedByGpu(address, address + bytes, kind == ReadKind::GpuCopy ? ArchC::LazyCensus::GpuUse::StagingIn : kind == ReadKind::AddressBased ? ArchC::LazyCensus::GpuUse::AddressRead : ArchC::LazyCensus::GpuUse::Read);
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (kind == ReadKind::AddressBased && bytes != 0) dropCarries(address, address + bytes, "c_gpu_staging_carry_drop_address_read");
@@ -5345,6 +5384,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind, bool mayStore) {
+    if (GpuAuthorityCensus::Enabled()) for (const auto& [begin, end] : ranges) GpuAuthorityCensus::GpuRead(begin, end, 8u + static_cast<std::uint32_t>(kind));
     ArchC::LazyCensus::UsedByGpu(ranges, kind == ReadKind::GpuCopy ? ArchC::LazyCensus::GpuUse::StagingIn : kind == ReadKind::AddressBased ? ArchC::LazyCensus::GpuUse::AddressRead : ArchC::LazyCensus::GpuUse::Read);
     if (kind == ReadKind::AddressBased && mayStore) {
         for (const auto& [begin, end] : ranges) dropCarries(begin, end, "c_gpu_staging_carry_drop_address_read");
@@ -5367,6 +5407,7 @@ bool Recorder::ValidReadList(const ReadList& ranges) {
 }
 
 void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind, bool mayStore) {
+    if (GpuAuthorityCensus::Enabled() && ranges) for (const auto& [begin, end] : *ranges) GpuAuthorityCensus::GpuRead(begin, end, 8u + static_cast<std::uint32_t>(kind));
     if (ranges != nullptr) ArchC::LazyCensus::UsedByGpu(*ranges, kind == ReadKind::AddressBased ? ArchC::LazyCensus::GpuUse::AddressRead : ArchC::LazyCensus::GpuUse::Read);
     if (kind == ReadKind::AddressBased && mayStore && ranges != nullptr) dropCarries(*ranges, "c_gpu_staging_carry_drop_address_list");
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;

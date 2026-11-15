@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -69,11 +71,11 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
-std::vector<std::uint32_t> Dispatch() {
+std::vector<std::uint32_t> Dispatch(const std::uint32_t* constantWords = Constants, std::uint32_t* outputWords = Output) {
     const auto codeAddress = reinterpret_cast<std::uintptr_t>(AddressCode.data());
-    const auto constants = reinterpret_cast<std::uintptr_t>(Constants);
+    const auto constants = reinterpret_cast<std::uintptr_t>(constantWords);
     const auto input = reinterpret_cast<std::uintptr_t>(Input);
-    const auto output = BufferDescriptor(Output, BufferBytes);
+    const auto output = BufferDescriptor(outputWords, BufferBytes);
     return {
         0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
         0xc0037600u, 0x207u, Lanes, 1u, 1u,
@@ -109,9 +111,53 @@ void Round(std::uint32_t value, const std::string& what) {
     CheckOutput(value + 1u, what);
 }
 
+void AllocationRounds(bool reportOnly) {
+    check(AgcDriver::ArchB::Switches::Enabled(AgcDriver::ArchB::Feature::FixHostSlabAlloc), "dispatch worker allocation scopes are disabled");
+    constexpr std::size_t Calls = 8;
+    constexpr std::size_t Rounds = 12;
+    constexpr std::size_t Warm = 4;
+    auto& counters = AgcDriver::HostAllocator::GetCounters();
+    std::uint64_t served = 0;
+    std::uint64_t exhausted = 0;
+    for (std::size_t round = 0; round < Warm + Rounds; ++round) {
+        std::vector<std::uint32_t> commands;
+        for (std::size_t call = 0; call < Calls; ++call) {
+            const auto slot = (call + round) % Calls;
+            auto* constants = Constants + slot * 64;
+            auto* output = Output + call * 64;
+            for (std::size_t lane = 0; lane < Lanes; ++lane) {
+                constants[lane] = static_cast<std::uint32_t>(0x1000 + round * Calls + call);
+                output[lane] = Unwritten;
+            }
+            const auto words = Dispatch(constants, output);
+            commands.insert(commands.end(), words.begin(), words.end());
+        }
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Constants), Calls * 256);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        const auto before = counters.served.load();
+        const auto fallback = counters.fallbackExhausted.load();
+        {
+            const AgcDriver::HostAllocator::Scope scope(true);
+            check(sceAgcDriverSubmitAcb(ComputeQueue, &packet) == 0, "allocation batch submission failed");
+            AgcDriverWaitIdle_nid_postfix();
+        }
+        if (round >= Warm) {
+            served += counters.served.load() - before;
+            exhausted += counters.fallbackExhausted.load() - fallback;
+        }
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Output), Calls * 256);
+        for (std::size_t call = 0; call < Calls; ++call) {
+            for (std::size_t lane = 0; lane < Lanes; ++lane) check(Output[call * 64 + lane] == 0x1001 + round * Calls + call, "an allocation batch retained another dispatch's constants or output binding");
+        }
+    }
+    std::printf("dispatch allocations: calls=%zu served=%llu per_call=%.3f exhausted=%llu\n", Calls * Rounds, static_cast<unsigned long long>(served), static_cast<double>(served) / (Calls * Rounds), static_cast<unsigned long long>(exhausted));
+    check(served > 0 && exhausted == 0, "the dispatch slab measurement was disabled or exhausted");
+    if (!reportOnly) check(served <= Calls * Rounds * 108, "repeated dispatch allocation bound exceeded");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         {
             const auto probe = OpenVulkanTestDevice();
@@ -130,6 +176,11 @@ int main() {
         Input = NewBlock();
         Output = NewBlock();
 
+        if (argc == 2 && std::string(argv[1]).starts_with("--allocations")) {
+            AllocationRounds(std::string(argv[1]) == "--allocations-report");
+            LibcRunShutdown_nid_postfix();
+            return 0;
+        }
         Round(0x11112222u, "the first dispatch");
         const std::array<std::uint32_t, 4> values{0x33334444u, 0x55556666u, 0x7a7b7c7du, 0x0f1e2d3cu};
         for (std::size_t round = 0; round < values.size(); ++round) {

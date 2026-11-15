@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Graphics/include/ResourceProofWork.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuAuthorityCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -1331,6 +1333,7 @@ public:
     std::shared_ptr<StorageTexture> StoreDepthPlane(const GuestTextureResource& resource, std::vector<bool>& units) {
         ApplyFastClear();
         auto mirror = Mirror(resource);
+        const GpuAuthorityCensus::ProducerScope censusProducer(GpuAuthorityCensus::ProducerFor(target.address, target.address + mirror->GuestBytes()));
         auto& counters = depthPlaneStoreCounters();
         ++counters.stores;
         const auto planeBytes = mirror->GuestBytes();
@@ -1373,6 +1376,7 @@ public:
     }
 
     void MarkAllStale(std::uint64_t planeBytes) {
+        GpuAuthorityCensus::Produced(target.address, target.address + planeBytes, target.address);
         SizeUnits(planeBytes);
         staleUnits.assign(staleUnits.size(), true);
         staleCount = staleUnits.size();
@@ -1898,6 +1902,7 @@ private:
             const auto texels = storage->AtomicView(0, storage->Descriptor().dimension == TextureDimension::k2DArray);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             depthToStoragePassFor(context).Record(commands, depthTransferView(), texels, areas);
+            if (toStorage) ResourceProofWork::Note(ResourceProofWork::Kind::DepthFlush, moved);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
             depthTransferPassCount.fetch_add(1, std::memory_order_relaxed);
             if (batch) {
@@ -1922,6 +1927,7 @@ private:
             }
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
             context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, destinationImage, VK_IMAGE_LAYOUT_GENERAL, count, copies.data());
+            if (toStorage) ResourceProofWork::Note(ResourceProofWork::Kind::DepthFlush, moved);
             directDepthCopies.fetch_add(1, std::memory_order_relaxed);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
             if (batch) {
@@ -1936,6 +1942,7 @@ private:
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, sourceImage, VK_IMAGE_LAYOUT_GENERAL, plane.staging->Handle(), count, toStorage ? planeRegions.data() : colorRegions.data());
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, plane.staging->Handle(), destinationImage, VK_IMAGE_LAYOUT_GENERAL, count, toStorage ? colorRegions.data() : planeRegions.data());
+        if (toStorage) ResourceProofWork::Note(ResourceProofWork::Kind::DepthFlush, moved);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
         if (batch) {
             batch->SubmitAndWait();
@@ -2257,6 +2264,7 @@ public:
                 const VkImageSubresourceLayers colorLayers{VK_IMAGE_ASPECT_COLOR_BIT, 0, slice.layer, 1};
                 const VkImageCopy copy{toStorage ? depthLayers : colorLayers, {0, 0, 0}, toStorage ? colorLayers : depthLayers, {0, 0, 0}, {extent.width, extent.height, 1}};
                 context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, toStorage ? slice.surface->image : storage->Image(), VK_IMAGE_LAYOUT_GENERAL, toStorage ? storage->Image() : slice.surface->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+                if (toStorage) ResourceProofWork::Note(ResourceProofWork::Kind::DepthFlush, sliceBytes());
                 directDepthCopies.fetch_add(1, std::memory_order_relaxed);
             }
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -2279,6 +2287,7 @@ public:
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         if (toStorage) {
             copyToImage(commands, staging->Handle(), storage->Image(), VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(storageRegions.size()), storageRegions.data());
+            ResourceProofWork::Note(ResourceProofWork::Kind::DepthFlush, sliceBytes() * slices.size(), slices.size());
         } else {
             for (const auto& slice : slices) {
                 const auto copy = region(slice.layer, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
@@ -2605,6 +2614,7 @@ void DepthSurface::PublishToGuest() {
             const auto offset = static_cast<std::size_t>(part.address - publication[index].range.address);
             const auto lost = GuestMemory::WriteChangedIfHeld(part.address, std::span<const std::byte>(result[index]).subspan(offset, part.bytes), std::span<const std::byte>(current[index]).subspan(offset, part.bytes), (seen++)->generation);
             Require(lost == 0u, "guest writes raced native multisample depth publication");
+            GpuAuthorityCensus::Published(part.address, part.address + part.bytes, GpuAuthorityCensus::Kind::DepthPlane);
         }
         if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::PlaneCommitted);
     }
@@ -2777,13 +2787,17 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     return true;
 }
 
-VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target, bool* unchanged = nullptr) {
+VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target, bool* unchanged = nullptr, bool* idle = nullptr) {
     if (target.htileAddress == 0) {
         if (unchanged != nullptr) *unchanged = true;
+        if (idle != nullptr) *idle = true;
         return 0;
     }
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) {
+        if (unchanged != nullptr) AgcDriver::ArchB::Recorder::Count("depth_htile_inaccessible");
+        return 0;
+    }
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
     auto* recorder = RecorderFor(context);
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
@@ -2793,13 +2807,19 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
         const auto found = htileReads().find(target.htileAddress);
         if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) {
             if (unchanged != nullptr) *unchanged = true;
+            if (idle != nullptr) *idle = true;
             return 0;
         }
         if (untracked) {
             const auto scanned = untrackedHtileScans().find(target.htileAddress);
-            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) return 0;
+            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) {
+                if (unchanged != nullptr) AgcDriver::ArchB::Recorder::Count("depth_htile_untracked_scan_held");
+                if (idle != nullptr) *idle = true;
+                return 0;
+            }
         }
     }
+    if (unchanged != nullptr) AgcDriver::ArchB::Recorder::Count(pending ? "depth_htile_pending" : collected == 0 ? "depth_htile_reread_uncollected" : "depth_htile_reread_changed");
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
     if (pending && pendingFills) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -2808,6 +2828,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
+                if (idle != nullptr) *idle = true;
                 return 0;
             }
             if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
@@ -3330,27 +3351,43 @@ bool ownsPlanes(const DepthSurface& surface) {
 // The repeat, or VK_NULL_HANDLE for the full call (`verifying` set when VERIFY asks the full call to check it).
 VkImageView repeatDepthView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilWritten, bool& verifying) {
     verifying = false;
-    if (!depthRepeat.valid || !depthRepeatActive()) return VK_NULL_HANDLE;
+    if (!depthRepeatActive()) return VK_NULL_HANDLE;
+    if (!depthRepeat.valid) {
+        AgcDriver::ArchB::Recorder::Count("depth_repeat_miss_no_token");
+        return VK_NULL_HANDLE;
+    }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
     auto& token = depthRepeat;
     if (!token.valid) return VK_NULL_HANDLE;
     if (surfacesReleased.load(std::memory_order_acquire) != token.released || surfacesSerial.load(std::memory_order_acquire) != token.surfaces || stalePlanesSerial.load(std::memory_order_acquire) != token.stale || mirrorEpoch != token.mirror || htileEvents.load(std::memory_order_acquire) != token.htile) {
+        AgcDriver::ArchB::Recorder::Count(surfacesReleased.load(std::memory_order_acquire) != token.released ? "depth_repeat_miss_serial_released" : surfacesSerial.load(std::memory_order_acquire) != token.surfaces ? "depth_repeat_miss_serial_surfaces" : stalePlanesSerial.load(std::memory_order_acquire) != token.stale ? "depth_repeat_miss_serial_stale" : mirrorEpoch != token.mirror ? "depth_repeat_miss_serial_mirror" : "depth_repeat_miss_serial_htile");
         token.valid = false;
         return VK_NULL_HANDLE;
     }
     auto* surface = token.surface;
-    if (token.depthWritten != depthWritten || surface->context.device != context.device || !sameDepthTarget(token.target, target)) return VK_NULL_HANDLE;
+    if (token.depthWritten != depthWritten || surface->context.device != context.device || !sameDepthTarget(token.target, target)) {
+        AgcDriver::ArchB::Recorder::Count(surface->context.device != context.device || !sameDepthTarget(token.target, target) ? (sameSurface(token.target, target) ? "depth_repeat_miss_target_fields" : "depth_repeat_miss_target_surface") : "depth_repeat_miss_depth_written");
+        return VK_NULL_HANDLE;
+    }
     if (!surface->active->load(std::memory_order_acquire) || surface != drawnDepth || surface->samplingActive || surface->pendingClearAspects() != 0 || (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) || (depthWritten && mirrorable(target) && (surface->staleUnits.empty() || surface->staleCount != surface->staleUnits.size())) || !ownsPlanes(*surface)) {
+        AgcDriver::ArchB::Recorder::Count(surface != drawnDepth ? "depth_repeat_miss_state_other_drawn" : !ownsPlanes(*surface) ? "depth_repeat_miss_state_planes" : surface->pendingClearAspects() != 0 ? "depth_repeat_miss_state_pending_clear" : surface->samplingActive ? "depth_repeat_miss_state_sampling" : mirrorable(target) && surface->scannedEpoch != mirrorEpoch ? "depth_repeat_miss_state_scanned" : "depth_repeat_miss_state_not_all_stale");
         token.valid = false;
         return VK_NULL_HANDLE;
     }
-    if (RoutesToNativeDepthOwner(target) || !surface->StencilStorageSeen()) return VK_NULL_HANDLE;
+    if (RoutesToNativeDepthOwner(target) || !surface->StencilStorageSeen()) {
+        AgcDriver::ArchB::Recorder::Count("depth_repeat_miss_native_or_stencil");
+        return VK_NULL_HANDLE;
+    }
     if (target.htileAddress != 0) {
         auto* recorder = RecorderFor(context);
-        if (recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)))) return VK_NULL_HANDLE;
+        if (recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)))) {
+            AgcDriver::ArchB::Recorder::Count("depth_repeat_miss_htile_pending");
+            return VK_NULL_HANDLE;
+        }
     }
-    if (!ArchC::ImageEpochs::Get().DrainIfNew() || surface->repeatEpoch.load(std::memory_order_acquire) != token.epoch || ArchC::ImageEpochs::Get().Loss() != token.loss) {
+    if (const bool drained = ArchC::ImageEpochs::Get().DrainIfNew(); !drained || surface->repeatEpoch.load(std::memory_order_acquire) != token.epoch || ArchC::ImageEpochs::Get().Loss() != token.loss) {
+        AgcDriver::ArchB::Recorder::Count(!drained ? "depth_repeat_miss_epoch_undrained" : surface->repeatEpoch.load(std::memory_order_acquire) != token.epoch ? "depth_repeat_miss_epoch_moved" : "depth_repeat_miss_epoch_loss");
         token.valid = false;
         return VK_NULL_HANDLE;
     }
@@ -3372,6 +3409,81 @@ VkImageView repeatDepthView(const Context& context, const DepthTarget& target, b
     return surface->view;
 }
 
+struct DepthRun {
+    bool valid = false;
+    DepthSurface* surface = nullptr;
+    DepthTarget target{};
+    bool depthWritten = false;
+    bool htilePending = false;
+    std::uint64_t proof = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t loss = 0;
+    std::uint64_t surfaces = 0;
+    std::uint64_t released = 0;
+    std::uint64_t stale = 0;
+    std::uint64_t mirror = 0;
+    std::uint64_t htile = 0;
+};
+
+DepthRun depthRun;
+
+bool depthRunActive() {
+    return ArchB::Switches::Enabled(ArchB::Feature::DepthRunRepeat) && depthRepeatActive();
+}
+
+bool depthRunVerifyNow() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_ARCHB_DEPTH_RUN_REPEAT_VERIFY");
+        return value == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::strtoull(value, nullptr, 10));
+    }();
+    if (period == 0) return false;
+    static std::atomic<std::uint64_t> uses{0};
+    return (uses.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0;
+}
+
+bool htilePendingFor(const Context& context, const DepthTarget& target) {
+    if (target.htileAddress == 0) return false;
+    auto* recorder = RecorderFor(context);
+    return recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, static_cast<std::size_t>(HtileMetadataBytes(target.extent)));
+}
+
+VkImageView repeatDepthRun(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilWritten, bool& verifying) {
+    verifying = false;
+    if (!depthRun.valid || !depthRunActive() || !GuestMemory::IsCommitterThread()) return VK_NULL_HANDLE;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::unique_lock lock(surfacesMutex());
+    auto& token = depthRun;
+    const auto miss = [&](const char* why, bool drop) {
+        AgcDriver::ArchB::Recorder::Count(why);
+        if (drop) token.valid = false;
+        return VkImageView{VK_NULL_HANDLE};
+    };
+    if (GuestMemory::ProofSerial() != token.proof) return miss("depth_run_miss_proof_serial", true);
+    if (surfacesReleased.load(std::memory_order_acquire) != token.released || surfacesSerial.load(std::memory_order_acquire) != token.surfaces || stalePlanesSerial.load(std::memory_order_acquire) != token.stale || mirrorEpoch != token.mirror || htileEvents.load(std::memory_order_acquire) != token.htile) return miss("depth_run_miss_depth_serials", true);
+    auto* surface = token.surface;
+    if (token.depthWritten != depthWritten || surface->context.device != context.device || !sameDepthTarget(token.target, target)) return miss(token.depthWritten != depthWritten ? "depth_run_miss_depth_written" : "depth_run_miss_target", false);
+    if (!surface->active->load(std::memory_order_acquire) || surface != drawnDepth || surface->samplingActive || surface->pendingClearAspects() != 0 || (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) || (depthWritten && mirrorable(target) && (surface->staleUnits.empty() || surface->staleCount != surface->staleUnits.size())) || !ownsPlanes(*surface)) return miss("depth_run_miss_state", true);
+    if (RoutesToNativeDepthOwner(target) || !surface->StencilStorageSeen()) return miss("depth_run_miss_native_or_stencil", false);
+    if (htilePendingFor(context, target) != token.htilePending) return miss("depth_run_miss_htile_pending_changed", true);
+    if (!ArchC::ImageEpochs::Get().DrainIfNew() || surface->repeatEpoch.load(std::memory_order_acquire) != token.epoch || ArchC::ImageEpochs::Get().Loss() != token.loss) return miss("depth_run_miss_epoch", true);
+    if (depthRunVerifyNow()) {
+        AgcDriver::ArchB::Recorder::Count("depth_run_verify_checks");
+        verifying = true;
+        return VK_NULL_HANDLE;
+    }
+    surface->retired = false;
+    surface->clearDepth = target.clearDepth;
+    surface->clearStencil = target.clearStencil;
+    depthOwners()[{context.device, target.address}] = {surface, ++planeBinds};
+    if (target.stencilAddress != 0) stencilOwners()[{context.device, target.stencilAddress}] = {surface, ++planeBinds};
+    surface->written = ++depthWrites;
+    if (depthWritten && mirrorable(target)) surface->NoteDepthWork();
+    if (stencilWritten) surface->MarkStencilStale();
+    drawnDepth = surface;
+    AgcDriver::ArchB::Recorder::Count("depth_run_hits");
+    return surface->view;
+}
+
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
@@ -3385,10 +3497,16 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
     bool repeatVerifying = false;
     if (const auto repeated = repeatDepthView(context, target, depthWritten, stencilWritten, repeatVerifying); repeated != VK_NULL_HANDLE) return repeated;
+    bool runVerifying = false;
+    if (!repeatVerifying) {
+        if (const auto repeated = repeatDepthRun(context, target, depthWritten, stencilWritten, runVerifying); repeated != VK_NULL_HANDLE) return repeated;
+    }
+    const bool runCandidate = depthRunActive() && target.samples == 1u && GuestMemory::IsCommitterThread();
+    bool htileIdle = false;
     // C_REPLAY_DEPTH_EPOCH: what this call did (a token is made only when it did nothing a repeat skips).
     const bool repeatCandidate = depthRepeatActive() && target.samples == 1u;
     bool htileUnchanged = false;
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target, &htileUnchanged);
+    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target, &htileUnchanged, &htileIdle);
     ArchC::ProbeAt(ArchC::Probe::DvHtile);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
@@ -3453,6 +3571,8 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     // C_REPLAY_DEPTH_EPOCH: the surface's epoch before the call's work (registered on its first candidate call).
     bool repeatQuiet = repeatCandidate && !created && htileUnchanged && htileCleared == 0 && !cleared && !surface->samplingActive && surface->pendingClearAspects() == 0 && surface == drawnDepth && ownsPlanes(*surface) && surface->StencilStorageSeen() && (!mirrorable(target) || surface->scannedEpoch == mirrorEpoch) && (!depthWritten || !mirrorable(target) || (!surface->staleUnits.empty() && surface->staleCount == surface->staleUnits.size()));
+    bool runQuiet = runCandidate && !created && !RoutesToNativeDepthOwner(target) && htileIdle && htileCleared == 0 && !cleared && surface->repeatRegistered && !surface->samplingActive && surface->pendingClearAspects() == 0 && surface == drawnDepth && ownsPlanes(*surface) && surface->StencilStorageSeen() && (!mirrorable(target) || surface->scannedEpoch == mirrorEpoch) && (!depthWritten || !mirrorable(target) || (!surface->staleUnits.empty() && surface->staleCount == surface->staleUnits.size()));
+    const auto runStaleBefore = stalePlanesSerial.load(std::memory_order_acquire);
     std::uint64_t repeatEpochBefore = 0;
     std::uint64_t repeatLossBefore = 0;
     std::uint64_t repeatStaleBefore = 0;
@@ -3463,6 +3583,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         surface->repeatRegistered = true;
         repeatQuiet = false;
     }
+    if (repeatCandidate && !repeatQuiet) AgcDriver::ArchB::Recorder::Count(created ? "depth_repeat_unquiet_created" : !htileUnchanged ? "depth_repeat_unquiet_htile_changed" : htileCleared != 0 ? "depth_repeat_unquiet_htile_cleared" : cleared ? "depth_repeat_unquiet_cleared" : surface->samplingActive ? "depth_repeat_unquiet_sampling" : surface->pendingClearAspects() != 0 ? "depth_repeat_unquiet_pending_clear" : surface != drawnDepth ? "depth_repeat_unquiet_other_drawn" : !ownsPlanes(*surface) ? "depth_repeat_unquiet_planes" : !surface->StencilStorageSeen() ? "depth_repeat_unquiet_stencil_storage" : mirrorable(target) && surface->scannedEpoch != mirrorEpoch ? "depth_repeat_unquiet_scanned" : depthWritten && mirrorable(target) && (surface->staleUnits.empty() || surface->staleCount != surface->staleUnits.size()) ? "depth_repeat_unquiet_not_all_stale" : "depth_repeat_unquiet_just_registered");
     if (repeatQuiet) {
         repeatDrained = ArchC::ImageEpochs::Get().DrainIfNew();
         repeatEpochBefore = surface->repeatEpoch.load(std::memory_order_acquire);
@@ -3485,8 +3606,10 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     if (!created) surface->NoteHtileClear(htileCleared);
     ArchC::ProbeAt(ArchC::Probe::DvPlanes);
-    if (mirrorable(target) && surface->SyncFromMemory(mirrorResource(target))) repeatQuiet = false;
-    if (surface->StencilMirrorable() && surface->SyncStencilFromMemory(stencilResource(target))) repeatQuiet = false;
+    const bool quietBeforeSync = repeatQuiet;
+    if (mirrorable(target) && surface->SyncFromMemory(mirrorResource(target))) repeatQuiet = runQuiet = false;
+    if (surface->StencilMirrorable() && surface->SyncStencilFromMemory(stencilResource(target))) repeatQuiet = runQuiet = false;
+    if (quietBeforeSync && !repeatQuiet) AgcDriver::ArchB::Recorder::Count("depth_repeat_unquiet_synced");
     surface->TakeStencilStorage();
     ArchC::ProbeAt(ArchC::Probe::DvSync);
     surface->ApplyFastClear();
@@ -3521,17 +3644,40 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
             // Arch C's token rule: every page armed, so a later store faults (and bumps the epoch) at once.
             const auto clock = GuestArena::GuestWtFaultClock_nid_no_patch();
             bool armed = true;
+            std::size_t rangeIndex = 0;
             for (const auto& range : depthRepeatRanges(*surface)) {
-                if (range.end > range.begin && GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(range.begin), static_cast<std::size_t>(range.end - range.begin), clock) != GuestArena::WtFaultAnswer::Unchanged) armed = false;
+                const auto answer = range.end > range.begin ? GuestArena::GuestWtFaultChangedSince_nid_no_patch(static_cast<std::uintptr_t>(range.begin), static_cast<std::size_t>(range.end - range.begin), clock) : GuestArena::WtFaultAnswer::Unchanged;
+                if (answer != GuestArena::WtFaultAnswer::Unchanged) {
+                    armed = false;
+                    static constexpr const char* names[3][2] = {{"depth_repeat_unarmed_depth_changed", "depth_repeat_unarmed_depth_untracked"}, {"depth_repeat_unarmed_stencil_changed", "depth_repeat_unarmed_stencil_untracked"}, {"depth_repeat_unarmed_htile_changed", "depth_repeat_unarmed_htile_untracked"}};
+                    AgcDriver::ArchB::Recorder::Count(names[rangeIndex][answer == GuestArena::WtFaultAnswer::Untracked ? 1 : 0]);
+                }
+                ++rangeIndex;
             }
+            if (!armed) AgcDriver::ArchB::Recorder::Count("depth_repeat_unmade_unarmed");
             if (armed) {
                 depthRepeat = {true, surface, target, depthWritten, repeatEpochBefore, repeatLossBefore, surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), repeatStaleBefore, mirrorEpoch, htileEvents.load(std::memory_order_acquire)};
                 depthRepeatCounters().made.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        else if (repeatQuiet) AgcDriver::ArchB::Recorder::Count(!repeatDrained ? "depth_repeat_unmade_undrained" : stalePlanesSerial.load(std::memory_order_acquire) != repeatStaleBefore ? "depth_repeat_unmade_stale_moved" : surface->repeatEpoch.load(std::memory_order_acquire) != repeatEpochBefore ? "depth_repeat_unmade_epoch_moved" : "depth_repeat_unmade_late_drain_or_loss");
         if (repeatVerifying && !depthRepeat.valid) {
             const auto previous = depthRepeatCounters().verifyMismatches.fetch_add(1, std::memory_order_relaxed);
             if (previous < 8) std::fprintf(stderr, "[archc] depth epoch VERIFY mismatch: the full depth view did work where the repeat held\n");
+        }
+    }
+    if (runCandidate) {
+        depthRun.valid = false;
+        if (runQuiet && stalePlanesSerial.load(std::memory_order_acquire) == runStaleBefore && ArchC::ImageEpochs::Get().DrainIfNew()) {
+            depthRun = {true, surface, target, depthWritten, htilePendingFor(context, target), GuestMemory::ProofSerial(), surface->repeatEpoch.load(std::memory_order_acquire), ArchC::ImageEpochs::Get().Loss(), surfacesSerial.load(std::memory_order_acquire), surfacesReleased.load(std::memory_order_acquire), runStaleBefore, mirrorEpoch, htileEvents.load(std::memory_order_acquire)};
+            AgcDriver::ArchB::Recorder::Count("depth_run_made");
+        } else {
+            AgcDriver::ArchB::Recorder::Count(!runQuiet ? "depth_run_unmade_not_quiet" : "depth_run_unmade_stale_or_drain");
+        }
+        if (runVerifying && !depthRun.valid) {
+            AgcDriver::ArchB::Recorder::Count("depth_run_verify_mismatches");
+            static std::atomic<unsigned> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[depth-run] VERIFY mismatch: the full depth view did work where the run repeat held\n");
         }
     }
     ArchC::ProbeAt(ArchC::Probe::DvStale);
@@ -3683,9 +3829,21 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
         // per store: a deferral left unresolved at its end is covered afterwards by the write-back's
         // own pending write, which is later than the writer.
         const Recorder::LazyFenceScope lazyFence(Recorder::LazyFenceScope::Kind::Depth);
-        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store");
+        const std::lock_guard gpu(GuestMemory::GpuMutex());
+        const auto storeScope = PlaneStoreScope("depth plane store");
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "depth plane store", storeScope);
+        if (entry.flushed) ResourceProofWork::Note(ResourceProofWork::Kind::DepthStore, entry.end - entry.begin);
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::PlaneRetiled);
+        SettlePlaneStore("depth plane store", entry.begin, entry.end, storeScope);
     }
-    for (auto& entry : storedStencils) entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "stencil plane store");
+    for (auto& entry : storedStencils) {
+        const std::lock_guard gpu(GuestMemory::GpuMutex());
+        const auto storeScope = PlaneStoreScope("stencil plane store");
+        entry.flushed = StorageTexture::FlushPending(entry.begin, static_cast<std::size_t>(entry.end - entry.begin), nullptr, "stencil plane store", storeScope);
+        if (entry.flushed) ResourceProofWork::Note(ResourceProofWork::Kind::DepthStore, entry.end - entry.begin);
+        if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::StencilRetiled);
+        SettlePlaneStore("stencil plane store", entry.begin, entry.end, storeScope);
+    }
     const auto generation = GuestMemory::TrackerGeneration();
     std::lock_guard lock(surfacesMutex());
     for (const auto& entry : storedStencils) {

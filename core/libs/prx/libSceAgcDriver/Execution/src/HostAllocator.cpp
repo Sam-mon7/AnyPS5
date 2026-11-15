@@ -399,7 +399,7 @@ void ReportSites() {
     ReleaseSRWLockShared(&sitesLock);
     std::sort(copy.begin(), copy.end(), [](const Site& left, const Site& right) { return left.calls > right.calls; });
     std::fprintf(stderr, "[host-alloc-sites] top allocations\n");
-    for (std::size_t i = 0; i < 36 && copy[i].calls != 0; ++i) {
+    for (std::size_t i = 0; i < 120 && copy[i].calls != 0; ++i) {
         HMODULE module = nullptr;
         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<const char*>(copy[i].address), &module);
         const auto offset = reinterpret_cast<std::uintptr_t>(copy[i].address) - reinterpret_cast<std::uintptr_t>(module);

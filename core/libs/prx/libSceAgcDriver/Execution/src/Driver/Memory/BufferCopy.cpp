@@ -36,7 +36,7 @@ int& LastCopyPathOnThread() {
     return path;
 }
 
-bool Driver::matchesCopyKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+bool Driver::matchesCopyKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool enabled = std::getenv("APS5_NO_COPY_HLE") == nullptr;
     if (!enabled || userData.size() != 12 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1 || !compute.groupIdEnable[0]) return false;
     static constexpr std::size_t copyKernelWords = 38;
@@ -53,7 +53,7 @@ bool Driver::matchesCopyKernel(std::span<const std::uint32_t> code, const std::v
     return userData[3] == 0x00014004u && userData[7] == 0x00014004u && userData[11] == 0x0004dfacu && stride(1) == 4 && stride(5) == 4 && stride(9) == 16 && !swizzled(1) && !swizzled(5) && !swizzled(9) && userData[10] >= 1;
 }
 
-bool MatchesStreamCopyKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+bool MatchesStreamCopyKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool enabled = std::getenv("APS5_NO_COPY_HLE") == nullptr;
     if (!enabled || userData.size() != 8 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1 || !compute.groupIdEnable[0]) return false;
     static constexpr std::array<std::uint32_t, 16> kernel{0xd7460008u, 0x04010e08u, 0x8f6a8708u, 0xd76d0009u, 0x0401806au, 0xe00c2000u, 0x80000008u, 0xe00c2000u, 0x80000409u, 0xbf8c3f71u, 0xe01c2000u, 0x80010008u, 0xbf8c3f70u, 0xe01c2000u, 0x80010409u, 0xbf810000u};
@@ -68,7 +68,7 @@ bool MatchesStreamCopyKernel(std::span<const std::uint32_t> code, const std::vec
     return stride(1) == 16 && stride(5) == 16 && !swizzled(1) && !swizzled(5) && userData[3] == userData[7] && type == 0 && !addTid && outOfBounds == 0 && dstSel == 0xfacu && format == 0x4bu;
 }
 
-std::optional<StreamCopy> StreamCopyRange(const std::vector<std::uint32_t>& userData, std::uint32_t groups) {
+std::optional<StreamCopy> StreamCopyRange(std::span<const std::uint32_t> userData, std::uint32_t groups) {
     const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
     const auto elements = std::min<std::uint64_t>(std::uint64_t{groups} * 128u, userData[6]);
     const StreamCopy copy{base(0), base(4), static_cast<std::size_t>(elements) * 16u};
@@ -76,7 +76,7 @@ std::optional<StreamCopy> StreamCopyRange(const std::vector<std::uint32_t>& user
     return copy;
 }
 
-bool MatchesIndexedCopyKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+bool MatchesIndexedCopyKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool enabled = std::getenv("APS5_NO_COPY_HLE") == nullptr;
     if (!enabled || userData.size() != 12 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1 || !compute.groupIdEnable[0]) return false;
     static constexpr std::array<std::uint32_t, 19> kernel{0xbfa00001u, 0xd7460000u, 0x04010c0cu, 0xf4201a84u, 0xfa000000u, 0xbf8cc07fu, 0x7da8006au, 0xbf88000au, 0xf4241a84u, 0xfa000004u, 0xbf8cc07fu, 0x4a08006bu, 0x4a00006au, 0xe0382000u, 0x80000000u, 0xbf8c3f70u, 0xe0782000u, 0x80010004u, 0xbf810000u};
@@ -89,7 +89,7 @@ bool MatchesIndexedCopyKernel(std::span<const std::uint32_t> code, const std::ve
     return stride(1) == 16 && stride(5) == 16 && stride(9) == 16 && !swizzled(1) && !swizzled(5) && !swizzled(9) && userData[3] == userData[7] && type == 0 && !addTid && outOfBounds == 0 && userData[10] >= 1;
 }
 
-std::optional<StreamCopy> IndexedCopyRange(const std::vector<std::uint32_t>& userData, std::uint32_t groups, std::uint32_t count, std::uint32_t sourceOffset, std::uint32_t destinationOffset) {
+std::optional<StreamCopy> IndexedCopyRange(std::span<const std::uint32_t> userData, std::uint32_t groups, std::uint32_t count, std::uint32_t sourceOffset, std::uint32_t destinationOffset) {
     const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
     const auto elements = std::min<std::uint64_t>(std::uint64_t{groups} * 64u, count);
     if (elements == 0 || std::uint64_t{sourceOffset} + elements > userData[2] || std::uint64_t{destinationOffset} + elements > userData[6]) return std::nullopt;
@@ -98,7 +98,7 @@ std::optional<StreamCopy> IndexedCopyRange(const std::vector<std::uint32_t>& use
     return copy;
 }
 
-std::optional<CopyKernelBounds> CopyKernelRanges(CopyKernelKind kind, const std::vector<std::uint32_t>& userData, std::uint32_t groups) {
+std::optional<CopyKernelBounds> CopyKernelRanges(CopyKernelKind kind, std::span<const std::uint32_t> userData, std::uint32_t groups) {
     const auto base = [&](std::size_t word) { return userData[word] | (static_cast<std::uint64_t>(userData[word + 1] & 0xffffu) << 32u); };
     if (groups == 0) return std::nullopt;
     CopyKernelBounds bounds;
@@ -190,7 +190,7 @@ bool Driver::knownValueVerify() {
     return verify;
 }
 
-bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
+bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
     const bool hashed = matchesCopyKernel(code, userData, compute);
     const bool indexed = !hashed && MatchesIndexedCopyKernel(code, userData, compute);
     const bool stream = !hashed && !indexed;
@@ -305,7 +305,7 @@ bool Driver::copyKernelRange(std::uint32_t queueId, std::uint64_t source, std::u
     return true;
 }
 
-bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
+bool Driver::enqueueCopyKernel(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
     if (queueId != 0 || localDevice == nullptr || !DrawPipeline::Active() || !DrawPipeline::DispatchItems() || !ArchB::Switches::Enabled(ArchB::Feature::PipeCopyKernelItems)) return false;
     const bool counted = matchesCopyKernel(code, userData, compute);
     const bool stream = !counted && MatchesStreamCopyKernel(code, userData, compute);

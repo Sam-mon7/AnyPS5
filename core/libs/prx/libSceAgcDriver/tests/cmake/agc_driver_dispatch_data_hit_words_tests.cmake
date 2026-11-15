@@ -1,0 +1,5 @@
+if(BUILD_TESTING AND WIN32)
+    add_test(NAME agc_driver_dispatch_allocation_bound COMMAND agc_driver_dispatch_data_hit_words_tests --allocations)
+    set_tests_properties(agc_driver_dispatch_allocation_bound PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "VUID-;was not found but was requested by env var VK_INSTANCE_LAYERS" ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_ARCHB_FIX_HOST_SLAB_ALLOC=1;APS5_ARCHB_GATE_RUN=1")
+    set_tests_properties(agc_driver_dispatch_allocation_bound PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+endif()

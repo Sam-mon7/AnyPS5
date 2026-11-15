@@ -135,6 +135,14 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     constexpr std::uint64_t Slack = 64 * 1024;
     constexpr std::pair<std::uint64_t, std::uint64_t> Unbounded{0, std::numeric_limits<std::uint64_t>::max()};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::size_t capacity = 0;
+    const auto countColor = [&](const Graphics::ColorTarget& color) {
+        capacity += (color.address != 0) + (color.dccAddress != 0) + (color.cmaskAddress != 0);
+    };
+    if (graphics.hasColorTarget) countColor(graphics.color);
+    for (const auto& color : graphics.colors) countColor(color);
+    if (graphics.depth) capacity += (graphics.depth->address != 0) + (graphics.depth->stencilAddress != 0) + (graphics.depth->htileAddress != 0);
+    ranges.reserve(capacity);
     bool bounded = true;
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin == 0) return;
@@ -214,8 +222,18 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(con
     return DrawWriteRanges(graphics, stages, ExactDrawWrites(), narrow, slicedDepth);
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages) {
+std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::size_t extra) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::size_t capacity = extra + (draw.indexed && draw.indexSize != 0 && draw.indexCount != 0);
+    if (draw.indirect) capacity += 1 + draw.indirect->countIndirect;
+    for (const auto& stage : stages) {
+        if (stage.program == nullptr) continue;
+        for (const auto& binding : stage.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() >= static_cast<std::size_t>(binding.count) * 4u) capacity += binding.count;
+        }
+    }
+    if (!stages.empty() && stages.front().program != nullptr) capacity += stages.front().program->vertexAttributes.size();
+    ranges.reserve(capacity);
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - begin) return;
         ranges.emplace_back(begin, begin + bytes);
