@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Translation/EmbeddedVertexFetch.hpp"
@@ -19,6 +22,12 @@
 #include <span>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -214,8 +223,8 @@ std::array<std::uint32_t, 4> SlotDescriptor(const void* data, std::uint32_t reco
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), records, 0x01014facu};
 }
 
-std::array<std::uint32_t, 4> OutputDescriptor() {
-    const auto address = reinterpret_cast<std::uintptr_t>(Output.data());
+std::array<std::uint32_t, 4> OutputDescriptor(const std::uint32_t* output) {
+    const auto address = reinterpret_cast<std::uintptr_t>(output);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(Output)), 0x31016facu};
 }
 
@@ -228,7 +237,7 @@ struct Expected {
 
 class Fixture {
 public:
-    explicit Fixture(std::shared_ptr<AgcDriver::VulkanDevice> device) : device(std::move(device)) {
+    explicit Fixture(std::shared_ptr<AgcDriver::VulkanDevice> device, bool writableSync = false) : device(std::move(device)), writableSync(writableSync) {
         const auto vertex = SlotDescriptor(VertexSlots.data(), static_cast<std::uint32_t>(VertexSlots.size()));
         const auto instance = SlotDescriptor(InstanceSlots.data(), static_cast<std::uint32_t>(InstanceSlots.size()));
         std::copy(vertex.begin(), vertex.end(), BufferTable.begin());
@@ -236,12 +245,36 @@ public:
         records = static_cast<std::uint32_t*>(::operator new(RecordBytes, std::align_val_t{65536}));
         GuestAllocations::Mutation mutation;
         mutation.Add(records, RecordBytes, true, true, true);
+#ifdef _WIN32
+        if (writableSync) {
+            sharedOutput = GuestArena::GuestArenaAllocate_nid_postfix(RecordBytes, RecordBytes);
+            Require(sharedOutput != nullptr, "cannot allocate synchronous draw output");
+            outputSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, RecordBytes, nullptr);
+            Require(outputSection != nullptr, "cannot create synchronous draw output section");
+            GuestArena::GuestArenaMap_nid_postfix(sharedOutput, RecordBytes, outputSection, 0, PAGE_READWRITE);
+            std::memset(sharedOutput, 0, RecordBytes);
+            mutation.Add(sharedOutput, RecordBytes, true, true, true);
+            output = {static_cast<std::uint32_t*>(sharedOutput), Output.size()};
+        }
+#endif
+    }
+
+    ~Fixture() {
+#ifdef _WIN32
+        if (sharedOutput != nullptr) {
+            device->WaitIdle();
+            GuestAllocations::Mutation().Remove(sharedOutput);
+            GuestArena::GuestArenaReset_nid_postfix(sharedOutput, RecordBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(sharedOutput, RecordBytes);
+            CloseHandle(outputSection);
+        }
+#endif
     }
 
     std::vector<std::uint32_t> UserData(std::uint32_t baseVertex, std::uint32_t startInstance) const {
         std::vector<std::uint32_t> userData(10, 0u);
-        const auto output = OutputDescriptor();
-        std::copy(output.begin(), output.end(), userData.begin());
+        const auto descriptor = OutputDescriptor(output.data());
+        std::copy(descriptor.begin(), descriptor.end(), userData.begin());
         const auto table = reinterpret_cast<std::uintptr_t>(BufferTable.data());
         userData[4] = static_cast<std::uint32_t>(table);
         userData[5] = static_cast<std::uint32_t>(table >> 32u);
@@ -303,9 +336,9 @@ public:
         pixelRequest.useCache = false;
         const auto pixel = ShaderRecompiler::Recompile(pixelRequest);
         const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderStage::Vertex, &vertex, 0u}, {ShaderStage::Fragment, &pixel, PixelPushOffset(vertexPush, device->Target())}}};
-        Output.fill(Unwritten);
+        std::fill(output.begin(), output.end(), Unwritten);
         device->Draw(State(), draw, shaders);
-        device->WaitIdle();
+        if (!writableSync) device->WaitIdle();
     }
 
     void Place(std::uint32_t firstVertexFetch, std::span<const std::uint32_t> fetchedVertices, std::uint32_t firstInstanceFetch) {
@@ -321,7 +354,7 @@ public:
             for (std::uint32_t vertex = 0; vertex < Vertices; ++vertex) {
                 const auto slot = instance * Vertices + vertex;
                 const Expected expected{rawVertices[vertex], instance, rawVertices[vertex] + baseVertex, instance + startInstance};
-                const auto* actual = Output.data() + slot * 4u;
+                const auto* actual = output.data() + slot * 4u;
                 const bool same = actual[2] == expected.vertexSum && actual[3] == expected.instanceSum && (!checkRaw || (actual[0] == expected.vertex && actual[1] == expected.instance));
                 char line[320];
                 if (checkRaw) std::snprintf(line, sizeof(line), "%s, vertex %u instance %u: v5 %u v8 %u, after the fetch adds %u %u; expected %u %u, %u %u\n", what.c_str(), vertex, instance, actual[0], actual[1], actual[2], actual[3], expected.vertex, expected.instance, expected.vertexSum, expected.instanceSum);
@@ -337,11 +370,19 @@ public:
         return records;
     }
 
+    std::uint64_t OutputAddress() const { return reinterpret_cast<std::uintptr_t>(output.data()); }
+
     std::shared_ptr<AgcDriver::VulkanDevice> device;
 
 private:
     static constexpr std::size_t RecordBytes = 65536;
     std::uint32_t* records = nullptr;
+    bool writableSync;
+    std::span<std::uint32_t> output{Output};
+#ifdef _WIN32
+    void* sharedOutput = nullptr;
+    HANDLE outputSection = nullptr;
+#endif
 };
 
 AgcDriver::DriverDetail::DrawProgram Program(const std::vector<std::uint32_t>& userData, std::span<const std::uint32_t> code = {}) {
@@ -540,14 +581,47 @@ std::string ExtendedFold(Fixture& fixture) {
     return failures;
 }
 
+std::string WritableSync(Fixture& fixture) {
+#ifdef _WIN32
+    using namespace AgcDriver::Graphics;
+    Require(std::getenv("APS5_SYNC_DRAWS") != nullptr, "writable synchronous draw test requires APS5_SYNC_DRAWS");
+    const auto before = VramWritableCounters();
+    const auto descriptorsBefore = VramDescriptorCounters();
+    constexpr std::uint32_t baseVertex = 1000;
+    constexpr std::uint32_t startInstance = 40;
+    const std::array<std::uint32_t, Vertices> indices{0, 1, 2};
+    const auto userData = fixture.UserData(baseVertex, startInstance);
+    const auto vertex = fixture.Vertex(VertexCode, userData);
+    const auto draw = FoldedDraw(vertex, userData, {0, Vertices, 0, Instances, 0, false, 0, 0});
+    fixture.Place(baseVertex, indices, startInstance);
+    fixture.Draw(vertex, draw);
+    const auto failures = fixture.Check("synchronous writable draw before WaitIdle", indices, baseVertex, startInstance, true);
+    Require(!GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(fixture.OutputAddress(), sizeof(Output)), "synchronous draw returned with protected output");
+    const auto after = VramWritableCounters();
+    if (VramWritable()) {
+        Require(VramDescriptorCounters().mirrorRegions > descriptorsBefore.mirrorRegions, "synchronous draw did not bind its shared output mirror");
+        Require(after.pagesWritten > before.pagesWritten && after.readbackBytes > before.readbackBytes, "synchronous draw did not publish its mirrored writes");
+        Require(!HasVramMirrorWriters() && after.pendingPages == 0, "synchronous draw left a pending mirror writer");
+    } else Require(after.pagesWritten == before.pagesWritten && after.readbackBytes == before.readbackBytes, "disabled writable draw entered mirror publication");
+    fixture.device->WaitIdle();
+    return failures;
+#else
+    return {};
+#endif
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
+        const bool writableSync = argc == 2 && std::strcmp(argv[1], "--vram-writable-sync") == 0;
+#ifndef _WIN32
+        if (writableSync) return VulkanTestSkipped;
+#endif
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Fixture fixture(device);
-        const auto failures = Run(fixture) + ExtendedFold(fixture);
+        Fixture fixture(device, writableSync);
+        const auto failures = writableSync ? WritableSync(fixture) : Run(fixture) + ExtendedFold(fixture);
         if (!failures.empty()) {
             std::cerr << "vertex and instance indices differ from the guest's:\n" << failures;
             return 1;

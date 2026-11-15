@@ -15,6 +15,12 @@ struct VramReport {
     VkDeviceSize budget = 0;
     VkDeviceSize usage = 0;
     VkDeviceSize target = 0;
+    std::uint64_t sampleId = 0;
+};
+
+struct VramPressure {
+    std::uint64_t age = 0;
+    std::size_t victims = 0;
 };
 
 class VramBudget {
@@ -24,11 +30,14 @@ public:
     VramBudget& operator=(const VramBudget&) = delete;
     static VkDeviceSize HeadroomFor(VkDeviceSize size);
     static VkDeviceSize TargetFor(VkDeviceSize size, VkDeviceSize available, VkDeviceSize reserve);
+    static VramPressure PressureFor(const VramReport& report);
+    static VkDeviceSize RebarAllowance(const VramReport& report, VkDeviceSize live, VkDeviceSize ceiling);
     bool Enabled() const { return heap.has_value(); }
     void Refresh();
     VkDeviceSize Excess();
     void Released(VkDeviceSize bytes);
     VramReport Report() const;
+    VramReport Current();
 
 private:
     VkDeviceSize target() const;
@@ -38,12 +47,13 @@ private:
     VkDeviceSize heapBytes = 0;
     VkDeviceSize limit = 0;
     VkDeviceSize headroom = 0;
-    std::mutex refreshMutex;
+    mutable std::mutex refreshMutex;
     bool announced = false;
     std::atomic<std::int64_t> readAt{0};
     std::atomic<VkDeviceSize> budget{0};
     std::atomic<VkDeviceSize> usage{0};
     std::atomic<VkDeviceSize> released{0};
+    std::uint64_t sampleId = 0;
 };
 
 }

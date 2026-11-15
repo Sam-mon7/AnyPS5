@@ -1381,6 +1381,9 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+target_sources(agc_driver_sampled_cache_budget_tests PRIVATE ${agcSampleLodShaderHeader})
+target_include_directories(agc_driver_sampled_cache_budget_tests PRIVATE ${agcTestShaderGeneratedRoot})
+
 target_include_directories(agc_driver_draw_offset_indices_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Translation/include)
@@ -2471,6 +2474,33 @@ if(BUILD_TESTING AND WIN32)
         ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_RESIDENT_HEAP_MIRRORS=0"
         ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_WRITABLE=unset:;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
     set_property(TEST agc_vram_descriptors_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
+    foreach(vramWritableMode IN ITEMS off on)
+        add_test(NAME agc_vram_writable_${vramWritableMode} COMMAND agc_driver_recorder_tests --vram-writable-only)
+        add_test(NAME agc_vram_writable_label_${vramWritableMode} COMMAND agc_driver_vram_writable_label_tests)
+        add_test(NAME agc_vram_writable_draw_${vramWritableMode} COMMAND agc_driver_draw_offset_indices_tests --vram-writable-sync)
+        add_test(NAME agc_vram_writable_copy_${vramWritableMode} COMMAND agc_driver_copied_writer_copy_tests --vram-writable-copy)
+        set_tests_properties(agc_vram_writable_${vramWritableMode} agc_vram_writable_label_${vramWritableMode} agc_vram_writable_draw_${vramWritableMode} agc_vram_writable_copy_${vramWritableMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30
+            ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=0;APS5_RESIDENT_HEAP_MIRRORS=0"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+        set_property(TEST agc_vram_writable_draw_${vramWritableMode} APPEND PROPERTY ENVIRONMENT "APS5_SYNC_DRAWS=1")
+    endforeach()
+    set_property(TEST agc_vram_writable_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_WRITABLE=set:1")
+    set_property(TEST agc_vram_writable_label_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_WRITABLE=set:1")
+    set_property(TEST agc_vram_writable_draw_on agc_vram_writable_copy_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_WRITABLE=set:1")
+    add_test(NAME agc_vram_writable_recorder COMMAND agc_driver_recorder_tests --vram-writable-recorder-only)
+    add_test(NAME agc_vram_writable_descriptors COMMAND agc_driver_recorder_tests --vram-descriptors-only)
+    add_test(NAME agc_vram_writable_heap COMMAND agc_driver_recorder_tests --resident-heap-only)
+    add_test(NAME agc_vram_writable_heap_fallback COMMAND agc_driver_recorder_tests --resident-heap-only)
+    add_test(NAME agc_vram_writable_bda_device COMMAND agc_driver_bda_device_tests)
+    add_test(NAME agc_vram_writable_graphics COMMAND agc_driver_graphics_tests --vram-writable-bda)
+    add_test(NAME agc_vram_writable_storage_refresh COMMAND agc_driver_recorder_tests --storage-refresh-only)
+    add_test(NAME agc_vram_writable_write_tracking COMMAND agc_write_tracking_tests)
+    add_test(NAME agc_vram_writable_copied_writer_copy COMMAND agc_driver_copied_writer_copy_tests --vram-writable-copy)
+    set_tests_properties(agc_vram_writable_recorder agc_vram_writable_descriptors agc_vram_writable_heap agc_vram_writable_heap_fallback agc_vram_writable_bda_device agc_vram_writable_graphics agc_vram_writable_storage_refresh agc_vram_writable_write_tracking agc_vram_writable_copied_writer_copy
+        PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_RESIDENT_HEAP_MIRRORS=0"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_DEFERRED=unset:;APS5_VRAM_CLEANUP=unset:;APS5_VRAM_TEXTURES=unset:;APS5_TEXTURE_AGE_EVICTION=unset:")
+    set_property(TEST agc_vram_writable_heap_fallback APPEND PROPERTY ENVIRONMENT "APS5_REBAR_MIB=0")
 endif()
 
 add_test_executable(agc_vram_options_tests EXCLUDE_FROM_ALL tests/VramOptions.cpp)
@@ -2489,6 +2519,20 @@ if(BUILD_TESTING)
     set_property(TEST agc_vram_options_descriptors APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1")
     set_property(TEST agc_vram_options_descriptors_requires_mirrors APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_DESCRIPTORS=set:1")
     set_property(TEST agc_vram_options_descriptors_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_RESIDENT_HEAP_MIRRORS=set:1")
+    add_test(NAME agc_vram_options_writable_requires_descriptors COMMAND agc_vram_options_tests "APS5_VRAM_WRITABLE requires APS5_VRAM_DESCRIPTORS=1")
+    set_tests_properties(agc_vram_options_writable_requires_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
+        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=unset:;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+    if(WIN32)
+        add_test(NAME agc_vram_options_writable COMMAND agc_vram_options_tests)
+        add_test(NAME agc_vram_options_writable_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
+        set_tests_properties(agc_vram_options_writable agc_vram_options_writable_resident_conflict PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+        set_property(TEST agc_vram_options_writable_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
+    else()
+        add_test(NAME agc_vram_options_writable_unsupported COMMAND agc_vram_options_tests "APS5_VRAM_WRITABLE requires Windows guest page protection support")
+        set_tests_properties(agc_vram_options_writable_unsupported PROPERTIES ENVIRONMENT_MODIFICATION
+            "APS5_VRAM_MIRRORS=set:1;APS5_VRAM_DESCRIPTORS=set:1;APS5_VRAM_WRITABLE=set:1;APS5_VRAM_DEFERRED=unset:;APS5_RESIDENT_HEAP_MIRRORS=unset:")
+    endif()
 endif()
 
 if(BUILD_TESTING)
@@ -2534,5 +2578,56 @@ if(BUILD_TESTING)
             endif()
         endforeach()
         set_property(TEST ${drainTest}_narrow APPEND PROPERTY ENVIRONMENT "APS5_NARROW_PACKET_DRAINS=1")
+    endforeach()
+endif()
+
+
+if(BUILD_TESTING AND WIN32)
+    set(vramTextureTestEnvironment "ANYPS5_REQUIRE_VULKAN=1;ANYPS5_NO_SHADER_CACHE=1;APS5_VRAM_MIRRORS=1;APS5_VRAM_DESCRIPTORS=1;APS5_VRAM_WRITABLE=1;APS5_VRAM_DEFERRED=1;APS5_VRAM_CLEANUP=1;APS5_VRAM_TEXTURES=0;APS5_TEXTURE_AGE_EVICTION=0;APS5_RESIDENT_HEAP_MIRRORS=0")
+    foreach(vramTextureMode IN ITEMS off on)
+        add_test(NAME agc_vram_textures_storage_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-storage)
+        add_test(NAME agc_vram_textures_snapshot_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-snapshot)
+        add_test(NAME agc_vram_textures_readonly_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests mirror-readonly)
+        add_test(NAME agc_vram_textures_age_${vramTextureMode} COMMAND agc_driver_sampled_cache_budget_tests age)
+        set_tests_properties(agc_vram_textures_storage_${vramTextureMode} agc_vram_textures_snapshot_${vramTextureMode} agc_vram_textures_readonly_${vramTextureMode} agc_vram_textures_age_${vramTextureMode}
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "${vramTextureTestEnvironment};APS5_NO_CLEARED_VIEW=1" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endforeach()
+    set_property(TEST agc_vram_textures_storage_on agc_vram_textures_snapshot_on agc_vram_textures_readonly_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_TEXTURES=set:1")
+    set_property(TEST agc_vram_textures_age_on APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_TEXTURE_AGE_EVICTION=set:1")
+    add_test(NAME agc_vram_textures_sampled_cache_budget COMMAND agc_driver_sampled_cache_budget_tests)
+    add_test(NAME agc_vram_textures_partially_resident COMMAND agc_driver_partially_resident_snapshot_tests)
+    add_test(NAME agc_vram_textures_partially_resident_pool COMMAND agc_driver_partially_resident_snapshot_tests)
+    add_test(NAME agc_vram_textures_partially_resident_pending COMMAND agc_driver_partially_resident_snapshot_tests --pending-stores)
+    add_test(NAME agc_vram_textures_image_table COMMAND agc_driver_image_table_reuse_tests)
+    add_test(NAME agc_vram_textures_image_table_epochs COMMAND agc_driver_image_table_reuse_tests)
+    set_tests_properties(agc_vram_textures_sampled_cache_budget agc_vram_textures_partially_resident agc_vram_textures_partially_resident_pool agc_vram_textures_partially_resident_pending agc_vram_textures_image_table agc_vram_textures_image_table_epochs
+        PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        ENVIRONMENT "${vramTextureTestEnvironment}" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1")
+    set_property(TEST agc_vram_textures_partially_resident_pool APPEND PROPERTY ENVIRONMENT "APS5_TEXTURE_SNAPSHOT_POOL_MIB=64")
+    set_property(TEST agc_vram_textures_image_table_epochs APPEND PROPERTY ENVIRONMENT "APS5_TABLE_REUSE_ACROSS_EPOCHS=1")
+    foreach(vramSnapshotRelease IN ITEMS 0 1)
+        foreach(vramSnapshotPool IN ITEMS 0 64)
+            add_test(NAME agc_vram_textures_snapshot_retention_${vramSnapshotRelease}_pool_${vramSnapshotPool} COMMAND agc_driver_image_table_reuse_tests --snapshot-retention)
+            set_tests_properties(agc_vram_textures_snapshot_retention_${vramSnapshotRelease}_pool_${vramSnapshotPool}
+                PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                ENVIRONMENT "${vramTextureTestEnvironment};APS5_RELEASE_TEXTURE_SNAPSHOTS=${vramSnapshotRelease};APS5_TEXTURE_SNAPSHOT_POOL_MIB=${vramSnapshotPool}"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_VRAM_TEXTURES=set:1")
+        endforeach()
+    endforeach()
+    foreach(vramTextureSwitch IN ITEMS textures age)
+        if(vramTextureSwitch STREQUAL "textures")
+            set(vramTextureVariable APS5_VRAM_TEXTURES)
+        else()
+            set(vramTextureVariable APS5_TEXTURE_AGE_EVICTION)
+        endif()
+        add_test(NAME agc_vram_options_${vramTextureSwitch} COMMAND agc_vram_options_tests)
+        add_test(NAME agc_vram_options_${vramTextureSwitch}_requires_cleanup COMMAND agc_vram_options_tests "${vramTextureVariable} requires APS5_VRAM_CLEANUP=1")
+        add_test(NAME agc_vram_options_${vramTextureSwitch}_resident_conflict COMMAND agc_vram_options_tests "APS5_RESIDENT_HEAP_MIRRORS to be off")
+        set_tests_properties(agc_vram_options_${vramTextureSwitch} agc_vram_options_${vramTextureSwitch}_requires_cleanup agc_vram_options_${vramTextureSwitch}_resident_conflict
+            PROPERTIES ENVIRONMENT "${vramTextureTestEnvironment}"
+            ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;${vramTextureVariable}=set:1")
+        set_property(TEST agc_vram_options_${vramTextureSwitch}_requires_cleanup APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_VRAM_CLEANUP=set:0")
+        set_property(TEST agc_vram_options_${vramTextureSwitch}_resident_conflict APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_RESIDENT_HEAP_MIRRORS=set:1")
     endforeach()
 endif()

@@ -37,12 +37,15 @@ struct TextureCacheUse {
     std::uint64_t storageBytes = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t omittedSnapshotBytes = 0;
+    std::uint64_t snapshotsMade = 0;
+    std::uint64_t mirrorSnapshotsMade = 0;
 };
 TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+bool CompletePendingTextureWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -178,6 +181,9 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    void BeginGpuWrites(Recorder& recorder) { guestMemory.BeginGpuWrites(recorder); }
+    void ReadyForSubmit(Recorder& recorder) { guestMemory.ReadyForSubmit(recorder); }
+    void SealForSubmit(CommandBatch* batch = nullptr) { guestMemory.SealForSubmit(batch); }
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }

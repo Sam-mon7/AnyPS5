@@ -9,6 +9,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
+#include "SampleLod_spv.h"
 #include "VulkanTestDevice.hpp"
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -17,7 +20,9 @@
 #endif
 #include <windows.h>
 #endif
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -50,7 +55,7 @@ constexpr std::uint64_t Ceiling = Budget + Budget / 4u;
 
 class Device {
 public:
-    explicit Device(bool resourceImages = false) {
+    explicit Device(bool resourceImages = false, bool mirrorTextures = false) {
 #ifdef _WIN32
         library = SDL_LoadObject("vulkan-1.dll");
 #else
@@ -102,6 +107,12 @@ public:
                 VkPhysicalDeviceFeatures supported{};
                 function<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(context.physical, &supported);
                 enabled.shaderStorageImageMultisample = supported.shaderStorageImageMultisample;
+            }
+            if (mirrorTextures) {
+                VkPhysicalDeviceFeatures supported{};
+                function<PFN_vkGetPhysicalDeviceFeatures>("vkGetPhysicalDeviceFeatures")(context.physical, &supported);
+                Require(supported.textureCompressionBC, "mirror texture tests require BC compression");
+                enabled.textureCompressionBC = VK_TRUE;
             }
             address.pNext = &bytes;
             std::vector<const char*> extensionsEnabled{VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME, VK_KHR_8BIT_STORAGE_EXTENSION_NAME};
@@ -668,6 +679,397 @@ std::uint64_t ReadBudget(const Context& context) {
     return SampledTextureCacheBudget(context);
 }
 
+class MirrorSampleProgram {
+public:
+    MirrorSampleProgram(const Context& context, Recorder& recorder, std::span<const std::uint32_t> code = SAMPLE_LOD_SPV) : context(context), recorder(recorder), result(context, sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = 2;
+        layoutInfo.pBindings = bindings;
+        Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &setLayout), "vkCreateDescriptorSetLayout");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float) * 2};
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &setLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &pipelineLayout), "vkCreatePipelineLayout");
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = code.size_bytes();
+        moduleInfo.pCode = code.data();
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+        pipelineInfo.layout = pipelineLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines");
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_NEAREST;
+        samplerInfo.minFilter = VK_FILTER_NEAREST;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+        Check(context.Function<PFN_vkCreateSampler>("vkCreateSampler")(context.device, &samplerInfo, nullptr, &sampler), "vkCreateSampler");
+        const VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 2;
+        poolInfo.pPoolSizes = sizes;
+        Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &poolInfo, nullptr, &pool), "vkCreateDescriptorPool");
+    }
+    ~MirrorSampleProgram() {
+        context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+        context.Function<PFN_vkDestroySampler>("vkDestroySampler")(context.device, sampler, nullptr);
+        context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, pipelineLayout, nullptr);
+        context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+    }
+    MirrorSampleProgram(const MirrorSampleProgram&) = delete;
+    MirrorSampleProgram& operator=(const MirrorSampleProgram&) = delete;
+
+    float Red(VkImageView view, VkImageLayout layout, float lod, float layer = 0) {
+        VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocateInfo.descriptorPool = pool;
+        allocateInfo.descriptorSetCount = 1;
+        allocateInfo.pSetLayouts = &setLayout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocateInfo, &set), "vkAllocateDescriptorSets");
+        const VkDescriptorImageInfo image{sampler, view, layout};
+        const VkDescriptorBufferInfo buffer{result.Handle(), 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        writes[0].dstSet = set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].pImageInfo = &image;
+        writes[1].dstSet = set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[1].pBufferInfo = &buffer;
+        context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 2, writes, 0, nullptr);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &set, 0, nullptr);
+        const float parameters[]{lod, layer};
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(parameters), parameters);
+        context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        recorder.Sync();
+        Check(context.Function<PFN_vkFreeDescriptorSets>("vkFreeDescriptorSets")(context.device, pool, 1, &set), "vkFreeDescriptorSets");
+        float texel[4];
+        std::memcpy(texel, result.Bytes().data(), sizeof(texel));
+        return texel[0];
+    }
+
+private:
+    const Context& context;
+    Recorder& recorder;
+    Buffer result;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+};
+
+void expectRed(float got, float want, const char* what) {
+    if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
+}
+
+
+#ifdef _WIN32
+class MirrorBlock {
+public:
+    static constexpr std::size_t Bytes = 4u * 65536u;
+    MirrorBlock(const Context& context, Recorder& recorder) : context(context), recorder(recorder) {
+        memory = GuestArena::GuestArenaAllocate_nid_postfix(Bytes, 65536);
+        Require(memory != nullptr, "cannot reserve mirrored texture memory");
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+        Require(section != nullptr, "cannot create mirrored texture section");
+        GuestArena::GuestArenaMap_nid_postfix(memory, Bytes, section, 0, PAGE_READWRITE);
+        std::memset(memory, 0, Bytes);
+        GuestAllocations::Mutation().Add(memory, Bytes, true, true, true);
+    }
+    ~MirrorBlock() {
+        recorder.Sync();
+        ClearCachedTextures(context.device);
+        recorder.FlushDeferredReleases();
+        ClearImageMirrors(context.device);
+        ClearHostImports(context.device);
+        GuestAllocations::Mutation().Remove(memory);
+        GuestArena::GuestArenaReset_nid_postfix(memory, Bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(memory, Bytes);
+        CloseHandle(section);
+    }
+    std::uint64_t Address(std::size_t offset = 0) const { return reinterpret_cast<std::uint64_t>(memory) + offset; }
+    void MakeReadOnly() const {
+        GuestAllocations::Mutation().Protect(memory, Bytes, true, false, true, [&] {
+            GuestArena::GuestArenaCommit_nid_postfix(memory, Bytes, PAGE_READONLY, Bytes);
+        });
+        std::uint32_t protection = 0;
+        Require(GuestArena::GuestArenaProtection_nid_postfix(Address(), &protection) && protection == PAGE_READONLY,
+                "readonly texture fixture kept writable guest protection");
+    }
+    void Seed() const {
+        auto seedContext = context;
+        seedContext.hostImportAlignment = 0;
+        seedContext.dmaBufImport = false;
+        GuestBufferMemory seed(seedContext);
+        seed.SetAddressWrites(false);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        seed.WriteBack();
+        recorder.Sync();
+        Require(HostImportFor(context, Address(), Bytes) == nullptr, "mirrored texture range acquired a competing host import");
+    }
+private:
+    const Context& context;
+    Recorder& recorder;
+    void* memory = nullptr;
+    HANDLE section = nullptr;
+};
+
+std::array<std::uint32_t, 8> MirrorDescriptor(std::uint64_t address, std::uint32_t format) {
+    constexpr std::uint32_t side = 64;
+    return {
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format << 20u) | (((side - 1u) & 3u) << 30u),
+        ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+        0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u,
+    };
+}
+
+void FillMirrorTexture(const std::array<std::uint32_t, 8>& words, std::uint8_t red, bool compressed) {
+    const auto resource = DecodeTextureResource(words);
+    const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    auto* memory = reinterpret_cast<std::uint8_t*>(resource.baseAddress);
+    if (!compressed) {
+        std::memset(memory, red, bytes);
+    } else {
+        const auto color = static_cast<std::uint16_t>((red == 0 ? 0u : 31u) << 11u);
+        const std::array<std::uint32_t, 2> block{static_cast<std::uint32_t>(color), 0u};
+        for (std::size_t offset = 0; offset < bytes; offset += sizeof(block)) std::memcpy(memory + offset, block.data(), sizeof(block));
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+}
+
+void RecordMirrorFill(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t value) {
+    auto memory = std::make_shared<GuestBufferMemory>(context);
+    memory->AddWritable(address, bytes);
+    memory->AddReadable(address, bytes);
+    memory->Upload(false);
+    std::uint32_t adjustment = 0;
+    const auto view = memory->Descriptor(address, bytes, adjustment);
+    Require(adjustment == 0, "mirrored texture writer unexpectedly needs an address adjustment");
+    memory->BeginGpuWrites(recorder);
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset, bytes, value);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    memory->RecordCopyBacks(recorder);
+    recorder.Keep(memory);
+    recorder.NotePendingWrites(memory->Writes());
+    recorder.OnComplete([memory] { memory->WriteBack(); });
+    memory->ReadyForSubmit(recorder);
+}
+
+void RecordStorageClear(const Context& context, Recorder& recorder, const std::shared_ptr<StorageTexture>& texture, float red) {
+    Require(StorageFormatForGuest(context, texture->Descriptor().format) == VK_FORMAT_R8G8B8A8_UNORM,
+            "pending mirror texture fixture has an unexpected storage format");
+    const auto commands = recorder.Commands();
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const VkClearColorValue color{{red, 0.0f, 0.0f, 1.0f}};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, texture->Descriptor().mipCount, 0, texture->ImageLayers()};
+    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, texture->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    recorder.Keep(texture);
+    texture->MarkDirty();
+}
+
+void pendingMirrorStorageTests(const Context& context, Recorder& recorder, MirrorSampleProgram& sampler, const std::array<std::uint32_t, 8>& words) {
+    ClearCachedTextures(context.device);
+    const auto resource = DecodeTextureResource(words);
+    const auto bytes = DescribeSurface(resource).guestBytes;
+    auto image = CachedStorageSurface(context, resource);
+    RecordStorageClear(context, recorder, image, 64.0f / 255.0f);
+    Require(StorageTexture::FindPending(resource.baseAddress, bytes) == image, "storage image did not retain its pending GPU results");
+    const auto submissions = recorder.Submissions();
+    const auto uploads = StorageTexture::MirrorUploads();
+    auto sampled = CachedSampledTexture(context, words);
+    Require(StorageTexture::FindPending(resource.baseAddress, bytes) == image, "sampling flushed the image's own pending GPU results");
+    Require(recorder.Submissions() == submissions, "sampling the image's own pending results submitted the open batch");
+    Require(StorageTexture::MirrorUploads() == uploads, "sampling the image's own pending results re-uploaded the mirror");
+    expectRed(sampler.Red(sampled->View(), sampled->Layout(), 0), 64.0f / 255.0f, "sampling did not preserve the image's pending GPU results");
+    RecordStorageClear(context, recorder, image, 192.0f / 255.0f);
+    auto replacement = StorageTexture::Create(context, *context.detiler, resource, 0);
+    Require(replacement != image, "direct storage creation reused the pending image");
+    Require(StorageTexture::FindPending(resource.baseAddress, bytes) == nullptr, "direct storage creation bypassed another image's pending results");
+    Texture view(context, replacement, resource, {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY});
+    expectRed(sampler.Red(view.View(), view.Layout(), 0), 192.0f / 255.0f, "direct storage creation read stale mirror bytes over a pending image");
+    image.reset();
+    sampled.reset();
+    replacement.reset();
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+}
+
+void readOnlyMirrorTextureTests(const Context& context) {
+    Recorder recorder(context);
+    recorder.Activate();
+    MirrorBlock block(context, recorder);
+    const auto words = MirrorDescriptor(block.Address(), 56u);
+    const auto bytes = static_cast<std::size_t>(DescribeSurface(DecodeTextureResource(words)).guestBytes);
+    FillMirrorTexture(words, 0x80, false);
+    block.MakeReadOnly();
+    block.Seed();
+    MirrorSampleProgram sampler(context, recorder);
+    const auto before = TextureCacheUsage().snapshotsMade;
+    auto source = MirrorSourceFor(context, block.Address(), bytes);
+    if (VramTextures()) Require(source.has_value(), "readonly mirrored surface has no GPU texture source");
+    const auto identity = source ? source->proof.identity : 0;
+    auto first = CachedSampledTexture(context, words);
+    expectRed(sampler.Red(first->View(), first->Layout(), 0), 128.0f / 255.0f, "readonly mirrored texture sampled the wrong bytes");
+    if (source) {
+        const auto unchanged = MirrorSourceFor(context, block.Address(), bytes);
+        Require(unchanged && unchanged->proof == source->proof, "unchanged readonly mirror lost its source proof");
+    }
+    first.reset();
+    source.reset();
+    recorder.FlushDeferredReleases();
+    ClearImageMirrors(context.device);
+    block.Seed();
+    auto replaced = CachedSampledTexture(context, words);
+    expectRed(sampler.Red(replaced->View(), replaced->Layout(), 0), 128.0f / 255.0f, "readonly mirror replacement sampled the wrong bytes");
+    if (VramTextures()) {
+        const auto replacement = MirrorSourceFor(context, block.Address(), bytes);
+        Require(replacement && replacement->proof.identity != identity, "readonly mirror replacement reused its source identity");
+        Require(TextureCacheUsage().snapshotsMade == before, "readonly mirror texture took a CPU snapshot");
+    } else Require(TextureCacheUsage().snapshotsMade > before, "readonly switch-off texture skipped the CPU snapshot path");
+    replaced.reset();
+    recorder.Sync();
+}
+
+void mirrorTextureTests(const Context& context, bool compressed) {
+    Recorder recorder(context);
+    recorder.Activate();
+    MirrorBlock block(context, recorder);
+    const auto words = MirrorDescriptor(block.Address(), compressed ? 169u : 56u);
+    const auto bytes = static_cast<std::size_t>(DescribeSurface(DecodeTextureResource(words)).guestBytes);
+    FillMirrorTexture(words, compressed ? 0 : 0x20, compressed);
+    block.Seed();
+    MirrorSampleProgram sampler(context, recorder);
+    const auto before = TextureCacheUsage();
+    const auto beforeUploads = StorageTexture::MirrorUploads();
+    auto first = CachedSampledTexture(context, words);
+    Require(first->ViewsStorageImage() == (!compressed && VramTextures()), "mirrored texture selected the wrong storage/snapshot path");
+    expectRed(sampler.Red(first->View(), first->Layout(), 0), compressed ? 0.0f : 32.0f / 255.0f, "initial mirrored texture");
+    auto initial = VramTextures() ? MirrorSourceFor(context, block.Address(), bytes) : std::nullopt;
+    if (VramTextures()) Require(initial.has_value(), "mirrored texture has no coherent buffer source");
+    FillMirrorTexture(words, compressed ? 255 : 0x60, compressed);
+    auto cpu = CachedSampledTexture(context, words);
+    expectRed(sampler.Red(cpu->View(), cpu->Layout(), 0), compressed ? 1.0f : 96.0f / 255.0f, "CPU write did not refresh mirrored texture");
+    if (VramTextures()) {
+        const auto refreshed = MirrorSourceFor(context, block.Address(), bytes);
+        Require(refreshed && refreshed->proof != initial->proof, "CPU write left the mirror texture source proof unchanged");
+        initial = refreshed;
+    }
+    const auto submissions = recorder.Submissions();
+    RecordMirrorFill(context, recorder, block.Address(), bytes, 0u);
+    auto gpu = CachedSampledTexture(context, words);
+    if (VramTextures()) {
+        Require(recorder.Submissions() == submissions, "writer-to-texture refresh submitted the open batch before GPU sampling");
+        const auto written = MirrorSourceFor(context, block.Address(), bytes);
+        Require(written && written->proof.revision != initial->proof.revision, "unsubmitted GPU writer did not invalidate the texture source revision");
+    }
+    expectRed(sampler.Red(gpu->View(), gpu->Layout(), 0), 0.0f, "GPU write did not refresh mirrored texture in command order");
+    const auto after = TextureCacheUsage();
+    if (VramTextures()) {
+        Require(after.snapshotsMade == before.snapshotsMade, "mirrored texture made a transient CPU snapshot");
+        Require(after.snapshotBytes == before.snapshotBytes, "mirrored texture retained CPU snapshot bytes");
+        if (compressed) Require(after.mirrorSnapshotsMade >= before.mirrorSnapshotsMade + 3, "compressed mirror refreshes did not use GPU snapshot copies");
+        else Require(StorageTexture::MirrorUploads() >= beforeUploads + 3, "storage texture refreshes did not upload from the mirror");
+    } else {
+        Require(after.snapshotsMade > before.snapshotsMade, "texture switch-off path did not retain CPU snapshot behavior");
+    }
+    initial.reset();
+    first.reset();
+    cpu.reset();
+    gpu.reset();
+    recorder.FlushDeferredReleases();
+    auto oldSource = VramTextures() ? MirrorSourceFor(context, block.Address(), bytes) : std::nullopt;
+    const auto oldIdentity = oldSource ? oldSource->proof.identity : 0;
+    oldSource.reset();
+    ClearImageMirrors(context.device);
+    FillMirrorTexture(words, compressed ? 255 : 0xa0, compressed);
+    block.Seed();
+    auto replaced = CachedSampledTexture(context, words);
+    expectRed(sampler.Red(replaced->View(), replaced->Layout(), 0), compressed ? 1.0f : 160.0f / 255.0f, "mirror replacement reused stale texture contents");
+    if (VramTextures()) {
+        const auto replacement = MirrorSourceFor(context, block.Address(), bytes);
+        Require(replacement && replacement->proof.identity != oldIdentity, "mirror replacement reused its source identity");
+    }
+    replaced.reset();
+    recorder.Sync();
+    if (!compressed) {
+        pendingMirrorStorageTests(context, recorder, sampler, words);
+        ClearCachedTextures(context.device);
+        auto clearWords = words;
+        const auto metadata = block.Address(2u * 65536u);
+        clearWords[6] = (1u << 21u) | (static_cast<std::uint32_t>((metadata >> 8u) & 0xffu) << 24u);
+        clearWords[7] = static_cast<std::uint32_t>(metadata >> 16u);
+        std::memset(reinterpret_cast<void*>(metadata), 0, 256);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(DecodeTextureResource(clearWords).dccAddress == metadata, "mirrored texture fallback has no DCC metadata");
+        const auto beforeClear = TextureCacheUsage().snapshotsMade;
+        auto cleared = CachedSampledTexture(context, clearWords);
+        expectRed(sampler.Red(cleared->View(), cleared->Layout(), 0), 0.0f, "DCC clear sampled physical mirror bytes instead of the synthetic clear");
+        Require(TextureCacheUsage().snapshotsMade > beforeClear, "synthetic DCC clear did not use the CPU fallback snapshot");
+        cleared.reset();
+    }
+    recorder.Sync();
+}
+#endif
+
+void ageTextureTests(const Context& context) {
+    if (!TextureAgeEviction()) {
+        frameTests(context);
+        earlyMissTests(context);
+        return;
+    }
+    Block block(context);
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    std::vector<std::weak_ptr<Texture>> recent;
+    for (std::size_t surface = 0; surface < 32; ++surface) recent.push_back(Sampled(context, block.Surface(0) + surface * 65536, 128));
+    Require(TextureCacheUsage().sampledBytes > Budget, "age policy did not overcommit for the current present's working set");
+    for (const auto& texture : recent) Require(!texture.expired(), "age policy evicted the current present's texture");
+    for (std::uint32_t age = 1; age <= 3; ++age) {
+        Recorder::CountPresent();
+        Sampled(context, block.Surface(0), 16);
+        for (const auto& texture : recent) Require(!texture.expired(), "age policy evicted a texture from the previous three presents");
+    }
+    Recorder::CountPresent();
+    Sampled(context, block.Surface(0), 32);
+    const auto victims = std::count_if(recent.begin(), recent.end(), [](const auto& texture) { return texture.expired(); });
+    Require(victims != 0 && victims <= 16, "age policy did not evict a bounded group of old textures under pressure");
+    const auto second = Sampled(context, block.Surface(1), 32);
+    Require(std::count_if(recent.begin(), recent.end(), [](const auto& texture) { return texture.expired(); }) == victims,
+            "age policy ran another eviction pass in the same present");
+    Require(Sampled(context, block.Surface(1), 32) == second, "age policy failed to cache a current-present admission");
+    ClearCachedTextures(context.device);
+}
+
 void memoryTests(Context context) {
     context.memoryProperties2 = &ReportBudget;
     const auto before = SampledTextureMemory();
@@ -694,6 +1096,7 @@ int main(int argc, char** argv) {
         const bool memory = argc > 1 && std::string(argv[1]) == "memory";
         const std::string mode = argc > 1 ? argv[1] : "";
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
+        const bool mirrors = mode == "mirror-storage" || mode == "mirror-snapshot" || mode == "mirror-readonly";
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", "1");
 #else
@@ -701,7 +1104,7 @@ int main(int argc, char** argv) {
 #endif
         std::unique_ptr<Device> device;
         try {
-            device = std::make_unique<Device>(resources);
+            device = std::make_unique<Device>(resources, mirrors);
         } catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
             std::printf("skipped, no usable Vulkan device: %s\n", error.what());
@@ -710,6 +1113,23 @@ int main(int argc, char** argv) {
         auto context = device->GetContext();
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+        if (mirrors) {
+#ifdef _WIN32
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (mode == "mirror-readonly") readOnlyMirrorTextureTests(context);
+            else mirrorTextureTests(context, mode == "mirror-snapshot");
+            std::puts("mirror texture tests passed");
+            return 0;
+#else
+            return VulkanTestSkipped;
+#endif
+        }
+        if (mode == "age") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            ageTextureTests(context);
+            std::puts("texture age tests passed");
+            return 0;
+        }
         if (resources) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;

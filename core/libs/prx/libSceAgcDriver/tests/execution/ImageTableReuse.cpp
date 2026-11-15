@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -23,6 +25,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <thread>
@@ -53,6 +57,8 @@ constexpr std::uint64_t CpuWriteResolutions = 1;
 
 alignas(256) std::array<std::uint32_t, Records> Keys{};
 alignas(256) std::array<std::uint32_t, Lanes * 4> Output{};
+std::uint32_t* OutputData = Output.data();
+bool LastTableMirrored = false;
 alignas(256) std::array<std::uint32_t, 32> Srt{};
 
 alignas(256) constexpr std::array<std::uint32_t, 28> TableCode{
@@ -87,7 +93,13 @@ public:
     explicit GuestBlock(std::size_t registered = BlockBytes, std::size_t allocationBytes = BlockBytes) : bytes(allocationBytes) {
 #ifdef _WIN32
         block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
-        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+        if (block != nullptr) {
+            if (AgcDriver::Graphics::VramWritable()) {
+                section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, static_cast<DWORD>(bytes), nullptr);
+                Require(section != nullptr, "cannot create shared image-table memory");
+                GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+            } else GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+        }
 #else
         constexpr std::uintptr_t alignment = 65536;
         void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -109,6 +121,7 @@ public:
 #ifdef _WIN32
         GuestArena::GuestArenaReset_nid_postfix(block, bytes);
         GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        if (section != nullptr) CloseHandle(section);
 #else
         munmap(block, bytes);
         GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
@@ -121,6 +134,9 @@ public:
 private:
     std::uint8_t* block = nullptr;
     std::size_t bytes;
+#ifdef _WIN32
+    HANDLE section = nullptr;
+#endif
 };
 
 void SetRecord(const GuestBlock& block, std::uint32_t record, const float* texels) {
@@ -198,13 +214,39 @@ void Store(AgcDriver::VulkanDevice& device, const GuestBlock& block, std::uint32
     device.WaitIdle();
 }
 
+bool MirroredSurface(AgcDriver::VulkanDevice& device, std::uint64_t address, std::size_t bytes) {
+    if (!AgcDriver::Graphics::VramTextures()) return false;
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::Graphics::Context context{};
+    context.device = device.Device();
+    return AgcDriver::Graphics::MirrorSourceCovers(context, address, bytes);
+}
+
+bool MirroredTable(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result) {
+    for (const auto& binding : result.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::ImageTable) continue;
+        for (std::size_t offset = 0; offset + 8 <= binding.guestDescriptor.size(); offset += 8) {
+            const auto resource = AgcDriver::Graphics::DecodeTextureResource(std::span(binding.guestDescriptor).subspan(offset, 8));
+            if (MirroredSurface(device, resource.baseAddress, static_cast<std::size_t>(AgcDriver::Graphics::DescribeSurface(resource).guestBytes))) return true;
+        }
+    }
+    return false;
+}
+
+std::size_t MirroredTextures(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
+    std::size_t count = 0;
+    for (std::uint32_t texture = 0; texture < Records; ++texture) count += MirroredSurface(device, AddressOf(block.Texels(texture)), TextureBytes);
+    return count;
+}
+
 std::vector<std::uint32_t> Dispatch(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& result, std::uint32_t record) {
     Keys[0] = record;
-    std::fill(Output.begin(), Output.end(), 0xdeadbeefu);
+    std::fill_n(OutputData, Output.size(), 0xdeadbeefu);
     device.Dispatch(result, 1, 1, 1, {}, AddressOf(TableCode.data()));
     device.WaitIdle();
+    LastTableMirrored = MirroredTable(device, result);
     std::vector<std::uint32_t> red(Lanes);
-    for (std::uint32_t lane = 0; lane < Lanes; ++lane) red[lane] = Output[lane * 4u];
+    for (std::uint32_t lane = 0; lane < Lanes; ++lane) red[lane] = OutputData[lane * 4u];
     return red;
 }
 
@@ -226,6 +268,10 @@ Step Since(const AgcDriver::Graphics::ImageTableReuseCounts& before) {
 
 void Expect(const AgcDriver::Graphics::ImageTableReuseCounts& before, std::uint64_t reused, std::uint64_t resolved, const std::string& what) {
     const auto step = Since(before);
+    if (LastTableMirrored) {
+        Require(step.reused == 0 && step.resolved != 0, "mirrored image table bypassed its required full lookup: " + what);
+        return;
+    }
     Require(step.reused == reused && step.resolved == resolved, "image table reuse: " + what + ": " + std::to_string(step.reused) + " reused and " + std::to_string(step.resolved) + " resolved tables, expected " + std::to_string(reused) + " and " + std::to_string(resolved));
 }
 
@@ -261,7 +307,7 @@ void RunSelectivePendingWrite(AgcDriver::VulkanDevice& device, const GuestBlock&
     SetRecord(block, 23, separate.Texels(0));
     const auto srt = Buffer(block.Table(), Records * Stride);
     std::copy(srt.begin(), srt.end(), Srt.begin());
-    SetOutput(Output.data());
+    SetOutput(OutputData);
     const auto result = Compile(device, block);
     AgcDriver::GuestMemory::BumpCollectEpoch();
 
@@ -295,7 +341,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
     std::copy(srt.begin(), srt.end(), Srt.begin());
     std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
-    SetOutput(Output.data());
+    SetOutput(OutputData);
     const auto result = Compile(device, block);
     const bool watched = AgcDriver::GuestMemory::WriteWatched();
 
@@ -363,7 +409,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
 
     SetOutput(block.Texels(13));
     const auto writer = Compile(device, block);
-    SetOutput(Output.data());
+    SetOutput(OutputData);
     before = AgcDriver::Graphics::ImageTableReuses();
     static_cast<void>(Dispatch(device, writer, 7));
     const auto sampled = Dispatch(device, result, 13);
@@ -390,6 +436,10 @@ void SettleAcrossEpochs(AgcDriver::VulkanDevice& device, const ShaderRecompiler:
     for (std::uint32_t attempt = 0; attempt < 4; ++attempt) {
         const auto before = AgcDriver::Graphics::ImageTableReuses();
         SampleInNewEpoch(device, result, record, expected, what);
+        if (LastTableMirrored) {
+            Require(Since(before).reused == 0 && Since(before).resolved != 0, "mirrored image table skipped its full lookup across epochs");
+            return;
+        }
         if (Since(before).reused == 1) return;
     }
     Require(false, "image table reuse across epochs: " + what + ": the table was never kept");
@@ -405,7 +455,7 @@ void RunAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
     const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
     std::copy(srt.begin(), srt.end(), Srt.begin());
     std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
-    SetOutput(Output.data());
+    SetOutput(OutputData);
     const auto result = Compile(device, block);
     if (!AgcDriver::GuestMemory::WriteWatched()) {
         std::puts("guest memory has no write watch: image table reuse across epochs is not tested");
@@ -444,7 +494,7 @@ void RunAcrossEpochs(AgcDriver::VulkanDevice& device, const GuestBlock& block) {
 
     SetOutput(block.Texels(13));
     const auto writer = Compile(device, block);
-    SetOutput(Output.data());
+    SetOutput(OutputData);
     SettleAcrossEpochs(device, result, 15, Row(block.Texels(15)), "the table before a dispatch wrote an entry sampled the wrong entry");
     AgcDriver::GuestMemory::BumpCollectEpoch();
     static_cast<void>(Dispatch(device, writer, 7));
@@ -477,7 +527,7 @@ void RunPinBudget(AgcDriver::VulkanDevice& device, bool overflow) {
         const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
         std::copy(srt.begin(), srt.end(), Srt.begin());
         std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
-        SetOutput(Output.data());
+        SetOutput(OutputData);
         return Compile(device, guest);
     };
     const auto result = prepare(block, side);
@@ -539,13 +589,14 @@ void RunSnapshotRetention(AgcDriver::VulkanDevice& device, const GuestBlock& blo
     const auto keys = Buffer(Keys.data(), static_cast<std::uint32_t>(sizeof(Keys)));
     std::copy(srt.begin(), srt.end(), Srt.begin());
     std::copy(keys.begin(), keys.end(), Srt.begin() + 4);
-    SetOutput(Output.data());
+    SetOutput(OutputData);
     const auto result = Compile(device, block);
     SampleInNewEpoch(device, result, 5, Row(block.Texels(5)), "snapshot retention sampled the wrong entry");
     auto use = TextureCacheUsage();
     Require(use.sampledEntries == Records, "snapshot retention did not cache every test texture");
-    Require(use.snapshotBytes == (released ? 0u : Records * TextureBytes), "snapshot retention kept the wrong CPU byte count");
-    Require(use.omittedSnapshotBytes == (released ? Records * TextureBytes : 0u), "snapshot retention omitted-byte accounting is wrong");
+    auto mirrored = MirroredTextures(device, block);
+    Require(use.snapshotBytes == (released ? 0u : (Records - mirrored) * TextureBytes), "snapshot retention kept the wrong CPU byte count");
+    Require(use.omittedSnapshotBytes == (released ? (Records - mirrored) * TextureBytes : 0u), "snapshot retention omitted-byte accounting is wrong");
     Fill(block, 5, 0.875f);
     SampleInNewEpoch(device, result, 5, Row(block.Texels(5)), "a released snapshot hid a CPU write");
 
@@ -559,14 +610,17 @@ void RunSnapshotRetention(AgcDriver::VulkanDevice& device, const GuestBlock& blo
     Require(DecodeTextureResource(std::span(binding->guestDescriptor).last(8)).dccAddress != 0, "snapshot retention fixture did not supply DCC metadata to the driver");
     SampleInNewEpoch(device, mixed, Records - 1, Row(block.Texels(Records - 1)), "snapshot retention changed DCC texels");
     use = TextureCacheUsage();
-    Require(use.snapshotBytes == (released ? TextureBytes : Records * TextureBytes), "snapshot retention DCC CPU bytes: " + std::to_string(use.snapshotBytes) + " retained, " + std::to_string(use.omittedSnapshotBytes) + " omitted");
+    mirrored = MirroredTextures(device, block);
+    const auto mirroredDcc = MirroredSurface(device, AddressOf(block.Texels(Records - 1)), TextureBytes);
+    Require(use.snapshotBytes == (released ? (mirroredDcc ? 0u : TextureBytes) : (Records - mirrored) * TextureBytes), "snapshot retention DCC CPU bytes: " + std::to_string(use.snapshotBytes) + " retained, " + std::to_string(use.omittedSnapshotBytes) + " omitted");
 
     AgcDriver::GuestMemory::Unwatch(AddressOf(block.Texels(0)), Records * TextureBytes);
     Require(AgcDriver::GuestMemory::CollectWrites(AddressOf(block.Texels(0)), TextureBytes) == 0, "snapshot retention fixture is still watched");
     Fill(block, 5, 0.625f);
     SampleInNewEpoch(device, mixed, 5, Row(block.Texels(5)), "a released snapshot hid a write after unwatching");
     use = TextureCacheUsage();
-    Require(use.snapshotBytes == Records * TextureBytes && use.omittedSnapshotBytes == 0, "unprovable snapshots did not retain comparison bytes");
+    mirrored = MirroredTextures(device, block);
+    Require(use.snapshotBytes == (Records - mirrored) * TextureBytes && use.omittedSnapshotBytes == 0, "unprovable snapshots did not retain comparison bytes");
     ClearCachedTextures(device.Device());
     Require(TextureCacheUsage().snapshotBytes == 0 && TextureCacheUsage().omittedSnapshotBytes == 0, "final cache clear kept snapshot byte charges");
 }
@@ -575,6 +629,11 @@ void RunSnapshotRetention(AgcDriver::VulkanDevice& device, const GuestBlock& blo
 
 int main(int argc, char** argv) {
     try {
+        std::unique_ptr<GuestBlock> writableOutput;
+        if (AgcDriver::Graphics::VramWritable()) {
+            writableOutput = std::make_unique<GuestBlock>();
+            OutputData = writableOutput->Table();
+        }
         GuestBlock block;
         GuestBlock stores(UnimportableBytes);
         GuestBlock separate(UnimportableBytes);

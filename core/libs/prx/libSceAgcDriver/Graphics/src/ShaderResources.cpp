@@ -11,6 +11,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -116,6 +118,7 @@ struct CachedTexture {
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    MirrorSourceProof mirrorProof;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -129,6 +132,11 @@ struct TextureCache {
     std::uint64_t bytes = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t omittedSnapshotBytes = 0;
+    std::uint64_t snapshotsMade = 0;
+    std::uint64_t mirrorSnapshotsMade = 0;
+    std::uint64_t collectedPresent = ~0ull;
+    std::uint64_t evictedPresent = ~0ull;
+    std::size_t ageVictims = 0;
     std::size_t passed = 0;
     std::chrono::steady_clock::time_point passedSince{};
     std::uint64_t firstUsesPresent = 0;
@@ -317,6 +325,7 @@ std::uint64_t snapshotPoolBudget() {
 // new one. A spare buffer keeps an older texture's bytes; the snapshot reads overwrite all of them but
 // a fill's tail shorter than one texel, which a new buffer has zeroed.
 std::vector<std::byte> takeSnapshot(TextureCache& cache, std::size_t bytes) {
+    ++cache.snapshotsMade;
     ++cache.counts.snapshotsMade;
     cache.counts.snapshotBytesMade += bytes;
     if (snapshotPoolBudget() != 0 && bytes != 0) {
@@ -390,7 +399,46 @@ void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     it->present = Recorder::Presents();
 }
 
+void collectAgedTextures(const Context& context, TextureCache& cache) {
+    if (!TextureAgeEviction()) return;
+    const auto present = Recorder::Presents();
+    if (cache.collectedPresent == present) return;
+    cache.collectedPresent = present;
+    if (context.bufferPool == nullptr) return;
+    auto& vram = context.bufferPool->Vram();
+    const auto pressure = VramBudget::PressureFor(vram.Current());
+    if (pressure.victims == 0) return;
+    std::size_t victims = 0;
+    for (auto it = cache.entries.end(); it != cache.entries.begin() && victims < pressure.victims;) {
+        --it;
+        if (it->key.device != context.device || it->accounted == 0 || it->present > present || present - it->present < pressure.age) continue;
+        const auto victim = it++;
+        const auto bytes = victim->accounted;
+        const bool released = victim->texture.use_count() == 1;
+        eraseTexture(cache, victim);
+        if (released) vram.Released(bytes);
+        ++victims;
+        ++cache.counts.evicted;
+    }
+}
+
 bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t incoming, std::uint64_t budget) {
+    if (TextureAgeEviction()) {
+        const auto present = Recorder::Presents();
+        if (cache.evictedPresent != present) {
+            cache.evictedPresent = present;
+            cache.ageVictims = 0;
+        }
+        for (auto it = cache.entries.end(); it != cache.entries.begin() && cache.ageVictims < 16 && cache.bytes + incoming > budget;) {
+            --it;
+            if (it->accounted == 0 || it->present > present || present - it->present <= 3) continue;
+            const auto victim = it++;
+            eraseTexture(cache, victim);
+            ++cache.ageVictims;
+            ++cache.counts.evicted;
+        }
+        return true;
+    }
     if (cache.bytes + incoming <= budget) return true;
     if (const auto now = std::chrono::steady_clock::now(); now - cache.passedSince >= std::chrono::seconds(1)) {
         cache.passed = 0;
@@ -454,6 +502,7 @@ void reportCacheCounts(TextureCache& cache, std::uint64_t budget) {
     const auto counts = std::exchange(cache.counts, {});
     reportPrint("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu evicted, %llu held ones passed over, %llu found changed; %llu MiB in %zu entries, budget %llu MiB, frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
     reportPrint("[texture-snapshots] cache CPU bytes: %llu retained, %llu omitted; %llu resnapshots after failed proof; %llu snapshots made (%llu MiB), %llu of them in reused buffers, %llu MiB spare (10 s)\n", static_cast<unsigned long long>(cache.snapshotBytes), static_cast<unsigned long long>(cache.omittedSnapshotBytes), static_cast<unsigned long long>(counts.resnapshots), static_cast<unsigned long long>(counts.snapshotsMade), static_cast<unsigned long long>(counts.snapshotBytesMade >> 20u), static_cast<unsigned long long>(counts.snapshotsReused), static_cast<unsigned long long>(cache.spareBytes >> 20u));
+    if (VramTextures()) reportPrint("[texture-mirrors] cumulative: %llu GPU snapshots, %llu storage detiles, %llu CPU snapshots\n", static_cast<unsigned long long>(cache.mirrorSnapshotsMade), static_cast<unsigned long long>(StorageTexture::MirrorUploads()), static_cast<unsigned long long>(cache.snapshotsMade));
 }
 
 struct ImageMemoEntry {
@@ -591,7 +640,7 @@ bool MetadataMoved(const StorageTexture& image, const GuestTextureResource& reso
 bool SampledFromStorageEligible(const Context& context, std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_SAMPLED_FROM_STORAGE") != nullptr;
     if (disabled || IsBlockCompressed(format) || !StorageFormatAvailable(context, format)) return false;
-    return HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
+    return HostImportCovers(context, address, static_cast<std::size_t>(guestBytes)) || MirrorSourceCovers(context, address, static_cast<std::size_t>(guestBytes));
 }
 
 bool SampledFromStorageEligible(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -816,12 +865,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
-    if (releaseSnapshots && source == nullptr && resource.dccAddress == 0 && Recorder::SnapshotWriteOverlaps(address, bytes)) {
+    if (releaseSnapshots && source == nullptr && !MirrorSourceCovers(context, address, bytes) && resource.dccAddress == 0 && Recorder::SnapshotWriteOverlaps(address, bytes)) {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
         GuestMemory::FlushGpuWrites(address, bytes);
     }
     auto generation = GuestMemory::CollectWrites(address, bytes);
-    if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
+    if (source != nullptr && (MirrorSourceCovers(context, address, bytes) || !GuestMemory::UnchangedSince(address, bytes, source->Generation()))) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         source->Refresh();
     }
@@ -835,6 +884,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         keys.reset();
     }
     if (!keys.has_value()) keys = scanKeys();
+    const auto mirror = source == nullptr && *keys == DccKeys::Uncompressed ? MirrorSourceFor(context, address, bytes) : std::nullopt;
     if (disabled) {
         if (source != nullptr && depthCompare) {
             auto texture = std::make_shared<Texture>(context, source, resource, components, Texture::DepthCopyTag{});
@@ -842,6 +892,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             return texture;
         }
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
+        if (mirror) return std::make_shared<Texture>(context, *context.detiler, resource, components, std::span<const std::byte>{}, depthCompare, &*mirror);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
@@ -859,13 +910,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
     dropUncachedViews(cache);
+    collectAgedTextures(context, cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
             if ((source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
-                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+                if (MirrorSourceCovers(context, address, bytes) || !GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
@@ -879,12 +931,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
+                if (mirror || it->mirrorProof.identity != 0) return false;
                 if (it->bytes.empty()) return false;
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
             const auto unchanged = [&] {
+                if (mirror) return it->mirrorProof == mirror->proof;
+                if (it->mirrorProof.identity != 0) return false;
                 if (it->committed != committed) return false;
                 if (it->bytes.empty() && snapshotGeneration == 0) return false;
                 return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->surfaceBytes) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->surfaceBytes, it->generation);
@@ -903,7 +958,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
-    CachedTexture entry{key, address, bytes, source != nullptr ? std::vector<std::byte>() : takeSnapshot(cache, bytes), nullptr, *keys, snapshotGeneration};
+    CachedTexture entry{key, address, bytes, source != nullptr || mirror ? std::vector<std::byte>() : takeSnapshot(cache, bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     if (source != nullptr) {
         entry.source = source;
@@ -916,6 +971,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.accounted = source->Cached() ? 0u : heldBytes(*source);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
+    } else if (mirror) {
+        entry.mirrorProof = mirror->proof;
+        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, std::span<const std::byte>{}, depthCompare, &*mirror);
+        entry.accounted = entry.texture->AllocationBytes();
+        ++cache.mirrorSnapshotsMade;
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
@@ -1196,6 +1256,8 @@ TextureCacheUse TextureCacheUsage() {
         use.sampledBytes = sampled.bytes;
         use.snapshotBytes = sampled.snapshotBytes;
         use.omittedSnapshotBytes = sampled.omittedSnapshotBytes;
+        use.snapshotsMade = sampled.snapshotsMade;
+        use.mirrorSnapshotsMade = sampled.mirrorSnapshotsMade;
     }
     use.storageBytes = storageCacheBytes();
     return use;
@@ -1700,6 +1762,7 @@ ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::Descriptor
 }
 
 bool TableCurrent(const Context& context, ReusedTable& table, const TableState& state) {
+    if (VramTextures() && std::any_of(table.elements.begin(), table.elements.end(), [&](const auto& element) { return MirrorSourceCovers(context, element.resource.baseAddress, static_cast<std::size_t>(element.guestBytes)); })) return false;
     if (table.state.epoch != state.epoch) {
         for (const auto& element : table.elements) {
             if (element.reusable) CompletePendingCpuWrites(context, element.query.address, element.query.bytes);
@@ -2684,6 +2747,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
+    if (VramTextures()) return false;
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto fail = [&reason](FastFail why) {
         reason = why;
@@ -2834,6 +2898,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
 }
 
 bool ShaderResources::fastRevalidateEach() {
+    if (VramTextures()) return false;
     if (validatedTextures.size() != textures.size()) return false;
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
@@ -2998,6 +3063,14 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     return false;
 }
 
+bool CompletePendingTextureWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (MirrorSourceCovers(context, address, bytes)) {
+        auto* recorder = Recorder::Active();
+        if (recorder == nullptr || !recorder->PendingLabelIn(address, bytes)) return false;
+    }
+    return CompletePendingCpuWrites(context, address, bytes);
+}
+
 const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage) {
     for (const auto& shader : shaders) {
         if (shader.stage != stage || shader.program == nullptr) continue;
@@ -3015,11 +3088,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
+        CompletePendingTextureWrites(context, range.address, static_cast<std::size_t>(range.bytes));
         if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
     }
     for (const auto& image : storageTextures) {
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+        CompletePendingTextureWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
@@ -4015,6 +4088,7 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
+    if (VramTextures()) return nullptr;
     if (record.texture == nullptr || record.texture->RefreshedPerUse()) return nullptr;
     struct Outcome {
         bool profile;
@@ -4108,7 +4182,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
-            CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+            CompletePendingTextureWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
             if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
             std::shared_ptr<Texture> texture;
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
@@ -4174,7 +4248,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
-        CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+        CompletePendingTextureWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
         if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
@@ -4363,7 +4437,7 @@ void ShaderResources::resolveImageTables() {
             if (previous != nullptr && element < previous->elements.size() && element < cached.size()) {
                 const auto& entry = previous->elements[element];
                 if (entry.reusable && cached[element] != nullptr) {
-                    CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
+                    CompletePendingTextureWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
                     bind(element, words, cached[element], entry.resource, entry.guestBytes, entry.firstLayer);
                     fresh.elements.push_back(entry);
                     reusedAny = true;
@@ -4391,7 +4465,7 @@ void ShaderResources::resolveImageTables() {
                 fresh.elements.push_back(std::move(rejected));
                 continue;
             }
-            CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+            CompletePendingTextureWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
             if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
             std::shared_ptr<Texture> texture;
             const auto components = ViewComponents(resource);
@@ -4524,7 +4598,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     // sampled texture of one views that image (SampledFromStorageEligible), so neither waits for
     // the producer.
     const auto consider = [&](std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes, bool sampled) {
-        const bool gpuDirect = sampled ? SampledFromStorageEligible(context, format, address, guestBytes) : HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
+        const bool gpuDirect = MirrorSourceCovers(context, address, static_cast<std::size_t>(guestBytes)) || (sampled ? SampledFromStorageEligible(context, format, address, guestBytes) : HostImportCovers(context, address, static_cast<std::size_t>(guestBytes)));
         if (!gpuDirect) surfaces.emplace_back(address, guestBytes);
     };
     if (completed) {

@@ -60,6 +60,20 @@ VkDeviceSize VramBudget::target() const {
     return TargetFor(heapBytes, reported != 0 ? std::min(reported, limit) : limit, headroom);
 }
 
+VramPressure VramBudget::PressureFor(const VramReport& report) {
+    if (report.target == 0 || report.usage < report.target - report.target / 10u) return {};
+    const auto effective = report.budget != 0 ? std::min(report.budget, report.heapBytes) : report.heapBytes;
+    const auto critical = report.target + (std::max(effective, report.target) - report.target) / 2u;
+    if (report.usage >= critical) return {16, 16};
+    if (report.usage >= report.target) return {80, 8};
+    return {160, 4};
+}
+
+VkDeviceSize VramBudget::RebarAllowance(const VramReport& report, VkDeviceSize live, VkDeviceSize ceiling) {
+    const auto other = report.usage - std::min(report.usage, live);
+    return std::min(ceiling, report.target - std::min(report.target, other));
+}
+
 void VramBudget::Refresh() {
     if (!heap) return;
     std::unique_lock lock(refreshMutex, std::try_to_lock);
@@ -71,6 +85,7 @@ void VramBudget::Refresh() {
     query(physical, &properties);
     budget.store(reported.heapBudget[*heap], std::memory_order_relaxed);
     usage.store(reported.heapUsage[*heap], std::memory_order_relaxed);
+    ++sampleId;
     readAt.store(ticks(), std::memory_order_relaxed);
     if (announced) return;
     announced = true;
@@ -93,6 +108,18 @@ void VramBudget::Released(VkDeviceSize bytes) {
 
 VramReport VramBudget::Report() const {
     return {heap.value_or(0), heapBytes, budget.load(std::memory_order_relaxed), usage.load(std::memory_order_relaxed), target()};
+}
+
+VramReport VramBudget::Current() {
+    if (!heap) return {};
+    const auto elapsed = std::chrono::steady_clock::duration(ticks() - readAt.load(std::memory_order_relaxed));
+    if (readAt.load(std::memory_order_relaxed) == 0 || elapsed >= refreshInterval) Refresh();
+    std::lock_guard lock(refreshMutex);
+    auto result = Report();
+    result.budget = result.budget != 0 ? std::min(result.budget, limit) : limit;
+    result.usage -= std::min(result.usage, released.load(std::memory_order_relaxed));
+    result.sampleId = sampleId;
+    return result;
 }
 
 }
