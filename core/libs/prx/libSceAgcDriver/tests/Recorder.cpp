@@ -22,6 +22,11 @@
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParameterArena.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/GatherShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -60,6 +65,8 @@
 #include "ReplaySplitFaces_vert_spv.h"
 #include "VertexRange_vert_spv.h"
 #include "VertexRangeProducer_frag_spv.h"
+#include "TemplateParams_vert_spv.h"
+#include "TemplateParams_frag_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "BdaAbi.hpp"
 #include "BdaShader.hpp"
@@ -557,6 +564,9 @@ public:
             enabled.shaderStorageImageReadWithoutFormat = supported.shaderStorageImageReadWithoutFormat;
             enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
             enabled.shaderStorageImageMultisample = supported.shaderStorageImageMultisample;
+            if (std::getenv("ANYPS5_TEST_EXACT_ROBUST") != nullptr) {
+                enabled.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics;
+            }
             context.storageImageMultisample = supported.shaderStorageImageMultisample == VK_TRUE;
             context.singlePassStorage = supported.shaderStorageImageReadWithoutFormat == VK_TRUE && supported.shaderStorageImageWriteWithoutFormat == VK_TRUE;
             address.pNext = &bytes;
@@ -642,14 +652,18 @@ public:
             } else {
                 context.descriptorIndexing = context.partiallyBound = context.variableDescriptorCount = context.runtimeDescriptorArray = false;
             }
+            if (std::getenv("ANYPS5_TEST_EXACT_ROBUST") != nullptr && hasExtension(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) extensionsEnabled.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
             VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness};
                 function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
                 nullDescriptors = robustness.nullDescriptor == VK_TRUE;
+                context.exactRobustLoads = std::getenv("ANYPS5_TEST_EXACT_ROBUST") != nullptr && robustness.robustBufferAccess2 == VK_TRUE;
             }
             robustness = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
             robustness.nullDescriptor = VK_TRUE;
+            robustness.robustBufferAccess2 = context.exactRobustLoads;
+            if (context.exactRobustLoads) enabled.robustBufferAccess = VK_TRUE;
             if (nullDescriptors) {
                 extensionsEnabled.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
                 robustness.pNext = address.pNext;
@@ -4859,6 +4873,7 @@ bool uploadCarryTests(const Device& device, Recorder& recorder, std::string_view
     commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment, readback->Handle(), 0, 520);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment, view.buffer, view.offset + adjustment + 4, 4);
     CopyBuffer(context, commands, view.buffer, view.offset + adjustment + 512, view.buffer, view.offset + adjustment + 516, 4);
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
@@ -15419,6 +15434,503 @@ int archcLazyFenceTests(const Device& device, Recorder& recorder, std::string_vi
     return 0;
 }
 
+int lazyShadowTests(const Device& device, Recorder& recorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    using namespace AgcDriver::GuestMemory;
+    namespace Lazy = AgcDriver::Graphics::ArchC::LazyPublish;
+    auto context = device.GetContext();
+    context.recorder = &recorder;
+    if (!device.Graphics() || context.hostImportAlignment == 0 || !UnitShadowEnabled()) return 77;
+    const auto decided = PrepareImportWatch(context);
+    SetImportWatch(context, ImportWatch::Watch);
+    struct RestoreWatch {
+        const Context& context;
+        ImportWatch decided;
+        ~RestoreWatch() { SetImportWatch(context, decided); }
+    } restoreWatch{context, decided};
+    const bool on = Switches::Enabled(Feature::LazyShadowPublish);
+    const bool verify = LazyShadowVerifyEnabled();
+    constexpr std::uint64_t unit = 65536;
+    const std::size_t bytes = scenario == "evict" ? (9u << 20u) : scenario == "image" ? (4u << 20u) : static_cast<std::size_t>(4 * unit);
+    void* block = AllocateWatched(bytes, unit);
+    if (block == nullptr) return 77;
+    struct Release {
+        void* block;
+        std::size_t bytes;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block, bytes};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        std::size_t bytes;
+        ~Cleanup() {
+            Lazy::PublishAll();
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block, bytes};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) return 77;
+    {
+        Buffer settled(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        CommandBatch batch(context);
+        const VkBufferCopy copy{import->lead, 0, 4};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(batch.Handle(), import->buffer, settled.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        batch.SubmitAndWait();
+        settled.Invalidate();
+        Require(std::all_of(settled.Bytes().begin(), settled.Bytes().end(), [](auto value) { return value == std::byte{0x11}; }), "the host import was not settled before fault protection");
+    }
+
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    if (on) Require(LazyShadowPublishEnabled(), "LAZY_SHADOW_PUBLISH is on but inactive (C_LAZY_PUBLISH or the fault tracker is off)");
+    CollectWritesUncached(address, bytes);
+    GuestArena::GuestWtFaultTrack_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    AgcDriver::GuestMemory::WtFaultFlip();
+    AgcDriver::GuestMemory::WtFaultFlip();
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto retile = [&](std::uint64_t begin, std::uint8_t value) {
+        auto destination = ShadowDestinationFor(context, *import, begin, begin + unit);
+        Require(destination.has_value() && destination->seedUnits.empty(), "a whole unit has no slab destination");
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::size_t i = 0; i < unit; ++i) pattern->Bytes()[i] = static_cast<std::byte>(value + (i % 251));
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, destination->offset, unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const ShadowedRange range{begin, begin + unit, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), TrackerGeneration());
+    };
+    const auto expected = [&](std::uint8_t value) {
+        std::vector<std::uint8_t> bytesOf(static_cast<std::size_t>(unit));
+        for (std::size_t i = 0; i < unit; ++i) bytesOf[i] = static_cast<std::uint8_t>(value + (i % 251));
+        return bytesOf;
+    };
+    const auto store = [&](std::uint64_t begin, std::uint64_t end) {
+        const ShadowConsumerScope consumer("storage image creation", begin, static_cast<std::size_t>(end - begin), PublishScope::None);
+        const auto storeScope = PlaneStoreScope("depth plane store");
+        Require((storeScope == PublishScope::None) == on, "the plane store's publication scope does not follow the switch");
+        static_cast<void>(StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "depth plane store", storeScope));
+        SettlePlaneStore("depth plane store", begin, end, storeScope);
+    };
+    const auto gpuRead = [&](std::uint64_t begin, std::uint64_t end) {
+        const std::pair<std::uint64_t, std::uint64_t> run{begin - address, end - address};
+        const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {});
+        auto host = std::make_shared<Buffer>(context, static_cast<std::size_t>(end - begin), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        recorder.Keep(host);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        bool slabOnly = true;
+        for (const auto& source : sources) {
+            const VkBufferCopy piece{source.offset, source.begin - run.first, source.end - source.begin};
+            copyBuffer(commands, source.buffer, host->Handle(), 1, &piece);
+            if (source.slab != nullptr) recorder.Keep(source.slab);
+            slabOnly = slabOnly && source.shadow;
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        host->Invalidate();
+        std::vector<std::uint8_t> seen(host->Bytes().size());
+        std::memcpy(seen.data(), host->Bytes().data(), seen.size());
+        return std::make_pair(seen, slabOnly);
+    };
+    const auto protection = [&](std::uint64_t at) {
+        return GuestArena::GuestWtFaultWatchedPages_nid_no_patch(at, 1) != 0;
+    };
+    const auto rawRead = [&](std::uint64_t begin, std::uint64_t length) {
+        std::vector<std::uint8_t> seen(static_cast<std::size_t>(length));
+        const volatile std::uint8_t* from = reinterpret_cast<const volatile std::uint8_t*>(begin);
+        for (std::size_t i = 0; i < seen.size(); ++i) seen[i] = from[i];
+        return seen;
+    };
+    if (scenario == "depth_handoff" || scenario == "stencil_handoff") {
+        const bool stencil = scenario == "stencil_handoff";
+        TextureDetiler detiler(context);
+        context.detiler = &detiler;
+        const auto plane = address + unit;
+        State state{};
+        state.stages.path = ShaderPath::Vertex;
+        state.depth = DepthTarget{plane, stencil ? address + 2 * unit : 0, {64, 64}, stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        state.depth->depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+        state.depthTest = state.depthWrite = true;
+        state.depthCompare = VK_COMPARE_OP_ALWAYS;
+        state.stencilTest = stencil;
+        state.stencilFront = state.stencilBack = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS, 255, 255, 0x5d};
+        state.renderExtent = {64, 64};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.viewport = {0, 64, 64, -64, 0, 1};
+        state.scissor = {{0, 0}, {64, 64}};
+        ShaderRecompiler::RecompileResult vertex, pixel;
+        vertex.spirv = std::vector<std::uint32_t>(std::begin(COVER_VERT_SPV), std::end(COVER_VERT_SPV));
+        pixel.spirv = std::vector<std::uint32_t>(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+        vertex.variantId = 0xc2001;
+        pixel.variantId = 0xc2002;
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}};
+        Draw(context, state, {0, 3, 0, 1, 0, false}, shaders);
+        WaitForOptimizedPipelines(context.device);
+        recorder.Sync();
+        std::promise<void> entered, attempting, acquired;
+        auto enteredFuture = entered.get_future();
+        auto attemptingFuture = attempting.get_future();
+        auto acquiredFuture = acquired.get_future();
+        bool escaped = false;
+        bool paused = false;
+        static std::function<void()> pause;
+        static DepthPublicationStage wanted;
+        wanted = stencil ? DepthPublicationStage::StencilRetiled : DepthPublicationStage::PlaneRetiled;
+        pause = [&] {
+            paused = true;
+            entered.set_value();
+            attemptingFuture.wait();
+            escaped = acquiredFuture.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready;
+        };
+        SetDepthPublicationHookForTest(+[](DepthPublicationStage stage) {
+            if (stage == wanted && pause) pause();
+        });
+        std::exception_ptr submitError;
+        std::vector<std::uint8_t> seen;
+        std::thread submitter([&] {
+            enteredFuture.wait();
+            attempting.set_value();
+            try {
+                std::lock_guard gpu(GpuMutex());
+                acquired.set_value();
+                recorder.Sync();
+                seen = rawRead(stencil ? address + 2 * unit : plane, 4);
+            } catch (...) { submitError = std::current_exception(); }
+        });
+        GpuMutex().unlock();
+        std::exception_ptr flushError;
+        try {
+            const ShadowConsumerScope consumer("storage image creation", plane, 2 * unit, PublishScope::None);
+            FlushDepthPlanes(plane, 2 * unit);
+        } catch (...) { flushError = std::current_exception(); }
+        if (!paused) entered.set_value();
+        submitter.join();
+        GpuMutex().lock();
+        SetDepthPublicationHookForTest(nullptr);
+        pause = {};
+        ClearDepthSurfaces(context.device);
+        SharedResourceCache().Clear();
+        ClearCachedTextures(context.device);
+        recorder.Sync();
+        ClearCachedPipelines(context.device);
+        if (flushError) std::rethrow_exception(flushError);
+        if (submitError) std::rethrow_exception(submitError);
+        Require(paused && !escaped, "a submitter acquired the GPU lock between retile and lazy enrollment");
+        const std::array<std::uint8_t, 4> wantedBytes = stencil ? std::array<std::uint8_t, 4>{0x5d, 0x5d, 0x5d, 0x5d} : std::array<std::uint8_t, 4>{0, 0, 0, 0x3f};
+        Require(seen.size() == wantedBytes.size() && std::equal(seen.begin(), seen.end(), wantedBytes.begin()), "the CPU reader saw stale depth/stencil bytes after submission");
+        std::cout << "agc_lazy_shadow_" << scenario << ": ok\n";
+        return 0;
+    }
+    if (scenario == "image") {
+        TextureDetiler detiler(context);
+        auto imageContext = context;
+        imageContext.detiler = &detiler;
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = 1024;
+        resource.height = 1024;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        Require(DescribeSurface(resource).guestBytes == 64 * unit, "the lazy image test must fill 64 units");
+        auto source = StorageTexture::Create(imageContext, detiler, resource, 0);
+        const auto commands = recorder.Commands();
+        recorder.Keep(source);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkClearColorValue red{{1.0f, 0.0f, 0.0f, 1.0f}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, source->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        source->MarkDrawn(0, 1, {{0, 0}, {1024, 1024}});
+        const auto before = LazyShadowTotals();
+        Require(StorageTexture::StoreDrawnLinear("address-based heaps", on ? PublishScope::None : PublishScope::Whole) == 1, "the GPU image was not stored");
+        recorder.Sync();
+        const auto stored = LazyShadowTotals();
+        Require(stored.publishedUnits == before.publishedUnits + (on && !verify ? 0 : 64), "the GPU image publication did not follow the switch");
+        source.reset();
+        auto consumer = StorageTexture::Create(imageContext, detiler, resource, 0);
+        Buffer pixels(context, 64 * unit, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto readCommands = recorder.Commands();
+        recorder.Keep(consumer);
+        RecordMemoryBarrier(context, readCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {1024, 1024, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(readCommands, consumer->Image(), VK_IMAGE_LAYOUT_GENERAL, pixels.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, readCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        pixels.Invalidate();
+        constexpr std::array<std::byte, 4> wanted{std::byte{255}, std::byte{0}, std::byte{0}, std::byte{255}};
+        for (std::size_t i = 0; i < 64 * unit; ++i) Require(pixels.Bytes()[i] == wanted[i % 4], "the slab upload produced wrong pixels");
+        Require(LazyShadowTotals().publishedUnits == stored.publishedUnits, "the GPU image consumer published");
+        if (on && !verify) Require(protection(address) && AnyShadowedOverlaps(address, 64 * unit), "the GPU-only image lost its lazy authority");
+        std::cout << "agc_lazy_shadow_image: ok\n";
+        return 0;
+    }
+    const auto first = address + unit;
+    const auto second = first + unit;
+    retile(first, 0x20);
+    retile(second, 0x60);
+    recorder.Sync();
+    const auto before = LazyShadowTotals();
+    const auto lazyBefore = Lazy::Totals();
+    if (scenario == "recommit") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 2 * unit);
+    store(first, second + unit);
+    recorder.Sync();
+    const auto stored = LazyShadowTotals();
+    if (on) {
+        Require(stored.publishedUnits == before.publishedUnits + (verify ? 2 : 0), "the lazy plane store published unexpectedly");
+        Require(stored.lazyStores == before.lazyStores + 1 && stored.leftBytes == before.leftBytes + 2 * unit, "the lazy plane store left the wrong units");
+        if (!verify) {
+            Require(stored.enrolledBytes == before.enrolledBytes + 2 * unit && Lazy::Totals().deferred == lazyBefore.deferred + 2, "the left units were not enrolled with the fault watch");
+            Require(protection(first) && AnyShadowedOverlaps(first, 2 * unit), "the left units are not watched, or not shadowed");
+        } else {
+            Require(stored.verifyChecks == before.verifyChecks + 2 && stored.verifyMismatches == before.verifyMismatches, "VERIFY did not compare the forced publication with the eager copy, or they differ");
+        }
+    } else {
+        Require(stored.publishedUnits == before.publishedUnits + 2 && !AnyShadowedOverlaps(first, 2 * unit), "the eager plane store did not publish both units");
+    }
+    const auto unitOne = expected(0x20);
+    const auto unitTwo = expected(0x60);
+    if (scenario == "predicate_threads") {
+        static_cast<void>(rawRead(first, 2 * unit));
+        static std::function<bool()> predicate;
+        GuestArena::GuestWtFaultWatch_nid_no_patch(first, 1);
+        for (int operation = 0; operation < 3; ++operation) {
+            const auto fresh = address + 3 * unit;
+            GuestArena::GuestWtFaultForget_nid_no_patch(fresh, 4096);
+            std::promise<void> entered, tracked;
+            auto enteredFuture = entered.get_future();
+            auto trackedFuture = tracked.get_future();
+            std::thread tracker([&] {
+                enteredFuture.wait();
+                GuestArena::GuestWtFaultTrack_nid_no_patch(fresh, 4096);
+                tracked.set_value();
+            });
+            bool completed = false;
+            predicate = [&] {
+                entered.set_value();
+                completed = trackedFuture.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+                return false;
+            };
+            GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(+[](std::uintptr_t, std::size_t) { return predicate(); });
+            if (operation == 0) GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+            if (operation == 1) GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
+            if (operation == 2) GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
+            tracker.join();
+            GuestArena::GuestWtFaultSetLazyPreservation_nid_no_patch(nullptr);
+            predicate = {};
+            if (operation == 0) GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+            Require(completed, "the preservation predicate retained the fault mutex and blocked a concurrent tracker");
+        }
+        std::cout << "agc_lazy_shadow_predicate_threads: ok\n";
+        return 0;
+    }
+    if (scenario == "publication_renewal") {
+        Require(recorder.HasTimeline(), "the renewal test needs a timeline recorder");
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        const VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR, nullptr, VK_SEMAPHORE_TYPE_TIMELINE_KHR, 0};
+        const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &semaphore), "renewal semaphore");
+        retile(first, 0x41);
+        StorageTexture::PublishShadowsOnly(first, unit, PublishScope::Whole, "publication A");
+        recorder.HoldNextSubmit(semaphore, 1);
+        const auto publicationA = recorder.SubmitAndEpoch();
+        Require(!recorder.WaitSerialFor(publicationA, 0), "publication A was not held in flight");
+        const VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, semaphore, 1};
+        if (verify) Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "release verified publication A");
+        retile(first, 0x91);
+        store(first, first + unit);
+        if (on && !verify) Require(protection(first), "publication B was not protected");
+        if (!verify) Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "release publication A");
+        recorder.WaitSerial(publicationA);
+        recorder.FinishUpTo(publicationA);
+        if (on && !verify) Require(protection(first) && LazyLeftUnpublished(first, unit) == 1, "completion A cleared B's lazy authority");
+        const auto newest = expected(0x91);
+        if (!on) recorder.Sync();
+        GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+        Require(rawRead(first, unit) == newest, "publication B lost its bytes after A completed");
+        GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+        recorder.Sync();
+        context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+        std::cout << "agc_lazy_shadow_publication_renewal: ok\n";
+        return 0;
+    }
+    if (scenario == "retire_pending") {
+        retile(first, 0x31);
+        retile(second, 0x73);
+        StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "retirement test");
+        Require(recorder.Recording(), "the retirement test needs an unfinished publication");
+        GuestAllocations::Mutation().Remove(block);
+        Require(HostImportFor(context, address, bytes) == nullptr, "the removed import did not retire");
+        Require(!AnyShadowedOverlaps(first, 2 * unit), "the retired import remains in the shadow registry");
+        if (!on || verify) recorder.Sync();
+        GuestArena::GuestWtFaultHold_nid_no_patch(first, 2 * unit);
+        const auto seen = rawRead(first, 2 * unit);
+        GuestArena::GuestWtFaultRelease_nid_no_patch(first, 2 * unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require(std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "a retired in-flight publication exposed stale bytes");
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
+        std::cout << "agc_lazy_shadow_retire_pending: ok\n";
+        return 0;
+    }
+    if (scenario == "batch_consumer") {
+        retile(first, 0x31);
+        retile(second, 0x73);
+        store(first, second + unit);
+        const auto publications = LazyShadowTotals().publishedUnits;
+        recorder.Submit();
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require((slabOnly || !on || verify) && std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "the cross-batch slab consumer read wrong bytes");
+        Require(LazyShadowTotals().publishedUnits == publications, "the cross-batch GPU consumer published");
+        std::cout << "agc_lazy_shadow_batch_consumer: ok\n";
+        return 0;
+    }
+    if (scenario == "observer_renewal") {
+        StorageTexture::PublishShadowsOnly(first, 2 * unit, PublishScope::Whole, "observer test");
+        recorder.Sync();
+        GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 2 * unit);
+        Require(GuestArena::GuestWtFaultWatch_nid_no_patch(first, 2 * unit) == 32, "the observational watch did not cover both units");
+        retile(first, 0x31);
+        retile(second, 0x73);
+        const auto renewed = LazyShadowTotals();
+    store(first, second + unit);
+        recorder.Sync();
+        Require(LazyShadowTotals().publishedUnits == renewed.publishedUnits + 2, "an observational watch was accepted as a lazy service watch");
+        const auto seen = rawRead(first, 2 * unit);
+        const auto one = expected(0x31);
+        const auto two = expected(0x73);
+        Require(std::equal(one.begin(), one.end(), seen.begin()) && std::equal(two.begin(), two.end(), seen.begin() + unit), "renewing an observational watch lost GPU bytes");
+        std::cout << "agc_lazy_shadow_observer_renewal: ok\n";
+        return 0;
+    }
+    if (scenario == "gpu") {
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        Require(slabOnly, "the upload did not read the slab");
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload read wrong bytes");
+        if (on && !verify) Require(LazyShadowTotals().publishedUnits == stored.publishedUnits && protection(first), "a GPU-only read published");
+    } else if (scenario == "cpu_read" || scenario == "hold" || scenario == "open" || scenario == "unwatch" || scenario == "protect" || scenario == "driver_read" || scenario == "recommit") {
+        if (scenario == "hold") GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+        if (scenario == "open") GuestArena::GuestWtFaultOpen_nid_no_patch(first, 1);
+        if (scenario == "unwatch") GuestArena::GuestWtFaultUnwatch_nid_no_patch(first, 1);
+        if (scenario == "protect") {
+#ifdef _WIN32
+            GuestArena::GuestArenaSetProtection_nid_postfix(first, 4096, PAGE_READWRITE);
+#else
+            return 77;
+#endif
+        }
+        if (scenario == "recommit") {
+#ifdef _WIN32
+            if (on && !verify) Require((GuestArena::GuestWtFaultWord_nid_no_patch(first) & GuestArena::WtFaultStateMask) == GuestArena::WtFaultOpen, "the recommit regression needs an underlying Open page");
+            GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(first), unit, PAGE_READWRITE, unit);
+#else
+            return 77;
+#endif
+        }
+        if (scenario == "driver_read") {
+            std::array<std::byte, 1> seen{};
+            Read(first, seen);
+        }
+        const auto readBytes = scenario == "cpu_read" ? unit : 2 * unit;
+        const auto seen = rawRead(first, readBytes);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && (readBytes == unit || std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit)), "the CPU read wrong bytes");
+        const auto read = LazyShadowTotals();
+        if (on && !verify) {
+            Require(read.publishedUnits == stored.publishedUnits + readBytes / unit, "the CPU read did not force each requested unit once");
+            if (scenario == "cpu_read") Require(Lazy::Totals().services == lazyBefore.services + 1, "the CPU fault did not run exactly one service");
+            Require(!protection(first) && !AnyShadowedOverlaps(first, readBytes), "the read range is still lazy");
+        }
+        const auto again = rawRead(first, readBytes);
+        Require(again == seen && LazyShadowTotals().publishedUnits == read.publishedUnits, "a second CPU read published again or read other bytes");
+        if (scenario == "hold") GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+    } else if (scenario == "cpu_write" || scenario == "host_write" || scenario.starts_with("driver_store")) {
+        const auto write = [&] {
+            volatile std::uint8_t* to = reinterpret_cast<volatile std::uint8_t*>(first + 8);
+            for (int i = 0; i < 16; ++i) to[i] = 0x77;
+        };
+        if (scenario == "host_write") {
+            const ReadSiteScope site(ReadSite::Store);
+            const GuestArena::HostWrite hold(reinterpret_cast<void*>(first + 8), 16);
+            write();
+        } else if (scenario.starts_with("driver_store")) {
+            Require(!Switches::Enabled(Feature::CLazyStoreHook), "the driver-store regression needs the optional hook off");
+            if (scenario == "driver_store_toggle") {
+                const char* control = std::getenv("APS5_ARCHB_CONTROL_FILE");
+                Require(control != nullptr, "the store toggle needs a control file");
+                std::ofstream(control) << "1 LAZY_SHADOW_PUBLISH=0\n";
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (Switches::Sequence() != 1 && std::chrono::steady_clock::now() < deadline) {
+                    Switches::PollControl();
+                    std::this_thread::yield();
+                }
+                Require(!Switches::Enabled(Feature::LazyShadowPublish), "lazy shadow publication did not turn off");
+            }
+            StoreOwnBytes(first + 8, 16, std::function<void()>(write));
+        } else {
+            write();
+        }
+        CollectWritesUncached(first, 2 * unit);
+        const auto [seen, slabOnly] = gpuRead(first, second + unit);
+        auto wanted = unitOne;
+        std::fill_n(wanted.begin() + 8, 16, std::uint8_t{0x77});
+        Require(!slabOnly, "the written unit is still read from the slab");
+        Require(std::equal(wanted.begin(), wanted.end(), seen.begin()) && std::equal(unitTwo.begin(), unitTwo.end(), seen.begin() + unit), "the upload after the CPU write read wrong bytes");
+    } else if (scenario == "evict") {
+        retile(second, 0x90);
+        recorder.Sync();
+        const char* budgetText = std::getenv("APS5_UNIT_SHADOW_MIB");
+        Require(budgetText != nullptr && std::strtoull(budgetText, nullptr, 10) < 16, "the evict scenario needs APS5_UNIT_SHADOW_MIB=8");
+        const auto distant = address + 128 * unit;
+        auto other = ShadowDestinationFor(context, *import, distant, distant + unit);
+        Require(other.has_value() && other->slab != nullptr, "the second slab was refused");
+        other.reset();
+        if (on && !verify) {
+            GuestArena::GuestWtFaultHold_nid_no_patch(first, 1);
+            const auto during = rawRead(first, 2 * unit);
+            const auto newest = expected(0x90);
+            Require(std::equal(unitOne.begin(), unitOne.end(), during.begin()) && std::equal(newest.begin(), newest.end(), during.begin() + unit), "opening an evicted publication exposed unfinished GPU bytes");
+            GuestArena::GuestWtFaultRelease_nid_no_patch(first, 1);
+        }
+        recorder.Sync();
+        Require(!AnyShadowedOverlaps(first, 2 * unit), "the evicted slab's units are still shadowed");
+        const auto seen = rawRead(first, 2 * unit);
+        const auto newer = expected(0x90);
+        Require(std::equal(unitOne.begin(), unitOne.end(), seen.begin()) && std::equal(newer.begin(), newer.end(), seen.begin() + unit), "an evicted unpublished unit lost its bytes");
+    } else {
+        return 2;
+    }
+    if (on && verify) Require(LazyShadowTotals().staleReads == before.staleReads, "VERIFY saw a CPU read of unpublished lazy units");
+    std::cout << "agc_lazy_shadow_" << scenario << (on ? (verify ? " (verify)" : "") : " (off)") << ": ok\n";
+    return 0;
+}
+
 int archcLazyTests(const Device& device, Recorder& recorder, std::string_view scenario) {
     using AgcDriver::ArchB::Feature;
     using AgcDriver::ArchB::Switches;
@@ -15545,8 +16057,6 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
         Require(std::all_of(seen.begin(), seen.begin() + 16, [](std::byte value) { return value == std::byte{0x77}; }), "the host write did not land");
         std::copy(published.begin(), published.begin() + 16, seen.begin());
     } else if (scenario == "store") {
-        // A driver store into the lazy range under the GPU mutex (C_LAZY_STORE_HOOK: published by the
-        // store hook, no fault; without it the store faults and the service publishes).
         AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         const std::array<std::byte, 1> value{std::byte{0x99}};
@@ -15565,7 +16075,7 @@ int archcLazyTests(const Device& device, Recorder& recorder, std::string_view sc
     }
     Require(seen == published, "the CPU did not read the draw's results after the label");
     const auto served = Lazy::Totals();
-    const bool hooked = on && scenario == "store" && Switches::Enabled(Feature::CLazyStoreHook);
+    const bool hooked = on && scenario == "store" && (Switches::Enabled(Feature::CLazyStoreHook) || GuestArena::GuestWtFaultLazyPreservationEnabled_nid_no_patch());
     if (hooked) {
         Require(served.services == deferred.services && served.storeHooks == deferred.storeHooks + 1, "the driver store was not published by the store hook alone");
         Require(Lazy::Entries() == 0 && protection() != PAGE_NOACCESS, "the hooked range is still lazy");
@@ -18154,17 +18664,725 @@ void smallElementDetileTests(Device& device) {
     std::cout << "small element detile tests passed\n";
 }
 
-int main(int argc, char** argv) {
-    struct SplitFacesControl {
-        std::filesystem::path path;
-        ~SplitFacesControl() { if (!path.empty()) std::filesystem::remove(path); }
-    } splitFacesControl;
-    if (argc == 3 && std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) {
-        splitFacesControl.path = std::filesystem::temp_directory_path() / ("anyps5-split-faces-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+int parameterArenaTests(const Device& device) {
+    ParameterSlices slices(4096, 64);
+    const auto first = slices.Allocate(100);
+    Require(first.has_value() && first->chunk == 0 && first->offset == 0 && first->bytes == 256, "a small slice did not take the first 256 bytes of the first chunk");
+    const auto second = slices.Allocate(300);
+    Require(second.has_value() && second->chunk == 0 && second->offset == 256 && second->bytes == 512 && second->offset % 64 == 0, "a second slice did not follow the first at an aligned offset");
+    Require(!slices.Allocate(8192).has_value() && !slices.Allocate(0).has_value(), "a slice over the chunk size or of no bytes was handed out");
+    const auto whole = slices.Allocate(4096);
+    Require(whole.has_value() && whole->chunk == 1 && whole->offset == 0 && slices.Chunks() == 2, "a slice that does not fit grew no new chunk");
+    const auto after = slices.Allocate(200);
+    Require(after.has_value() && after->chunk == 2 && after->offset == 0 && slices.Chunks() == 3, "a slice after a full chunk did not open a new chunk");
+    Require(!slices.Allocate(4096, 3).has_value() && slices.Chunks() == 3, "a capped arena grew a retained chunk");
+    auto slice = *first;
+    std::array<bool, ParameterSlices::Flights> taken{};
+    for (std::size_t use = 0; use < ParameterSlices::Flights; ++use) {
+        const auto flight = ParameterSlices::Pick(slice, 5, 4);
+        Require(flight.has_value() && !taken[*flight], "the open batch was handed a flight it already references");
+        taken[*flight] = true;
+    }
+    Require(!ParameterSlices::Pick(slice, 5, 4).has_value(), "a fourth use in the open batch reused a flight the batch references");
+    Require(!ParameterSlices::Pick(slice, 6, 4).has_value(), "a flight was reused while the submitted batch that read it is still pending");
+    const auto reused = ParameterSlices::Pick(slice, 6, 5);
+    Require(reused.has_value() && slice.serials[*reused] == 6, "a flight whose batch completed was not handed out");
+    slice.serials = {7, 5, 6};
+    const auto oldest = ParameterSlices::Pick(slice, 8, 6);
+    Require(oldest.has_value() && *oldest == 1, "flight selection did not take the least recently used completed flight");
+    auto held = *second;
+    held.serials = {9, 0, 0};
+    slices.Release(held);
+    const auto recycled = slices.Allocate(400);
+    Require(recycled.has_value() && recycled->chunk == second->chunk && recycled->offset == second->offset && recycled->serials[0] == 9, "a released slice was not reused with its flight serials");
+    auto recycledSlice = *recycled;
+    for (int use = 0; use < 4; ++use) {
+        const auto flight = ParameterSlices::Pick(recycledSlice, 10, 8);
+        if (flight.has_value()) Require(*flight != 0, "a reused slice handed out a flight a pending batch still reads");
+    }
+    auto context = device.GetContext();
+    auto arena = std::make_shared<ParameterArena>(context, 4096);
+    auto lease = ParameterArena::Allocate(arena, 100);
+    Require(lease != nullptr && arena->Chunks() == 1 && lease->slice.offset % ParameterArena::Alignment(context) == 0, "the arena did not make its first chunk");
+    std::array<VkBuffer, ParameterArena::Flights> handles{};
+    for (std::size_t flight = 0; flight < handles.size(); ++flight) {
+        handles[flight] = arena->Handle(flight, 0);
+        Require(handles[flight] != VK_NULL_HANDLE && arena->Bytes(flight, 0) != nullptr, "a flight has no mapped buffer");
+        for (std::size_t other = 0; other < flight; ++other) Require(handles[other] != handles[flight], "two flights share a buffer");
+        arena->Bytes(flight, 0)[lease->slice.offset] = static_cast<std::byte>(flight + 1);
+    }
+    auto grown = ParameterArena::Allocate(arena, 4096);
+    Require(grown != nullptr && grown->slice.chunk == 1 && arena->Chunks() == 2, "a full arena did not grow a chunk");
+    for (std::size_t flight = 0; flight < handles.size(); ++flight) Require(arena->Handle(flight, 0) == handles[flight] && arena->Bytes(flight, 0)[lease->slice.offset] == static_cast<std::byte>(flight + 1), "growth moved a slice already handed out");
+    Require(ParameterArena::Allocate(arena, 4096, 2 * 4096 * ParameterArena::Flights) == nullptr && arena->Chunks() == 2, "the Vulkan arena bypassed its retained-buffer budget");
+    const auto offset = lease->slice.offset;
+    lease.reset();
+    Require(arena->Freed() == 1, "a released lease did not return its slice");
+    auto again = ParameterArena::Allocate(arena, 64);
+    Require(again != nullptr && again->slice.chunk == 0 && again->slice.offset == offset && arena->Freed() == 0, "a released slice was not taken again");
+    std::cout << "parameter arena tests passed\n";
+    return 0;
+}
+
+int drawTemplateTests(const Device& device, Recorder& mainRecorder, std::string_view scenario) {
+    using AgcDriver::ArchB::Feature;
+    using AgcDriver::ArchB::Switches;
+    using Census = AgcDriver::ArchB::Recorder;
+    if (!device.Graphics() || device.GetContext().hostImportAlignment == 0) return 77;
+    Require(Switches::Enabled(Feature::ArchcDrawReplay) && Switches::Enabled(Feature::ArchcReplayPatchSlots) && Switches::Enabled(Feature::ZeroCopyStorage), "the template cases need draw replay, patch slots and zero-copy storage");
+    const bool on = Switches::Enabled(Feature::DrawTemplates);
+    if (scenario == "live") Census::Boundary(true, 1, Census::Clock::now());
+    const char* verifyText = std::getenv("APS5_ARCHB_DRAW_TEMPLATES_VERIFY");
+    const bool verify = verifyText != nullptr && std::string_view(verifyText) == "1";
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t bytes = unit * 5;
+    void* watched = nullptr;
+    bool arenaOwned = false;
 #ifdef _WIN32
-        _putenv_s("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str());
+    if (scenario == "publish") {
+        watched = GuestArena::GuestArenaAllocate_nid_postfix(bytes, unit);
+        if (watched != nullptr) {
+            GuestArena::GuestArenaCommit_nid_postfix(watched, bytes, PAGE_READWRITE, bytes);
+            arenaOwned = true;
+        }
+    } else
+#endif
+    watched = AllocateWatched(bytes, unit);
+    if (watched == nullptr) return 77;
+    struct Release {
+        void* watched;
+        bool arenaOwned;
+        ~Release() {
+            if (arenaOwned) {
+                GuestArena::GuestArenaReset_nid_postfix(watched, bytes);
+                GuestArena::GuestArenaRelease_nid_postfix(watched, bytes);
+            } else ReleaseWatched(watched, bytes);
+        }
+    } release{watched, arenaOwned};
+    auto* block = static_cast<std::byte*>(watched);
+    std::fill_n(block, bytes, std::byte{0});
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    DescriptorCache descriptors(context);
+    context.descriptorCache = &descriptors;
+    struct Reactivate {
+        Recorder& recorder;
+        ~Reactivate() { recorder.Activate(); }
+    } reactivate{mainRecorder};
+    Recorder recorder(context);
+    recorder.Activate();
+    context.recorder = &recorder;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Cleanup {
+        const Context& context;
+        Recorder& recorder;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            WaitForOptimizedPipelines(context.device);
+            SharedResourceCache().Clear();
+            ClearCachedTextures(context.device);
+            ClearDepthSurfaces(context.device);
+            recorder.Sync();
+            ClearCachedPipelines(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } cleanup{context, recorder, block};
+    if (scenario == "publish") SetImportWatch(context, ImportWatch::Watch);
+    if (HostImportFor(context, address, bytes) == nullptr) return 77;
+    if (scenario == "tail" && !context.exactRobustLoads) return 77;
+    AgcDriver::GuestMemory::MarkCommitterThread();
+    const auto arguments = address + unit;
+    const auto data = address + unit * 2;
+    const auto put = [&](std::uint64_t at, std::uint32_t value) { AgcDriver::GuestMemory::Write(at, std::as_bytes(std::span(&value, 1))); };
+    const std::array<std::uint32_t, 4> record{3, 1, 0, 0};
+    AgcDriver::GuestMemory::Write(arguments, std::as_bytes(std::span(record)));
+    AgcDriver::Pm4::DrawParameters indirect{0, 0, 0, 0, 0, false};
+    indirect.indirect.emplace();
+    indirect.indirect->arguments = arguments;
+    indirect.indirect->opcode = 0x24;
+    indirect.indirect->recordBytes = 16;
+    indirect.indirect->stride = 16;
+    indirect.indirect->count = 1;
+    indirect.indirect->countIndirect = false;
+    indirect.indirect->countAddress = 0;
+    indirect.indirect->vertexRule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule::InPlace;
+    indirect.indirect->instanceRule = AgcDriver::Pm4::DrawParameters::IndirectDraw::Rule::InPlace;
+    const auto vsharp = [](std::uint64_t at, std::uint32_t size) { return std::vector<std::uint32_t>{static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, size, 0x31000000u}; };
+    auto vertex = std::make_shared<ShaderRecompiler::RecompileResult>();
+    vertex->spirv = std::vector<std::uint32_t>(std::begin(TEMPLATEPARAMS_VERT_SPV), std::end(TEMPLATEPARAMS_VERT_SPV));
+    vertex->variantId = 401;
+    vertex->shaderDataDwords = 4;
+    {
+        ShaderRecompiler::DescriptorBinding guest{};
+        guest.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        guest.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        guest.descriptorSet = 0;
+        guest.binding = 0;
+        guest.count = 1;
+        guest.guestDescriptor = vsharp(data + 4, 16);
+        auto flags = guest.Flags();
+        flags.bufferWritten = {false};
+        flags.bufferRead = {true};
+        flags.bufferAtomic = {false};
+        guest.SetFlags(std::move(flags));
+        vertex->bindings.push_back(guest);
+        ShaderRecompiler::DescriptorBinding srt{};
+        srt.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        srt.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        srt.descriptorSet = 0;
+        srt.binding = 1;
+        srt.count = 1;
+        srt.guestDescriptor = {0, 0, 0, 0};
+        vertex->bindings.push_back(srt);
+        ShaderRecompiler::DescriptorBinding shaderData{};
+        shaderData.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        shaderData.role = ShaderRecompiler::DescriptorRole::ShaderData;
+        shaderData.descriptorSet = 0;
+        shaderData.binding = 2;
+        shaderData.count = 1;
+        shaderData.guestDescriptor = {0, 0, 0, 0};
+        vertex->bindings.push_back(shaderData);
+    }
+    if (scenario == "fault") {
+        auto spirv = vertex->spirv.Words();
+        std::vector<std::uint32_t> module(spirv.begin(), spirv.end());
+        const auto id = module[3]++;
+        std::uint32_t pointer = 0;
+        std::size_t annotations = 0, variables = 0;
+        for (std::size_t at = 5; at < module.size();) {
+            const auto count = module[at] >> 16u;
+            const auto opcode = module[at] & 0xffffu;
+            if (annotations == 0 && opcode >= spv::OpTypeVoid && opcode <= spv::OpTypeForwardPointer) annotations = at;
+            if (opcode == spv::OpVariable && module[at + 3] == spv::StorageClassStorageBuffer) pointer = module[at + 1];
+            if (opcode == spv::OpFunction) { variables = at; break; }
+            at += count;
+        }
+        Require(pointer != 0 && annotations != 0 && variables != 0, "the fault fixture has no storage declaration to extend");
+        const std::array<std::uint32_t, 4> variable{(4u << 16u) | spv::OpVariable, pointer, id, spv::StorageClassStorageBuffer};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(variables), variable.begin(), variable.end());
+        const std::array<std::uint32_t, 8> decorations{(4u << 16u) | spv::OpDecorate, id, spv::DecorationDescriptorSet, 0, (4u << 16u) | spv::OpDecorate, id, spv::DecorationBinding, 3};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(annotations), decorations.begin(), decorations.end());
+        vertex->spirv = std::move(module);
+        vertex->bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+        ShaderRecompiler::DescriptorBinding fault{};
+        fault.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        fault.role = ShaderRecompiler::DescriptorRole::FaultBuffer;
+        fault.binding = 3;
+        fault.count = 1;
+        fault.readOnly = false;
+        vertex->bindings.push_back(fault);
+    }
+    auto pixel = std::make_shared<ShaderRecompiler::RecompileResult>();
+    pixel->spirv = std::vector<std::uint32_t>(std::begin(TEMPLATEPARAMS_FRAG_SPV), std::end(TEMPLATEPARAMS_FRAG_SPV));
+    pixel->variantId = 402;
+    if (scenario == "tail") {
+        constexpr std::array<std::uint32_t, 7> code{0xe0300004u, 0x80000000u, 0xbf8c3f70u, 0x7e0202f2u, 0xf800180fu, 0x01010100u, 0xbf810000u};
+        const auto words = vsharp(data + 4, 5);
+        ShaderRecompiler::RecompileRequest request{};
+        request.shader = {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userData = words;
+        request.context.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
+        request.context.pixel->wave32 = true;
+        request.context.pixel->targetOutputMode[0] = 9;
+        request.context.pixel->targetExportMapping.fill(0xe4u);
+        request.target.vulkanVersion = VK_API_VERSION_1_1;
+        request.target.spirvVersion = 0x00010300;
+        const std::array<std::uint32_t, 1> capabilities{spv::CapabilityShader};
+        request.target.supportedCapabilities = capabilities;
+        request.target.robustBufferAccess2 = true;
+        request.target.exactRobustLoads = true;
+        request.target.fixedPushSlots = true;
+        request.layout = {0, 0, 0, 128};
+        request.useCache = false;
+        *pixel = ShaderRecompiler::Recompile(request);
+        pixel->variantId = 402;
+    }
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> programs;
+    const auto stateFor = [](std::uint64_t base, bool additive) {
+        auto state = std::make_shared<State>();
+        state->stages.path = ShaderPath::Vertex;
+        state->color = {base, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+        state->colors = {state->color};
+        state->hasColorTarget = true;
+        state->renderExtent = {64, 64};
+        state->topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state->viewport = {0, 64, 64, -64, 0, 1};
+        state->scissor = {{0, 0}, {64, 64}};
+        state->frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        state->blend.colorWriteMask = 15;
+        if (additive) {
+            state->blend.blendEnable = VK_TRUE;
+            state->blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.colorBlendOp = VK_BLEND_OP_ADD;
+            state->blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            state->blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        }
+        state->blends = {state->blend};
+        return state;
+    };
+    const auto target = stateFor(address, scenario == "flights" || scenario == "publish");
+    const auto variant = std::make_shared<std::uint64_t>(vertex->variantId);
+    using namespace AgcDriver::DriverDetail;
+    std::shared_ptr<GatherCommitTemplate> liveTemplate;
+    std::shared_ptr<GatherDrawPlan> learning;
+    std::shared_ptr<DispatchVariant> gatherVariant;
+    alignas(16) std::array<std::uint64_t, 2> liveRoot{};
+    alignas(16) std::array<std::uint32_t, 8> firstChild{}, secondChild{};
+    std::vector<std::uint32_t> liveUser;
+    std::shared_ptr<GatherTemplate> liveShape;
+    if (scenario == "live") {
+        vertex->memoryOffsetDword = 1;
+        vertex->pushConstants.resize(8);
+        auto words = vertex->spirv.Words();
+        std::vector<std::uint32_t> module(words.begin(), words.end());
+        std::uint32_t uintType = 0;
+        std::size_t annotations = 0, declarations = 0;
+        for (std::size_t at = 5; at < module.size(); at += module[at] >> 16u) {
+            const auto opcode = module[at] & 0xffffu;
+            if (annotations == 0 && opcode >= spv::OpTypeVoid && opcode <= spv::OpTypeForwardPointer) annotations = at;
+            if (opcode == spv::OpTypeInt && module[at + 2] == 32 && module[at + 3] == 0) uintType = module[at + 1];
+            if (opcode == spv::OpFunction) { declarations = at; break; }
+        }
+        Require(uintType != 0 && annotations != 0 && declarations != 0, "the live fixture lacks its SPIR-V declaration points");
+        const auto length = module[3]++, array = module[3]++, structure = module[3]++, pointer = module[3]++, variable = module[3]++;
+        const std::vector<std::uint32_t> declared{(4u << 16u) | spv::OpConstant, uintType, length, 32, (4u << 16u) | spv::OpTypeArray, array, uintType, length, (3u << 16u) | spv::OpTypeStruct, structure, array, (4u << 16u) | spv::OpTypePointer, pointer, spv::StorageClassPushConstant, structure, (4u << 16u) | spv::OpVariable, pointer, variable, spv::StorageClassPushConstant};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(declarations), declared.begin(), declared.end());
+        const std::vector<std::uint32_t> decorated{(4u << 16u) | spv::OpDecorate, array, spv::DecorationArrayStride, 4, (3u << 16u) | spv::OpDecorate, structure, spv::DecorationBlock, (5u << 16u) | spv::OpMemberDecorate, structure, 0, spv::DecorationOffset, 0};
+        module.insert(module.begin() + static_cast<std::ptrdiff_t>(annotations), decorated.begin(), decorated.end());
+        vertex->spirv = std::move(module);
+
+        vertex->shaderDataUserWords = {2};
+        vertex->bindings[1].guestDescriptor[0] = 1;
+        vertex->bindings[2].guestDescriptor[0] = 4;
+        const std::uint32_t offset = 4;
+        std::memcpy(vertex->pushConstants.data(), &offset, 4);
+        const auto guest = vsharp(data + 4, 16);
+        std::copy(guest.begin(), guest.end(), firstChild.begin());
+        firstChild[4] = 1;
+        liveRoot[0] = reinterpret_cast<std::uintptr_t>(firstChild.data());
+        const auto root = reinterpret_cast<std::uintptr_t>(liveRoot.data());
+        liveUser = {static_cast<std::uint32_t>(root), static_cast<std::uint32_t>(root >> 32), 4};
+        gatherVariant = std::make_shared<DispatchVariant>();
+        gatherVariant->compiled = vertex;
+        gatherVariant->runs = {{root, root + 8}, {liveRoot[0], liveRoot[0] + sizeof(firstChild)}};
+        gatherVariant->words = {static_cast<std::uint32_t>(liveRoot[0]), static_cast<std::uint32_t>(liveRoot[0] >> 32)};
+        gatherVariant->words.insert(gatherVariant->words.end(), firstChild.begin(), firstChild.end());
+        gatherVariant->runBases = {0, -1};
+        gatherVariant->runParents = {{DispatchVariant::NoFlatBinding, 0}, {0, 0}};
+        gatherVariant->relocatableWords = 1;
+        gatherVariant->userWordsWalked = 3;
+        gatherVariant->nestedPointerProof = true;
+        gatherVariant->flatBinding = 1;
+        gatherVariant->dataPositions = {6};
+        gatherVariant->dataSlots = {0};
+        gatherVariant->bufferBaseMasks = {{2, 0xfffffffcu}, {3, 0xffffu}};
+        gatherVariant->bufferBasePatches = {{2, 0, 0}, {3, 0, 1}};
+        liveShape = std::make_shared<GatherTemplate>(*BuildGatherTemplate(*gatherVariant, liveUser, 0, {true, true, true, true}));
+        Require(liveShape->refusal == nullptr && liveShape->nested, "the live pixel fixture did not get a nested gather template");
+        liveTemplate = std::make_shared<GatherCommitTemplate>();
+        liveTemplate->state = target;
+        liveTemplate->stages = {{vertex, variant, ShaderRecompiler::ShaderStage::Vertex, 0}, {pixel, {}, ShaderRecompiler::ShaderStage::Fragment, 0}};
+        learning = std::make_shared<GatherDrawPlan>();
+        learning->matched = true;
+        learning->incomplete = GatherUnknownBindings;
+        learning->stages.resize(2);
+        FillGatherPlan(*liveShape, liveUser, gatherVariant->words, learning->stages[0]);
+    }
+    const auto draw = [&](std::uint64_t at, std::uint32_t size, std::uint32_t word) {
+        auto current = std::make_shared<ShaderRecompiler::RecompileResult>(*vertex);
+        current->bindings[0].guestDescriptor = vsharp(at, size);
+        current->bindings[1].guestDescriptor = {word, 0, 0, 0};
+        programs.push_back(current);
+        auto words = current->bindings[0].guestDescriptor;
+        words.insert(words.end(), current->bindings[1].guestDescriptor.begin(), current->bindings[1].guestDescriptor.end());
+        auto currentPixel = pixel;
+        if (scenario == "tail") {
+            currentPixel = std::make_shared<ShaderRecompiler::RecompileResult>(*pixel);
+            const auto guest = std::find_if(currentPixel->bindings.begin(), currentPixel->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers; });
+            Require(guest != currentPixel->bindings.end(), "the translated tail shader has no buffer element");
+            guest->guestDescriptor = vsharp(at, 5);
+            programs.push_back(currentPixel);
+        }
+        DrawSlotIdentity identity{target, {{vertex, variant, std::move(words), true, false}, {pixel}}};
+        identity.gatherTemplate = liveTemplate;
+        identity.learning = learning.get();
+        if (scenario == "tail") identity.stages[1] = {pixel, variant, {}, true, false};
+        const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, current.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, currentPixel.get(), 0u}};
+        Draw(context, *target, indirect, shaders, {}, nullptr, nullptr, 0, nullptr, false, &identity);
+        WaitForOptimizedPipelines(context.device);
+    };
+    const auto settle = [&] {
+        StorageTexture::FlushAllPending("draw template test");
+        recorder.Sync();
+        AgcDriver::GuestMemory::WtFaultFlip();
+    };
+    const auto expect = [&](std::uint32_t red, std::uint32_t green, std::uint32_t blue, const char* what) {
+        std::vector<std::byte> read(64 * 64 * 4);
+        recorder.Sync();
+        ReadColorTarget(target->color, read);
+        for (std::size_t i = 0; i < read.size(); i += 4) {
+            const std::array<std::uint32_t, 4> seen{std::to_integer<std::uint32_t>(read[i]), std::to_integer<std::uint32_t>(read[i + 1]), std::to_integer<std::uint32_t>(read[i + 2]), std::to_integer<std::uint32_t>(read[i + 3])};
+            if (seen != std::array<std::uint32_t, 4>{red, green, blue, 255}) {
+                throw std::runtime_error(std::string(what) + ": texel " + std::to_string(i / 4) + " is " + std::to_string(seen[0]) + "," + std::to_string(seen[1]) + "," + std::to_string(seen[2]) + "," + std::to_string(seen[3]) + ", expected " + std::to_string(red) + "," + std::to_string(green) + "," + std::to_string(blue) + ",255");
+            }
+        }
+    };
+    std::map<std::string, double> total;
+    const auto collect = [&] {
+        auto counters = Census::Collect(Census::Clock::now()).counters;
+        for (const auto& [name, value] : counters) total[name] += value;
+        return counters;
+    };
+    if (scenario == "fault") {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const std::array stages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        ShaderResources resources(context, stages, target->color, 1, 0, 0);
+        const auto serial = recorder.OpenSerial();
+        static_cast<void>(recorder.Commands());
+        recorder.Sync();
+        Require(recorder.CompletedThrough() >= serial, "the fault fixture's actual submission did not complete");
+        const auto reclaimed = BdaResources::FaultSlots(context.device).reclaimed;
+        bool wasReclaimed = false;
+        {
+            std::vector<std::unique_ptr<BdaResources>> pressure;
+            while (BdaResources::FaultSlots(context.device).reclaimed == reclaimed && pressure.size() < 20000) pressure.push_back(std::make_unique<BdaResources>(context, true));
+            wasReclaimed = BdaResources::FaultSlots(context.device).reclaimed > reclaimed;
+        }
+        const auto retired = BdaResources::FaultSlots(context.device);
+        std::cout << "fault retirement: completed " << recorder.CompletedThrough() << " reclaimed " << retired.reclaimed << " before " << reclaimed << " held " << retired.held << " chunks " << retired.chunks << " slots " << retired.slots << std::endl;
+        Require(wasReclaimed && retired.chunks == 0, "the fault retirement test did not reclaim and retire the idle fault chunk");
+        const auto retaken = BdaResources::FaultSlots(context.device).retaken;
+        Buffer buffer(context, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const std::array<std::pair<VkBuffer, VkDeviceSize>, 1> flights{{{buffer.Handle(), 0}}};
+        auto made = resources.MakeTemplateSets({}, flights);
+        Require(made != nullptr && resources.TemplateStaticMismatches(*made, 0) == 0, "a template initialized with a retired fault descriptor");
+        Require(BdaResources::FaultSlots(context.device).retaken > retaken, "the retired fault slot was not retaken before descriptor initialization");
+        std::cout << "agc_draw_templates_fault: ok\n";
+        return 0;
+    }
+    const auto base = data + 4;
+    put(base, 0x0101u);
+    for (int i = 0; i < 4; ++i) {
+        draw(base, 16, 1);
+        settle();
+    }
+    draw(base, 16, 1);
+    draw(base, 16, 1);
+    const auto prime = data + 0x800 + 4;
+    put(prime, 0x0101u);
+    draw(prime, 16, 1);
+    settle();
+    const auto warmed = ArchcReplayCounts();
+    if (warmed.captures == 0 || warmed.hits == 0) {
+        for (const auto& [name, value] : collect()) {
+            if (value != 0 && (name.starts_with("archc_replay_refused") || name.starts_with("archc_replay_ineligible") || name.starts_with("archc_replay_hits") || name.starts_with("archc_replay_captures") || name.starts_with("archc_replay_legacy") || name.starts_with("draw_templates"))) std::cout << name << " " << value << "\n";
+        }
+    }
+    Require(warmed.captures != 0 && warmed.hits != 0, "the repeated template draw was not replayed");
+    const std::uint32_t warmDraws = 7;
+    if (scenario == "live") {
+        Require(liveTemplate->ready.load(), "the committer did not publish the live pixel layout");
+        static_cast<void>(collect());
+        const auto moved = data + 0x100 + 4;
+        put(moved, 0x0101);
+        put(moved + 4, 0x6655);
+        const auto words = vsharp(moved, 16);
+        std::copy(words.begin(), words.end(), secondChild.begin());
+        secondChild[4] = 0x77;
+        liveRoot[0] = reinterpret_cast<std::uintptr_t>(secondChild.data());
+        liveUser[2] = 8;
+        std::vector<std::uint32_t> gathered;
+        const GatherReader reader = [](std::uint64_t address, std::span<std::uint32_t> out) {
+            bool owned = false;
+            return AgcDriver::GuestMemory::CopyMappedGuarded(address, std::as_writable_bytes(out), owned) == AgcDriver::GuestMemory::Compare::Equal;
+        };
+        const auto outcome = EvaluateGather(*liveShape, liveUser, reader, gathered, nullptr, true);
+        Require(outcome.matched, "moving the nested pointer, V# and constants changed structure");
+        auto plan = std::make_shared<GatherDrawPlan>();
+        plan->stages.resize(2);
+        plan->commitTemplate = liveTemplate;
+        plan->matched = plan->complete = true;
+        FillGatherPlan(*liveShape, liveUser, gathered, plan->stages[0], {}, &liveTemplate->stages[0]);
+        auto old = std::make_shared<ShaderRecompiler::RecompileResult>(*vertex);
+        old->bindings[0].guestDescriptor = words;
+        old->bindings[1].guestDescriptor[0] = secondChild[4];
+        old->bindings[2].guestDescriptor[0] = liveUser[2];
+        std::memcpy(old->pushConstants.data(), &liveUser[2], 4);
+        const std::array oldStages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, old.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        const std::array donorStages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, vertex.get(), 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, pixel.get(), 0}};
+        DrawSlotIdentity live{target, {{vertex, variant}, {pixel}}};
+        live.gatherTemplate = liveTemplate;
+        live.gather = plan.get();
+        live.referenceStages = oldStages;
+        live.referenceDraw = &indirect;
+        Draw(context, *target, indirect, donorStages, {}, nullptr, nullptr, 0, nullptr, false, &live);
+        expect(0x55, 0x66, 0x77, "the live plan's nested pointer, V# and constant words");
+        const auto counters = collect();
+        for (const auto& [name, count] : counters) if (name.starts_with("draw_templates_live")) std::cout << name << " " << count << "\n";
+        Require(counters.contains("draw_templates_live_commits") && counters.at("draw_templates_live_commits") == 1, "the changed-value pixel draw did not commit a live template");
+        for (const auto& [name, count] : counters) Require(!name.starts_with("draw_templates_live_verify_mismatch_") || count == 0, "the changed-value live template differs from the old binding path");
+        DrawSlotIdentity oldIdentity{target, {{old}, {pixel}}};
+        Draw(context, *target, indirect, oldStages, {}, nullptr, nullptr, 0, nullptr, false, &oldIdentity);
+        expect(0x55, 0x66, 0x77, "the old path for the same changed values");
+        auto decode = std::make_shared<DrawDecode>();
+        DrawProgram front{}, fragment{};
+        front.userData = liveUser;
+        front.binary.stage = ShaderRecompiler::ShaderStage::Vertex;
+        fragment.binary.stage = ShaderRecompiler::ShaderStage::Fragment;
+        decode->programs = {front, fragment};
+        DrawEntry entry;
+        entry.decode = decode;
+        auto fragmentVariant = std::make_shared<DispatchVariant>();
+        fragmentVariant->compiled = pixel;
+        const std::array variants{gatherVariant, fragmentVariant};
+        GatherShadowDraw capture;
+        capture.programs = decode->programs;
+        capture.entry = &entry;
+        capture.matched = variants;
+        capture.hit = capture.keyed = capture.live = true;
+        capture.options = {true, true, true, true};
+        capture.commitTemplate = liveTemplate;
+        capture.read = &reader;
+        const auto safe = RunGatherShadow(capture);
+        Require(safe != nullptr && safe->complete, "the pending-write fixture did not begin with a complete plan");
+        recorder.NotePendingWrite(reinterpret_cast<std::uintptr_t>(liveRoot.data()), sizeof(std::uint64_t));
+        const auto pending = RunGatherShadow(capture);
+        Require(pending == nullptr || !pending->complete, "an open-batch GPU write over the captured parent allowed a live plan");
+        recorder.Sync();
+        std::cout << "agc_draw_templates_live: exact changed-value pixels match; a pending captured parent refuses\n";
+    } else if (scenario == "stream") {
+        static_cast<void>(collect());
+        const auto moved = data + 0x100 + 4;
+        put(moved, 0x4231u);
+        const auto hitsBefore = ArchcReplayCounts().hits;
+        draw(moved, 16, 0x52);
+        expect(0x31, 0x42, 0x52, "a replay with a moved V# base and new FlattenedSrt words");
+        put(moved, 0x6655u);
+        draw(moved, 16, 0x77);
+        expect(0x55, 0x66, 0x77, "a replay after the CPU rewrote the moved element");
+        const auto unaligned = data + 0x200 + 12;
+        put(unaligned, 0x9988u);
+        draw(unaligned, 16, 0xaa);
+        expect(0x88, 0x99, 0xaa, "a replay whose moved base has another offset in the storage alignment");
+        auto counters = collect();
+        Require(ArchcReplayCounts().hits == hitsBefore + 3, "the draws with moved elements were not replayed");
+        if (on) Require(counters["draw_templates_replays"] == 3 && counters["draw_templates_candidates"] == 3 && counters["draw_templates_built_new"] == 1, "the replays with small moved elements did not take one template");
+        else Require(counters["draw_templates_replays"] == 0 && counters["draw_templates_candidates"] == 3, "the template path ran with its switch off");
+        const auto large = data + 0x1000 + 4;
+        put(large, 0xbbccu);
+        draw(large, 8192, 0xdd);
+        expect(0xcc, 0xbb, 0xdd, "a replay whose moved element is over the template limit");
+        put(large, 0xbecfu);
+        draw(large, 8192, 0xde);
+        expect(0xcf, 0xbe, 0xde, "a second in-place replay after the CPU rewrote the large element");
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 2 && counters["draw_templates_in_place_draws"] == 2 && counters["draw_templates_refused_large"] == 0, "a large moved element was not bound in place through its import");
+        const auto misplaced = data + 0x2000 + 12;
+        put(misplaced, 0xa1b2u);
+        draw(misplaced, 8192, 0xc3);
+        expect(0xb2, 0xa1, 0xc3, "a large moved element whose import offset is off the storage alignment");
+        counters = collect();
+        if (on) Require(counters["draw_templates_refused_in_place_alignment"] == 1 && counters["draw_templates_replays"] == 0, "a large element off the storage alignment was not refused to the old path");
+        draw(moved, 16, 0x11);
+        expect(0x55, 0x66, 0x11, "a small replay after a large one");
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_built_new"] == 0 && counters["draw_templates_built_shape"] == 0, "the small template was not kept beside the large one");
+        put(moved, 0x00776655u);
+        draw(moved, 5, 0x13);
+        expect(0x55, 0x66, 0x13, "a replay whose moved element is five bytes at adjustment four");
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 1, "the five-byte element was not templated");
+        for (int round = 0; round < 6; ++round) {
+            draw(moved, 16, round % 2 == 0 ? 1u : 0x21u);
+            expect(0x55, 0x66, round % 2 == 0 ? 1u : 0x21u, "a replay alternating its FlattenedSrt words between the template's and changed ones");
+        }
+        counters = collect();
+        if (on) Require(counters["draw_templates_replays"] == 6 && counters["draw_templates_built_new"] + counters["draw_templates_built_shape"] <= 1, "alternating between two element shapes rebuilt a template on each use");
+        std::cout << "agc_draw_templates_stream" << (on ? "" : " (off)") << ": ok\n";
+    } else if (scenario == "flights" || scenario == "publish") {
+        expect(warmDraws, warmDraws, warmDraws, "the additive warm-up draws");
+        static_cast<void>(collect());
+        std::uint32_t red = warmDraws;
+        std::uint32_t green = warmDraws;
+        std::uint32_t blue = warmDraws;
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            const auto at = data + 0x100 * (k + 1) + 4;
+            put(at, (k + 1) | ((2 * k + 1) << 8u));
+            red += k + 1;
+            green += 2 * k + 1;
+        }
+        for (std::uint32_t k = 0; k < 5; ++k) {
+            draw(data + 0x100 * (k + 1) + 4, 16, k + 3);
+            blue += k + 3;
+        }
+        auto counters = collect();
+        if (on && scenario == "flights") Require(counters["draw_templates_replays"] == 5 && counters["draw_templates_refused_flight_busy"] == 0 && (scenario == "publish" || counters["draw_templates_flight_groups"] == 2), "five uses of one template in one batch did not take five flights of two flight groups");
+        else if (!on) Require(counters["draw_templates_replays"] == 0, "the template path ran with its switch off");
+        expect(red, green, blue, "five additive replays of one template in one batch");
+        draw(data + 0x100 + 4, 16, 2);
+        red += 1;
+        green += 1;
+        blue += 2;
+        counters = collect();
+        if (on && scenario == "flights") Require(counters["draw_templates_replays"] == 1 && counters["draw_templates_refused_flight_busy"] == 0 && counters["draw_templates_flight_groups"] == 0, "a flight was not free again after its batch completed");
+        expect(red, green, blue, "an additive replay after the batch completed");
+        struct Gate {
+            const Context& context;
+            Recorder& recorder;
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            void Release() {
+                if (semaphore == VK_NULL_HANDLE) return;
+                std::uint64_t value = 0;
+                Check(context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, semaphore, &value), "template hold counter");
+                if (value != 0) return;
+                const VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR, nullptr, semaphore, 1};
+                Check(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal), "template hold release");
+            }
+            ~Gate() {
+                try {
+                    Release();
+                    recorder.Sync();
+                } catch (...) {
+                }
+                if (semaphore != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, semaphore, nullptr);
+            }
+        } gate{context, recorder};
+        const VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR, nullptr, VK_SEMAPHORE_TYPE_TIMELINE_KHR, 0};
+        const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &gate.semaphore), "template hold semaphore");
+        for (std::uint32_t k = 0; k < 8; ++k) put(data + 0x100 * (k + 7) + 4, (k + 2) | ((k + 1) << 8u));
+        static_cast<void>(collect());
+        recorder.HoldNextSubmit(gate.semaphore, 1);
+        draw(data + 0x100 * 7 + 4, 16, 4);
+        const auto held = recorder.OpenSerial();
+        recorder.Submit();
+        Require(recorder.CompletedThrough() < held, "the held batch completed before its gate opened");
+        for (std::uint32_t k = 1; k < 8; ++k) draw(data + 0x100 * (k + 7) + 4, 16, k + 4);
+        Require(recorder.CompletedThrough() < held, "the held batch completed while later draws were recorded");
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            red += k + 2;
+            green += k + 1;
+            blue += k + 4;
+        }
+        counters = collect();
+        if (on && scenario == "flights") Require(counters["draw_templates_replays"] == 8 && counters["draw_templates_refused_flight_busy"] == 0, "the draws around a held submission were not templated");
+        gate.Release();
+        expect(red, green, blue, "additive replays recorded while an earlier batch that read a flight was held on the GPU");
+        if (scenario == "publish") {
+            if ((context.limits.framebufferDepthSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0) return 77;
+            DepthTarget source{data, address + 4 * unit, {64, 64}, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.0f, 0, address + 3 * unit, false, 4};
+            source.depthSwizzle = 24;
+            source.iterate256 = true;
+            source.htilePipeAligned = true;
+            source.htileDepthOnly = true;
+            {
+                std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                Require(DepthSurfaceView(context, source) != VK_NULL_HANDLE, "the flight publication fixture has no native depth view");
+                NoteDepthSurfaceWrite(context, source);
+                std::cout << "publication source: " << DescribeDepthOverlaps(context.device, data, unit) << " watched " << AgcDriver::GuestMemory::Watched(data, unit) << " guarded " << ResidentDepthGuardOverlaps_nid_no_patch(data, unit) << std::endl;
+            }
+            recorder.Sync();
+            for (int warm = 0; warm < 4; ++warm) {
+                draw(base, 16, 1);
+                ++blue;
+                expect(red, green, blue, "warming a slot over the existing native depth owner");
+            }
+            {
+                std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                NoteDepthSurfaceWrite(context, source);
+            }
+            ShaderRecompiler::RecompileResult neutralVertex, neutralPixel;
+            neutralVertex.spirv = std::vector<std::uint32_t>(std::begin(COVER_VERT_SPV), std::end(COVER_VERT_SPV));
+            std::vector<std::uint32_t> neutralWords(std::begin(COVER_FRAG_SPV), std::end(COVER_FRAG_SPV));
+            for (auto& word : neutralWords) if (word == 0x3f800000u) word = 0;
+            neutralPixel.spirv = std::move(neutralWords);
+            neutralVertex.variantId = 403;
+            neutralPixel.variantId = 404;
+            const std::array neutralStages{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &neutralVertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &neutralPixel, 0}};
+            Draw(context, *target, indirect, neutralStages);
+            WaitForOptimizedPipelines(context.device);
+            static_cast<void>(collect());
+            const auto beforePublication = recorder.OpenSerial();
+            draw(base, 16, 2);
+            Require(recorder.OpenSerial() > beforePublication, "the static native depth read did not submit during template preparation");
+            Gate publicationGate{context, recorder};
+            Check(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &publicationGate.semaphore), "publication hold semaphore");
+            recorder.HoldNextSubmit(publicationGate.semaphore, 1);
+            const auto publicationSerial = recorder.OpenSerial();
+            recorder.Submit();
+            for (std::uint32_t word = 3; word <= 6; ++word) draw(base, 16, word);
+            Require(recorder.CompletedThrough() < publicationSerial, "the publication draw's submission did not remain held");
+            const auto publicationCounts = collect();
+            if (on && publicationCounts.at("draw_templates_replays") != 5) {
+                for (const auto& [name, value] : publicationCounts) if (value != 0 && (name.starts_with("draw_templates_") || name.starts_with("archc_replay_refused_"))) std::cout << name << " " << value << "\n";
+            }
+            if (on) Require(publicationCounts.at("draw_templates_replays") == 5, "the publication flight case did not take the template path for all five draws");
+            publicationGate.Release();
+            blue += 20;
+            expect(red, green, blue, "a held template flight stamped after static native depth publication submitted its earlier batch");
+        }
+        std::cout << "agc_draw_templates_flights" << (on ? "" : " (off)") << ": ok\n";
+    } else if (scenario == "tail") {
+        static_cast<void>(collect());
+        for (std::uint32_t round = 0; round < 3; ++round) {
+            const auto moved = data + 0x100 * (round + 1) + 4;
+            put(moved, 0x4231u);
+            put(moved + 4, 0x3f800000u);
+            draw(moved, 16, round + 2);
+            expect(0, 255, 255, "a translated DWORD load spanning the five-byte element's tail");
+        }
+        const auto counters = collect();
+        if (on) Require(counters.at("draw_templates_replays") == 3, "the translated tail loads did not use templates");
+        std::cout << "agc_draw_templates_tail: ok\n";
+    } else if (scenario == "budget") {
+        static_cast<void>(collect());
+        const auto moved = data + 0x100 + 4;
+        put(moved, 0x4231u);
+        for (int round = 0; round < 4; ++round) {
+            draw(moved, 16, round % 2 == 0 ? 1u : 0x21u);
+            expect(0x31, 0x42, round % 2 == 0 ? 1u : 0x21u, "a replay under a template budget of one flight group");
+        }
+        auto counters = collect();
+        Require(counters["draw_templates_refused_budget"] == 2 && counters["draw_templates_replays"] == 2 && counters["draw_templates_built_new"] == 1, "a second template generation was built over the budget");
+        for (std::uint32_t round = 0; round < 80; ++round) draw(moved, 32 + round * 4, round + 2);
+        expect(0x31, 0x42, 81, "a long open batch with template generation churn under the allocation caps");
+        counters = collect();
+        Require(counters["draw_templates_refused_budget"] == 80 && counters["draw_templates_sets_allocated"] == 0, "outstanding generations bypassed the set budget");
+        std::cout << "agc_draw_templates_budget: ok\n";
+    } else {
+        throw std::runtime_error("unknown draw template scenario");
+    }
+    static_cast<void>(collect());
+    for (const char* kind : {"element_bytes", "element_range", "static_binding", "element_set", "push"}) Require(total[std::string("draw_templates_verify_mismatch_") + kind] == 0, "VERIFY counted a template mismatch");
+    if (verify && on) Require(total["draw_templates_verify_checks"] == total["draw_templates_replays"] && total["draw_templates_replays"] != 0, "VERIFY did not check every templated replay");
+    std::cout << "draw templates: replays " << total["draw_templates_replays"] << ", verify checks " << total["draw_templates_verify_checks"] << ", bytes " << total["draw_templates_bytes"] << ", sets " << total["draw_templates_sets_allocated"] << ", writes " << total["draw_templates_descriptor_writes"] << std::endl;
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    struct RuntimeControl {
+        std::filesystem::path path;
+        ~RuntimeControl() { if (!path.empty()) std::filesystem::remove(path); }
+    } runtimeControl;
+    if (argc == 3 && ((std::string_view(argv[1]) == "--archc-replay" && std::string_view(argv[2]).starts_with("split_faces_")) || (std::string_view(argv[1]) == "--lazy-shadow" && std::string_view(argv[2]) == "driver_store_toggle"))) {
+        runtimeControl.path = std::filesystem::temp_directory_path() / ("anyps5-recorder-control-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".txt");
+#ifdef _WIN32
+        _putenv_s("APS5_ARCHB_CONTROL_FILE", runtimeControl.path.string().c_str());
 #else
-        setenv("APS5_ARCHB_CONTROL_FILE", splitFacesControl.path.string().c_str(), 1);
+        setenv("APS5_ARCHB_CONTROL_FILE", runtimeControl.path.string().c_str(), 1);
 #endif
     }
 #ifdef _WIN32
@@ -18388,7 +19606,7 @@ int main(int argc, char** argv) {
         }
 #endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
-        Recorder recorder(device.GetContext());
+        Recorder recorder(device.GetContext(), device.Timeline());
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
             if (device.GetContext().hostImportAlignment == 0) return 77;
@@ -18811,6 +20029,12 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string_view(argv[1]) == "--archc-replay") {
             return archcReplayTests(device, recorder, argv[2]);
         }
+        if (argc == 3 && std::string_view(argv[1]) == "--draw-templates") {
+            return drawTemplateTests(device, recorder, argv[2]);
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--parameter-arena") {
+            return parameterArenaTests(device);
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--archc-template-token") {
             return archcTemplateTokenTests(device, recorder);
         }
@@ -18819,6 +20043,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-lazy") {
             return archcLazyTests(device, recorder, argv[2]);
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--lazy-shadow") {
+            return lazyShadowTests(device, recorder, argv[2]);
         }
         if (argc == 3 && std::string_view(argv[1]) == "--archc-label-prewait") {
             return archcLabelPrewaitTests(device, recorder, argv[2]);
