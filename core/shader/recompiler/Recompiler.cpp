@@ -1253,6 +1253,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
+    result.bdaWrites = variant.info.info.bdaWrites;
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
     if (!artifact.stencilReferences.empty()) {

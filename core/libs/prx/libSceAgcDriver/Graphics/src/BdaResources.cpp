@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -140,6 +141,7 @@ BdaResources::BdaResources(const Context& context) {
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+    if (VramWritable()) memoryOwner = &memory;
     const auto cached = memory.CachedAddressTable();
     struct AddressRangesStorage {};
     auto& built = HostThreadLocal<std::vector<ShaderRecompiler::BdaAbi::Range>, AddressRangesStorage>();
@@ -315,9 +317,11 @@ void BdaResources::SetImageTables(std::vector<ImageTableFaults> tables, std::vec
 void BdaResources::markWrittenPages() const {
     namespace Abi = ShaderRecompiler::BdaAbi;
     auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
-    Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
+    const bool overflow = words[Abi::WrittenOverflowWord] != 0;
+    Require(!overflow || memoryOwner != nullptr, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     const auto count = words[Abi::WrittenCountWord];
-    if (count == 0) return;
+    if (overflow) memoryOwner->QueueBdaOverflow();
+    if (count == 0 && !overflow) return;
     Require(Abi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t bytes) {
         const auto end = begin + bytes;
         for (const auto& [base, size] : imageTableRanges) {
@@ -327,7 +331,8 @@ void BdaResources::markWrittenPages() const {
                 Require(false, message.str());
             }
         }
-        GuestMemory::MarkWritten(begin, bytes);
+        if (memoryOwner != nullptr) memoryOwner->QueueBdaWrites(begin, bytes);
+        else GuestMemory::MarkWritten(begin, bytes);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];
@@ -335,6 +340,7 @@ void BdaResources::markWrittenPages() const {
         words[Abi::WrittenSlotsWord + 2 * slot + 1] = 0;
     }
     words[Abi::WrittenCountWord] = 0;
+    words[Abi::WrittenOverflowWord] = 0;
 }
 
 }

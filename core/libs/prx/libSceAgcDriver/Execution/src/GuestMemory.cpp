@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VramOptions.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -541,6 +543,18 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
         const auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
+        bool gpuPending = false;
+        if (GuestArena::GuestArenaGpuOverlayProtection_nid_no_patch(cursor, &logicalProtection, &gpuPending)) {
+            constexpr std::uintptr_t gpuPage = 4096;
+            const auto page = cursor & ~(gpuPage - 1);
+            const auto stop = std::min({end, regionEnd, page + gpuPage});
+            const bool readable = memory.State == MEM_COMMIT && (logicalProtection & PAGE_GUARD) == 0 && readableProtection(logicalProtection & 0xffu);
+            const bool writable = readable && writableProtection(logicalProtection & 0xffu);
+            pages.record(page, stop, readable, writable, generation);
+            if (!emit(PageRun{cursor, stop, readable, writable})) return true;
+            cursor = stop;
+            continue;
+        }
         const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         if (GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection)) {
             constexpr std::uintptr_t sharedPage = 0x4000;
@@ -1264,6 +1278,11 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return import();
+    std::unique_lock gpuLock(GpuMutex(), std::defer_lock);
+    if (Graphics::VramWritable()) {
+        gpuLock.lock();
+        FlushGpuWrites(address, bytes);
+    }
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1359,6 +1378,17 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    std::unique_lock gpuLock(GpuMutex(), std::defer_lock);
+    std::optional<GuestArena::HostWrite> hostWrite;
+    if (Graphics::VramWritable()) {
+        gpuLock.lock();
+#ifdef _WIN32
+        if (GuestArena::GuestArenaHasGpuOverlay_nid_no_patch(address, bytes)) {
+            hostWrite.emplace(reinterpret_cast<void*>(address), bytes);
+            require(hostWrite->Open(), "cannot prepare a host write over GPU watched memory");
+        }
+#endif
+    }
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;

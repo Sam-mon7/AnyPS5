@@ -11,9 +11,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <mutex>
 #include <map>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <stdexcept>
 #include <string>
@@ -70,8 +73,11 @@ public:
                     mapped->second.armed = 0;
                     invalidate(*mapped->second.page);
                 }
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                if (gpuFault.load(std::memory_order_acquire) != nullptr) applyGpuProtection(cursor, stop - cursor, protection);
+                else {
+                    DWORD previous;
+                    if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
+                }
                 cursor = stop;
             }
         }
@@ -92,7 +98,11 @@ public:
         timer.Step(MemoryLockProbe::MapStep::Setup);
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
-        const auto owned = std::make_shared<Section>(duplicate);
+        auto owned = std::make_shared<Section>(duplicate);
+        if (gpuTracking()) {
+            owned = canonicalGpuSection(std::move(owned));
+            section = owned->handle;
+        }
         if (RunViews()) {
             const auto end = cursor + bytes;
             timer.Step(MemoryLockProbe::MapStep::Split);
@@ -114,11 +124,13 @@ public:
                 auto shared = physical[key].lock();
                 if (!shared) {
                     shared = std::make_shared<SharedPage>();
+                    if (gpuTracking()) shared->section = owned;
                     physical[key] = shared;
                 }
                 const auto base = cursor + done;
                 shared->aliases.push_back(base);
                 views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
+                for (std::size_t sub = 0; sub < subpages; ++sub) if (shared->gpuOwners[sub] != 0) applyGpuPage(base + sub * subpageBytes);
                 remember(freshRanges, base, base + pageBytes);
                 invalidate(*shared);
                 timer.PageDone();
@@ -150,11 +162,13 @@ public:
             if (!lean) shared = physical[key].lock();
             if (!shared) {
                 shared = std::make_shared<SharedPage>();
+                if (gpuTracking()) shared->section = owned;
                 physical[key] = shared;
             }
             const auto base = cursor + done;
             shared->aliases.push_back(base);
             views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
+            for (std::size_t sub = 0; sub < subpages; ++sub) if (shared->gpuOwners[sub] != 0) applyGpuPage(base + sub * subpageBytes);
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
             timer.PageDone();
@@ -168,10 +182,20 @@ public:
             it->second.armed = 0;
             invalidate(*it->second.page);
         }
+        for (auto it = gpuPages.lower_bound(address); it != gpuPages.end() && it->first < address + bytes; ++it) it->second.protection = protection;
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
         MemoryLockProbe::Lock lock(mutex, "pin", bytes);
+        if (gpuTracking()) {
+            for (auto page = address & ~(subpageBytes - 1); page < address + bytes; page += subpageBytes) if (gpuPages.contains(page)) throw std::runtime_error("cannot pin memory with an active GPU write watch");
+        }
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
+            if (std::any_of(it->second.page->gpuOwners.begin(), it->second.page->gpuOwners.end(), [](auto owner) { return owner != 0; })) throw std::runtime_error("cannot pin shared memory with an active GPU write watch");
+        }
+        if (gpuTracking()) {
+            for (auto page = address & ~(subpageBytes - 1); page < address + bytes; page += subpageBytes) if (!views.contains(page & ~(pageBytes - 1))) ++gpuPins[page];
+        }
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& page = *it->second.page;
             ++page.pins;
@@ -192,9 +216,14 @@ public:
             if (page.pins != 0) --page.pins;
             invalidate(page);
         }
+        for (auto it = gpuPins.lower_bound(address & ~(subpageBytes - 1)); it != gpuPins.end() && it->first < address + bytes;) {
+            if (--it->second == 0) it = gpuPins.erase(it);
+            else ++it;
+        }
     }
 
     bool HandleWrite(std::uintptr_t address) {
+        if (const auto handled = handleGpuFault(address, true)) return *handled;
         MemoryLockProbe::Lock lock(mutex, "write-fault", 1);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
@@ -208,6 +237,7 @@ public:
     }
 
     bool HandleTransition(std::uintptr_t address) {
+        if (gpuAccessProtected.load(std::memory_order_acquire)) if (const auto handled = handleGpuFault(address, false)) return *handled;
         if (transitionOwner.load() == GetCurrentThreadId()) return false;
         bool recent = false;
         for (std::size_t slot = 0; slot < transitionSlots && !recent; ++slot) recent = transitionFrom[slot].load() <= address && address < transitionTo[slot].load();
@@ -227,15 +257,36 @@ public:
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes) {
+        const bool reserved = gpuTracking();
+        if (reserved) {
+            if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+            {
+                MemoryLockProbe::Lock lock(mutex, "gpu-host-write-reserve", bytes);
+                for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) if (!writable(it->second.protection)) return false;
+                for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) ++it->second.hostWrites;
+                for (auto page = address & ~(subpageBytes - 1); page < address + bytes; page += subpageBytes) if (!views.contains(page & ~(pageBytes - 1))) ++gpuHostWrites[page];
+            }
+            try {
+                for (auto page = address & ~(subpageBytes - 1); page < address + bytes; page += subpageBytes) {
+                    if (const auto handled = handleGpuFault(page, true); handled && !*handled) {
+                        EndHostWrite(address, bytes);
+                        return false;
+                    }
+                }
+            } catch (...) {
+                EndHostWrite(address, bytes);
+                throw;
+            }
+        }
         MemoryLockProbe::Lock lock(mutex, "host-write-begin", bytes);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
-            if (!writable(it->second.protection)) return false;
+            if (!reserved && !writable(it->second.protection)) return false;
         }
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
-            ++view.hostWrites;
+            if (!reserved) ++view.hostWrites;
             const auto written = subpagesOf(it->first, address, end);
             invalidate(*view.page, written);
             const auto opened = static_cast<std::uint8_t>(view.armed & written);
@@ -252,6 +303,10 @@ public:
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             --it->second.hostWrites;
             invalidate(*it->second.page, subpagesOf(it->first, address, end));
+        }
+        for (auto it = gpuHostWrites.lower_bound(address & ~(subpageBytes - 1)); it != gpuHostWrites.end() && it->first < end;) {
+            if (--it->second == 0) it = gpuHostWrites.erase(it);
+            else ++it;
         }
     }
 
@@ -273,9 +328,14 @@ public:
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             const auto page = views.find(address + done);
             if (page == views.end()) throw refuse("the range is not a run of shared views");
+            if (std::any_of(page->second.page->gpuOwners.begin(), page->second.page->gpuOwners.end(), [](auto owner) { return owner != 0; })) throw refuse("a GPU write watch is active");
             if (page->second.offset != offset + done || (page->second.section != section && !sameSection(page->second.section->handle, section->handle))) contiguous = false;
         }
-        if (!contiguous) return mapAliasRuns(address, bytes);
+        if (!contiguous) {
+            auto* alias = mapAliasRuns(address, bytes);
+            rememberGpuAlias(alias, address, bytes);
+            return alias;
+        }
         const auto lead = offset % system.dwAllocationGranularity;
         void* alias = map(section->handle, GetCurrentProcess(), nullptr, offset - lead, lead + bytes, 0, PAGE_READWRITE, nullptr, 0);
         if (alias == nullptr) {
@@ -283,7 +343,9 @@ public:
             std::snprintf(text, sizeof(text), "MapViewOfFile3 of a read-write alias of shared guest memory 0x%llx+0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), text);
         }
-        return static_cast<char*>(alias) + lead;
+        auto* result = static_cast<char*>(alias) + lead;
+        rememberGpuAlias(result, address, bytes);
+        return result;
     }
 
     void UnmapAlias(void* alias) {
@@ -294,6 +356,15 @@ public:
                 const auto error = releaseAlias(found->first, found->second);
                 splitAliases.erase(found);
                 if (error != ERROR_SUCCESS) throw std::system_error(static_cast<int>(error), std::system_category(), "unmap a run of a shared guest alias");
+                forgetGpuAlias(alias);
+                return;
+            }
+            if (gpuAliases.contains(reinterpret_cast<std::uintptr_t>(alias))) {
+                SYSTEM_INFO system{};
+                GetSystemInfo(&system);
+                const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
+                if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), 0)) fail("unmap shared GPU alias");
+                forgetGpuAlias(alias);
                 return;
             }
         }
@@ -301,6 +372,7 @@ public:
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), 0)) fail("unmap shared guest alias");
+        untrackedAliases.fetch_sub(1, std::memory_order_relaxed);
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
@@ -308,6 +380,235 @@ public:
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
+        return true;
+    }
+
+    void SetGpuPageFault(bool (*callback)(std::uintptr_t, bool)) {
+        MemoryLockProbe::Lock lock(mutex, "gpu-callback", 0);
+        if (!gpuPages.empty() && callback != gpuFault.load()) throw std::runtime_error("cannot replace the GPU fault callback while pages are watched");
+        if (callback != nullptr && untrackedAliases.load(std::memory_order_relaxed) != 0) throw std::runtime_error("close existing untracked host aliases before enabling GPU page watches");
+        if (callback != nullptr && gpuFault.load() == nullptr) {
+            std::map<std::pair<std::uintptr_t, std::uint64_t>, std::shared_ptr<SharedPage>> shared;
+            for (const auto& [key, weak] : physical) if (auto page = weak.lock(); page != nullptr && page->section != nullptr && key.first == reinterpret_cast<std::uintptr_t>(page->section->handle)) shared.emplace(key, std::move(page));
+            std::map<SharedPage*, std::shared_ptr<SharedPage>> moved;
+            for (auto& [address, view] : views) {
+                view.section = canonicalGpuSection(view.section);
+                const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(view.section->handle), view.offset);
+                auto [found, inserted] = shared.try_emplace(key, view.page);
+                if (!moved.contains(view.page.get())) {
+                    if (!inserted && found->second != view.page) {
+                        found->second->pins += view.page->pins;
+                        found->second->hostAliases += view.page->hostAliases;
+                    }
+                    moved.emplace(view.page.get(), found->second);
+                }
+                view.page = found->second;
+                view.page->section = view.section;
+                view.seen = {};
+            }
+            decltype(physical) canonical;
+            for (const auto& [key, page] : shared) canonical.emplace(key, page);
+            physical.swap(canonical);
+            for (const auto& [key, page] : shared) page->aliases.clear();
+            for (const auto& [address, view] : views) view.page->aliases.push_back(address);
+            for (auto& [address, aliases] : gpuAliases) for (auto& page : aliases) if (const auto found = moved.find(page.get()); found != moved.end()) page = found->second;
+            cleanRanges.clear();
+        }
+        gpuFault.store(callback, std::memory_order_release);
+    }
+
+    bool CanProtectGpuAccess(std::uintptr_t address, std::size_t bytes) {
+        if (gpuFault.load(std::memory_order_acquire) == nullptr || !wholeGpuPages(address, bytes)) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-access-eligible", bytes);
+        for (auto page = address; page < address + bytes; page += subpageBytes) {
+            const auto view = views.find(page & ~(pageBytes - 1));
+            if (view == views.end() || !writable(view->second.protection) || !canProtectGpuShared(*view->second.page)) return false;
+        }
+        return true;
+    }
+
+    bool ProtectGpuAccess(std::uintptr_t address, std::size_t bytes) {
+        if (gpuFault.load(std::memory_order_acquire) == nullptr || !wholeGpuPages(address, bytes)) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-access-protect", bytes);
+        std::vector<std::pair<std::uintptr_t, GpuPage>> changed;
+        for (auto page = address; page < address + bytes; page += subpageBytes) {
+            const auto found = gpuPages.find(page);
+            if (found == gpuPages.end() || found->second.shared == nullptr || !canProtectGpuShared(*found->second.shared)) return false;
+            changed.emplace_back(*found);
+        }
+        gpuAccessProtected.store(true, std::memory_order_release);
+        for (const auto& [page, item] : changed) gpuPages.at(page).pending = true;
+        try { applyGpuChanges(changed); }
+        catch (...) {
+            for (const auto& [page, item] : changed) gpuPages.at(page).pending = item.pending;
+            applyGpuChanges(changed);
+            throw;
+        }
+        return true;
+    }
+
+    bool HasGpuOverlay(std::uintptr_t address, std::size_t bytes) {
+        if (gpuFault.load(std::memory_order_acquire) == nullptr || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-overlay-range", bytes);
+        const auto first = address & ~(subpageBytes - 1);
+        const auto found = gpuPages.lower_bound(first);
+        if (found != gpuPages.end() && found->first < address + bytes) return true;
+        for (auto view = views.lower_bound(address & ~(pageBytes - 1)); view != views.end() && view->first < address + bytes; ++view) {
+            const auto mask = subpagesOf(view->first, address, address + bytes);
+            for (std::size_t sub = 0; sub < subpages; ++sub) if ((mask & (1u << sub)) != 0 && view->second.page->gpuOwners[sub] != 0) return true;
+        }
+        return false;
+    }
+
+    bool ArmGpuWriteWatch(std::uintptr_t address, std::size_t bytes) {
+        if (gpuFault.load(std::memory_order_acquire) == nullptr || !wholeGpuPages(address, bytes)) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-arm", bytes);
+        std::vector<std::pair<std::uintptr_t, GpuPage>> added;
+        std::map<SharedPage*, std::uint8_t> sharedPages;
+        MEMORY_BASIC_INFORMATION memory{};
+        std::uintptr_t memoryEnd = 0;
+        for (auto page = address; page < address + bytes; page += subpageBytes) {
+            if (gpuPages.contains(page)) return false;
+            if (page >= memoryEnd) {
+                memory = query(page);
+                memoryEnd = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+            }
+            if (memory.State != MEM_COMMIT) return false;
+            const auto view = views.find(page & ~(pageBytes - 1));
+            const DWORD protection = view == views.end() ? memory.Protect : view->second.protection;
+            if (!writable(protection)) return false;
+            GpuPage item{nullptr, protection, ++gpuNextSerial, true, false};
+            if (view != views.end()) {
+                item.shared = view->second.page;
+                const auto sub = (page % pageBytes) / subpageBytes;
+                if (item.shared->pins != 0 || item.shared->hostAliases != 0 || item.shared->gpuOwners[sub] != 0) return false;
+                for (const auto alias : item.shared->aliases) if (views.at(alias).hostWrites != 0) return false;
+                auto& mask = sharedPages[item.shared.get()];
+                if ((mask & (1u << sub)) != 0) return false;
+                mask |= static_cast<std::uint8_t>(1u << sub);
+            } else if (memory.Type != MEM_PRIVATE || gpuHostWrites.contains(page) || gpuPins.contains(page)) return false;
+            added.emplace_back(page, std::move(item));
+        }
+        try {
+            for (const auto& [page, item] : added) {
+                gpuPages.emplace(page, item);
+                if (item.shared != nullptr) item.shared->gpuOwners[(page % pageBytes) / subpageBytes] = page;
+            }
+            applyGpuChanges(added);
+        } catch (...) {
+            for (const auto& [page, item] : added) removeGpuPage(page);
+            throw;
+        }
+        return true;
+    }
+
+    void DisarmGpuWriteWatch(std::uintptr_t address, std::size_t bytes) {
+        if (!wholeGpuPages(address, bytes)) throw std::runtime_error("GPU write watch is not made of whole pages");
+        MemoryLockProbe::Lock lock(mutex, "gpu-disarm", bytes);
+        std::vector<std::pair<std::uintptr_t, GpuPage>> removed;
+        for (auto it = gpuPages.lower_bound(address); it != gpuPages.end() && it->first < address + bytes;) {
+            removed.emplace_back(*it);
+            if (it->second.shared != nullptr) it->second.shared->gpuOwners[(it->first % pageBytes) / subpageBytes] = 0;
+            it = gpuPages.erase(it);
+        }
+        applyGpuChanges(removed);
+    }
+
+    bool PublishGpuPage(std::uintptr_t address, const void* gpu, const void* firstCpuBase) {
+        if (address % subpageBytes != 0 || gpu == nullptr) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-publish", subpageBytes);
+        const auto found = gpuPages.find(address);
+        if (found == gpuPages.end() || (!found->second.pending && !writable(found->second.protection)) || (!found->second.armed && firstCpuBase == nullptr)) return false;
+        const auto shared = found->second.shared;
+        const bool pending = found->second.pending;
+        const auto releaseAlias = [this](void* alias) { if (alias != nullptr) unmap(GetCurrentProcess(), alias, 0); };
+        std::unique_ptr<void, decltype(releaseAlias)> alias(nullptr, releaseAlias);
+        auto* destination = reinterpret_cast<unsigned char*>(address);
+        if (pending) {
+            const auto& view = views.at(address & ~(pageBytes - 1));
+            SYSTEM_INFO system{};
+            GetSystemInfo(&system);
+            const auto offset = view.offset + address % pageBytes;
+            const auto lead = offset % system.dwAllocationGranularity;
+            alias.reset(map(view.section->handle, GetCurrentProcess(), nullptr, offset - lead, lead + subpageBytes, 0, PAGE_READWRITE, nullptr, 0));
+            if (alias == nullptr) fail("map GPU publication alias");
+            destination = static_cast<unsigned char*>(alias.get()) + lead;
+        }
+        std::array<unsigned char, subpageBytes> untouched;
+        const auto* base = static_cast<const unsigned char*>(firstCpuBase);
+        if (base == nullptr) {
+            std::memcpy(untouched.data(), destination, untouched.size());
+            base = untouched.data();
+        }
+        const auto protection = found->second.protection;
+        if (!pending) removeGpuPage(address);
+        if (shared != nullptr) {
+            auto& view = views.at(address & ~(pageBytes - 1));
+            if (!pending) view.armed &= static_cast<std::uint8_t>(~(1u << ((address % pageBytes) / subpageBytes)));
+            invalidate(*shared, static_cast<std::uint8_t>(1u << ((address % pageBytes) / subpageBytes)));
+        }
+        if (!pending) {
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(address), subpageBytes, protection, &previous)) fail("open GPU publication page");
+            gpuProtectionSerial.fetch_add(1, std::memory_order_release);
+        }
+        const auto* source = static_cast<const unsigned char*>(gpu);
+        static_assert(std::atomic_ref<unsigned char>::is_always_lock_free);
+        for (std::size_t at = 0; at < subpageBytes; ++at) {
+            if (source[at] == base[at]) continue;
+            auto expected = base[at];
+            std::atomic_ref<unsigned char>(destination[at]).compare_exchange_strong(expected, source[at], std::memory_order_relaxed);
+        }
+        if (pending) {
+            alias.reset();
+            removeGpuPage(address);
+        }
+        return true;
+    }
+
+    bool GpuOverlayProtection(std::uintptr_t address, std::uint32_t* protection, bool* pending) {
+        if (gpuFault.load(std::memory_order_acquire) == nullptr) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-protection", 1);
+        const auto owner = gpuOwner(address);
+        if (owner == 0) return false;
+        const auto view = views.find(address & ~(pageBytes - 1));
+        *protection = view == views.end() ? gpuPages.at(owner).protection : view->second.protection;
+        if (pending != nullptr) *pending = gpuPages.at(owner).pending;
+        return true;
+    }
+
+    bool ApplyGpuProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
+        if (gpuFault.load(std::memory_order_acquire) == nullptr) return false;
+        MemoryLockProbe::Lock lock(mutex, "gpu-protect", bytes);
+        applyGpuProtection(address, bytes, protection);
+        return true;
+    }
+
+    bool VisitGpuAliases(std::uintptr_t address, std::size_t bytes, bool (*visitor)(std::uintptr_t, std::size_t, void*), void* context) {
+        if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address || visitor == nullptr) return false;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> aliases;
+        {
+            MemoryLockProbe::Lock lock(mutex, "gpu-aliases", bytes);
+            for (auto cursor = address; cursor < address + bytes;) {
+                const auto base = cursor & ~(pageBytes - 1);
+                const auto stop = std::min(address + bytes, base + pageBytes);
+                const auto view = views.find(base);
+                if (view != views.end()) {
+                    for (const auto alias : view->second.page->aliases) if (alias != base) aliases.emplace_back(alias + cursor - base, alias + stop - base);
+                } else {
+                    const auto memory = query(cursor);
+                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                }
+                cursor = stop;
+            }
+        }
+        std::sort(aliases.begin(), aliases.end());
+        for (std::size_t index = 0; index < aliases.size();) {
+            const auto begin = aliases[index].first;
+            auto end = aliases[index++].second;
+            while (index < aliases.size() && aliases[index].first <= end) end = std::max(end, aliases[index++].second);
+            if (!visitor(begin, end - begin, context)) return false;
+        }
         return true;
     }
 
@@ -391,9 +692,14 @@ public:
                             untracked |= arming;
                             continue;
                         }
-                        const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        protectSubpages(alias, arming, protection, "arm shared memory write tracking");
-                        other.armed |= arming;
+                        if (gpuFault.load(std::memory_order_acquire) != nullptr) {
+                            other.armed |= arming;
+                            applyGpuView(alias, arming);
+                        } else {
+                            const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+                            protectSubpages(alias, arming, protection, "arm shared memory write tracking");
+                            other.armed |= arming;
+                        }
                     }
                     const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
                     auto cleanFrom = cursor;
@@ -464,6 +770,7 @@ private:
     static_assert(subpageBytes == 4096, "Collect reports one page per subpage");
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
+    struct Section;
     struct SharedPage {
         std::array<std::uint64_t, subpages> generation = [] {
             std::array<std::uint64_t, subpages> initial{};
@@ -472,6 +779,9 @@ private:
         }();
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
+        std::array<std::uintptr_t, subpages> gpuOwners{};
+        std::uint32_t hostAliases = 0;
+        std::shared_ptr<Section> section;
     };
     struct Section {
         HANDLE handle;
@@ -490,7 +800,219 @@ private:
         std::uint32_t hostWrites;
         std::uint8_t collected = 0;
     };
+    struct GpuPage {
+        std::shared_ptr<SharedPage> shared;
+        DWORD protection;
+        std::uint64_t serial;
+        bool armed;
+        bool pending;
+    };
     using Ranges = std::map<std::uintptr_t, std::uintptr_t>;
+
+    static bool wholeGpuPages(std::uintptr_t address, std::size_t bytes) {
+        return address != 0 && bytes != 0 && address % subpageBytes == 0 && bytes % subpageBytes == 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address;
+    }
+
+    std::uintptr_t gpuOwner(std::uintptr_t address) const {
+        const auto page = address & ~(subpageBytes - 1);
+        const auto view = views.find(page & ~(pageBytes - 1));
+        if (view != views.end()) return view->second.page->gpuOwners[(page % pageBytes) / subpageBytes];
+        return gpuPages.contains(page) ? page : 0;
+    }
+
+    DWORD effectiveGpuProtection(std::uintptr_t page, DWORD protection) const {
+        const auto owner = gpuOwner(page);
+        if (owner != 0 && gpuPages.at(owner).pending) return PAGE_NOACCESS;
+        const auto view = views.find(page & ~(pageBytes - 1));
+        const auto bit = static_cast<std::uint8_t>(1u << ((page % pageBytes) / subpageBytes));
+        const bool watched = (owner != 0 && gpuPages.at(owner).armed) || (view != views.end() && (view->second.armed & bit) != 0);
+        if (watched && writable(protection)) return protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+        return protection;
+    }
+
+    void protectGpuPage(std::uintptr_t page, DWORD protection) {
+        DWORD previous;
+        if (!VirtualProtect(reinterpret_cast<void*>(page), subpageBytes, protection, &previous)) fail("protect GPU watched page");
+        gpuProtectionSerial.fetch_add(1, std::memory_order_release);
+    }
+
+    void applyGpuPage(std::uintptr_t page) {
+        const auto view = views.find(page & ~(pageBytes - 1));
+        if (view == views.end()) {
+            const auto found = gpuPages.find(page);
+            if (found != gpuPages.end()) protectGpuPage(page, effectiveGpuProtection(page, found->second.protection));
+            return;
+        }
+        applyGpuShared(*view->second.page, static_cast<std::uint8_t>(1u << ((page % pageBytes) / subpageBytes)));
+    }
+
+    void applyGpuShared(SharedPage& page, std::uint8_t mask) {
+        for (const auto alias : page.aliases) applyGpuView(alias, mask);
+    }
+
+    void applyGpuView(std::uintptr_t alias, std::uint8_t mask) {
+        const auto logical = views.at(alias).protection;
+        for (std::size_t sub = 0; sub < subpages;) {
+            if ((mask & (1u << sub)) == 0) { ++sub; continue; }
+            const auto protection = effectiveGpuProtection(alias + sub * subpageBytes, logical);
+            std::uint8_t group = static_cast<std::uint8_t>(1u << sub++);
+            while (sub < subpages && (mask & (1u << sub)) != 0 && effectiveGpuProtection(alias + sub * subpageBytes, logical) == protection) group |= static_cast<std::uint8_t>(1u << sub++);
+            protectSubpages(alias, group, protection, "protect shared GPU watched pages");
+            gpuProtectionSerial.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    bool canProtectGpuShared(const SharedPage& page) const {
+        if (page.pins != 0 || page.hostAliases != 0) return false;
+        for (const auto alias : page.aliases) if (views.at(alias).hostWrites != 0) return false;
+        return true;
+    }
+
+    void applyGpuChanges(const std::vector<std::pair<std::uintptr_t, GpuPage>>& changes) {
+        std::map<SharedPage*, std::uint8_t> shared;
+        for (std::size_t index = 0; index < changes.size();) {
+            const auto& [page, item] = changes[index];
+            if (item.shared != nullptr) {
+                shared[item.shared.get()] |= static_cast<std::uint8_t>(1u << ((page % pageBytes) / subpageBytes));
+                ++index;
+                continue;
+            }
+            const auto protection = effectiveGpuProtection(page, item.protection);
+            auto end = page + subpageBytes;
+            ++index;
+            while (index < changes.size() && changes[index].first == end && changes[index].second.shared == nullptr && effectiveGpuProtection(end, changes[index].second.protection) == protection) {
+                end += subpageBytes;
+                ++index;
+            }
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(page), end - page, protection, &previous)) fail("protect private GPU watched pages");
+            gpuProtectionSerial.fetch_add(1, std::memory_order_release);
+        }
+        for (const auto& [page, mask] : shared) applyGpuShared(*page, mask);
+    }
+
+    void removeGpuPage(std::uintptr_t page) {
+        const auto found = gpuPages.find(page);
+        if (found == gpuPages.end()) return;
+        const auto watched = found->second;
+        if (watched.shared != nullptr) watched.shared->gpuOwners[(page % pageBytes) / subpageBytes] = 0;
+        gpuPages.erase(found);
+        if (watched.shared == nullptr) protectGpuPage(page, watched.protection);
+        else applyGpuPage(page);
+    }
+
+    void applyGpuProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) throw std::runtime_error("GPU protection range overflow");
+        for (auto page = address & ~(subpageBytes - 1); page < address + bytes; page += subpageBytes) {
+            const auto memory = query(page);
+            if (memory.State != MEM_COMMIT) continue;
+            const auto view = views.find(page & ~(pageBytes - 1));
+            const auto logical = view == views.end() ? protection : view->second.protection;
+            if (auto found = gpuPages.find(page); found != gpuPages.end()) found->second.protection = logical;
+            protectGpuPage(page, effectiveGpuProtection(page, logical));
+        }
+    }
+
+    bool retryGpuFault(std::uintptr_t address, bool write) const {
+        const auto serial = gpuProtectionSerial.load(std::memory_order_acquire);
+        if (serial == 0) return false;
+        thread_local std::uintptr_t lastAddress = 0;
+        thread_local std::uint64_t lastSerial = 0;
+        if (lastAddress == address && lastSerial == serial) return false;
+        const auto memory = query(address);
+        const auto protection = memory.Protect & 0xffu;
+        if (memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) != 0 || (write ? !writable(protection) : protection != PAGE_READONLY && protection != PAGE_READWRITE && protection != PAGE_EXECUTE_READ && protection != PAGE_EXECUTE_READWRITE)) return false;
+        lastAddress = address;
+        lastSerial = serial;
+        return true;
+    }
+
+    std::optional<bool> handleGpuFault(std::uintptr_t address, bool write) {
+        const auto callback = gpuFault.load(std::memory_order_acquire);
+        if (callback == nullptr) return std::nullopt;
+        std::uintptr_t owner = 0;
+        std::uint64_t serial = 0;
+        {
+            MemoryLockProbe::Lock lock(mutex, "gpu-fault", 1);
+            owner = gpuOwner(address);
+            if (owner != 0) {
+                const auto& page = gpuPages.at(owner);
+                if (!page.pending && (!write || !page.armed)) return retryGpuFault(address, write) ? std::optional<bool>{true} : std::nullopt;
+                const auto view = views.find(address & ~(pageBytes - 1));
+                const auto logical = view == views.end() ? page.protection : view->second.protection;
+                if (write ? !writable(logical) : !readable(logical)) return false;
+                serial = page.serial;
+            }
+        }
+        if (owner == 0) return retryGpuFault(address, write) ? std::optional<bool>{true} : std::nullopt;
+        if (!callback(owner, write)) {
+            MemoryLockProbe::Lock lock(mutex, "gpu-fault-stale", 1);
+            const auto found = gpuPages.find(owner);
+            if (found != gpuPages.end() && found->second.serial != serial) return true;
+            if (found == gpuPages.end() && retryGpuFault(address, write)) return true;
+            return false;
+        }
+        MemoryLockProbe::Lock lock(mutex, "gpu-fault-resume", 1);
+        if (auto found = gpuPages.find(owner); found != gpuPages.end() && found->second.serial == serial) {
+            if (found->second.pending) return false;
+            found->second.armed = false;
+            if (found->second.shared != nullptr) {
+                const auto bit = static_cast<std::uint8_t>(1u << ((owner % pageBytes) / subpageBytes));
+                invalidate(*found->second.shared, bit);
+                const auto view = views.find(address & ~(pageBytes - 1));
+                if (view != views.end()) view->second.armed &= static_cast<std::uint8_t>(~bit);
+            }
+            applyGpuPage(owner);
+        }
+        return true;
+    }
+
+    bool gpuTracking() const {
+        static const bool enabled = [] {
+            const auto* text = std::getenv("APS5_VRAM_WRITABLE");
+            return text != nullptr && std::string_view(text) == "1";
+        }();
+        return enabled || gpuFault.load(std::memory_order_acquire) != nullptr;
+    }
+
+    std::shared_ptr<Section> canonicalGpuSection(std::shared_ptr<Section> section) {
+        if (compare == nullptr) throw std::runtime_error("GPU shared-page tracking requires CompareObjectHandles");
+        for (auto it = gpuSections.begin(); it != gpuSections.end();) {
+            const auto previous = it->lock();
+            if (previous == nullptr) it = gpuSections.erase(it);
+            else {
+                if (sameSection(previous->handle, section->handle)) return previous;
+                ++it;
+            }
+        }
+        gpuSections.push_back(section);
+        return section;
+    }
+
+    void rememberGpuAlias(void* alias, std::uintptr_t address, std::size_t bytes) {
+        if (!gpuTracking()) {
+            untrackedAliases.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::vector<std::shared_ptr<SharedPage>> pages;
+        pages.reserve(bytes / pageBytes);
+        for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            pages.push_back(views.at(address + done).page);
+        }
+        const auto [found, inserted] = gpuAliases.emplace(reinterpret_cast<std::uintptr_t>(alias), std::move(pages));
+        if (!inserted) throw std::runtime_error("duplicate GPU host alias");
+        for (const auto& page : found->second) ++page->hostAliases;
+    }
+
+    void forgetGpuAlias(void* alias) {
+        const auto found = gpuAliases.find(reinterpret_cast<std::uintptr_t>(alias));
+        if (found == gpuAliases.end()) {
+            untrackedAliases.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+        for (const auto& page : found->second) --page->hostAliases;
+        gpuAliases.erase(found);
+    }
 
     static void forget(Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
         auto it = ranges.lower_bound(start);
@@ -561,6 +1083,9 @@ private:
     static bool writable(DWORD protection) {
         return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE;
     }
+    static bool readable(DWORD protection) {
+        return protection == PAGE_READONLY || protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READ || protection == PAGE_EXECUTE_READWRITE;
+    }
     using AllocateFunction = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
     using MapFunction = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
     using UnmapFunction = BOOL (WINAPI*)(HANDLE, PVOID, ULONG);
@@ -609,6 +1134,8 @@ private:
 
     void reset(std::uintptr_t address, std::size_t bytes) {
         const auto end = address + bytes;
+        const auto watched = gpuPages.lower_bound(address);
+        if (watched != gpuPages.end() && watched->first < end) throw std::runtime_error("cannot release memory with an active GPU write watch");
         if (!runs.empty()) splitRuns(address, end);
         forgetClean(address, end);
         for (auto cursor = address; cursor < end;) {
@@ -696,6 +1223,11 @@ private:
         const auto runEnd = base + run.bytes;
         const auto cutFrom = std::max(base, address);
         const auto cutTo = std::min(runEnd, end);
+        for (auto page = base; !gpuPages.empty() && page < runEnd; page += pageBytes) {
+            if (page >= cutFrom && page < cutTo) continue;
+            const auto& owners = views.at(page).page->gpuOwners;
+            if (std::any_of(owners.begin(), owners.end(), [](auto owner) { return owner != 0; })) throw std::runtime_error("cannot split a shared run while kept pages have GPU watches");
+        }
         const Transition transition(*this, base, runEnd);
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER)) fail("unmap a shared guest run to split it");
         runs.erase(base);
@@ -717,6 +1249,7 @@ private:
             for (auto armed = page; armed < stop; armed += pageBytes) {
                 const auto& view = views.at(armed);
                 if (view.armed != 0) protectSubpages(armed, view.armed, protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY, "re-arm a kept shared guest page");
+                for (std::size_t sub = 0; sub < subpages; ++sub) if (view.page->gpuOwners[sub] != 0) applyGpuPage(armed + sub * subpageBytes);
             }
             page = stop;
         }
@@ -764,6 +1297,16 @@ private:
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
+    std::map<std::uintptr_t, std::vector<std::shared_ptr<SharedPage>>> gpuAliases;
+    std::map<std::uintptr_t, GpuPage> gpuPages;
+    std::map<std::uintptr_t, std::size_t> gpuHostWrites;
+    std::map<std::uintptr_t, std::size_t> gpuPins;
+    std::vector<std::weak_ptr<Section>> gpuSections;
+    std::atomic<std::size_t> untrackedAliases{0};
+    std::atomic<bool (*)(std::uintptr_t, bool)> gpuFault{nullptr};
+    std::atomic<std::uint64_t> gpuProtectionSerial{0};
+    std::atomic<bool> gpuAccessProtected{false};
+    std::uint64_t gpuNextSerial = 0;
     std::map<std::uintptr_t, Run> runs;
     static constexpr std::size_t transitionSlots = 16;
     std::array<std::atomic<std::uintptr_t>, transitionSlots> transitionFrom{};

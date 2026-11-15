@@ -22,6 +22,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 
@@ -32,6 +33,20 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 using Role = ShaderRecompiler::DescriptorRole;
+
+#ifdef _WIN32
+HANDLE mirrorSection(std::size_t bytes) {
+    if (!VramWritable()) return nullptr;
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(bytes >> 32u), static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create a shared heap mirror fixture");
+    return section;
+}
+
+void commitMirrorSection(void* pointer, std::size_t bytes, HANDLE section, std::size_t offset, std::size_t granule) {
+    if (section != nullptr) GuestArena::GuestArenaMap_nid_postfix(pointer, bytes, section, offset, PAGE_READWRITE);
+    else GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, PAGE_READWRITE, granule);
+}
+#endif
 
 template<typename TAction>
 void reject(TAction action, const char* reason) {
@@ -863,6 +878,8 @@ void importWatchTests() {
 }
 
 void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
+    std::unique_lock gpuLock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    if (VramWritable()) gpuLock.lock();
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
         std::cout << "guest arena unavailable or not write-watched: heap mirrors not tested\n";
         return;
@@ -870,19 +887,23 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t bytes = 2 * 65536;
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
 #ifdef _WIN32
-    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+    const auto section = mirrorSection(bytes);
+    commitMirrorSection(block, bytes, section, 0, bytes);
 #endif
     auto* guest = static_cast<std::uint8_t*>(block);
     std::memset(block, 0x11, bytes);
     const auto address = reinterpret_cast<std::uintptr_t>(block);
+    bool registeredWritable = false;
     const auto registry = [&](bool add, bool writable) {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
         if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, writable, true);
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+        registeredWritable = add && writable;
     };
-    const auto build = [&](std::uint64_t written, const std::function<void(GuestBufferMemory&)>& gpu) {
+    const auto build = [&](std::uint64_t written, const std::function<void(GuestBufferMemory&)>& gpu, const std::function<void()>& cpu = {}) {
         GuestBufferMemory leased(context);
+        if (VramWritable()) leased.SetAddressWrites(false);
         leased.AcquireRegistered();
         if (written != 0) leased.AddWritable(written, 32);
         leased.Upload(true);
@@ -895,14 +916,18 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         for (auto part = found; cursor < address + bytes && part != ranges.end(); ++part) {
             Require(part->begin == cursor && part->end > cursor && part->end <= address + bytes, "heap BDA ranges have gaps or overlap");
             Require(part->deviceAddress == device + cursor - address, "heap BDA ranges are not contiguous on the device");
-            const bool writable = written != 0u && part->begin >= written && part->end <= written + 32u;
+            const bool writable = (VramWritable() && registeredWritable) || (written != 0u && part->begin >= written && part->end <= written + 32u);
             const auto permissions = ShaderRecompiler::BdaAbi::Read | (writable ? ShaderRecompiler::BdaAbi::Write : 0u);
             Require(part->permissions == permissions, "heap BDA range has incorrect permissions");
             if (writable) writableBytes += part->end - part->begin;
             cursor = part->end;
         }
-        Require(cursor == address + bytes && writableBytes == (written != 0u ? 32u : 0u), "heap BDA coverage or writable extent is incorrect");
+        const auto expectedWritable = VramWritable() && registeredWritable ? bytes : (written != 0u ? 32u : 0u);
+        Require(cursor == address + bytes && writableBytes == expectedWritable, "heap BDA coverage or writable extent is incorrect");
+        if (cpu && VramWritable()) cpu();
+        if (VramWritable()) leased.SealForSubmit();
         if (gpu) gpu(leased);
+        if (cpu && !VramWritable()) cpu();
         leased.WriteBack();
         return device;
     };
@@ -942,6 +967,7 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         std::uint32_t adjustment = 0;
         const auto view = leased.Descriptor(address + 16, 32, adjustment);
         access.bytes(view.buffer)[view.offset + adjustment] = std::byte{0x77};
+    }, [&] {
         guest[16 + 8] = 0x55;
     });
     Require(guest[16] == 0x77 && guest[16 + 8] == 0x55, "a writable heap mirror's write-back lost the GPU's store or rolled back the CPU's");
@@ -1011,13 +1037,15 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     {
         constexpr std::size_t size = 2 * 65536;
         void* raw = GuestArena::GuestArenaAllocate_nid_postfix(size, 65536);
-        GuestArena::GuestArenaCommit_nid_postfix(raw, size, PAGE_READWRITE, size);
+        const auto readonlySection = mirrorSection(size);
+        commitMirrorSection(raw, size, readonlySection, 0, size);
         auto* bytes8 = static_cast<std::uint8_t*>(raw);
         std::memset(raw, 0x11, size);
         const auto base = reinterpret_cast<std::uintptr_t>(raw);
         const auto page = base + 65536;
         DWORD previous = 0;
-        Require(VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &previous) != 0, "cannot make the aliased page read-only");
+        if (VramWritable()) GuestArena::GuestArenaSetProtection_nid_postfix(page, 4096, PAGE_READONLY);
+        else Require(VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READONLY, &previous) != 0, "cannot make the aliased page read-only");
         GuestAllocations::GuestAllocationsInvalidate_nid_postfix(page, 4096);
         const auto registerRange = [&](bool add) {
             auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
@@ -1039,16 +1067,21 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
             access.bytes(view.buffer)[view.offset + adjustment + static_cast<std::size_t>(at - (page - 16))] = std::byte{0x77};
             leased.WriteBack();
         };
-        const auto made = MirrorCounters().heapMirrors;
-        storeAt(page - 8);
-        Require(MirrorCounters().heapMirrors == made + 1 && bytes8[65536 - 8] == 0x77, "a store next to a read-only page was not written back");
-        bool refused = false;
-        try {
-            storeAt(page + 4);
-        } catch (const std::runtime_error& error) {
-            refused = std::string(error.what()).find("aliased writes are not implemented") != std::string::npos;
+        if (VramWritable()) {
+            reject([&] { storeAt(page - 8); }, "requires shared protection or a coherent host import");
+            Require(bytes8[65536 - 8] == 0x11 && bytes8[65536 + 4] == 0x11, "a refused writable range changed a read-only page or its neighbour");
+        } else {
+            const auto made = MirrorCounters().heapMirrors;
+            storeAt(page - 8);
+            Require(MirrorCounters().heapMirrors == made + 1 && bytes8[65536 - 8] == 0x77, "a store next to a read-only page was not written back");
+            bool refused = false;
+            try {
+                storeAt(page + 4);
+            } catch (const std::runtime_error& error) {
+                refused = std::string(error.what()).find("aliased writes are not implemented") != std::string::npos;
+            }
+            Require(refused && bytes8[65536 + 4] == 0x11, "a GPU change of a read-only page was not refused");
         }
-        Require(refused && bytes8[65536 + 4] == 0x11, "a GPU change of a read-only page was not refused");
         {
             GuestBufferMemory plain(context);
             plain.AddReadable(page, 16);
@@ -1060,10 +1093,12 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         }
         registerRange(false);
         sweep();
-        Require(VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &previous) != 0, "cannot restore the aliased page");
+        if (VramWritable()) GuestArena::GuestArenaSetProtection_nid_postfix(page, 4096, PAGE_READWRITE);
+        else Require(VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &previous) != 0, "cannot restore the aliased page");
         GuestAllocations::GuestAllocationsInvalidate_nid_postfix(page, 4096);
         GuestArena::GuestArenaReset_nid_postfix(raw, size);
         GuestArena::GuestArenaRelease_nid_postfix(raw, size);
+        if (readonlySection != nullptr) CloseHandle(readonlySection);
     }
 #endif
     {
@@ -1133,6 +1168,7 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     }
 #ifdef _WIN32
     GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+    if (section != nullptr) CloseHandle(section);
 #endif
     GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 }
@@ -1359,6 +1395,8 @@ void hostWriteWatchExclusionTests() {
 
 void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
 #ifdef _WIN32
+    std::unique_lock gpuLock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    if (VramWritable()) gpuLock.lock();
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
         std::cout << "guest arena unavailable or not write-watched: sparse heap mirrors not tested\n";
         return;
@@ -1371,7 +1409,8 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
     constexpr std::size_t past = 3584u << 10u;
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(reserved, 65536);
     auto* guest = static_cast<std::uint8_t*>(block);
-    GuestArena::GuestArenaCommit_nid_postfix(block, committed, PAGE_READWRITE, 65536);
+    const auto section = mirrorSection(reserved);
+    commitMirrorSection(block, committed, section, 0, 65536);
     std::memset(block, 0x5a, committed);
     const auto base = reinterpret_cast<std::uintptr_t>(block);
     const auto registry = [&](bool add) {
@@ -1380,7 +1419,7 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
-    const auto bind = [&](bool written, const std::function<void(std::span<std::byte>, const VkDescriptorBufferInfo&)>& gpu) {
+    const auto bind = [&](bool written, const std::function<void(std::span<std::byte>, const VkDescriptorBufferInfo&)>& gpu, const std::function<void()>& cpu = {}) {
         GuestBufferMemory memory(context);
         if (written) memory.AddWritable(base, reserved);
         else memory.AddReadable(base, reserved);
@@ -1388,12 +1427,16 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
         std::uint32_t adjustment = 0;
         const auto view = memory.Descriptor(base, reserved, adjustment);
         Require(adjustment == 0, "a sparse heap view at its base is adjusted");
+        if (cpu && VramWritable()) cpu();
+        if (VramWritable()) memory.SealForSubmit();
         gpu(access.bytes(view.buffer), view);
+        if (cpu && !VramWritable()) cpu();
         memory.WriteBack();
         return view;
     };
     const auto address = [&] {
         GuestBufferMemory memory(context);
+        if (VramWritable()) memory.SetAddressWrites(false);
         memory.AcquireRegistered();
         memory.Upload(true);
         const auto ranges = memory.AddressRanges();
@@ -1414,6 +1457,7 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
     const auto first = bind(true, [&](std::span<std::byte> bytes, const VkDescriptorBufferInfo& view) {
         Require(view.range == extent && bytes[view.offset + committed - 1] == std::byte{0x5a} && bytes[view.offset + committed] == std::byte{}, "a sparse heap is not bound to a mirror of its committed extent");
         bytes[view.offset + 8] = std::byte{0x77};
+    }, [&] {
         guest[24] = 0x55;
     });
     const auto made = MirrorCounters();
@@ -1426,14 +1470,14 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
     Require(second.buffer == first.buffer && again.rebuilds == made.rebuilds && again.blocksCopied == made.blocksCopied + 1, "a sparse heap bound again was read again beyond its written block");
     bind(false, [](std::span<std::byte>, const VkDescriptorBufferInfo&) {});
     Require(MirrorCounters().blocksCopied == again.blocksCopied && MirrorCounters().rebuilds == again.rebuilds, "an unchanged sparse heap was read again");
-    GuestArena::GuestArenaCommit_nid_postfix(guest + late, 65536, PAGE_READWRITE, 65536);
+    commitMirrorSection(guest + late, 65536, section, late, 65536);
     guest[late + 4] = 0x66;
     bind(false, [&](std::span<std::byte> bytes, const VkDescriptorBufferInfo& view) {
         Require(view.buffer == first.buffer && bytes[view.offset + late + 4] == std::byte{0x66} && bytes[view.offset + late + 65536] == std::byte{}, "a page committed after the mirror was made was not read into it");
     });
     const auto [end, device] = address();
     Require(end == base + extent && device != 0 && access.addressBytes(device)[late + 4] == std::byte{0x66} && MirrorCounters().rebuilds == again.rebuilds, "an address-based build does not map the sparse heap mirror up to its extent");
-    GuestArena::GuestArenaCommit_nid_postfix(guest + grown, 65536, PAGE_READWRITE, 65536);
+    commitMirrorSection(guest + grown, 65536, section, grown, 65536);
     guest[grown + 2] = 0x44;
     const auto [grownEnd, grownDevice] = address();
     Require(grownEnd == base + 3 * extent && grownDevice != device && access.addressBytes(grownDevice)[grown + 2] == std::byte{0x44} && access.addressBytes(grownDevice)[8] == std::byte{0x77}, "a sparse heap committed past its mirror was not mirrored again");
@@ -1454,7 +1498,7 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
     {
         constexpr std::size_t whole = 1u << 20u;
         GuestArena::GuestArenaReset_nid_postfix(block, reserved);
-        GuestArena::GuestArenaCommit_nid_postfix(guest, whole, PAGE_READWRITE, 65536);
+        commitMirrorSection(guest, whole, section, 0, 65536);
         std::memset(guest, 0x31, whole);
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
         GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, whole, true, true, true);
@@ -1473,10 +1517,53 @@ void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) 
     }
     GuestArena::GuestArenaReset_nid_postfix(block, reserved);
     GuestArena::GuestArenaRelease_nid_postfix(block, reserved);
+    if (section != nullptr) CloseHandle(section);
 #else
     static_cast<void>(context);
     static_cast<void>(access);
 #endif
+}
+
+void RunVramWritableBdaResourceTests(const Context& context, const BdaTestAccess& access) {
+    Require(VramWritable(), "the writable VRAM graphics fixture requires APS5_VRAM_WRITABLE");
+    Require(context.hostImportAlignment == 0, "the writable VRAM graphics fixture requires disabled host imports");
+#ifdef _WIN32
+    Require(GuestArena::GuestArenaAvailable_nid_postfix() && GuestArena::GuestArenaWriteWatched_nid_postfix(), "the writable VRAM graphics fixture requires a write-watched guest arena");
+    constexpr std::size_t bytes = 65536;
+    void* privateRange = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+    GuestArena::GuestArenaCommit_nid_postfix(privateRange, bytes, PAGE_READWRITE, bytes);
+    std::memset(privateRange, 0x37, bytes);
+    const auto base = reinterpret_cast<std::uintptr_t>(privateRange);
+    const auto before = MirrorCounters();
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, privateRange, bytes, true, true, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    reject([&] {
+        GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+    }, "VRAM writable range requires shared protection or a coherent host import");
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, privateRange);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    reject([&] {
+        GuestBufferMemory memory(context);
+        memory.AddWritable(base, 16);
+        memory.Upload(false);
+    }, "VRAM writable descriptor requires shared protection or a coherent host import");
+    Require(MirrorCounters().heapMirrors == before.heapMirrors && std::all_of(static_cast<std::uint8_t*>(privateRange), static_cast<std::uint8_t*>(privateRange) + bytes, [](std::uint8_t value) { return value == 0x37; }), "an unsupported private writer acquired a mirror or changed guest bytes");
+    GuestArena::GuestArenaReset_nid_postfix(privateRange, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(privateRange, bytes);
+#endif
+    heapMirrorTests(context, access);
+    importedHeapMirrorTests(context, access);
+    sparseHeapMirrorTests(context, access);
+    hostWriteWatchExclusionTests();
+    ClearImageMirrors(context.device);
+    ClearSnapshotCopies(context.device);
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {

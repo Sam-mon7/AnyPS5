@@ -68,6 +68,8 @@
 #include <vector>
 
 void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, bool sparse);
+void RunVramWritableTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder, std::unique_lock<AgcDriver::GuestMemory::GpuMutexType>& gpu);
+void RunVramCleanupTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
 
 namespace {
 
@@ -336,6 +338,31 @@ private:
 
 using Kind = Recorder::ReadKind;
 
+void* AllocateDescriptorWatched(std::size_t bytes, std::size_t alignment, void*& section) {
+#ifdef _WIN32
+    if (VramWritable()) {
+        auto* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, static_cast<DWORD>(bytes), nullptr);
+        Require(section != nullptr, "cannot create shared descriptor memory");
+        GuestArena::GuestArenaMap_nid_postfix(block, bytes, section, 0, PAGE_READWRITE);
+        return block;
+    }
+#endif
+    return AllocateWatched(bytes, alignment);
+}
+
+void ReleaseDescriptorWatched(void* block, std::size_t bytes, void* section) {
+#ifdef _WIN32
+    if (section != nullptr) {
+        GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+        CloseHandle(section);
+        return;
+    }
+#endif
+    ReleaseWatched(block, bytes);
+}
+
 void vramDescriptorTests(const Device& device, Recorder& recorder) {
     namespace Memory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
@@ -346,7 +373,8 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 2 * blockBytes;
     constexpr std::size_t viewBytes = 64;
     for (const bool imported : {false, true}) {
-        auto* block = static_cast<std::uint8_t*>(AllocateWatched(bytes, blockBytes));
+        void* section = nullptr;
+        auto* block = static_cast<std::uint8_t*>(AllocateDescriptorWatched(bytes, blockBytes, section));
         Require(block != nullptr, "VRAM descriptor fixture requires watched memory");
         const auto address = reinterpret_cast<std::uint64_t>(block);
         const auto element = address + blockBytes;
@@ -354,15 +382,16 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
             const Context& context;
             Recorder& recorder;
             void* block;
+            void* section;
             ~Release() {
                 recorder.Sync();
                 recorder.FlushDeferredReleases();
                 GuestAllocations::Mutation().Remove(block);
                 ClearImageMirrors(context.device);
                 ClearHostImports(context.device);
-                ReleaseWatched(block, bytes);
+                ReleaseDescriptorWatched(block, bytes, section);
             }
-        } release{context, recorder, block};
+        } release{context, recorder, block, section};
         std::memset(block, 0x11, bytes);
         GuestAllocations::Mutation().Add(block, bytes, true, !imported, true);
         VkBuffer importBuffer = VK_NULL_HANDLE;
@@ -377,6 +406,7 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
             seedContext.dmaBufImport = false;
         }
         GuestBufferMemory seed(seedContext);
+        seed.SetAddressWrites(false);
         seed.AcquireRegistered();
         seed.Upload(true);
         std::uint32_t adjustment = 0;
@@ -439,6 +469,7 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         program.bindings.push_back(binding);
         const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         const auto writeBackBefore = VramDescriptorCounters();
+        const auto writableBefore = VramWritableCounters();
         auto resources = std::make_shared<ShaderResources>(context, compute);
         struct PipelineRelease {
             const Context& context;
@@ -469,6 +500,7 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, pipeline.module, "main", nullptr};
         pipelineInfo.layout = pipeline.layout;
         Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline.pipeline), "VRAM descriptor pipeline");
+        resources->BeginGpuWrites(recorder);
         const auto commands = recorder.Commands();
         recorder.Keep(resources);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -480,6 +512,7 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, 1, 1, 1);
         resources->MarkGpuWrites(recorder);
         recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        resources->ReadyForSubmit(recorder);
         block[blockBytes + 8] = 0x5a;
         recorder.Sync();
         Require(block[blockBytes] == 0x46 && block[blockBytes + 8] == 0x5a,
@@ -487,9 +520,12 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         if (VramDescriptors()) {
             Require(HostImportFor(context, address, bytes) == nullptr, "a descriptor writer imported its mirror-backed range");
             const auto writeBackAfter = VramDescriptorCounters();
-            Require(writeBackAfter.referenceBytes > writeBackBefore.referenceBytes && writeBackAfter.resultBytes > writeBackBefore.resultBytes,
-                    "mirror descriptor write-back did not copy its reference and result through the GPU");
-            Require(writeBackAfter.writeBackBytes > writeBackBefore.writeBackBytes, "mirror descriptor write-back was not counted");
+            if (VramWritable()) Require(VramWritableCounters().pagesWritten > writableBefore.pagesWritten && VramWritableCounters().readbackBytes > writableBefore.readbackBytes, "mirror descriptor write-back did not use the writable page queue");
+            else {
+                Require(writeBackAfter.referenceBytes > writeBackBefore.referenceBytes && writeBackAfter.resultBytes > writeBackBefore.resultBytes,
+                        "mirror descriptor write-back did not copy its reference and result through the GPU");
+                Require(writeBackAfter.writeBackBytes > writeBackBefore.writeBackBytes, "mirror descriptor write-back was not counted");
+            }
         }
         auto written = std::make_shared<GuestBufferMemory>(context);
         written->AddWritable(element + 4, 4);
@@ -498,6 +534,7 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         std::uint32_t writtenAdjustment = 0;
         const auto writtenView = written->Descriptor(element + 4, viewBytes, writtenAdjustment);
         Require(writtenAdjustment == 0 && writtenView.buffer != backing.buffer, "misaligned descriptor writer was not staged");
+        written->BeginGpuWrites(recorder);
         const auto writeCommands = recorder.Commands();
         RecordMemoryBarrier(context, writeCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                             VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -508,6 +545,7 @@ void vramDescriptorTests(const Device& device, Recorder& recorder) {
         recorder.Keep(written);
         recorder.NotePendingWrites(written->Writes());
         recorder.OnComplete([written] { written->WriteBack(); });
+        written->ReadyForSubmit(recorder);
         block[blockBytes + 12] = 0x6b;
         recorder.Sync();
         std::uint32_t writtenValue = 0;
@@ -524,7 +562,8 @@ void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
     context.hostImportAlignment = 0;
     context.dmaBufImport = false;
     constexpr std::size_t blockBytes = 65536;
-    auto* block = static_cast<std::uint8_t*>(AllocateWatched(2 * blockBytes, blockBytes));
+    void* section = nullptr;
+    auto* block = static_cast<std::uint8_t*>(AllocateDescriptorWatched(2 * blockBytes, blockBytes, section));
     Require(block != nullptr, "boundary descriptor fixture requires watched memory");
     const auto address = reinterpret_cast<std::uint64_t>(block);
     const auto begin = address + blockBytes - 32;
@@ -532,6 +571,7 @@ void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
         const Context& context;
         Recorder& recorder;
         std::uint8_t* block;
+        void* section;
         ~Release() {
             recorder.Sync();
             recorder.FlushDeferredReleases();
@@ -539,9 +579,9 @@ void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
             GuestAllocations::Mutation().Remove(block + blockBytes);
             ClearImageMirrors(context.device);
             ClearHostImports(context.device);
-            ReleaseWatched(block, 2 * blockBytes);
+            ReleaseDescriptorWatched(block, 2 * blockBytes, section);
         }
-    } release{context, recorder, block};
+    } release{context, recorder, block, section};
     std::memset(block, 0x11, 2 * blockBytes);
     {
         GuestAllocations::Mutation mutation;
@@ -549,6 +589,7 @@ void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
         mutation.Add(block + blockBytes, blockBytes, true, true, true);
     }
     GuestBufferMemory seed(context);
+    seed.SetAddressWrites(false);
     seed.AcquireRegistered();
     seed.Upload(true);
     std::uint32_t adjustment = 0;
@@ -564,6 +605,7 @@ void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
         std::uint32_t offset = 0;
         const auto view = memory->Descriptor(at, size, offset);
         Require(offset == 0, "boundary writer retained an adjusted descriptor");
+        memory->BeginGpuWrites(recorder);
         const auto commands = recorder.Commands();
         std::shared_ptr<Buffer> uploaded;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -583,6 +625,7 @@ void vramDescriptorBoundaryTests(const Device& device, Recorder& recorder) {
         recorder.Keep(memory);
         recorder.NotePendingWrites(memory->Writes());
         recorder.OnComplete([memory] { memory->WriteBack(); });
+        memory->ReadyForSubmit(recorder);
         return uploaded;
     };
     write(begin, 32, 0x22222222u, 0);
@@ -641,11 +684,17 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t heldTailAt = 6 * extent;
     auto* block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(reserved, blockBytes));
     Require(block != nullptr, "sparse growth fixture could not reserve its heap");
+    HANDLE section = nullptr;
+    if (VramWritable()) {
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, reserved, nullptr);
+        Require(section != nullptr, "sparse growth fixture could not create its shared section");
+    }
     const auto address = reinterpret_cast<std::uint64_t>(block);
     struct Release {
         const Context& context;
         Recorder& recorder;
         std::uint8_t* block;
+        HANDLE section;
         ~Release() {
             recorder.Sync();
             recorder.FlushDeferredReleases();
@@ -654,9 +703,11 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
             ClearHostImports(context.device);
             GuestArena::GuestArenaReset_nid_postfix(block, reserved);
             GuestArena::GuestArenaRelease_nid_postfix(block, reserved);
+            if (section != nullptr) CloseHandle(section);
         }
-    } release{context, recorder, block};
-    GuestArena::GuestArenaCommit_nid_postfix(block, blockBytes, PAGE_READWRITE, blockBytes);
+    } release{context, recorder, block, section};
+    if (section != nullptr) GuestArena::GuestArenaMap_nid_postfix(block, blockBytes, section, 0, PAGE_READWRITE);
+    else GuestArena::GuestArenaCommit_nid_postfix(block, blockBytes, PAGE_READWRITE, blockBytes);
     std::memset(block, 0x11, blockBytes);
     GuestAllocations::Mutation().Add(block, reserved, true, true, true);
     const auto read = [&](const std::shared_ptr<GuestBufferMemory>& memory, std::uint64_t at) {
@@ -682,6 +733,7 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
     std::uint32_t adjustment = 0;
     const auto initial = writer->Descriptor(address, reserved, adjustment);
     Require(adjustment == 0 && initial.range == extent, "sparse growth fixture has an unexpected initial mirror extent");
+    writer->BeginGpuWrites(recorder);
     const auto commands = recorder.Commands();
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -693,10 +745,13 @@ void vramDescriptorSparseGrowthTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrites(writer->Writes());
     const auto completed = std::make_shared<bool>(false);
     recorder.OnComplete([writer, completed] { writer->WriteBack(); *completed = true; });
+    writer->ReadyForSubmit(recorder);
     block[8] = 0x55;
-    GuestArena::GuestArenaCommit_nid_postfix(block + grownAt, blockBytes, PAGE_READWRITE, blockBytes);
+    if (section != nullptr) GuestArena::GuestArenaMap_nid_postfix(block + grownAt, blockBytes, section, grownAt, PAGE_READWRITE);
+    else GuestArena::GuestArenaCommit_nid_postfix(block + grownAt, blockBytes, PAGE_READWRITE, blockBytes);
     block[grownAt] = 0x66;
     auto grown = std::make_shared<GuestBufferMemory>(context);
+    grown->SetAddressWrites(false);
     grown->AcquireRegistered();
     grown->Upload(true);
     const auto grownView = grown->Descriptor(address, reserved, adjustment);
@@ -8264,6 +8319,23 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-cleanup-only") {
+            RunVramCleanupTests(device.GetContext(), recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-writable-only") {
+            RunVramWritableTests(device.GetContext(), recorder, gpu);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--vram-writable-recorder-only") {
+            RunVramWritableTests(device.GetContext(), recorder, gpu);
+            vramDescriptorTests(device, recorder);
+            vramDescriptorBoundaryTests(device, recorder);
+            vramDescriptorSparseGrowthTests(device, recorder);
+            RunResidentHeapMirrorTests(device.GetContext(), recorder, false);
+            RunResidentHeapMirrorTests(device.GetContext(), recorder, true);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--vram-descriptors-only") {
             vramDescriptorTests(device, recorder);
             vramDescriptorBoundaryTests(device, recorder);

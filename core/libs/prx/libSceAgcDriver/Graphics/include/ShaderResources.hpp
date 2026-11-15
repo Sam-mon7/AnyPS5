@@ -178,6 +178,9 @@ public:
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
     void MarkGpuWrites(Recorder& recorder);
+    void BeginGpuWrites(Recorder& recorder) { guestMemory.BeginGpuWrites(recorder); }
+    void ReadyForSubmit(Recorder& recorder) { guestMemory.ReadyForSubmit(recorder); }
+    void SealForSubmit(CommandBatch* batch = nullptr) { guestMemory.SealForSubmit(batch); }
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return (bda != nullptr && faultChecks) || guestMemory.HasCopiedWrites(); }
