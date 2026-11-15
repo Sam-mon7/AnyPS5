@@ -6,7 +6,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -457,6 +460,59 @@ void UnchangedInputs(Scene& scene) {
     const auto color = scene.DrawnColor();
     Require(color == 200, "address draw space reuse: the repeated draw read " + std::to_string(color) + " instead of the guest constant 200");
     Require(Builds() == before, "address draw space reuse: a read-only address-based draw repeated with unchanged inputs over an imported allocation built its resources again (" + std::to_string(Builds() - before) + " builds)");
+}
+
+void ShadowRanges(Scene& scene) {
+    using namespace AgcDriver::Graphics;
+    constexpr std::uint8_t HostColor = 40;
+    constexpr std::uint8_t ShadowColor = 190;
+    const auto address = scene.constants.Address();
+    scene.Store(scene.constants, 0, HostColor);
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        SharedResourceCache().Clear();
+        const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(scene.device);
+        const auto* import = HostImportFor(context, address, BlockBytes);
+        Require(import != nullptr, "address draw space reuse: the shadow constant has no host import");
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "address draw space reuse: the shadow constant has no recorder");
+        AgcDriver::GuestMemory::CollectWritesUncached(address, BlockBytes);
+        const auto destination = ShadowDestinationFor(context, *import, address, address + BlockBytes);
+        Require(destination.has_value() && destination->seedUnits.empty(), "address draw space reuse: the whole constant unit has no unseeded shadow destination");
+        const auto level = Level(ShadowColor);
+        std::uint32_t pattern = 0;
+        std::memcpy(&pattern, &level, sizeof(pattern));
+        const auto commands = recorder->Commands();
+        recorder->Keep(destination->slab);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, destination->buffer, destination->offset, BlockBytes, pattern);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+        recorder->MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+        const ShadowedRange range{address, address + BlockBytes, destination->slab};
+        MarkShadowed(*import, std::span(&range, 1), AgcDriver::GuestMemory::TrackerGeneration());
+    }
+    const auto shadowUnpublished = [&](const char* when) {
+        Require(AnyShadowedOverlaps(address, BlockBytes), std::string("address draw space reuse: the constant shadow was removed ") + when);
+        float host = 0;
+        std::memcpy(&host, scene.constants.Data(), sizeof(host));
+        Require(host == Level(HostColor), std::string("address draw space reuse: the shadow constant was published to the host ") + when);
+    };
+    shadowUnpublished("before the first draw");
+    const auto verifiedBefore = AddressDrawReuseVerifications();
+    const auto before = Builds();
+    const Outcomes first;
+    const auto firstColor = scene.DrawnColor();
+    Require(firstColor == ShadowColor, "address draw space reuse: the first shadowed draw read " + std::to_string(firstColor) + " instead of " + std::to_string(ShadowColor));
+    shadowUnpublished("after the first draw");
+    Require(first[AddressDrawReuse::Built] == 1 && first.Total() == 1 && Builds() == before + 1, "address draw space reuse: the first shadowed draw counted " + first.Text() + " and " + std::to_string(Builds() - before) + " builds, expected one new reusable build");
+    const auto built = Builds();
+    const Outcomes repeated;
+    const auto repeatedColor = scene.DrawnColor();
+    Require(repeatedColor == ShadowColor, "address draw space reuse: the repeated shadowed draw read " + std::to_string(repeatedColor) + " instead of " + std::to_string(ShadowColor));
+    shadowUnpublished("after the repeated draw");
+    Require(repeated[AddressDrawReuse::Reused] == 1 && repeated.Total() == 1 && Builds() == built, "address draw space reuse: the repeated shadowed draw counted " + repeated.Text() + " and " + std::to_string(Builds() - built) + " builds, expected the shadowed build reused");
+    const auto verified = AddressDrawReuseVerifications() - verifiedBefore;
+    Require(std::getenv("APS5_VERIFY_ADDRESS_DRAW_REUSE") == nullptr || verified == 1, "address draw space reuse: the shadowed reuse was verified " + std::to_string(verified) + " times instead of once");
+    std::printf("address draw space reuse: shadow-ranges built=1 reused=1 repeat-builds=0 host=40 rendered=190 unpublished-before=1 unpublished-after-build=1 unpublished-after-reuse=1 verified=%llu\n", static_cast<unsigned long long>(verified));
 }
 
 void CpuWrite(Scene& scene) {
@@ -1024,6 +1080,12 @@ int main(int argc, char** argv) {
             const auto verifiedBefore = AgcDriver::Graphics::AddressDrawReuseVerifications();
             if (mode == "--off") {
                 Disabled(scene);
+            } else if (only == "shadow-ranges") {
+                if (!AgcDriver::Graphics::ShadowAddressEnabled()) {
+                    std::puts("skipped, shadow address reads are unavailable");
+                    return VulkanTestSkipped;
+                }
+                ShadowRanges(scene);
             } else {
                 const std::span<const NamedCase> cases = mode == "--transitions" ? std::span<const NamedCase>(TransitionCases) : mode == "--held" ? std::span<const NamedCase>(HeldCases) : std::span<const NamedCase>(DefaultCases);
                 bool ran = false;

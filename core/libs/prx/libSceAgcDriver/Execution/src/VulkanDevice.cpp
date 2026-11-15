@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Timeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ArchB/Switches.hpp"
@@ -5227,8 +5228,42 @@ std::size_t DispatchMoveBytes() {
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
+bool DispatchUsesAddressTable(const Graphics::CompiledShader& shader) {
+    return shader.program != nullptr && std::ranges::any_of(shader.program->bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+}
+
+bool VerifyDispatchSpaceReuse() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_VERIFY_DISPATCH_SPACE_REUSE");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+struct DispatchSpaceCounters {
+    std::atomic<std::uint64_t> built{0}, hits{0}, inFlight{0}, spaceChanged{0}, guardChanged{0}, snapshotRefused{0}, revalidateFailed{0}, verified{0}, mismatches{0};
+};
+
+DispatchSpaceCounters& DispatchSpaces() {
+    static auto* counters = [] {
+        auto* value = new DispatchSpaceCounters;
+        ArchB::Recorder::RegisterCounter("dispatch_space_built", value->built);
+        ArchB::Recorder::RegisterCounter("dispatch_space_hits", value->hits);
+        ArchB::Recorder::RegisterCounter("dispatch_space_in_flight", value->inFlight);
+        ArchB::Recorder::RegisterCounter("dispatch_space_changed", value->spaceChanged);
+        ArchB::Recorder::RegisterCounter("dispatch_space_guard_changed", value->guardChanged);
+        ArchB::Recorder::RegisterCounter("dispatch_space_snapshot_refused", value->snapshotRefused);
+        ArchB::Recorder::RegisterCounter("dispatch_space_revalidate_failed", value->revalidateFailed);
+        ArchB::Recorder::RegisterCounter("dispatch_space_verified", value->verified);
+        ArchB::Recorder::RegisterCounter("dispatch_space_mismatches", value->mismatches);
+        return value;
+    }();
+    return *counters;
+}
+
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device, bool movable = true) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), movable && DispatchMove());
+    const bool address = Graphics::ShaderResources::DispatchSpaceReuseEnabled() && DispatchUsesAddressTable(shader);
+    auto key = Graphics::ShaderResources::ContentKey(shader, address || !TemplateDataRefresh(), !address && movable && DispatchMove());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
@@ -5258,6 +5293,7 @@ struct PreparedDispatch {
     // cache held the key's object at prepare time: the dispatch revalidates `cached` instead.
     std::shared_ptr<Graphics::ShaderResources> resources;
     std::shared_ptr<Graphics::ShaderResources> cached;
+    std::unique_ptr<DispatchBuildTrace::Event> buildTrace;
     ResourceCache::Key key;
     bool exact = false;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
@@ -5907,9 +5943,41 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     return serial;
 }
 
+VulkanDevice::DispatchSpaceReuseStats VulkanDevice::DispatchSpaceReuseCounts() {
+    const auto& c = DispatchSpaces();
+    return {Graphics::ShaderResources::DispatchSpaceReuseEnabled(), c.built.load(), c.hits.load(), c.inFlight.load(), c.spaceChanged.load(), c.guardChanged.load(), c.snapshotRefused.load(), c.revalidateFailed.load(), c.verified.load(), c.mismatches.load()};
+}
+
 VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
     const auto& counters = Presyncs();
     return {counters.checked.load(std::memory_order_relaxed), counters.presyncs.load(std::memory_order_relaxed), counters.keyChecks.load(std::memory_order_relaxed), counters.keyWaits.load(std::memory_order_relaxed)};
+}
+
+namespace {
+
+std::uint64_t BuildTraceNanoseconds(double ms) {
+    return static_cast<std::uint64_t>(std::max(0.0, ms) * 1000000.0);
+}
+
+void BuildTraceDetail(DispatchBuildTrace::Event& event, const Graphics::ShaderResources::FailureDetail& detail) {
+    event.detail = {detail.check, detail.role, detail.binding, detail.element, detail.priorAddress, detail.currentAddress, detail.priorBytes, detail.currentBytes, detail.priorIdentity, detail.currentIdentity};
+}
+
+const char* BuildTraceRecipeName(RecipeBuildFailure failure) {
+    static constexpr std::array<const char*, static_cast<std::size_t>(RecipeBuildFailure::Count)> names{
+        "not-attempted", "built", "disabled", "uncacheable", "overlay", "address-table", "lease", "copied-writes", "not-reusable", "completion", "objects", "key"};
+    const auto index = static_cast<std::size_t>(failure);
+    return index < names.size() ? names[index] : "unknown";
+}
+
+const char* BuildTraceCacheReason(bool cacheable, bool htile, const ShaderRecompiler::RecompileResult& shader) {
+    if (cacheable) return "resource-key-miss";
+    if (htile) return "htile-clear";
+    if (!ResourceCacheEnabled()) return "resource-cache-disabled";
+    if (shader.PipelineVariantId() == 0) return "no-pipeline-variant";
+    return "uncacheable";
+}
+
 }
 
 std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads, std::uint64_t programAddress, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews) {
@@ -5922,6 +5990,10 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0, registeredImageViews};
     const auto context = graphicsContext();
     auto prepared = std::make_shared<PreparedDispatch>();
+    if (DispatchBuildTrace::Enabled()) {
+        prepared->buildTrace = std::make_unique<DispatchBuildTrace::Event>();
+        prepared->buildTrace->program = programAddress;
+    }
     prepared->dispatchThreads = dispatchThreads;
     // A cached build (the map locks itself) is revalidated under the mutex by the dispatch, which
     // looks it up again by the key made here; the object stays local, only its surfaces matter
@@ -5935,16 +6007,29 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         phaseStart = now;
     };
     if (!htileClear.has_value() && ResourceCacheEnabled() && shader.PipelineVariantId() != 0) {
+        prepared->exact = Graphics::ShaderResources::DispatchSpaceReuseEnabled() && DispatchUsesAddressTable(compute);
         prepared->key = DispatchContentKey(compute, context.device);
         phase(PreparedDispatch::PrepareKey);
         cached = state->resourceCache.Find(prepared->key);
-        if (cached != nullptr && DispatchMove()) {
+        if (prepared->buildTrace != nullptr) (DispatchMove() && !prepared->exact ? prepared->buildTrace->movableFind : prepared->buildTrace->exactFind) = cached != nullptr ? "hit" : "miss";
+        if (cached != nullptr && DispatchMove() && !prepared->exact) {
             Graphics::ShaderResources::MoveProof proof;
             if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof).has_value()) {
                 DispatchMoves().filtered[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
+                if (prepared->buildTrace != nullptr) {
+                    prepared->buildTrace->reuse = "move-refused-at-prepare";
+                    BuildTraceDetail(*prepared->buildTrace, proof.detail);
+                    auto failed = *prepared->buildTrace;
+                    failed.shader = &shader;
+                    failed.key = prepared->key;
+                    failed.event = "reuse-failed";
+                    failed.reason = "move-refused-at-prepare";
+                    DispatchBuildTrace::Emit(failed);
+                }
                 prepared->key = DispatchContentKey(compute, context.device, false);
                 prepared->exact = true;
                 cached = state->resourceCache.Find(prepared->key);
+                if (prepared->buildTrace != nullptr) prepared->buildTrace->exactFind = cached != nullptr ? "hit" : "miss";
             }
         }
         static const bool exactFallback = std::getenv("APS5_NO_DISPATCH_EXACT_FALLBACK") == nullptr;
@@ -5952,6 +6037,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
             auto exactKey = DispatchContentKey(compute, context.device, false);
             if (exactKey != prepared->key) {
                 cached = state->resourceCache.Find(exactKey);
+                if (prepared->buildTrace != nullptr) prepared->buildTrace->exactFind = cached != nullptr ? "hit" : "miss";
                 if (cached != nullptr) {
                     prepared->key = std::move(exactKey);
                     prepared->exact = true;
@@ -6121,6 +6207,8 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto miss = [&](RecipeMiss reason) {
         counters.precheckMisses[reason].fetch_add(1, std::memory_order_relaxed);
+        static constexpr std::array<const char*, RecipeMissCount> names{"no-recipe", "device-mismatch", "template-gone", "objects-gone", "not-recordable"};
+        DispatchBuildTrace::Recipe(names[reason]);
         return std::shared_ptr<RecipeHit>{};
     };
     if (!DispatchRecipes() || recipe == nullptr) return miss(MissNoRecipe);
@@ -6152,6 +6240,7 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
         hit->precheckMs = static_cast<double>(ns) / 1e6;
         counters.precheckNs.fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
     }
+    DispatchBuildTrace::Recipe("hit");
     return hit;
 }
 
@@ -6330,6 +6419,30 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (fallback) NotePrivateDispatch(fallback, 0);
     }
     recordStep(PhaseRecordCommands);
+    std::shared_ptr<Graphics::ShaderResources::DispatchUse> spaceUse;
+    const auto transferSpace = [&](int*) {
+        if (spaceUse != nullptr) spaceUse->space = resources.ReleaseSpace();
+    };
+    int recordedSpaceScope = 0;
+    std::unique_ptr<int, decltype(transferSpace)> recordedSpaceGuard(&recordedSpaceScope, transferSpace);
+    if (resources.SpaceReuse()) {
+        spaceUse = std::make_shared<Graphics::ShaderResources::DispatchUse>();
+        spaceUse->faultPin = Graphics::ShaderResources::pinDispatchFaultSlot(record.resources);
+        recorder.Keep(spaceUse);
+        recorder.Keep(record.resources);
+        recorder.OnComplete([kept = record.resources, use = spaceUse] {
+            const auto finish = [&](int*) { use->faultPin.reset(); use->completed.store(true, std::memory_order_release); };
+            int completed = 0;
+            std::unique_ptr<int, decltype(finish)> completedGuard(&completed, finish);
+            try {
+                kept->CheckFaults();
+            } catch (...) {
+                kept->dispatchSpacePoisoned.store(true, std::memory_order_release);
+                throw;
+            }
+        }, true);
+        resources.dispatchUse = spaceUse;
+    }
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
     recorder.Keep(record.resources);
@@ -6570,13 +6683,13 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
     const bool completionNeeded = resources.NeedsCompletion() || record.htileClear.has_value();
-    if (completionNeeded && resources.Reusable()) {
+    if (completionNeeded && resources.Reusable() && !resources.SpaceReuse()) {
         auto kept = record.resources;
         recorder.OnComplete([kept, htileClear = record.htileClear] {
             kept->CheckFaults();
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         }, !record.htileClear.has_value());
-    } else if (completionNeeded) {
+    } else if (completionNeeded && !resources.SpaceReuse()) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;
         auto kept = record.resources;
@@ -6590,6 +6703,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (resources.HasCopiedWrites()) writers->push_back(kept);
     }
     recordStep(PhaseRecordCompletion);
+    if (resources.SpaceReuse() && record.resourceKeyMatched) ++DispatchSpaces().hits;
 }
 
 // The module, pipeline layout and pipeline of a compute result over `setLayout` (the set layout
@@ -6764,11 +6878,37 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     DispatchTimer::countDispatch(profile);
     const auto lookupsBefore = Graphics::DeviceProcLookups();
     std::shared_ptr<Graphics::ShaderResources> resources;
+    const auto releaseUnrecordedSpace = [&](int*) {
+        if (resources != nullptr && resources->SpaceReuse() && resources->SpaceHeld()) static_cast<void>(resources->ReleaseSpace());
+    };
+    int spaceScope = 0;
+    std::unique_ptr<int, decltype(releaseUnrecordedSpace)> spaceGuard(&spaceScope, releaseUnrecordedSpace);
     ResourceCache::Key contentKey;
     const bool cacheable = !htileClear.has_value() && ResourceCacheEnabled() && shader.PipelineVariantId() != 0;
     // The object came from the resource cache: a compute template whose data buffers take this
     // dispatch's words at the record (ShaderResources::RefreshData).
     bool fromCache = false;
+    std::optional<DispatchBuildTrace::Event> buildTrace;
+    if (DispatchBuildTrace::Enabled()) {
+        buildTrace = prepared != nullptr && prepared->buildTrace != nullptr ? *prepared->buildTrace : DispatchBuildTrace::Event{};
+        buildTrace->program = programAddress;
+        buildTrace->shader = &shader;
+        buildTrace->reason = buildTrace->reuse == std::string_view("move-refused-at-prepare") ? "key-miss-after-move-refusal" : BuildTraceCacheReason(cacheable, htileClear.has_value(), shader);
+    }
+    bool traceBuilt = false;
+    const auto traceFailure = [&](const char* reason, const Graphics::ShaderResources::ProofReport* proof, const ResourceCache::Key& key) {
+        if (!buildTrace) return;
+        auto failed = *buildTrace;
+        failed.event = "reuse-failed";
+        failed.reason = reason;
+        failed.reuse = "failed";
+        failed.key = key;
+        if (proof != nullptr) BuildTraceDetail(failed, proof->detail);
+        DispatchBuildTrace::Emit(failed);
+        buildTrace->reason = reason;
+        buildTrace->reuse = "failed";
+        buildTrace->detail = failed.detail;
+    };
     bool refusedMove = false;
     double revalidateMs = 0;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> overlay;
@@ -6809,6 +6949,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         static const bool deferEviction = std::getenv("APS5_NO_DEFERRED_EVICTION") == nullptr;
         std::vector<std::shared_ptr<Graphics::ShaderResources>> evicted;
         state->resourceCache.Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
+        if (buildTrace) {
+            buildTrace->cacheMembership = resources->CacheMembership();
+            buildTrace->cacheInsert = buildTrace->cacheMembership != 0 ? "held" : "not-held-after-insert";
+        }
         for (auto& object : evicted) {
             object->KeepStorageImageBytes(*state->recorder);
             state->recorder->Keep(std::move(object));
@@ -6827,7 +6971,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         censusLap.restart();
+        if (threadGroup != std::array<std::uint32_t, 3>{}) resources->allowDispatchSpaceReuse = false;
         resources->Complete();
+        traceBuilt = true;
+        if (resources->SpaceReuse()) ++DispatchSpaces().built;
         censusLap.lap(PhaseResourcesComplete);
         require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
         if (profile) {
@@ -6860,12 +7007,60 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // object it found: revalidated as a map hit would be (an entry replaced meanwhile is left
         // alone by the pointer-conditional Remove). APS5_NO_PREPARED_FIND=1 looks the key up again.
         static const bool preparedFind = std::getenv("APS5_NO_PREPARED_FIND") == nullptr;
-        const bool exactEntry = prepared != nullptr && prepared->exact;
+        const bool exactEntry = (Graphics::ShaderResources::DispatchSpaceReuseEnabled() && DispatchUsesAddressTable(shaders[0])) || (prepared != nullptr && prepared->exact);
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        if (buildTrace && !(preparedFind && prepared != nullptr && prepared->buildTrace != nullptr)) (DispatchMove() && !exactEntry ? buildTrace->movableFind : buildTrace->exactFind) = cached != nullptr ? "hit" : "miss";
         censusLap.restart();
         if (cached != nullptr) {
-            if (cached->Revalidate(shaders[0])) {
+            Graphics::ShaderResources::ProofReport diagnosticProof;
+            const auto diagnosticStart = buildTrace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto releaseCandidateSpace = [](Graphics::ShaderResources* value) { static_cast<void>(value->ReleaseSpace()); };
+            std::unique_ptr<Graphics::ShaderResources, decltype(releaseCandidateSpace)> heldSpace(nullptr, releaseCandidateSpace);
+            bool spaceReady = !cached->SpaceReuse();
+            bool inFlight = false;
+            if (cached->SpaceReuse()) {
+                auto& counts = DispatchSpaces();
+                const auto previous = cached->dispatchUse.lock();
+                inFlight = (previous != nullptr && !previous->completed.load(std::memory_order_acquire)) || cached->SpaceHeld();
+                if (cached->dispatchSpacePoisoned.load(std::memory_order_acquire)) ++counts.revalidateFailed;
+                else if (inFlight) ++counts.inFlight;
+                else if (threadGroup != std::array<std::uint32_t, 3>{}) ++counts.revalidateFailed;
+                else {
+                    for (const auto& snapshot : snapshots) {
+                        if (snapshot.bytes.empty() || !state->recorder->PendingWriteOverlaps(snapshot.address, snapshot.bytes.size())) continue;
+                        Graphics::Recorder::CountSync(4);
+                        state->recorder->SyncThrough(snapshot.address, snapshot.bytes.size());
+                    }
+                    heldSpace.reset(cached.get());
+                    if (!cached->RetakeSpace()) ++counts.spaceChanged;
+                    else if (!cached->AddressTableGuardCurrent()) ++counts.guardChanged;
+                    else {
+                        spaceReady = cached->SnapshotsServedInPlace(snapshots) == Graphics::SnapshotService::Served;
+                        if (!spaceReady) ++counts.snapshotRefused;
+                    }
+                }
+            }
+            const bool valid = spaceReady && cached->Revalidate(shaders[0], buildTrace ? &diagnosticProof : nullptr);
+            if (cached->SpaceReuse() && spaceReady && !valid) ++DispatchSpaces().revalidateFailed;
+            if (valid && cached->SpaceReuse() && VerifyDispatchSpaceReuse()) {
+                const auto verificationPin = Graphics::ShaderResources::pinDispatchFaultSlot(cached);
+                cached->prepareFaultSlot();
+                const Graphics::ShaderResources fresh(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0, htileClear, false);
+                cached->prepareFaultSlot();
+                auto& counts = DispatchSpaces();
+                ++counts.verified;
+                const char* mismatch = cached->CompareDispatchSpace(fresh);
+                if (mismatch == nullptr && !cached->AddressTableGuardCurrent()) mismatch = "table guard";
+                if (mismatch == nullptr && cached->SnapshotsServedInPlace(snapshots) != Graphics::SnapshotService::Served) mismatch = "snapshot obligations";
+                if (mismatch != nullptr) {
+                    ++counts.mismatches;
+                    throw std::runtime_error(std::string("APS5_VERIFY_DISPATCH_SPACE_REUSE: ") + mismatch);
+                }
+            }
+            if (buildTrace) buildTrace->revalidateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - diagnosticStart).count());
+            if (valid) {
+                if (buildTrace) buildTrace->reuse = "passed";
                 bool usable = true;
                 if (DispatchMove() && !exactEntry) {
                     auto& moves = DispatchMoves();
@@ -6886,6 +7081,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     }
                     if (!moved.has_value()) {
                         usable = false;
+                        if (buildTrace) BuildTraceDetail(*buildTrace, proof.detail);
+                        traceFailure("movable-refused", nullptr, contentKey);
                         moves.refused[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
                     } else if (moved->empty()) {
                         moves.exact.fetch_add(1, std::memory_order_relaxed);
@@ -6900,20 +7097,29 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     contentKey = DispatchContentKey(shaders[0], context.device, false);
                     refusedMove = true;
                     cached = state->resourceCache.Find(contentKey);
-                    if (cached != nullptr && cached->Revalidate(shaders[0])) usable = true;
+                    if (buildTrace) buildTrace->exactFind = cached != nullptr ? "hit" : "miss";
+                    Graphics::ShaderResources::ProofReport exactProof;
+                    const auto exactStart = buildTrace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const bool exactValid = cached != nullptr && cached->Revalidate(shaders[0], buildTrace ? &exactProof : nullptr);
+                    if (buildTrace && cached != nullptr) buildTrace->revalidateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - exactStart).count());
+                    if (exactValid) usable = true;
                     else if (cached != nullptr) {
+                        traceFailure("exact-revalidation-failed", &exactProof, contentKey);
                         state->resourceCache.Remove(contentKey, cached.get());
                         ++d.cacheInvalidated;
                         state->recorder->Keep(std::move(cached));
                     }
                 }
                 if (usable) {
-                    if (refusedMove || exactEntry) DispatchMoves().served.fetch_add(1, std::memory_order_relaxed);
+                    if ((refusedMove || exactEntry) && !cached->SpaceReuse()) DispatchMoves().served.fetch_add(1, std::memory_order_relaxed);
+                    static_cast<void>(heldSpace.release());
                     resources = std::move(cached);
                     fromCache = true;
                     ++d.cacheHits;
                 }
             } else {
+                if (heldSpace != nullptr) heldSpace.reset();
+                traceFailure(inFlight ? "space-in-flight" : "revalidation-failed", &diagnosticProof, contentKey);
                 state->resourceCache.Remove(contentKey, cached.get());
                 ++d.cacheInvalidated;
                 // Off the mutex with its batch, as an evicted entry (insert()).
@@ -6930,7 +7136,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (resources == nullptr) {
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         censusLap.restart();
-        resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0, htileClear);
+        resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0, htileClear, threadGroup == std::array<std::uint32_t, 3>{});
+        traceBuilt = true;
+        if (resources->SpaceReuse()) ++DispatchSpaces().built;
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
         censusLap.lap(PhaseResourcesFullBuild);
         if (cacheable) {
@@ -6938,6 +7146,25 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             if (refusedMove) noteRefusalBuild(resources->Reusable());
             if (resources->Reusable()) insert();
         }
+    }
+    if (buildTrace && traceBuilt) {
+        const auto& timing = resources->Timing();
+        buildTrace->key = contentKey;
+        buildTrace->reusable = resources->ReuseBlockReason();
+        buildTrace->addressTable = resources->UsesAddressTable();
+        buildTrace->bdaReadOnly = resources->BdaReadOnly();
+        buildTrace->spaceOnly = resources->guestMemory.SpaceOnly();
+        buildTrace->copiedWrites = resources->HasCopiedWrites();
+        buildTrace->holdsLease = resources->HoldsLease();
+        buildTrace->stageANs = BuildTraceNanoseconds(timing.prepareMs);
+        buildTrace->completeNs = BuildTraceNanoseconds(timing.completeMs);
+        buildTrace->imagesNs = BuildTraceNanoseconds(timing.imagesMs);
+        buildTrace->uploadNs = BuildTraceNanoseconds(timing.uploadMs);
+        buildTrace->bdaNs = BuildTraceNanoseconds(timing.bdaMs);
+        const auto traffic = resources->guestMemory.Traffic();
+        buildTrace->cpuBytes = traffic.cpuBytes;
+        buildTrace->gpuBytes = traffic.gpuBytes;
+        buildTrace->copiedBytes = resources->CopiedBytes();
     }
     resources->PatchPushConstants(pushBytes);
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
@@ -6975,7 +7202,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         timer.phase(PhasePipeline);
     }
     DispatchCompletion completion{context, shaders, pushStages, pushBytes, objects, resources, contentKey, cacheable, fromCache, revalidateMs, overlay, lookupsBefore, timer, timing, groupsText, std::move(privateDispatch)};
-    return recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion, recipeFailure);
+    RecipeBuildFailure diagnosticRecipeFailure = RecipeBuildFailure::NotAttempted;
+    auto* effectiveRecipeFailure = recipeFailure != nullptr ? recipeFailure : buildTrace ? &diagnosticRecipeFailure : nullptr;
+    const auto outcome = recordCompletedDispatch(shader, x, y, z, arguments, programAddress, recipeOut, threadGroup, htileClear, completion, effectiveRecipeFailure);
+    if (buildTrace && traceBuilt) {
+        buildTrace->recipeBuilt = BuildTraceRecipeName(*effectiveRecipeFailure);
+        DispatchBuildTrace::Emit(*buildTrace);
+    }
+    return outcome;
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, DispatchCompletion& completion, RecipeBuildFailure* recipeFailure) {
@@ -7007,6 +7241,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
+    const bool heldSpaceLease = resources->SpaceReuse() && resources->HoldsLease();
     recordDispatch(record);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
@@ -7015,12 +7250,12 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     // when the batch finished (deferred lease release, see Graphics::SyncLeaseWork): a guest thread
     // that needs a leased allocation syncs the recorder itself through the registry's pin waiter.
     // APS5_SYNC_LEASE_DISPATCH=1 completes such dispatches at once, as before.
-    if (SyncEachDispatch() || (resources->HoldsLease() && Graphics::SyncLeaseWork())) {
+    if (SyncEachDispatch() || ((heldSpaceLease || resources->HoldsLease()) && Graphics::SyncLeaseWork())) {
         Graphics::Recorder::CountSync(3);
         const auto syncStart = std::chrono::steady_clock::now();
         recorder.Sync();
         timer.phase(PhaseSync);
-        if (resources->HoldsLease()) Graphics::CountLeaseOutcome(true, 0);
+        if ((heldSpaceLease || resources->HoldsLease())) Graphics::CountLeaseOutcome(true, 0);
         if (profile) {
             // APS5_PROFILE_DRAW: the [recorder] line's "address-based" syncs by program, every 10 s,
             // so the programs still waiting here are known (under the GpuMutex, like the rest).
@@ -7046,7 +7281,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
                 byProgram.clear();
             }
         }
-    } else if (resources->HoldsLease()) {
+    } else if ((heldSpaceLease || resources->HoldsLease())) {
         // The lease is in the open batch (kept above, nothing submitted since): the pin waiter
         // finishes the recorder up to that batch's serial. Prints the [address-sync] leases line.
         Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
@@ -7070,7 +7305,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
             return RecipeBuildFailure::None;
         }();
     }
-    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && (completionRecipes || !resources->NeedsCompletion()) && objects != nullptr && !contentKey.empty()) {
+    if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && !resources->UsesAddressTable() && !resources->HoldsLease() && !resources->SpaceReuse() && resources->Reusable() && (completionRecipes || !resources->NeedsCompletion()) && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;
@@ -7105,10 +7340,27 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     auto& d = Dispatches();
     const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
     const auto context = graphicsContext();
+    const auto traceRecipeFailure = [&](const char* reason, const Graphics::ShaderResources::ProofReport* proof, std::uint64_t ns) {
+        if (!DispatchBuildTrace::Enabled()) return;
+        DispatchBuildTrace::Event event;
+        event.shader = &shader;
+        event.key = recipe.key;
+        event.program = programAddress;
+        event.event = "reuse-failed";
+        event.reason = reason;
+        event.reuse = "failed";
+        event.revalidateNs = ns;
+        if (proof != nullptr) BuildTraceDetail(event, proof->detail);
+        DispatchBuildTrace::Recipe(reason);
+        DispatchBuildTrace::Emit(event);
+    };
     if (recipe.needsCompletion != hit->resources->NeedsCompletion() || recipe.holdsLease || !hit->resources->Reusable() || hit->resources->HasCopiedWrites() || hit->resources->UsesAddressTable()) throw std::runtime_error("Vulkan dispatch: recipe over a non-reusable template");
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
     // the ordinary path, whose word-keyed lookup serves or builds the object for the live words.
-    if (refreshByWords && !TemplateDataRefresh()) return RecipeOutcome::Rebuild;
+    if (refreshByWords && !TemplateDataRefresh()) {
+        traceRecipeFailure("recipe-data-refresh-disabled", nullptr, 0);
+        return RecipeOutcome::Rebuild;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DispatchTimer timer(profile, arguments != 0, shader.spirv.size(), programAddress);
     DispatchTimer::countDispatch(profile);
@@ -7117,6 +7369,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     // may replace the device between the two).
     if (recipe.device != state->device) {
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
+        traceRecipeFailure("recipe-device-mismatch", nullptr, 0);
         return RecipeOutcome::Rebuild;
     }
     if (hit->presyncSerial != 0) {
@@ -7135,6 +7388,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
         // would use a content-equal object and the comparison has no counterpart. Counted, and the
         // ordinary path runs with the prepared find (C10: the template goes to the batch).
         if (verify->cached.get() != hit->resources.get()) {
+            traceRecipeFailure("recipe-verify-replaced", nullptr, 0);
             counters.verifyReplaced.fetch_add(1, std::memory_order_relaxed);
             hit->resources->KeepStorageImageBytes(*state->recorder);
             state->recorder->Keep(std::move(hit->resources));
@@ -7170,6 +7424,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     report.trace = traceProofProgram != 0 && programAddress == traceProofProgram;
     CensusLap censusLap;
     if (censusLap.on) ArchB::Recorder::Count("c8_recipe_calls");
+    const auto diagnosticProofStart = DispatchBuildTrace::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = hit->resources->ProveCurrent(shaders[0], &report);
     censusLap.lap(PhaseProof);
     if (report.trace) {
@@ -7196,6 +7451,8 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     }
     timer.phase(PhaseProof);
     if (!proved) {
+        const auto ns = DispatchBuildTrace::Enabled() ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - diagnosticProofStart).count()) : 0;
+        traceRecipeFailure("recipe-proof-failed", &report, ns);
         state->resourceCache.Remove(recipe.key, hit->resources.get());
         ++d.cacheInvalidated;
         // Off the mutex with its batch, as an evicted entry.

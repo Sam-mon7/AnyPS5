@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/DispatchBuildTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -455,6 +456,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         recorderWork.SetKey({ArchB::Recorder::Kind::Dispatch, digest});
         if (!resolving && DrawShaderProfileEnabled()) pendingDispatchPhases().digest = digest;
     }
+    const auto buildTraceDigest = DispatchBuildTrace::Enabled() ? (snapshot.CodeDigest() ^ codeOffset) * 0x100000001b3ull : 0;
+    const DispatchBuildTrace::Scope buildTrace(submission.queue, address, buildTraceDigest, currentPacketOffset(), submission.serial);
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
@@ -998,7 +1001,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
         NoteQ0Dispatch(aliasEntry ? Q0Dispatch::AliasItem : Q0Dispatch::Item);
-        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, allocChurn, partialSnapshot, hostSlabAlloc, cheapTimers, buildTraceContext = DispatchBuildTrace::Current(), recorderKey = recorderWork.Identity(), localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, ticket, htileClearCompletion, htileMask, computeSync] {
+            const DispatchBuildTrace::Scope buildTrace(buildTraceContext);
             const HostAllocator::Scope hostSlabScope(hostSlabAlloc);
             const ArchB::CheapClock::Scope cheapTimersScope(cheapTimers);
             ArchB::Recorder::Work recorderWork(recorderKey, ArchB::Recorder::Phase::Record, false);

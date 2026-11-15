@@ -1,4 +1,10 @@
 if(BUILD_TESTING)
+    add_test(NAME agc_driver_address_draw_space_reuse_shadow_ranges COMMAND agc_driver_address_draw_space_reuse_tests --case shadow-ranges)
+    set_tests_properties(agc_driver_address_draw_space_reuse_shadow_ranges PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_address_draw_space_reuse_shadow_ranges PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_address_draw_space_reuse_pool_faults COMMAND agc_driver_address_draw_space_reuse_tests --case fault-per-use)
     set_tests_properties(agc_driver_address_draw_space_reuse_pool_faults PROPERTIES
         ENVIRONMENT "APS5_ARCHB_FIX_DRAW_SET_POOL=1;APS5_ARCHB_FIX_MOVED_WORD_UPLOAD=1;APS5_ARCHB_ZERO_COPY_STORAGE=1;APS5_ARCHB_ZERO_COPY_MOVED=1"

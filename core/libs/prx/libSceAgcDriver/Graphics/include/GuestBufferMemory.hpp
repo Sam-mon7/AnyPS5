@@ -469,6 +469,13 @@ public:
     bool ReleaseCompletedSpace(std::uint64_t recorder, std::uint64_t completedThrough);
     static void ReleaseRetainedSpaces(std::uint64_t recorder, std::uint64_t completedThrough);
     SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const;
+    struct UploadTraffic {
+        std::uint64_t cpuBytes = 0;
+        std::uint64_t gpuBytes = 0;
+        std::uint64_t retainedCpuBytes = 0;
+        std::uint64_t retainedGpuBytes = 0;
+    };
+    UploadTraffic Traffic() const { return uploadTraffic; }
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
         for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
@@ -650,7 +657,7 @@ private:
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
-    void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    void recordGpuCopies(std::span<Region* const> copies, bool addressable, bool retained = false);
     void recordCarryVerify(Recorder& recorder, std::span<Region* const> carried, bool cross = false);
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;
@@ -690,6 +697,7 @@ private:
     std::vector<std::pair<std::uint64_t, std::shared_ptr<Buffer>>> heapReadbacks;
     std::vector<std::uint64_t> evictedRanges;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
+    UploadTraffic uploadTraffic{};
     bool prepared = false;
     bool uploaded = false;
     bool committed = false;
